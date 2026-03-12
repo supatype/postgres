@@ -51,26 +51,29 @@ jobs:
 
       - name: Verify extensions
         run: |
-          docker exec pg_test psql -U supatype_admin -d postgres -c "
-            SELECT extname FROM pg_available_extensions
+          docker exec -e PGPASSWORD=testpassword pg_test psql -U supatype_admin -d postgres -c "
+            SELECT name FROM pg_available_extensions
             WHERE name IN (
               'pgcrypto','uuid-ossp','pg_stat_statements',
-              'pg_cron','pg_net','pgsodium',
+              'pg_cron','pg_net',
               'postgis','vector','pg_graphql','pgjwt'
             )
             ORDER BY name;
           "
 
-      - name: Verify security extensions loaded
+      - name: Verify shared_preload_libraries
         run: |
-          docker exec pg_test psql -U supatype_admin -d postgres -c "
-            SELECT name FROM pg_available_extensions
-            WHERE name IN ('supautils')
-            ORDER BY name;
-          "
-          # Verify plan_filter and safeupdate are in shared_preload_libraries
-          docker exec pg_test psql -U supatype_admin -d postgres -c "
+          docker exec -e PGPASSWORD=testpassword pg_test psql -U supatype_admin -d postgres -c "
             SHOW shared_preload_libraries;
+          "
+
+      - name: Verify pg_guard loaded
+        run: |
+          docker exec -e PGPASSWORD=testpassword pg_test psql -U supatype_admin -d postgres -c "
+            SHOW session_preload_libraries;
+          "
+          docker exec -e PGPASSWORD=testpassword pg_test psql -U supatype_admin -d postgres -c "
+            SHOW pg_guard.privileged_role;
           "
 
       - name: Show logs on failure
