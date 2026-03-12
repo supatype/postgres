@@ -1,0 +1,35 @@
+.DS_Store
+.python-version
+.mise.toml
+venv/
+*.swp
+docker/cache/
+
+ansible/image-manifest*.json
+testinfra-aio-container-logs.log
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+#nix related
+result*
+.env-local
+.history
+.envrc
+.direnv
+.nixos-test-history
+
+#IDE
+.idea/
+.vscode/
+
+db/schema.sql
+common-nix.vars.pkr.hcl
+
+# pre-commit config is managed in nix
+.pre-commit-config.yaml
+nixos.qcow2
+.lsp
+.clj-kondo

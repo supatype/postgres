@@ -1,0 +1,43 @@
+name: Mirror PostgREST
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - ".github/workflows/mirror-postgrest.yml"
+      - "ansible/vars.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      postgrest_release: ${{ steps.args.outputs.result }}
+    steps:
+      - name: Checkout Repo
+        uses: supatype/postgres/.github/actions/shared-checkout@HEAD
+      - id: args
+        uses: mikefarah/yq@065b200af9851db0d5132f50bc10b1406ea5c0a8 # v4.50.1
+        with:
+          cmd: yq '.postgrest_release' 'ansible/vars.yml'
+
+  mirror:
+    needs:
+      - version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v2.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: akhilerm/tag-push-action@85bf542f43f5f2060ef76262a67ee3607cb6db37 # v2.1.0
+        with:
+          src: docker.io/postgrest/postgrest:v${{ needs.version.outputs.postgrest_release }}
+          dst: ghcr.io/supatype/postgrest:v${{ needs.version.outputs.postgrest_release }}
