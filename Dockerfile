@@ -66,9 +66,12 @@ COPY config/pg_ident.conf /etc/postgresql/pg_ident.conf
 COPY config/pg_guard.conf /etc/postgresql-custom/pg_guard.conf
 COPY config/extension-custom-scripts/ /etc/postgresql-custom/extension-custom-scripts/
 
-# Bootstrap migrations (postgres entrypoint runs these on first start)
+# Bootstrap migrations: the stock postgres entrypoint only runs *.sh / *.sql in this
+# directory itself — not in subfolders. migrate.sh applies init-scripts/ + migrations/.
 COPY migrations/db/init-scripts/ /docker-entrypoint-initdb.d/init-scripts/
 COPY migrations/db/migrations/    /docker-entrypoint-initdb.d/migrations/
+COPY migrations/db/migrate.sh /docker-entrypoint-initdb.d/99-supatype-migrate.sh
+RUN chmod +x /docker-entrypoint-initdb.d/99-supatype-migrate.sh
 
 ENV POSTGRES_USER=supatype_admin
 

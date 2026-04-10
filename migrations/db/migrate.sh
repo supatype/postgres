@@ -5,7 +5,8 @@ set -eu
 # Used by both ami and docker builds to initialise database schema.
 # Env vars:
 #   POSTGRES_DB        defaults to postgres
-#   POSTGRES_HOST      defaults to localhost
+#   POSTGRES_HOST      if set, psql uses TCP to this host; if unset, use Unix socket
+#                      (required for official postgres image first-boot init)
 #   POSTGRES_PORT      defaults to 5432
 #   POSTGRES_PASSWORD  defaults to ""
 #   USE_DBMATE         defaults to ""
@@ -14,12 +15,15 @@ set -eu
 #######################################
 
 export PGDATABASE="${POSTGRES_DB:-postgres}"
-export PGHOST="${POSTGRES_HOST:-localhost}"
 export PGPORT="${POSTGRES_PORT:-5432}"
+if [ -n "${POSTGRES_HOST:-}" ]; then
+	export PGHOST="$POSTGRES_HOST"
+fi
 export PGPASSWORD="${POSTGRES_PASSWORD:-}"
 
 # if args are supplied, simply forward to dbmate
-connect="$PGPASSWORD@$PGHOST:$PGPORT/$PGDATABASE?sslmode=disable"
+_connect_host="${PGHOST:-localhost}"
+connect="$PGPASSWORD@$_connect_host:$PGPORT/$PGDATABASE?sslmode=disable"
 if [ "$#" -ne 0 ]; then
     export DATABASE_URL="${DATABASE_URL:-postgres://supatype_admin:$connect}"
     exec dbmate "$@"
