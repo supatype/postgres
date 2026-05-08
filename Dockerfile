@@ -4,7 +4,6 @@ ARG PGVECTOR_VERSION=0.8.0
 ARG PG_NET_VERSION=0.14.0
 ARG PG_GRAPHQL_VERSION=1.5.9
 ARG PGJWT_COMMIT=f3d82fd30151e754e19ce5d6a06c71c20689ce3d
-ARG PG_GUARD_VERSION=0.24.0
 
 # PGDG apt repo (for pg_cron, postgis, pgsodium)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -50,9 +49,9 @@ RUN ARCH=$(dpkg --print-architecture) \
      -o /tmp/pg_graphql.deb \
   && dpkg -i /tmp/pg_graphql.deb && rm /tmp/pg_graphql.deb
 
-# pg_guard — role/extension privilege enforcement (critical for cloud security)
-RUN git clone --depth 1 --branch v${PG_GUARD_VERSION} https://github.com/supatype/pg_guard.git /tmp/pg_guard \
-  && cd /tmp/pg_guard && make && make install && rm -rf /tmp/pg_guard
+# pg_guard — role/extension privilege enforcement (bundled in extensions/)
+COPY extensions/pg_guard/ /tmp/pg_guard/
+RUN cd /tmp/pg_guard && make && make install && rm -rf /tmp/pg_guard
 
 # Remove build tools
 RUN apt-get purge -y build-essential git postgresql-server-dev-17 pkg-config libssl-dev libcurl4-openssl-dev \

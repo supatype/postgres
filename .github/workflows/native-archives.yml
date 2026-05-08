@@ -1,0 +1,531 @@
+name: Build Native PG17 Archives
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PG_VERSION: "17.2"
+  PG_TARBALL: "postgresql-17.2.tar.gz"
+  PG_URL: "https://ftp.postgresql.org/pub/source/v17.2/postgresql-17.2.tar.gz"
+  PG_SHA256: "da2f4c65c38a0b33c6c1b6f6b061e4543ca32b73ce1a3a75ef3a94e55c86e74c"
+  INSTALL_PREFIX: "/usr/local/supatype-pg"
+  # Extension versions — must match Dockerfile ARGs
+  PGVECTOR_VERSION: "0.8.0"
+  PGJWT_COMMIT: "f3d82fd30151e754e19ce5d6a06c71c20689ce3d"
+
+jobs:
+  build:
+    name: Build PG17 (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            os: ubuntu-22.04
+            platform: linux
+            arch: amd64
+            cross: false
+
+          - target: linux-arm64
+            os: ubuntu-22.04
+            platform: linux
+            arch: arm64
+            cross: true
+            cross_triple: aarch64-linux-gnu
+
+          - target: darwin-arm64
+            os: macos-14
+            platform: darwin
+            arch: arm64
+            cross: false
+
+          - target: darwin-x86_64
+            os: macos-13
+            platform: darwin
+            arch: x86_64
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------ #
+      # Install build dependencies
+      # ------------------------------------------------------------------ #
+      - name: Install dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libssl-dev \
+            libreadline-dev \
+            zlib1g-dev \
+            libicu-dev \
+            libzstd-dev
+
+      - name: Install cross-compile toolchain (linux-arm64)
+        if: matrix.cross == true
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libssl-dev:arm64 \
+            libreadline-dev:arm64 \
+            zlib1g-dev:arm64 \
+            libicu-dev:arm64 \
+            libzstd-dev:arm64
+          sudo dpkg --add-architecture arm64
+
+      - name: Install dependencies (macOS)
+        if: matrix.platform == 'darwin'
+        run: |
+          brew install openssl readline icu4c zstd
+
+      # ------------------------------------------------------------------ #
+      # Download & verify PG17 source
+      # ------------------------------------------------------------------ #
+      - name: Download PostgreSQL ${{ env.PG_VERSION }} source
+        run: |
+          curl -fsSL "${{ env.PG_URL }}" -o "${{ env.PG_TARBALL }}"
+
+      - name: Verify SHA256 checksum (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          echo "${{ env.PG_SHA256 }}  ${{ env.PG_TARBALL }}" | sha256sum --check
+
+      - name: Verify SHA256 checksum (macOS)
+        if: matrix.platform == 'darwin'
+        run: |
+          echo "${{ env.PG_SHA256 }}  ${{ env.PG_TARBALL }}" | shasum -a 256 --check
+
+      - name: Extract source
+        run: |
+          tar -xzf "${{ env.PG_TARBALL }}"
+
+      # ------------------------------------------------------------------ #
+      # Configure
+      # ------------------------------------------------------------------ #
+      - name: Configure (Linux native amd64)
+        if: matrix.platform == 'linux' && matrix.cross == false
+        working-directory: postgresql-${{ env.PG_VERSION }}
+        run: |
+          ./configure \
+            --prefix=${{ env.INSTALL_PREFIX }} \
+            --with-openssl \
+            --with-uuid=e2fs \
+            --with-icu \
+            --with-zstd \
+            --disable-rpath
+
+      - name: Configure (Linux cross arm64)
+        if: matrix.platform == 'linux' && matrix.cross == true
+        working-directory: postgresql-${{ env.PG_VERSION }}
+        run: |
+          export CC=aarch64-linux-gnu-gcc
+          export CXX=aarch64-linux-gnu-g++
+          export AR=aarch64-linux-gnu-ar
+          export STRIP=aarch64-linux-gnu-strip
+          ./configure \
+            --prefix=${{ env.INSTALL_PREFIX }} \
+            --host=aarch64-linux-gnu \
+            --build=x86_64-linux-gnu \
+            --with-openssl \
+            --with-uuid=e2fs \
+            --with-icu \
+            --with-zstd \
+            --disable-rpath
+
+      - name: Configure (macOS)
+        if: matrix.platform == 'darwin'
+        working-directory: postgresql-${{ env.PG_VERSION }}
+        run: |
+          OPENSSL_PREFIX="$(brew --prefix openssl)"
+          ICU4C_PREFIX="$(brew --prefix icu4c)"
+          READLINE_PREFIX="$(brew --prefix readline)"
+          ZSTD_PREFIX="$(brew --prefix zstd)"
+          ./configure \
+            --prefix=${{ env.INSTALL_PREFIX }} \
+            --with-openssl \
+            --with-uuid=e2fs \
+            --with-icu \
+            --with-zstd \
+            --disable-rpath \
+            --with-libraries="${OPENSSL_PREFIX}/lib:${ICU4C_PREFIX}/lib:${READLINE_PREFIX}/lib:${ZSTD_PREFIX}/lib" \
+            --with-includes="${OPENSSL_PREFIX}/include:${ICU4C_PREFIX}/include:${READLINE_PREFIX}/include:${ZSTD_PREFIX}/include"
+
+      # ------------------------------------------------------------------ #
+      # Build & staged install
+      # ------------------------------------------------------------------ #
+      - name: Build PostgreSQL
+        working-directory: postgresql-${{ env.PG_VERSION }}
+        run: |
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            JOBS=$(nproc)
+          else
+            JOBS=$(sysctl -n hw.logicalcpu)
+          fi
+          make -j"${JOBS}"
+
+      - name: Install PostgreSQL (staged)
+        working-directory: postgresql-${{ env.PG_VERSION }}
+        run: |
+          make install DESTDIR="$(pwd)/../pg-install"
+
+      # ------------------------------------------------------------------ #
+      # Build pg_guard extension (bundled in extensions/pg_guard/)
+      # ------------------------------------------------------------------ #
+      - name: Build and bundle pg_guard
+        if: matrix.cross == false
+        run: |
+          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
+          PG_CONFIG="${PG_CONFIG}" make -C extensions/pg_guard
+          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
+          mkdir -p "${LIB_DIR}"
+          find extensions/pg_guard \( -name "pg_guard.so" -o -name "pg_guard.dylib" \) \
+            -exec cp {} "${LIB_DIR}/" \;
+          echo "pg_guard bundled into lib dir."
+
+      - name: Skip pg_guard (cross-compile — not supported)
+        if: matrix.cross == true
+        run: echo "::notice::pg_guard cross-compilation not supported in CI — skipping."
+
+      # ------------------------------------------------------------------ #
+      # pgvector — vector similarity search (C extension, native targets only)
+      # ------------------------------------------------------------------ #
+      - name: Build and bundle pgvector
+        if: matrix.cross == false
+        run: |
+          # Build from an explicit tagged release for reproducible archives.
+          git clone --depth 1 --branch v${{ env.PGVECTOR_VERSION }} \
+            https://github.com/pgvector/pgvector.git
+          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
+          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
+          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
+          mkdir -p "${SHARE_DIR}"
+          PG_CONFIG="${PG_CONFIG}" make -C pgvector -j4
+          find pgvector \( -name "vector.so" -o -name "vector.dylib" \) \
+            -exec cp {} "${LIB_DIR}/" \;
+          cp pgvector/vector.control "${SHARE_DIR}/"
+          find pgvector -name "vector--*.sql" -exec cp {} "${SHARE_DIR}/" \;
+          echo "pgvector bundled."
+
+      - name: Skip pgvector (cross-compile — C extension)
+        if: matrix.cross == true
+        run: echo "::notice::pgvector cross-compilation not supported — skipping."
+
+      # ------------------------------------------------------------------ #
+      # pgjwt — JWT generation/verification in SQL (SQL-only, all targets)
+      # ------------------------------------------------------------------ #
+      - name: Bundle pgjwt
+        run: |
+          git clone https://github.com/michelp/pgjwt.git
+          git -C pgjwt checkout ${{ env.PGJWT_COMMIT }}
+          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
+          mkdir -p "${SHARE_DIR}"
+          cp pgjwt/pgjwt.control "${SHARE_DIR}/"
+          find pgjwt -name "pgjwt--*.sql" -exec cp {} "${SHARE_DIR}/" \;
+          echo "pgjwt bundled."
+
+      # ------------------------------------------------------------------ #
+      # Package archive
+      # ------------------------------------------------------------------ #
+      - name: Create archive
+        run: |
+          FILENAME="supatype-pg-17-${{ matrix.target }}.tar.gz"
+          tar -czf "${FILENAME}" -C pg-install${{ env.INSTALL_PREFIX }} .
+          echo "ARCHIVE_NAME=${FILENAME}" >> "$GITHUB_ENV"
+
+      - name: Generate checksum (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sha256sum "${{ env.ARCHIVE_NAME }}" > "${{ env.ARCHIVE_NAME }}.sha256"
+
+      - name: Generate checksum (macOS)
+        if: matrix.platform == 'darwin'
+        run: |
+          shasum -a 256 "${{ env.ARCHIVE_NAME }}" > "${{ env.ARCHIVE_NAME }}.sha256"
+
+      # ------------------------------------------------------------------ #
+      # Upload to S3 CDN
+      # ------------------------------------------------------------------ #
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.CDN_AWS_REGION }}
+
+      - name: Upload archive to CDN
+        run: |
+          EP="${{ secrets.CDN_ENDPOINT }}"
+          BASE="s3://${{ secrets.CDN_BUCKET }}/postgres/v${{ env.PG_VERSION }}"
+          ARCHIVE="supatype-pg-17-${{ matrix.target }}.tar.gz"
+          aws s3 cp "${ARCHIVE}" "${BASE}/${ARCHIVE}" \
+            --endpoint-url "${EP}" \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp "${ARCHIVE}.sha256" "${BASE}/${ARCHIVE}.sha256" \
+            --endpoint-url "${EP}" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      # ------------------------------------------------------------------ #
+      # Upload artifact for release job
+      # ------------------------------------------------------------------ #
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: supatype-pg-17-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          retention-days: 7
+
+  # -------------------------------------------------------------------- #
+  # Windows — MSYS2/MINGW64: prebuilt PG17 package + extensions compiled
+  # via PGXS.  Produces the same supatype-postgres distribution as Linux/
+  # macOS (pg_guard.dll bundled alongside the PG executables).
+  # -------------------------------------------------------------------- #
+  build-windows:
+    name: Build PG17 + extensions (windows-amd64)
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-postgresql
+            mingw-w64-x86_64-gcc
+            make
+            base-devel
+            git
+
+      # ------------------------------------------------------------------ #
+      # Build pg_guard against MSYS2's PG17
+      # PGXS handles the .dll suffix automatically on win32.
+      # ------------------------------------------------------------------ #
+      - name: Build pg_guard
+        run: |
+          PG_CONFIG=/mingw64/bin/pg_config
+          make -C extensions/pg_guard PG_CONFIG="$PG_CONFIG"
+
+      # ------------------------------------------------------------------ #
+      # Stage archive contents
+      # Layout matches the Linux/macOS archives:
+      #   bin/        PG executables + all required runtime DLLs
+      #   lib/postgresql/  extension DLLs (pg_guard.dll)
+      #   share/postgresql/ timezone data, locale data (needed by initdb)
+      # ------------------------------------------------------------------ #
+      - name: Stage archive contents
+        run: |
+          STAGING="$(pwd)/staging"
+          mkdir -p "$STAGING/bin" \
+                   "$STAGING/lib/postgresql" \
+                   "$STAGING/share/postgresql"
+
+          # PostgreSQL executables
+          for exe in postgres pg_ctl initdb psql pg_dump pg_restore \
+                     createdb dropdb createuser dropuser pg_isready \
+                     pg_basebackup ecpg; do
+            [ -f "/mingw64/bin/${exe}.exe" ] && cp "/mingw64/bin/${exe}.exe" "$STAGING/bin/"
+          done
+
+          # Runtime DLLs — include only MSYS2/MINGW64 DLLs (skip Windows system DLLs)
+          for exe in "$STAGING/bin/"*.exe; do
+            ldd "$exe" 2>/dev/null \
+              | awk '/\/mingw64\/bin\// { print $3 }' \
+              | while read dll; do
+                  [ -f "$dll" ] && cp -n "$dll" "$STAGING/bin/"
+                done
+          done
+
+          # pg_guard extension DLL
+          find extensions/pg_guard -name "pg_guard.dll" \
+            -exec cp {} "$STAGING/lib/postgresql/" \;
+
+          # PG share data (timezone tables, encoding maps — required by initdb)
+          cp -r /mingw64/share/postgresql/. "$STAGING/share/postgresql/"
+
+      # ------------------------------------------------------------------ #
+      # pgvector (Windows — MSYS2 package preferred, HEAD fallback)
+      # ------------------------------------------------------------------ #
+      - name: Install/build pgvector (Windows)
+        run: |
+          STAGING="$(pwd)/staging"
+          mkdir -p "${STAGING}/lib/postgresql" "${STAGING}/share/postgresql/extension"
+
+          # Use MSYS2 package first (ABI-compatible). If unavailable, build from
+          # explicit tag instead of floating HEAD for reproducibility.
+          if pacman -S --noconfirm --needed mingw-w64-x86_64-pgvector 2>/dev/null \
+             && [ -f /mingw64/lib/postgresql/vector.dll ]; then
+            cp /mingw64/lib/postgresql/vector.dll "${STAGING}/lib/postgresql/"
+            cp /mingw64/share/postgresql/extension/vector.control \
+               "${STAGING}/share/postgresql/extension/"
+            find /mingw64/share/postgresql/extension -name "vector--*.sql" \
+              -exec cp {} "${STAGING}/share/postgresql/extension/" \;
+            echo "pgvector: installed from MSYS2 package"
+          else
+            git clone --depth 1 --branch v${{ env.PGVECTOR_VERSION }} https://github.com/pgvector/pgvector.git
+            make -C pgvector PG_CONFIG=/mingw64/bin/pg_config -j4
+            find pgvector -name "vector.dll" \
+              -exec cp {} "${STAGING}/lib/postgresql/" \;
+            cp pgvector/vector.control "${STAGING}/share/postgresql/extension/"
+            find pgvector -name "vector--*.sql" \
+              -exec cp {} "${STAGING}/share/postgresql/extension/" \;
+            echo "pgvector: built from release tag"
+          fi
+
+      # ------------------------------------------------------------------ #
+      # pgjwt (Windows — SQL-only, no compilation needed)
+      # ------------------------------------------------------------------ #
+      - name: Bundle pgjwt (Windows)
+        run: |
+          git clone https://github.com/michelp/pgjwt.git
+          git -C pgjwt checkout ${{ env.PGJWT_COMMIT }}
+          STAGING="$(pwd)/staging"
+          mkdir -p "${STAGING}/share/postgresql/extension"
+          cp pgjwt/pgjwt.control "${STAGING}/share/postgresql/extension/"
+          find pgjwt -name "pgjwt--*.sql" \
+            -exec cp {} "${STAGING}/share/postgresql/extension/" \;
+          echo "pgjwt bundled (Windows)."
+
+      # ------------------------------------------------------------------ #
+      # Package
+      # ------------------------------------------------------------------ #
+      - name: Create zip archive
+        shell: pwsh
+        run: |
+          $archiveName = "supatype-pg-17-windows-amd64.zip"
+          Compress-Archive -Path "staging\*" -DestinationPath $archiveName
+          "ARCHIVE_NAME=$archiveName" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
+      - name: Generate checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "$env:ARCHIVE_NAME" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:ARCHIVE_NAME" | Out-File -Encoding ascii "$env:ARCHIVE_NAME.sha256"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.CDN_AWS_REGION }}
+
+      - name: Upload archive to CDN
+        shell: pwsh
+        run: |
+          $archive = "supatype-pg-17-windows-amd64.zip"
+          $base    = "s3://${{ secrets.CDN_BUCKET }}/postgres/v$env:PG_VERSION"
+          $ep      = "${{ secrets.CDN_ENDPOINT }}"
+          aws s3 cp $archive "$base/$archive" `
+            --endpoint-url $ep `
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp "$archive.sha256" "$base/$archive.sha256" `
+            --endpoint-url $ep `
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: supatype-pg-17-windows-amd64
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          retention-days: 7
+
+  # -------------------------------------------------------------------- #
+  # Sign combined checksums, update latest.json, attach to GitHub Release
+  # -------------------------------------------------------------------- #
+  release:
+    name: Sign, Update CDN & Release
+    needs: [build, build-windows]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: supatype-pg-17-*
+          merge-multiple: true
+
+      - name: Generate combined checksums.sha256
+        run: |
+          sha256sum supatype-pg-17-*.tar.gz supatype-pg-17-*.zip > checksums.sha256
+          cat checksums.sha256
+
+      - name: Install minisign
+        run: sudo apt-get install -y minisign
+
+      - name: Sign checksums.sha256
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          printf '%s' "$MINISIGN_PRIVATE_KEY" > /tmp/minisign.key
+          echo "$MINISIGN_PASSWORD" | minisign \
+            -S -s /tmp/minisign.key \
+            -m checksums.sha256 \
+            -t "supatype postgres releases ${{ github.ref_name }}"
+          rm -f /tmp/minisign.key
+
+      - name: Configure AWS credentials (Hetzner Object Storage)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.CDN_AWS_REGION }}
+
+      - name: Upload checksums + signature to CDN
+        run: |
+          EP="${{ secrets.CDN_ENDPOINT }}"
+          BASE="s3://${{ secrets.CDN_BUCKET }}/postgres/v${{ env.PG_VERSION }}"
+          aws s3 cp checksums.sha256 "${BASE}/checksums.sha256" \
+            --endpoint-url "${EP}" \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp checksums.sha256.minisig "${BASE}/checksums.sha256.minisig" \
+            --endpoint-url "${EP}" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Update postgres/latest.json
+        run: |
+          EP="${{ secrets.CDN_ENDPOINT }}"
+          printf '{"version":"%s","date":"%s","checksums_url":"https://releases.supatype.io/postgres/v%s/checksums.sha256"}\n' \
+            "${{ env.PG_VERSION }}" "$(date -u +%Y-%m-%d)" "${{ env.PG_VERSION }}" > latest.json
+          aws s3 cp latest.json \
+            "s3://${{ secrets.CDN_BUCKET }}/postgres/latest.json" \
+            --endpoint-url "${EP}" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: false
+          files: |
+            supatype-pg-17-*.tar.gz
+            supatype-pg-17-*.tar.gz.sha256
+            supatype-pg-17-*.zip
+            supatype-pg-17-*.zip.sha256
+            checksums.sha256
+            checksums.sha256.minisig

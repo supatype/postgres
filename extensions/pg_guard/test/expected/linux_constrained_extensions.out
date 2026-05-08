@@ -1,0 +1,54 @@
+-- constrained by cpu
+create extension adminpack;
+ERROR:  not enough CPUs for using this extension
+DETAIL:  required CPUs: 64
+HINT:  upgrade to an instance with higher resources
+\echo
+
+-- constrained by memory
+create extension cube;
+ERROR:  not enough memory for using this extension
+DETAIL:  required memory: 17 GB
+HINT:  upgrade to an instance with higher resources
+\echo
+
+-- constrained by disk
+create extension lo;
+ERROR:  not enough free disk space for using this extension
+DETAIL:  required free disk space: 100 GB
+HINT:  upgrade to an instance with higher resources
+\echo
+
+-- passes all resource constraints
+create extension amcheck;
+\echo
+
+-- no resource constraints
+create extension bloom;
+\echo
+
+-- check json validation works
+set pg_guard.constrained_extensions to '';
+ERROR:  pg_guard.constrained_extensions: invalid json
+set pg_guard.constrained_extensions to '[]';
+ERROR:  pg_guard.constrained_extensions: unexpected array
+set pg_guard.constrained_extensions to '1';
+ERROR:  pg_guard.constrained_extensions: unexpected scalar, expected an object
+set pg_guard.constrained_extensions to '"foo"';
+ERROR:  pg_guard.constrained_extensions: unexpected scalar, expected an object
+set pg_guard.constrained_extensions to '{"plrust": []}';
+ERROR:  pg_guard.constrained_extensions: unexpected array
+set pg_guard.constrained_extensions to '{"plrust": {"cpu": true}}';
+ERROR:  pg_guard.constrained_extensions: unexpected cpu value, expected a number
+set pg_guard.constrained_extensions to '{"plrust": {"cpu": {}}}';
+ERROR:  pg_guard.constrained_extensions: unexpected object for cpu, mem or disk, expected a value
+set pg_guard.constrained_extensions to '{"plrust": {"anykey": "11GB"}}';
+ERROR:  pg_guard.constrained_extensions: unexpected field, only cpu, mem or disk are allowed
+set pg_guard.constrained_extensions to '{"plrust": {"disk": 123}}';
+ERROR:  pg_guard.constrained_extensions: unexpected disk value, expected a string with bytes in human-readable format (as returned by pg_size_pretty)
+set pg_guard.constrained_extensions to '{"plrust": {"mem": 456}}';
+ERROR:  pg_guard.constrained_extensions: unexpected mem value, expected a string with bytes in human-readable format (as returned by pg_size_pretty)
+set pg_guard.constrained_extensions to '{"plrust": {"mem": ""}}';
+ERROR:  invalid size: ""
+set pg_guard.constrained_extensions to '{"plrust": 123}';
+ERROR:  pg_guard.constrained_extensions: unexpected scalar, expected an object

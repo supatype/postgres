@@ -1,0 +1,51 @@
+name: pg_guard tests
+
+on:
+  pull_request:
+    paths:
+      - 'extensions/pg_guard/**'
+  push:
+    branches: [main]
+    paths:
+      - 'extensions/pg_guard/**'
+
+jobs:
+  test:
+    name: pg_guard regression (PG${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }}
+
+      - name: Build pg_guard
+        run: |
+          PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config \
+            make -C extensions/pg_guard
+
+      - name: Run regression tests
+        run: |
+          PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config \
+            make -C extensions/pg_guard check
+        env:
+          # pg_regress needs to connect to a running cluster; pg_guard's
+          # test/init.sh handles cluster creation via pg_ctl.
+          PGUSER: postgres
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg_guard-regression-diffs-pg${{ matrix.pg }}
+          path: extensions/pg_guard/regression.diffs
+          retention-days: 7
