@@ -79,8 +79,13 @@ jobs:
         run: |
           IMAGE="supatype/postgres"
 
-          # Always push 17-latest and develop
+          # Rolling PG17 pointer (currently only major we ship)
           docker buildx imagetools create -t ${IMAGE}:17-latest \
+            ${IMAGE}:17-latest-amd64 \
+            ${IMAGE}:17-latest-arm64
+
+          # Flat alias: same digest as 17-latest (no extra branch-only vs tag-only divergence)
+          docker buildx imagetools create -t ${IMAGE}:latest \
             ${IMAGE}:17-latest-amd64 \
             ${IMAGE}:17-latest-arm64
 
@@ -88,10 +93,6 @@ jobs:
             VERSION="${{ github.ref_name }}"
             VERSION="${VERSION#v}"
             docker buildx imagetools create -t ${IMAGE}:${VERSION} \
-              ${IMAGE}:${VERSION}-amd64 \
-              ${IMAGE}:${VERSION}-arm64
-            # Also tag as latest
-            docker buildx imagetools create -t ${IMAGE}:latest \
               ${IMAGE}:${VERSION}-amd64 \
               ${IMAGE}:${VERSION}-arm64
           fi
