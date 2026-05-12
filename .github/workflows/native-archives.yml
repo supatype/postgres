@@ -30,26 +30,23 @@ jobs:
             os: ubuntu-22.04
             platform: linux
             arch: amd64
-            cross: false
 
+          # Native ARM64 runner so pg_guard + pgvector (PGXS) compile against the
+          # same staged postgres as linux-amd64 (cross-compiling those extensions was skipped).
           - target: linux-arm64
-            os: ubuntu-22.04
+            os: ubuntu-24.04-arm
             platform: linux
             arch: arm64
-            cross: true
-            cross_triple: aarch64-linux-gnu
 
           - target: darwin-arm64
             os: macos-14
             platform: darwin
             arch: arm64
-            cross: false
 
           - target: darwin-x86_64
             os: macos-13
             platform: darwin
             arch: x86_64
-            cross: false
 
     runs-on: ${{ matrix.os }}
 
@@ -71,19 +68,6 @@ jobs:
             zlib1g-dev \
             libicu-dev \
             libzstd-dev
-
-      - name: Install cross-compile toolchain (linux-arm64)
-        if: matrix.cross == true
-        run: |
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            libssl-dev:arm64 \
-            libreadline-dev:arm64 \
-            zlib1g-dev:arm64 \
-            libicu-dev:arm64 \
-            libzstd-dev:arm64
-          sudo dpkg --add-architecture arm64
 
       - name: Install dependencies (macOS)
         if: matrix.platform == 'darwin'
@@ -114,30 +98,12 @@ jobs:
       # ------------------------------------------------------------------ #
       # Configure
       # ------------------------------------------------------------------ #
-      - name: Configure (Linux native amd64)
-        if: matrix.platform == 'linux' && matrix.cross == false
+      - name: Configure (Linux)
+        if: matrix.platform == 'linux'
         working-directory: postgresql-${{ env.PG_VERSION }}
         run: |
           ./configure \
             --prefix=${{ env.INSTALL_PREFIX }} \
-            --with-openssl \
-            --with-uuid=e2fs \
-            --with-icu \
-            --with-zstd \
-            --disable-rpath
-
-      - name: Configure (Linux cross arm64)
-        if: matrix.platform == 'linux' && matrix.cross == true
-        working-directory: postgresql-${{ env.PG_VERSION }}
-        run: |
-          export CC=aarch64-linux-gnu-gcc
-          export CXX=aarch64-linux-gnu-g++
-          export AR=aarch64-linux-gnu-ar
-          export STRIP=aarch64-linux-gnu-strip
-          ./configure \
-            --prefix=${{ env.INSTALL_PREFIX }} \
-            --host=aarch64-linux-gnu \
-            --build=x86_64-linux-gnu \
             --with-openssl \
             --with-uuid=e2fs \
             --with-icu \
@@ -184,7 +150,7 @@ jobs:
       # Build pg_guard extension (bundled in extensions/pg_guard/)
       # ------------------------------------------------------------------ #
       - name: Build and bundle pg_guard
-        if: matrix.cross == false
+        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
         run: |
           PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
           PG_CONFIG="${PG_CONFIG}" make -C extensions/pg_guard
@@ -194,15 +160,11 @@ jobs:
             -exec cp {} "${LIB_DIR}/" \;
           echo "pg_guard bundled into lib dir."
 
-      - name: Skip pg_guard (cross-compile — not supported)
-        if: matrix.cross == true
-        run: echo "::notice::pg_guard cross-compilation not supported in CI — skipping."
-
       # ------------------------------------------------------------------ #
       # pgvector — vector similarity search (C extension, native targets only)
       # ------------------------------------------------------------------ #
       - name: Build and bundle pgvector
-        if: matrix.cross == false
+        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
         run: |
           # Build from an explicit tagged release for reproducible archives.
           git clone --depth 1 --branch v${{ env.PGVECTOR_VERSION }} \
@@ -217,10 +179,6 @@ jobs:
           cp pgvector/vector.control "${SHARE_DIR}/"
           find pgvector -name "vector--*.sql" -exec cp {} "${SHARE_DIR}/" \;
           echo "pgvector bundled."
-
-      - name: Skip pgvector (cross-compile — C extension)
-        if: matrix.cross == true
-        run: echo "::notice::pgvector cross-compilation not supported — skipping."
 
       # ------------------------------------------------------------------ #
       # pgjwt — JWT generation/verification in SQL (SQL-only, all targets)

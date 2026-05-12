@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # build-native.sh — Build PostgreSQL 17 from source for a given target platform.
 # Mirrors the steps in .github/workflows/native-archives.yml so the build can be
-# reproduced locally without CI.
+# reproduced locally without CI. (CI uses a native Linux ARM64 runner for
+# linux-arm64 so pg_guard + pgvector compile; this script still supports
+# cross-compiling Postgres from x86_64 Linux without those extensions.)
 #
 # Usage:
 #   ./scripts/build-native.sh --target <target> [--pg-guard-dir <path>]
 #
 # Targets:
 #   linux-amd64      Native Linux x86-64
-#   linux-arm64      Cross-compiled Linux aarch64 (requires aarch64-linux-gnu-gcc)
+#   linux-arm64      Linux aarch64 — native build on arm64 hosts; from x86_64 Linux, Postgres cross-builds but pg_guard/pgvector are skipped (install aarch64-linux-gnu-*)
 #   darwin-arm64     Native macOS Apple Silicon
 #   darwin-x86_64    Native macOS Intel
 #
@@ -96,10 +98,14 @@ case "${HOST_OS}" in
   *) die "Unsupported host OS: ${HOST_OS}" ;;
 esac
 
-# Determine if cross-compiling
+# linux-arm64: cross-compile Postgres only from x86_64 Linux. On aarch64 Linux
+# (e.g. GitHub ubuntu-24.04-arm) or macOS, build natively so pg_guard/pgvector run.
 IS_CROSS=false
 if [[ "${TARGET}" == "linux-arm64" && "${HOST_PLATFORM}" == "linux" ]]; then
-  IS_CROSS=true
+  host_arch="$(uname -m)"
+  if [[ "${host_arch}" == "x86_64" ]]; then
+    IS_CROSS=true
+  fi
 fi
 
 # Auto-detect job count
@@ -210,7 +216,7 @@ CONFIGURE_FLAGS=(
   "--disable-rpath"
 )
 
-if [[ "${TARGET}" == "linux-arm64" ]]; then
+if [[ "${IS_CROSS}" == "true" ]]; then
   export CC=aarch64-linux-gnu-gcc
   export CXX=aarch64-linux-gnu-g++
   export AR=aarch64-linux-gnu-ar
