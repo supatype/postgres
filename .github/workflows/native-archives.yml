@@ -194,6 +194,39 @@ jobs:
           echo "pgjwt bundled."
 
       # ------------------------------------------------------------------ #
+      # macOS — Developer ID + notarization (Phase 10.6 B7; same secrets as server-release)
+      # ------------------------------------------------------------------ #
+      - name: Sign staged Postgres tree (macOS)
+        if: matrix.platform == 'darwin'
+        env:
+          APPLE_CERT_BASE64: ${{ secrets.APPLE_CERT_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERT_BASE64:-}" ]; then
+            echo "::notice::APPLE_CERT_BASE64 unset — skipping macOS codesign for Postgres bundle."
+            exit 0
+          fi
+          ROOT="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}"
+          echo "$APPLE_CERT_BASE64" | base64 --decode > cert.p12
+          security create-keychain -p ci-keychain ci.keychain
+          security import cert.p12 -k ci.keychain -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-keychain-settings -t 3600 -u ci.keychain
+          security unlock-keychain -p ci-keychain ci.keychain
+          security list-keychains -d user -s ci.keychain $(security list-keychains -d user | sed 's/\"//g')
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci-keychain ci.keychain
+          SIGN_ID="Developer ID Application: Supatype Inc (${APPLE_TEAM_ID})"
+          find "$ROOT" -type f ! -name "*.sql" ! -name "*.txt" ! -name "*.sample" | while IFS= read -r f; do
+            case "$(file -b "$f" 2>/dev/null)" in
+              Mach-O*)
+                codesign --sign "$SIGN_ID" --options runtime --timestamp --force "$f"
+                ;;
+            esac
+          done
+          rm -f cert.p12
+
+      # ------------------------------------------------------------------ #
       # Package archive
       # ------------------------------------------------------------------ #
       - name: Create archive
@@ -201,6 +234,27 @@ jobs:
           FILENAME="supatype-pg-17-${{ matrix.target }}.tar.gz"
           tar -czf "${FILENAME}" -C pg-install${{ env.INSTALL_PREFIX }} .
           echo "ARCHIVE_NAME=${FILENAME}" >> "$GITHUB_ENV"
+
+      - name: Notarize Postgres archive (macOS)
+        if: matrix.platform == 'darwin'
+        env:
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_NOTARY_APPLE_ID:-}" ] || [ -z "${APPLE_NOTARY_PASSWORD:-}" ]; then
+            echo "::notice::Apple notary secrets unset — skipping notarization for Postgres bundle."
+            exit 0
+          fi
+          ARCH="${{ env.ARCHIVE_NAME }}"
+          zip -j "${ARCH}.notary.zip" "${ARCH}"
+          xcrun notarytool submit "${ARCH}.notary.zip" \
+            --apple-id "$APPLE_NOTARY_APPLE_ID" \
+            --password "$APPLE_NOTARY_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 20m
+          rm -f "${ARCH}.notary.zip"
 
       - name: Generate checksum (Linux)
         if: matrix.platform == 'linux'
