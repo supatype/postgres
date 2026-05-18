@@ -1,0 +1,4 @@
+# PGXS objects must be compiled inside the image (not from host)
+extensions/pg_guard/src/*.o
+extensions/pg_guard/.deps/
+**/*.o

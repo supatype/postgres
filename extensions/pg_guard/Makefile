@@ -73,7 +73,10 @@ else
   DL_SUFFIX=dylib
 endif
 
-PG_CPPFLAGS := $(CPPFLAGS) -DMODVERSION=\"$(MODVERSION)\" -DTEST=1
+PG_CPPFLAGS := $(CPPFLAGS) -DMODVERSION=\"$(MODVERSION)\"
+ifeq ($(TEST), 1)
+PG_CPPFLAGS += -DTEST=1
+endif
 
 ifdef BUILD_DIR
 OBJS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRC))

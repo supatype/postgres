@@ -51,7 +51,7 @@ RUN ARCH=$(dpkg --print-architecture) \
 
 # pg_guard — role/extension privilege enforcement (bundled in extensions/)
 COPY extensions/pg_guard/ /tmp/pg_guard/
-RUN cd /tmp/pg_guard && make && make install && rm -rf /tmp/pg_guard
+RUN cd /tmp/pg_guard && make clean && make && make install && rm -rf /tmp/pg_guard
 
 # Remove build tools
 RUN apt-get purge -y build-essential git postgresql-server-dev-17 pkg-config libssl-dev libcurl4-openssl-dev \

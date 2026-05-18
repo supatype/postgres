@@ -33,3 +33,9 @@ common-nix.vars.pkr.hcl
 nixos.qcow2
 .lsp
 .clj-kondo
+
+# pg_guard / PGXS build artifacts (never commit — breaks Linux Docker builds)
+extensions/pg_guard/src/*.o
+extensions/pg_guard/.deps/
+extensions/pg_guard/**/*.so
+extensions/pg_guard/**/*.dylib
