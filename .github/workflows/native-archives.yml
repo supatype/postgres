@@ -18,6 +18,10 @@ env:
   # Extension versions — must match Dockerfile ARGs
   PGVECTOR_VERSION: "0.8.0"
   PGJWT_COMMIT: "f3d82fd30151e754e19ce5d6a06c71c20689ce3d"
+  # Hetzner Object Storage — env only; configure-aws-credentials calls AWS STS.
+  AWS_ACCESS_KEY_ID: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: ${{ secrets.CDN_AWS_REGION }}
 
 jobs:
   build:
@@ -269,13 +273,6 @@ jobs:
       # ------------------------------------------------------------------ #
       # Upload to S3 CDN
       # ------------------------------------------------------------------ #
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.CDN_AWS_REGION }}
-
       - name: Upload archive to CDN
         run: |
           EP="${{ secrets.CDN_ENDPOINT }}"
@@ -434,13 +431,6 @@ jobs:
           $hash = (Get-FileHash "$env:ARCHIVE_NAME" -Algorithm SHA256).Hash.ToLower()
           "$hash  $env:ARCHIVE_NAME" | Out-File -Encoding ascii "$env:ARCHIVE_NAME.sha256"
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.CDN_AWS_REGION }}
-
       - name: Upload archive to CDN
         shell: pwsh
         run: |
@@ -500,13 +490,6 @@ jobs:
             -m checksums.sha256 \
             -t "supatype postgres releases ${{ github.ref_name }}"
           rm -f /tmp/minisign.key
-
-      - name: Configure AWS credentials (Hetzner Object Storage)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.CDN_AWS_REGION }}
 
       - name: Upload checksums + signature to CDN
         run: |
