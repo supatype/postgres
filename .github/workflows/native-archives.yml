@@ -458,30 +458,30 @@ jobs:
 
           EP="${{ secrets.CDN_ENDPOINT }}"
           BUCKET="${{ secrets.CDN_BUCKET }}"
-          PREFIX="postgres/v${{ env.PG_VERSION }}"
+          BASE="s3://${BUCKET}/postgres/v${{ env.PG_VERSION }}"
           CACHE_CONTROL="public, max-age=31536000, immutable"
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
+          aws configure set default.s3.multipart_threshold 5GB
+          aws configure set default.s3.max_concurrent_requests 1
 
-          put_object() {
+          upload_file() {
             local body="$1"
-            local key="$2"
+            local destination="$2"
             local attempt delay
 
             for attempt in 1 2 3 4 5; do
-              if aws s3api put-object \
-                --bucket "${BUCKET}" \
-                --key "${key}" \
-                --body "${body}" \
+              if aws s3 cp "${body}" "${destination}" \
                 --endpoint-url "${EP}" \
                 --cache-control "${CACHE_CONTROL}" \
                 --cli-connect-timeout 60 \
-                --cli-read-timeout 300; then
+                --cli-read-timeout 300 \
+                --no-progress; then
                 return 0
               fi
 
               if [[ "${attempt}" == "5" ]]; then
-                echo "::error::Upload failed after ${attempt} attempts: ${body} -> s3://${BUCKET}/${key}"
+                echo "::error::Upload failed after ${attempt} attempts: ${body} -> ${destination}"
                 return 1
               fi
 
@@ -493,7 +493,7 @@ jobs:
 
           for artifact in supatype-pg-17-*; do
             if [[ -f "${artifact}" ]]; then
-              put_object "${artifact}" "${PREFIX}/${artifact}"
+              upload_file "${artifact}" "${BASE}/${artifact}"
             fi
           done
 
@@ -541,30 +541,30 @@ jobs:
 
           EP="${{ secrets.CDN_ENDPOINT }}"
           BUCKET="${{ secrets.CDN_BUCKET }}"
-          PREFIX="postgres/v${{ env.PG_VERSION }}"
+          BASE="s3://${BUCKET}/postgres/v${{ env.PG_VERSION }}"
           CACHE_CONTROL="public, max-age=31536000, immutable"
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
+          aws configure set default.s3.multipart_threshold 5GB
+          aws configure set default.s3.max_concurrent_requests 1
 
-          put_object() {
+          upload_file() {
             local body="$1"
-            local key="$2"
+            local destination="$2"
             local attempt delay
 
             for attempt in 1 2 3 4 5; do
-              if aws s3api put-object \
-                --bucket "${BUCKET}" \
-                --key "${key}" \
-                --body "${body}" \
+              if aws s3 cp "${body}" "${destination}" \
                 --endpoint-url "${EP}" \
                 --cache-control "${CACHE_CONTROL}" \
                 --cli-connect-timeout 60 \
-                --cli-read-timeout 300; then
+                --cli-read-timeout 300 \
+                --no-progress; then
                 return 0
               fi
 
               if [[ "${attempt}" == "5" ]]; then
-                echo "::error::Upload failed after ${attempt} attempts: ${body} -> s3://${BUCKET}/${key}"
+                echo "::error::Upload failed after ${attempt} attempts: ${body} -> ${destination}"
                 return 1
               fi
 
@@ -574,8 +574,8 @@ jobs:
             done
           }
 
-          put_object checksums.sha256 "${PREFIX}/checksums.sha256"
-          put_object checksums.sha256.minisig "${PREFIX}/checksums.sha256.minisig"
+          upload_file checksums.sha256 "${BASE}/checksums.sha256"
+          upload_file checksums.sha256.minisig "${BASE}/checksums.sha256.minisig"
 
       - name: Update postgres/latest.json
         run: |
@@ -585,19 +585,20 @@ jobs:
           BUCKET="${{ secrets.CDN_BUCKET }}"
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
+          aws configure set default.s3.multipart_threshold 5GB
+          aws configure set default.s3.max_concurrent_requests 1
 
           printf '{"version":"%s","date":"%s","checksums_url":"https://releases.supatype.io/postgres/v%s/checksums.sha256"}\n' \
             "${{ env.PG_VERSION }}" "$(date -u +%Y-%m-%d)" "${{ env.PG_VERSION }}" > latest.json
 
           for attempt in 1 2 3 4 5; do
-            if aws s3api put-object \
-              --bucket "${BUCKET}" \
-              --key "postgres/latest.json" \
-              --body latest.json \
+            if aws s3 cp latest.json \
+              "s3://${BUCKET}/postgres/latest.json" \
               --endpoint-url "${EP}" \
               --cache-control "no-cache, no-store, must-revalidate" \
               --cli-connect-timeout 60 \
-              --cli-read-timeout 300; then
+              --cli-read-timeout 300 \
+              --no-progress; then
               break
             fi
 
