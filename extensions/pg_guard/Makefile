@@ -1,7 +1,7 @@
 OS = $(shell uname -s)
 
 GREP ?= grep
-PG_CONFIG = pg_config
+PG_CONFIG ?= pg_config
 
 # the `-Wno`s quiet C90 warnings
 PG_CFLAGS = -std=c11 -Wextra -Wall -Werror \
@@ -24,7 +24,7 @@ SRC_DIR = src
 
 SRC = $(wildcard src/*.c)
 
-PG_VERSION = $(strip $(shell $(PG_CONFIG) --version | $(GREP) -oP '(?<=PostgreSQL )[0-9]+'))
+PG_VERSION = $(strip $(shell $(PG_CONFIG) --version | sed -n 's/^PostgreSQL \([0-9][0-9]*\).*/\1/p'))
 # 0 is true
 PG_EQ15 = $(shell test $(PG_VERSION) -eq 15; echo $$?)
 PG_NEQ15 = $(shell test $(PG_VERSION) -ne 15; echo $$?)

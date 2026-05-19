@@ -228,6 +228,9 @@ if [[ "${IS_CROSS}" == "true" ]]; then
     "--build=x86_64-linux-gnu"
   )
 elif [[ "${HOST_PLATFORM}" == "darwin" ]]; then
+  # Xcode 16.4's SDK exposes strchrnul as macOS 15.4+, but PG17 can use its
+  # portable fallback and keep older deployment targets building.
+  export ac_cv_func_strchrnul=no
   OPENSSL_PREFIX="$(brew --prefix openssl)"
   ICU4C_PREFIX="$(brew --prefix icu4c)"
   READLINE_PREFIX="$(brew --prefix readline)"
@@ -271,7 +274,7 @@ else
   if [[ ! -x "${PG_CONFIG_BIN}" ]]; then
     die "pg_config not found at ${PG_CONFIG_BIN}"
   fi
-  PG_CONFIG="${PG_CONFIG_BIN}" make -C "${PG_GUARD_DIR}"
+  make -C "${PG_GUARD_DIR}" PG_CONFIG="${PG_CONFIG_BIN}"
   LIB_DIR="${STAGE_DIR}${INSTALL_PREFIX}/lib"
   mkdir -p "${LIB_DIR}"
   find "${PG_GUARD_DIR}" \( -name "pg_guard.so" -o -name "pg_guard.dylib" \) \
@@ -298,11 +301,11 @@ else
   # retry with HEAD (which tracks the latest PG release).
   git clone --depth 1 --branch "v${PGVECTOR_VERSION}" \
     https://github.com/pgvector/pgvector.git "${BUILD_DIR}/pgvector"
-  if ! PG_CONFIG="${PG_CONFIG_BIN}" make -C "${BUILD_DIR}/pgvector" -j"${JOBS}"; then
+  if ! make -C "${BUILD_DIR}/pgvector" PG_CONFIG="${PG_CONFIG_BIN}" -j"${JOBS}"; then
     warn "pgvector ${PGVECTOR_VERSION} failed to compile — retrying with HEAD..."
     rm -rf "${BUILD_DIR}/pgvector"
     git clone --depth 1 https://github.com/pgvector/pgvector.git "${BUILD_DIR}/pgvector"
-    PG_CONFIG="${PG_CONFIG_BIN}" make -C "${BUILD_DIR}/pgvector" -j"${JOBS}"
+    make -C "${BUILD_DIR}/pgvector" PG_CONFIG="${PG_CONFIG_BIN}" -j"${JOBS}"
   fi
 
   find "${BUILD_DIR}/pgvector" \( -name "vector.so" -o -name "vector.dylib" \) \
