@@ -26,7 +26,7 @@ set -euo pipefail
 # Defaults
 # --------------------------------------------------------------------------- #
 PG_VERSION="${PG_VERSION:-17.2}"
-PG_SHA256="${PG_SHA256:-da2f4c65c38a0b33c6c1b6f6b061e4543ca32b73ce1a3a75ef3a94e55c86e74c}"
+PG_SHA256="${PG_SHA256:-51d8cdd6a5220fa8c0a3b12f2d0eeb50fcf5e0bdb7b37904a9cdff5cf1e61c36}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local/supatype-pg}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
