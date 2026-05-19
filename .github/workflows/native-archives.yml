@@ -437,8 +437,8 @@ jobs:
 
   # -------------------------------------------------------------------- #
   # Upload archives to CDN from one Linux runner.  This avoids parallel
-  # multipart setup calls from every build runner against Hetzner Object
-  # Storage and mirrors the schema-engine release topology.
+  # multipart uploads from every build runner against Hetzner Object Storage
+  # while keeping multipart enabled for large Postgres archives.
   # -------------------------------------------------------------------- #
   publish-cdn:
     name: Upload PG17 archives to CDN
@@ -462,7 +462,8 @@ jobs:
           CACHE_CONTROL="public, max-age=31536000, immutable"
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
-          aws configure set default.s3.multipart_threshold 5GB
+          aws configure set default.s3.multipart_threshold 64MB
+          aws configure set default.s3.multipart_chunksize 64MB
           aws configure set default.s3.max_concurrent_requests 1
 
           upload_file() {
@@ -474,8 +475,8 @@ jobs:
               if aws s3 cp "${body}" "${destination}" \
                 --endpoint-url "${EP}" \
                 --cache-control "${CACHE_CONTROL}" \
-                --cli-connect-timeout 60 \
-                --cli-read-timeout 300 \
+                --cli-connect-timeout 120 \
+                --cli-read-timeout 1200 \
                 --no-progress; then
                 return 0
               fi
@@ -545,7 +546,8 @@ jobs:
           CACHE_CONTROL="public, max-age=31536000, immutable"
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
-          aws configure set default.s3.multipart_threshold 5GB
+          aws configure set default.s3.multipart_threshold 64MB
+          aws configure set default.s3.multipart_chunksize 64MB
           aws configure set default.s3.max_concurrent_requests 1
 
           upload_file() {
@@ -557,8 +559,8 @@ jobs:
               if aws s3 cp "${body}" "${destination}" \
                 --endpoint-url "${EP}" \
                 --cache-control "${CACHE_CONTROL}" \
-                --cli-connect-timeout 60 \
-                --cli-read-timeout 300 \
+                --cli-connect-timeout 120 \
+                --cli-read-timeout 1200 \
                 --no-progress; then
                 return 0
               fi
@@ -585,7 +587,8 @@ jobs:
           BUCKET="${{ secrets.CDN_BUCKET }}"
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
-          aws configure set default.s3.multipart_threshold 5GB
+          aws configure set default.s3.multipart_threshold 64MB
+          aws configure set default.s3.multipart_chunksize 64MB
           aws configure set default.s3.max_concurrent_requests 1
 
           printf '{"version":"%s","date":"%s","checksums_url":"https://releases.supatype.io/postgres/v%s/checksums.sha256"}\n' \
@@ -596,8 +599,8 @@ jobs:
               "s3://${BUCKET}/postgres/latest.json" \
               --endpoint-url "${EP}" \
               --cache-control "no-cache, no-store, must-revalidate" \
-              --cli-connect-timeout 60 \
-              --cli-read-timeout 300 \
+              --cli-connect-timeout 120 \
+              --cli-read-timeout 1200 \
               --no-progress; then
               break
             fi
