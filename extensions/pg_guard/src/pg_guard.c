@@ -1194,7 +1194,13 @@ restrict_placeholders_check_hook(char                            **newval,
 
     tofree = string = pstrdup(placeholders_disallowed_values);
 
-    while ((token = strsep(&string, ",")) != NULL) {
+    for (token = string; token != NULL;) {
+      char *next = strchr(token, ',');
+      if (next != NULL) {
+        *next = '\0';
+        next++;
+      }
+
       if (strstr(val, token)) {
         GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
         GUC_check_errmsg("The placeholder contains the \"%s\" disallowed value",
@@ -1203,6 +1209,8 @@ restrict_placeholders_check_hook(char                            **newval,
         pfree(val);
         return false;
       }
+
+      token = next;
     }
 
     pfree(tofree);

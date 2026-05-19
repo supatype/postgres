@@ -228,9 +228,11 @@ if [[ "${IS_CROSS}" == "true" ]]; then
     "--build=x86_64-linux-gnu"
   )
 elif [[ "${HOST_PLATFORM}" == "darwin" ]]; then
-  # Xcode 16.4's SDK exposes strchrnul as macOS 15.4+, but PG17 can use its
-  # portable fallback and keep older deployment targets building.
-  export ac_cv_func_strchrnul=no
+  if [[ "$(uname -m)" == "x86_64" && -z "${MACOSX_DEPLOYMENT_TARGET:-}" ]]; then
+    # Xcode 16.4's SDK exposes strchrnul as macOS 15.4+, and PG17 builds
+    # with -Werror=unguarded-availability-new on Intel macOS.
+    export MACOSX_DEPLOYMENT_TARGET=15.4
+  fi
   OPENSSL_PREFIX="$(brew --prefix openssl)"
   ICU4C_PREFIX="$(brew --prefix icu4c)"
   READLINE_PREFIX="$(brew --prefix readline)"

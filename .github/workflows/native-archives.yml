@@ -83,6 +83,13 @@ jobs:
         run: |
           brew install openssl readline icu4c zstd
 
+      - name: Set macOS Intel deployment target
+        if: matrix.platform == 'darwin' && matrix.arch == 'x86_64'
+        run: |
+          # Xcode 16.4's SDK exposes strchrnul as macOS 15.4+, and PG17 builds
+          # with -Werror=unguarded-availability-new on this runner.
+          echo "MACOSX_DEPLOYMENT_TARGET=15.4" >> "$GITHUB_ENV"
+
       # ------------------------------------------------------------------ #
       # Download & verify PG17 source
       # ------------------------------------------------------------------ #
@@ -123,9 +130,6 @@ jobs:
         if: matrix.platform == 'darwin'
         working-directory: postgresql-${{ env.PG_VERSION }}
         run: |
-          # Xcode 16.4's SDK exposes strchrnul as macOS 15.4+, but PG17 can use
-          # its portable fallback and keep older deployment targets building.
-          export ac_cv_func_strchrnul=no
           OPENSSL_PREFIX="$(brew --prefix openssl)"
           ICU4C_PREFIX="$(brew --prefix icu4c)"
           READLINE_PREFIX="$(brew --prefix readline)"
