@@ -285,21 +285,6 @@ jobs:
           shasum -a 256 "${{ env.ARCHIVE_NAME }}" > "${{ env.ARCHIVE_NAME }}.sha256"
 
       # ------------------------------------------------------------------ #
-      # Upload to S3 CDN
-      # ------------------------------------------------------------------ #
-      - name: Upload archive to CDN
-        run: |
-          EP="${{ secrets.CDN_ENDPOINT }}"
-          BASE="s3://${{ secrets.CDN_BUCKET }}/postgres/v${{ env.PG_VERSION }}"
-          ARCHIVE="supatype-pg-17-${{ matrix.target }}.tar.gz"
-          aws s3 cp "${ARCHIVE}" "${BASE}/${ARCHIVE}" \
-            --endpoint-url "${EP}" \
-            --cache-control "public, max-age=31536000, immutable"
-          aws s3 cp "${ARCHIVE}.sha256" "${BASE}/${ARCHIVE}.sha256" \
-            --endpoint-url "${EP}" \
-            --cache-control "public, max-age=31536000, immutable"
-
-      # ------------------------------------------------------------------ #
       # Upload artifact for release job
       # ------------------------------------------------------------------ #
       - name: Upload artifact
@@ -441,19 +426,6 @@ jobs:
           $hash = (Get-FileHash "$env:ARCHIVE_NAME" -Algorithm SHA256).Hash.ToLower()
           "$hash  $env:ARCHIVE_NAME" | Out-File -Encoding ascii "$env:ARCHIVE_NAME.sha256"
 
-      - name: Upload archive to CDN
-        shell: pwsh
-        run: |
-          $archive = "supatype-pg-17-windows-amd64.zip"
-          $base    = "s3://${{ secrets.CDN_BUCKET }}/postgres/v$env:PG_VERSION"
-          $ep      = "${{ secrets.CDN_ENDPOINT }}"
-          aws s3 cp $archive "$base/$archive" `
-            --endpoint-url $ep `
-            --cache-control "public, max-age=31536000, immutable"
-          aws s3 cp "$archive.sha256" "$base/$archive.sha256" `
-            --endpoint-url $ep `
-            --cache-control "public, max-age=31536000, immutable"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -464,11 +436,73 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------- #
+  # Upload archives to CDN from one Linux runner.  This avoids parallel
+  # multipart setup calls from every build runner against Hetzner Object
+  # Storage and mirrors the schema-engine release topology.
+  # -------------------------------------------------------------------- #
+  publish-cdn:
+    name: Upload PG17 archives to CDN
+    needs: [build, build-windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: supatype-pg-17-*
+          merge-multiple: true
+
+      - name: Upload archives to CDN
+        run: |
+          set -euo pipefail
+
+          EP="${{ secrets.CDN_ENDPOINT }}"
+          BUCKET="${{ secrets.CDN_BUCKET }}"
+          PREFIX="postgres/v${{ env.PG_VERSION }}"
+          CACHE_CONTROL="public, max-age=31536000, immutable"
+          export AWS_RETRY_MODE=standard
+          export AWS_MAX_ATTEMPTS=10
+
+          put_object() {
+            local body="$1"
+            local key="$2"
+            local attempt delay
+
+            for attempt in 1 2 3 4 5; do
+              if aws s3api put-object \
+                --bucket "${BUCKET}" \
+                --key "${key}" \
+                --body "${body}" \
+                --endpoint-url "${EP}" \
+                --cache-control "${CACHE_CONTROL}" \
+                --cli-connect-timeout 60 \
+                --cli-read-timeout 300; then
+                return 0
+              fi
+
+              if [[ "${attempt}" == "5" ]]; then
+                echo "::error::Upload failed after ${attempt} attempts: ${body} -> s3://${BUCKET}/${key}"
+                return 1
+              fi
+
+              delay=$((attempt * attempt * 5))
+              echo "::warning::Upload attempt ${attempt} failed for ${body}; retrying in ${delay}s"
+              sleep "${delay}"
+            done
+          }
+
+          for artifact in supatype-pg-17-*; do
+            if [[ -f "${artifact}" ]]; then
+              put_object "${artifact}" "${PREFIX}/${artifact}"
+            fi
+          done
+
+  # -------------------------------------------------------------------- #
   # Sign combined checksums, update latest.json, attach to GitHub Release
   # -------------------------------------------------------------------- #
   release:
     name: Sign, Update CDN & Release
-    needs: [build, build-windows]
+    needs: [publish-cdn]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -503,24 +537,79 @@ jobs:
 
       - name: Upload checksums + signature to CDN
         run: |
+          set -euo pipefail
+
           EP="${{ secrets.CDN_ENDPOINT }}"
-          BASE="s3://${{ secrets.CDN_BUCKET }}/postgres/v${{ env.PG_VERSION }}"
-          aws s3 cp checksums.sha256 "${BASE}/checksums.sha256" \
-            --endpoint-url "${EP}" \
-            --cache-control "public, max-age=31536000, immutable"
-          aws s3 cp checksums.sha256.minisig "${BASE}/checksums.sha256.minisig" \
-            --endpoint-url "${EP}" \
-            --cache-control "public, max-age=31536000, immutable"
+          BUCKET="${{ secrets.CDN_BUCKET }}"
+          PREFIX="postgres/v${{ env.PG_VERSION }}"
+          CACHE_CONTROL="public, max-age=31536000, immutable"
+          export AWS_RETRY_MODE=standard
+          export AWS_MAX_ATTEMPTS=10
+
+          put_object() {
+            local body="$1"
+            local key="$2"
+            local attempt delay
+
+            for attempt in 1 2 3 4 5; do
+              if aws s3api put-object \
+                --bucket "${BUCKET}" \
+                --key "${key}" \
+                --body "${body}" \
+                --endpoint-url "${EP}" \
+                --cache-control "${CACHE_CONTROL}" \
+                --cli-connect-timeout 60 \
+                --cli-read-timeout 300; then
+                return 0
+              fi
+
+              if [[ "${attempt}" == "5" ]]; then
+                echo "::error::Upload failed after ${attempt} attempts: ${body} -> s3://${BUCKET}/${key}"
+                return 1
+              fi
+
+              delay=$((attempt * attempt * 5))
+              echo "::warning::Upload attempt ${attempt} failed for ${body}; retrying in ${delay}s"
+              sleep "${delay}"
+            done
+          }
+
+          put_object checksums.sha256 "${PREFIX}/checksums.sha256"
+          put_object checksums.sha256.minisig "${PREFIX}/checksums.sha256.minisig"
 
       - name: Update postgres/latest.json
         run: |
+          set -euo pipefail
+
           EP="${{ secrets.CDN_ENDPOINT }}"
+          BUCKET="${{ secrets.CDN_BUCKET }}"
+          export AWS_RETRY_MODE=standard
+          export AWS_MAX_ATTEMPTS=10
+
           printf '{"version":"%s","date":"%s","checksums_url":"https://releases.supatype.io/postgres/v%s/checksums.sha256"}\n' \
             "${{ env.PG_VERSION }}" "$(date -u +%Y-%m-%d)" "${{ env.PG_VERSION }}" > latest.json
-          aws s3 cp latest.json \
-            "s3://${{ secrets.CDN_BUCKET }}/postgres/latest.json" \
-            --endpoint-url "${EP}" \
-            --cache-control "no-cache, no-store, must-revalidate"
+
+          for attempt in 1 2 3 4 5; do
+            if aws s3api put-object \
+              --bucket "${BUCKET}" \
+              --key "postgres/latest.json" \
+              --body latest.json \
+              --endpoint-url "${EP}" \
+              --cache-control "no-cache, no-store, must-revalidate" \
+              --cli-connect-timeout 60 \
+              --cli-read-timeout 300; then
+              break
+            fi
+
+            if [[ "${attempt}" == "5" ]]; then
+              echo "::error::Upload failed after ${attempt} attempts: latest.json -> s3://${BUCKET}/postgres/latest.json"
+              exit 1
+            fi
+
+            delay=$((attempt * attempt * 5))
+            echo "::warning::Upload attempt ${attempt} failed for latest.json; retrying in ${delay}s"
+            sleep "${delay}"
+          done
 
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
