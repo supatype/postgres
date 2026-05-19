@@ -20,10 +20,15 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$PG_VERSION   = "17"
-$ARCHIVE_NAME = "supatype-pg-$PG_VERSION-windows-amd64.zip"
+$PG_MAJOR        = "17"
+$PG_FULL_VERSION = "17.2"
+$ARCHIVE_NAME    = "supatype-pg-$PG_MAJOR-windows-amd64.zip"
+$MSYS2_PG_PACKAGE = "mingw-w64-x86_64-postgresql-17.2-1-any.pkg.tar.zst"
+$MSYS2_PG_URL     = "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-postgresql-17.2-1-any.pkg.tar.zst"
+$MSYS2_PG_SHA256  = "fcb193f732c51209b74469011219de5178b20ba7ea181177363f3f04ea442f9e"
+$PGVECTOR_VERSION = "0.8.0"
 
-$CacheDir  = Join-Path $env:USERPROFILE ".supatype\cache\postgres\$PG_VERSION"
+$CacheDir  = Join-Path $env:USERPROFILE ".supatype\cache\postgres\$PG_MAJOR"
 $CacheDest = Join-Path $CacheDir $ARCHIVE_NAME
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
@@ -78,38 +83,33 @@ function Invoke-Msys2([string]$Script) {
 try {
     # ── Step 1: Install build dependencies ───────────────────────────────────
     Write-Host "[supatype-postgres] Installing MSYS2 packages (this may take a minute on first run)..."
-    Invoke-Msys2 "pacman -S --noconfirm --needed mingw-w64-x86_64-postgresql mingw-w64-x86_64-gcc make base-devel git 2>&1 | tail -5"
+    Invoke-Msys2 "pacman -S --noconfirm --needed mingw-w64-x86_64-gcc make base-devel git curl 2>&1 | tail -5"
+
+    Write-Host "[supatype-postgres] Installing pinned PostgreSQL $PG_FULL_VERSION package..."
+    Invoke-Msys2 @"
+curl -fsSL '$MSYS2_PG_URL' -o '$MsysTmp/$MSYS2_PG_PACKAGE'
+echo '$MSYS2_PG_SHA256  $MsysTmp/$MSYS2_PG_PACKAGE' | sha256sum --check
+pacman -U --noconfirm '$MsysTmp/$MSYS2_PG_PACKAGE'
+pg_config --version
+pg_config --version | grep -F 'PostgreSQL $PG_FULL_VERSION'
+"@
 
     # ── Step 2: Build pg_guard ────────────────────────────────────────────────
     Write-Host "[supatype-postgres] Building pg_guard..."
     Invoke-Msys2 "make -C '$MsysRepo/extensions/pg_guard' PG_CONFIG=/mingw64/bin/pg_config"
 
-    # ── Step 2b: Install pgvector ─────────────────────────────────────────────
-    # Strategy: try the MSYS2 package first (always ABI-compatible with the
-    # installed Postgres version). Fall back to building from HEAD if the
-    # package isn't available yet (e.g. new PG major release).
+    # ── Step 2b: Build pgvector ───────────────────────────────────────────────
     Write-Host "[supatype-postgres] Installing pgvector..."
     $PgvectorDist = "$MsysTmp/pgvector-dist"
     Invoke-Msys2 "mkdir -p '$PgvectorDist/lib' '$PgvectorDist/share'"
 
-    try { Invoke-Msys2 "pacman -S --noconfirm --needed mingw-w64-x86_64-pgvector" } catch {}
-
-    $hasPackage = (& $Bash --login -c "export MSYSTEM=MINGW64; source /etc/profile; [ -f /mingw64/lib/postgresql/vector.dll ] && echo yes || echo no" 2>$null).Trim() -eq "yes"
-
-    if ($hasPackage) {
-        Write-Host "[supatype-postgres] pgvector: using MSYS2 package"
-        Invoke-Msys2 "cp /mingw64/lib/postgresql/vector.dll '$PgvectorDist/lib/'"
-        Invoke-Msys2 "cp /mingw64/share/postgresql/extension/vector.control '$PgvectorDist/share/'"
-        Invoke-Msys2 "find /mingw64/share/postgresql/extension -name 'vector--*.sql' -exec cp {} '$PgvectorDist/share/' \;"
-    } else {
-        Write-Host "[supatype-postgres] pgvector: building from HEAD (MSYS2 package unavailable)"
-        $PgvectorSrc = "$MsysTmp/pgvector-src"
-        Invoke-Msys2 "git clone --depth 1 https://github.com/pgvector/pgvector.git '$PgvectorSrc'"
-        Invoke-Msys2 "make -C '$PgvectorSrc' PG_CONFIG=/mingw64/bin/pg_config -j4"
-        Invoke-Msys2 "find '$PgvectorSrc' -name 'vector.dll' -exec cp {} '$PgvectorDist/lib/' \;"
-        Invoke-Msys2 "cp '$PgvectorSrc/vector.control' '$PgvectorDist/share/'"
-        Invoke-Msys2 "find '$PgvectorSrc' -name 'vector--*.sql' -exec cp {} '$PgvectorDist/share/' \;"
-    }
+    Write-Host "[supatype-postgres] pgvector: building pinned v$PGVECTOR_VERSION source"
+    $PgvectorSrc = "$MsysTmp/pgvector-src"
+    Invoke-Msys2 "git clone --depth 1 --branch v$PGVECTOR_VERSION https://github.com/pgvector/pgvector.git '$PgvectorSrc'"
+    Invoke-Msys2 "make -C '$PgvectorSrc' PG_CONFIG=/mingw64/bin/pg_config -j4"
+    Invoke-Msys2 "find '$PgvectorSrc' -name 'vector.dll' -exec cp {} '$PgvectorDist/lib/' \;"
+    Invoke-Msys2 "cp '$PgvectorSrc/vector.control' '$PgvectorDist/share/'"
+    Invoke-Msys2 "find '$PgvectorSrc' -name 'vector--*.sql' -exec cp {} '$PgvectorDist/share/' \;"
 
     # ── Step 2c: Clone pgjwt (SQL-only, no compilation needed) ───────────────
     Write-Host "[supatype-postgres] Cloning pgjwt..."

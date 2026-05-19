@@ -147,7 +147,8 @@ if [[ "${HOST_PLATFORM}" == "linux" ]]; then
     libreadline-dev \
     zlib1g-dev \
     libicu-dev \
-    libzstd-dev
+    libzstd-dev \
+    uuid-dev
 
   if [[ "${IS_CROSS}" == "true" ]]; then
     info "Installing aarch64 cross-compilation toolchain..."
@@ -160,7 +161,8 @@ if [[ "${HOST_PLATFORM}" == "linux" ]]; then
       libreadline-dev:arm64 \
       zlib1g-dev:arm64 \
       libicu-dev:arm64 \
-      libzstd-dev:arm64
+      libzstd-dev:arm64 \
+      uuid-dev:arm64
   fi
 
 elif [[ "${HOST_PLATFORM}" == "darwin" ]]; then
@@ -230,6 +232,7 @@ elif [[ "${HOST_PLATFORM}" == "darwin" ]]; then
   ICU4C_PREFIX="$(brew --prefix icu4c)"
   READLINE_PREFIX="$(brew --prefix readline)"
   ZSTD_PREFIX="$(brew --prefix zstd)"
+  export PKG_CONFIG_PATH="${ICU4C_PREFIX}/lib/pkgconfig:${OPENSSL_PREFIX}/lib/pkgconfig:${READLINE_PREFIX}/lib/pkgconfig:${ZSTD_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
   CONFIGURE_FLAGS+=(
     "--with-libraries=${OPENSSL_PREFIX}/lib:${ICU4C_PREFIX}/lib:${READLINE_PREFIX}/lib:${ZSTD_PREFIX}/lib"
     "--with-includes=${OPENSSL_PREFIX}/include:${ICU4C_PREFIX}/include:${READLINE_PREFIX}/include:${ZSTD_PREFIX}/include"

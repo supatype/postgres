@@ -14,6 +14,9 @@ env:
   PG_TARBALL: "postgresql-17.2.tar.gz"
   PG_URL: "https://ftp.postgresql.org/pub/source/v17.2/postgresql-17.2.tar.gz"
   PG_SHA256: "51d8cdd6a5220fa8c0a3b12f2d0eeb50fcf5e0bdb7b37904a9cdff5cf1e61c36"
+  MSYS2_PG_PACKAGE: "mingw-w64-x86_64-postgresql-17.2-1-any.pkg.tar.zst"
+  MSYS2_PG_URL: "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-postgresql-17.2-1-any.pkg.tar.zst"
+  MSYS2_PG_SHA256: "fcb193f732c51209b74469011219de5178b20ba7ea181177363f3f04ea442f9e"
   INSTALL_PREFIX: "/usr/local/supatype-pg"
   # Extension versions — must match Dockerfile ARGs
   PGVECTOR_VERSION: "0.8.0"
@@ -72,7 +75,8 @@ jobs:
             libreadline-dev \
             zlib1g-dev \
             libicu-dev \
-            libzstd-dev
+            libzstd-dev \
+            uuid-dev
 
       - name: Install dependencies (macOS)
         if: matrix.platform == 'darwin'
@@ -123,6 +127,8 @@ jobs:
           ICU4C_PREFIX="$(brew --prefix icu4c)"
           READLINE_PREFIX="$(brew --prefix readline)"
           ZSTD_PREFIX="$(brew --prefix zstd)"
+          # icu4c (and other keg-only formulae) are not on pkg-config's default path.
+          export PKG_CONFIG_PATH="${ICU4C_PREFIX}/lib/pkgconfig:${OPENSSL_PREFIX}/lib/pkgconfig:${READLINE_PREFIX}/lib/pkgconfig:${ZSTD_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
           ./configure \
             --prefix=${{ env.INSTALL_PREFIX }} \
             --with-openssl \
@@ -321,11 +327,19 @@ jobs:
           msystem: MINGW64
           update: true
           install: >-
-            mingw-w64-x86_64-postgresql
             mingw-w64-x86_64-gcc
             make
             base-devel
             git
+            curl
+
+      - name: Install PostgreSQL 17.2 (Windows)
+        run: |
+          curl -fsSL "${{ env.MSYS2_PG_URL }}" -o "${{ env.MSYS2_PG_PACKAGE }}"
+          echo "${{ env.MSYS2_PG_SHA256 }}  ${{ env.MSYS2_PG_PACKAGE }}" | sha256sum --check
+          pacman -U --noconfirm "${{ env.MSYS2_PG_PACKAGE }}"
+          pg_config --version
+          pg_config --version | grep -F "PostgreSQL ${{ env.PG_VERSION }}"
 
       # ------------------------------------------------------------------ #
       # Build pg_guard against MSYS2's PG17
@@ -374,33 +388,21 @@ jobs:
           cp -r /mingw64/share/postgresql/. "$STAGING/share/postgresql/"
 
       # ------------------------------------------------------------------ #
-      # pgvector (Windows — MSYS2 package preferred, HEAD fallback)
+      # pgvector (Windows — pinned source build against pinned PostgreSQL 17)
       # ------------------------------------------------------------------ #
-      - name: Install/build pgvector (Windows)
+      - name: Build pgvector (Windows)
         run: |
           STAGING="$(pwd)/staging"
           mkdir -p "${STAGING}/lib/postgresql" "${STAGING}/share/postgresql/extension"
 
-          # Use MSYS2 package first (ABI-compatible). If unavailable, build from
-          # explicit tag instead of floating HEAD for reproducibility.
-          if pacman -S --noconfirm --needed mingw-w64-x86_64-pgvector 2>/dev/null \
-             && [ -f /mingw64/lib/postgresql/vector.dll ]; then
-            cp /mingw64/lib/postgresql/vector.dll "${STAGING}/lib/postgresql/"
-            cp /mingw64/share/postgresql/extension/vector.control \
-               "${STAGING}/share/postgresql/extension/"
-            find /mingw64/share/postgresql/extension -name "vector--*.sql" \
-              -exec cp {} "${STAGING}/share/postgresql/extension/" \;
-            echo "pgvector: installed from MSYS2 package"
-          else
-            git clone --depth 1 --branch v${{ env.PGVECTOR_VERSION }} https://github.com/pgvector/pgvector.git
-            make -C pgvector PG_CONFIG=/mingw64/bin/pg_config -j4
-            find pgvector -name "vector.dll" \
-              -exec cp {} "${STAGING}/lib/postgresql/" \;
-            cp pgvector/vector.control "${STAGING}/share/postgresql/extension/"
-            find pgvector -name "vector--*.sql" \
-              -exec cp {} "${STAGING}/share/postgresql/extension/" \;
-            echo "pgvector: built from release tag"
-          fi
+          git clone --depth 1 --branch v${{ env.PGVECTOR_VERSION }} https://github.com/pgvector/pgvector.git
+          make -C pgvector PG_CONFIG=/mingw64/bin/pg_config -j4
+          find pgvector -name "vector.dll" \
+            -exec cp {} "${STAGING}/lib/postgresql/" \;
+          cp pgvector/vector.control "${STAGING}/share/postgresql/extension/"
+          find pgvector -name "vector--*.sql" \
+            -exec cp {} "${STAGING}/share/postgresql/extension/" \;
+          echo "pgvector: built from pinned release tag"
 
       # ------------------------------------------------------------------ #
       # pgjwt (Windows — SQL-only, no compilation needed)
