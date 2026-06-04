@@ -444,6 +444,11 @@ jobs:
     name: Upload PG17 archives to CDN
     needs: [build, build-windows]
     runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.CDN_AWS_REGION }}
+      AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
       - name: Download all archives
@@ -456,15 +461,28 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Hetzner: bare regional endpoint only, e.g. https://nbg1.your-objectstorage.com
           EP="${{ secrets.CDN_ENDPOINT }}"
+          EP="${EP%/}"
           BUCKET="${{ secrets.CDN_BUCKET }}"
           BASE="s3://${BUCKET}/postgres/v${{ env.PG_VERSION }}"
           CACHE_CONTROL="public, max-age=31536000, immutable"
+
+          if [[ "${EP}" == *"/${BUCKET}"* ]] || [[ "${EP}" == *"/${BUCKET}/"* ]]; then
+            echo "::error::CDN_ENDPOINT must be the regional host only (https://nbg1.your-objectstorage.com), not include the bucket."
+            exit 1
+          fi
+
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
+          aws configure set default.s3.addressing_style path
+          aws configure set default.s3.signature_version s3v4
           aws configure set default.s3.multipart_threshold 64MB
           aws configure set default.s3.multipart_chunksize 64MB
           aws configure set default.s3.max_concurrent_requests 1
+
+          echo "Preflight: Hetzner bucket access"
+          aws s3 ls "s3://${BUCKET}/" --endpoint-url "${EP}"
 
           upload_file() {
             local body="$1"
@@ -508,6 +526,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.CDN_AWS_REGION }}
+      AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
       - name: Download all artifacts
@@ -541,11 +564,14 @@ jobs:
           set -euo pipefail
 
           EP="${{ secrets.CDN_ENDPOINT }}"
+          EP="${EP%/}"
           BUCKET="${{ secrets.CDN_BUCKET }}"
           BASE="s3://${BUCKET}/postgres/v${{ env.PG_VERSION }}"
           CACHE_CONTROL="public, max-age=31536000, immutable"
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
+          aws configure set default.s3.addressing_style path
+          aws configure set default.s3.signature_version s3v4
           aws configure set default.s3.multipart_threshold 64MB
           aws configure set default.s3.multipart_chunksize 64MB
           aws configure set default.s3.max_concurrent_requests 1
@@ -584,9 +610,12 @@ jobs:
           set -euo pipefail
 
           EP="${{ secrets.CDN_ENDPOINT }}"
+          EP="${EP%/}"
           BUCKET="${{ secrets.CDN_BUCKET }}"
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
+          aws configure set default.s3.addressing_style path
+          aws configure set default.s3.signature_version s3v4
           aws configure set default.s3.multipart_threshold 64MB
           aws configure set default.s3.multipart_chunksize 64MB
           aws configure set default.s3.max_concurrent_requests 1
