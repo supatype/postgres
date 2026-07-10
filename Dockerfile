@@ -5,7 +5,7 @@ ARG PG_NET_VERSION=0.14.0
 ARG PG_GRAPHQL_VERSION=1.5.9
 ARG PGJWT_COMMIT=f3d82fd30151e754e19ce5d6a06c71c20689ce3d
 
-# PGDG apt repo (for pg_cron, postgis, pgsodium)
+# PGDG apt repo (for pg_cron, postgis, wal2json, pgsodium)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates gnupg lsb-release \
   && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-server-dev-17 \
     postgresql-17-postgis-3 \
     postgresql-17-cron \
+    postgresql-17-wal2json \
   && rm -rf /var/lib/apt/lists/*
 
 # pgvector
