@@ -1,6 +1,10 @@
 # supatype/postgres
 
-PostgreSQL 17 with a curated set of extensions and security hardening for the Supatype platform. Published as a multi-arch Docker image and native binary archives for all major platforms.
+PostgreSQL 17 with a curated set of extensions and security hardening for the [Supatype](https://github.com/supatype/supatype) platform. This is the default Postgres image for **`supatype dev`**, **self-host Compose**, and cloud project databases.
+
+**Product:** [github.com/supatype](https://github.com/supatype) · **Docs:** [supatype.github.io/supatype](https://supatype.github.io/supatype/)
+
+Published as a multi-arch Docker image and native binary archives for all major platforms.
 
 ---
 
@@ -45,6 +49,7 @@ Default superuser is `supatype_admin` (set via `POSTGRES_USER`).
 | [pg_cron](https://github.com/citusdata/pg_cron) | Scheduled jobs inside PostgreSQL |
 | [pg_safeupdate](https://github.com/eradman/pg-safeupdate) | Prevents UPDATE/DELETE without a WHERE clause |
 | [pg_plan_filter](https://github.com/pgexperts/pg_plan_filter) | Rejects queries that exceed a cost threshold |
+| [wal2json](https://github.com/eulerto/wal2json) | Logical decoding output plugin (JSON CDC for realtime) |
 | [pg_guard](extensions/pg_guard/) | Role and extension privilege enforcement (bundled) |
 
 ### Auto-loaded libraries
@@ -60,7 +65,7 @@ session_preload_libraries = 'pg_guard'
 
 | Setting | Value | Notes |
 |---|---|---|
-| `wal_level` | `logical` | Ready for logical replication |
+| `wal_level` | `logical` | Ready for logical replication (wal2json plugin bundled) |
 | `max_replication_slots` | `5` | |
 | `max_wal_senders` | `10` | |
 | `row_security` | `on` | RLS enforced by default |

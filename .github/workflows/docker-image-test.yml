@@ -76,6 +76,13 @@ jobs:
             SHOW pg_guard.privileged_role;
           "
 
+      - name: Verify wal2json logical decoding plugin
+        run: |
+          docker exec -e PGPASSWORD=testpassword pg_test psql -U supatype_admin -d postgres -c "
+            SELECT slot_name FROM pg_create_logical_replication_slot('ci_wal2json_test', 'wal2json');
+            SELECT pg_drop_replication_slot('ci_wal2json_test');
+          "
+
       - name: Show logs on failure
         if: failure()
         run: docker logs pg_test || true
