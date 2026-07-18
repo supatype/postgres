@@ -24,9 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-17-wal2json \
   && rm -rf /var/lib/apt/lists/*
 
-# pgvector
+# pgvector — OPTFLAGS="" avoids -march=native (AVX-512 SIGILL on older CPUs / GH Actions).
 RUN git clone --depth 1 --branch v${PGVECTOR_VERSION} https://github.com/pgvector/pgvector.git /tmp/pgvector \
-  && cd /tmp/pgvector && make && make install && rm -rf /tmp/pgvector
+  && cd /tmp/pgvector && make OPTFLAGS="" && make install && rm -rf /tmp/pgvector
 
 # pg_net (async HTTP from triggers)
 RUN git clone --depth 1 --branch v${PG_NET_VERSION} https://github.com/supabase/pg_net.git /tmp/pg_net \
