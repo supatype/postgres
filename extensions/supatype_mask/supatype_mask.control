@@ -1,0 +1,11 @@
+# supatype_mask -- per-column read masking and write rejection.
+#
+# The extension supplies only the rejection function. The masking itself lives in the
+# preloaded library, so `CREATE EXTENSION` is what makes a rejection expressible, not
+# what turns masking on.
+comment = 'Per-column read masking and write rejection driven by security labels'
+default_version = '1.0'
+module_pathname = '$libdir/supatype_mask'
+relocatable = false
+schema = supatype_mask
+superuser = true
