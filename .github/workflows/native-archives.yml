@@ -179,6 +179,34 @@ jobs:
           echo "pg_guard bundled into lib dir."
 
       # ------------------------------------------------------------------ #
+      # supatype_mask — per-column read masking and write rejection
+      #
+      # Bundled with its `.control` and SQL, not just the library: `CREATE EXTENSION`
+      # needs all three. (The pg_guard step above copies only the shared object, which
+      # is why that extension cannot be created from a native archive.)
+      #
+      # Without this, field-level access rules could not be enforced on the native
+      # provider at all — the default `supatype dev` — so a schema declaring them fell
+      # back to generated `api` views while the same schema on `supatype/postgres` used
+      # the planner rewrite. Same source, two mechanisms, purely because of packaging.
+      # ------------------------------------------------------------------ #
+      - name: Build and bundle supatype_mask
+        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
+        run: |
+          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
+          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
+          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
+          mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
+          make -C extensions/supatype_mask clean
+          make -C extensions/supatype_mask PG_CONFIG="${PG_CONFIG}"
+          find extensions/supatype_mask \
+            \( -name "supatype_mask.so" -o -name "supatype_mask.dylib" \) \
+            -exec cp {} "${LIB_DIR}/" \;
+          cp extensions/supatype_mask/supatype_mask.control "${SHARE_DIR}/"
+          cp extensions/supatype_mask/supatype_mask--*.sql "${SHARE_DIR}/"
+          echo "supatype_mask bundled into lib + share/postgresql/extension."
+
+      # ------------------------------------------------------------------ #
       # pgvector — vector similarity search (C extension, native targets only)
       # ------------------------------------------------------------------ #
       - name: Build and bundle pgvector
@@ -343,10 +371,19 @@ jobs:
           make -C extensions/pg_guard PG_CONFIG="$PG_CONFIG"
 
       # ------------------------------------------------------------------ #
+      # Build supatype_mask against MSYS2's PG17 (PGXS emits the .dll suffix).
+      # ------------------------------------------------------------------ #
+      - name: Build supatype_mask
+        run: |
+          PG_CONFIG=/mingw64/bin/pg_config
+          make -C extensions/supatype_mask clean
+          make -C extensions/supatype_mask PG_CONFIG="$PG_CONFIG"
+
+      # ------------------------------------------------------------------ #
       # Stage archive contents
       # Layout matches the Linux/macOS archives:
       #   bin/        PG executables + all required runtime DLLs
-      #   lib/postgresql/  extension DLLs (pg_guard.dll)
+      #   lib/postgresql/  extension DLLs (pg_guard.dll, supatype_mask.dll)
       #   share/postgresql/ timezone data, locale data (needed by initdb)
       # ------------------------------------------------------------------ #
       - name: Stage archive contents
@@ -376,8 +413,21 @@ jobs:
           find extensions/pg_guard -name "pg_guard.dll" \
             -exec cp {} "$STAGING/lib/postgresql/" \;
 
+          # supatype_mask: the DLL here, its control and SQL after the share copy below —
+          # `CREATE EXTENSION` needs all three, and pg_guard ships only its library, which is
+          # why that one cannot be created from a native archive.
+          find extensions/supatype_mask -name "supatype_mask.dll" \
+            -exec cp {} "$STAGING/lib/postgresql/" \;
+
           # PG share data (timezone tables, encoding maps — required by initdb)
           cp -r /mingw64/share/postgresql/. "$STAGING/share/postgresql/"
+
+          # After that copy, not before: it would overwrite anything already staged here.
+          mkdir -p "$STAGING/share/postgresql/extension"
+          cp extensions/supatype_mask/supatype_mask.control \
+             "$STAGING/share/postgresql/extension/"
+          cp extensions/supatype_mask/supatype_mask--*.sql \
+             "$STAGING/share/postgresql/extension/"
 
       # ------------------------------------------------------------------ #
       # pgvector (Windows — pinned source build against pinned PostgreSQL 17)
