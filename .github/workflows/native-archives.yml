@@ -51,7 +51,11 @@ jobs:
             arch: arm64
 
           # macos-13 retired 2025-12-04 — last Intel runner label is macos-15-intel.
-          - target: darwin-x86_64
+          # `darwin-amd64`, matching `linux-amd64` and `windows-amd64`: the archive name comes from
+          # this target, and the CLI asks for `amd64` on every platform (process.arch "x64").
+          # Published as `darwin-x86_64`, the Intel macOS archive could never be found — the CLI
+          # reported "Checksum not found for supatype-pg-17-darwin-amd64".
+          - target: darwin-amd64
             os: macos-15-intel
             platform: darwin
             arch: x86_64

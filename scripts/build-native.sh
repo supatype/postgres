@@ -12,7 +12,7 @@
 #   linux-amd64      Native Linux x86-64
 #   linux-arm64      Linux aarch64 — native build on arm64 hosts; from x86_64 Linux, Postgres cross-builds but pg_guard/pgvector are skipped (install aarch64-linux-gnu-*)
 #   darwin-arm64     Native macOS Apple Silicon
-#   darwin-x86_64    Native macOS Intel
+#   darwin-amd64    Native macOS Intel
 #
 # Environment overrides:
 #   PG_VERSION       Defaults to 17.2
@@ -51,7 +51,7 @@ Options:
                            linux-amd64      Native Linux x86-64
                            linux-arm64      Cross-compiled Linux aarch64
                            darwin-arm64     Native macOS Apple Silicon
-                           darwin-x86_64    Native macOS Intel
+                           darwin-amd64    Native macOS Intel
   --help                 Show this help message and exit.
 
 Environment overrides:
@@ -84,8 +84,8 @@ done
 
 # Validate target
 case "${TARGET}" in
-  linux-amd64|linux-arm64|darwin-arm64|darwin-x86_64) ;;
-  *) die "Invalid target '${TARGET}'. Must be one of: linux-amd64, linux-arm64, darwin-arm64, darwin-x86_64" ;;
+  linux-amd64|linux-arm64|darwin-arm64|darwin-amd64) ;;
+  *) die "Invalid target '${TARGET}'. Must be one of: linux-amd64, linux-arm64, darwin-arm64, darwin-amd64" ;;
 esac
 
 # Detect host OS
