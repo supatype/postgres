@@ -58,6 +58,12 @@ jobs:
           # at — "could not open test/resultmap: Permission denied" — because the working tree belongs
           # to the runner. Installation already happened above, with sudo, so nothing here needs
           # privileges.
+          # /var/run/postgresql belongs to the `postgres` user the Debian package created, and the
+          # server puts its Unix socket there: as the runner it starts, binds TCP, then dies with
+          # "could not create lock file /var/run/postgresql/.s.PGSQL.5555.lock". Hand the directory to
+          # whoever is running rather than moving the socket, so the harness stays identical to the
+          # documented Docker flow, where it runs as postgres and this is already writable.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /var/run/postgresql
           SKIP_INSTALL=1 \
             PG_BIN=/usr/lib/postgresql/${{ matrix.pg }}/bin \
             bash test/run-tests.sh supatype_mask
