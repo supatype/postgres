@@ -62,6 +62,18 @@ jobs:
             PG_BIN=/usr/lib/postgresql/${{ matrix.pg }}/bin \
             bash test/run-tests.sh supatype_mask
 
+      # The harness sends initdb to /dev/null and the server log to a file, so a startup failure
+      # arrives as "pg_ctl: could not start server" and nothing else. Print both rather than guess.
+      - name: Show the server log on failure
+        if: failure()
+        run: |
+          echo "--- /tmp/pg.log ---"
+          cat /tmp/pg.log || echo "(no server log)"
+          echo "--- pgdata present? ---"
+          ls -la /tmp/pgdata 2>&1 | head -5 || true
+          echo "--- is the library installed for this major? ---"
+          ls -la "$(/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config --pkglibdir)" | grep -i supatype || echo "(supatype_mask.so not found)"
+
       - name: Upload regression diffs on failure
         if: failure()
         uses: actions/upload-artifact@v4
