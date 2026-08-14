@@ -52,9 +52,13 @@ jobs:
       - name: Run regression tests
         working-directory: extensions/supatype_mask
         run: |
-          sudo chown -R postgres /tmp
-          sudo -u postgres env \
-            SKIP_INSTALL=1 \
+          # As the runner user, not `sudo -u postgres`: the harness runs `initdb -U postgres`, so the
+          # cluster superuser is `postgres` whoever starts it, and Postgres refuses to run only as
+          # *root*. Running as `postgres` meant pg_regress could not read the checkout it was pointed
+          # at — "could not open test/resultmap: Permission denied" — because the working tree belongs
+          # to the runner. Installation already happened above, with sudo, so nothing here needs
+          # privileges.
+          SKIP_INSTALL=1 \
             PG_BIN=/usr/lib/postgresql/${{ matrix.pg }}/bin \
             bash test/run-tests.sh supatype_mask
 
