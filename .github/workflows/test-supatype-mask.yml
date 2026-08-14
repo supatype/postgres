@@ -1,0 +1,89 @@
+name: supatype_mask tests
+
+on:
+  pull_request:
+    paths:
+      - 'extensions/supatype_mask/**'
+  push:
+    branches: [main]
+    paths:
+      - 'extensions/supatype_mask/**'
+
+jobs:
+  test:
+    name: supatype_mask regression (PG${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # PG17+ only: the rewrite touches Var, Query and the node walkers, which are
+        # not stable across majors the way pg_guard's ProcessUtility hook is.
+        pg: [17]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # PGDG, because the runner image does not carry PostgreSQL 17: installing it from the default
+      # Ubuntu repositories fails with "Unable to locate package", which is a missing repository rather
+      # than a missing package.
+      - name: Add the PostgreSQL apt repository
+        run: |
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }}
+
+      - name: Build and install
+        run: |
+          PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config \
+            make -C extensions/supatype_mask
+          sudo PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config \
+            make -C extensions/supatype_mask install
+
+      - name: Run regression tests
+        working-directory: extensions/supatype_mask
+        run: |
+          # As the runner user, not `sudo -u postgres`: the harness runs `initdb -U postgres`, so the
+          # cluster superuser is `postgres` whoever starts it, and Postgres refuses to run only as
+          # *root*. Running as `postgres` meant pg_regress could not read the checkout it was pointed
+          # at — "could not open test/resultmap: Permission denied" — because the working tree belongs
+          # to the runner. Installation already happened above, with sudo, so nothing here needs
+          # privileges.
+          # /var/run/postgresql belongs to the `postgres` user the Debian package created, and the
+          # server puts its Unix socket there: as the runner it starts, binds TCP, then dies with
+          # "could not create lock file /var/run/postgresql/.s.PGSQL.5555.lock". Hand the directory to
+          # whoever is running rather than moving the socket, so the harness stays identical to the
+          # documented Docker flow, where it runs as postgres and this is already writable.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /var/run/postgresql
+          SKIP_INSTALL=1 \
+            PG_BIN=/usr/lib/postgresql/${{ matrix.pg }}/bin \
+            bash test/run-tests.sh supatype_mask
+
+      # The harness sends initdb to /dev/null and the server log to a file, so a startup failure
+      # arrives as "pg_ctl: could not start server" and nothing else. Print both rather than guess.
+      - name: Show the server log on failure
+        if: failure()
+        run: |
+          echo "--- /tmp/pg.log ---"
+          cat /tmp/pg.log || echo "(no server log)"
+          echo "--- pgdata present? ---"
+          ls -la /tmp/pgdata 2>&1 | head -5 || true
+          echo "--- is the library installed for this major? ---"
+          ls -la "$(/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config --pkglibdir)" | grep -i supatype || echo "(supatype_mask.so not found)"
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supatype_mask-regression-diffs-pg${{ matrix.pg }}
+          path: /tmp/out/regression.diffs
+          retention-days: 7

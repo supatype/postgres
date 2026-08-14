@@ -98,6 +98,10 @@ pg_config --version | grep -F 'PostgreSQL $PG_FULL_VERSION'
     Write-Host "[supatype-postgres] Building pg_guard..."
     Invoke-Msys2 "make -C '$MsysRepo/extensions/pg_guard' PG_CONFIG=/mingw64/bin/pg_config"
 
+    # ── Step 2a: Build supatype_mask ──────────────────────────────────────────
+    Write-Host "[supatype-postgres] Building supatype_mask..."
+    Invoke-Msys2 "make -C '$MsysRepo/extensions/supatype_mask' PG_CONFIG=/mingw64/bin/pg_config"
+
     # ── Step 2b: Build pgvector ───────────────────────────────────────────────
     Write-Host "[supatype-postgres] Installing pgvector..."
     $PgvectorDist = "$MsysTmp/pgvector-dist"
@@ -145,6 +149,15 @@ cp -r /mingw64/lib/postgresql/. "`$STAGING/lib/postgresql/"
 # pg_guard extension DLL (overwrites any stale copy)
 find '$MsysRepo/extensions/pg_guard' -name 'pg_guard.dll' \
     -exec cp {} "`$STAGING/lib/postgresql/" \;
+
+# supatype_mask DLL plus its extension files -- the rejection function is SQL-visible,
+# so the .control and .sql have to travel with the library.
+find '$MsysRepo/extensions/supatype_mask' -name 'supatype_mask.dll' \
+    -exec cp {} "`$STAGING/lib/postgresql/" \;
+mkdir -p "`$STAGING/share/postgresql/extension"
+cp '$MsysRepo/extensions/supatype_mask/supatype_mask.control' \
+   '$MsysRepo/extensions/supatype_mask/supatype_mask--1.0.sql' \
+   "`$STAGING/share/postgresql/extension/"
 
 # Share data (timezone tables etc. -- required by initdb)
 cp -r /mingw64/share/postgresql/. "`$STAGING/share/postgresql/"

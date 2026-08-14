@@ -39,3 +39,14 @@ extensions/pg_guard/src/*.o
 extensions/pg_guard/.deps/
 extensions/pg_guard/**/*.so
 extensions/pg_guard/**/*.dylib
+
+extensions/supatype_mask/src/*.o
+extensions/supatype_mask/src/*.bc
+extensions/supatype_mask/**/*.so
+extensions/supatype_mask/**/*.dylib
+extensions/supatype_mask/**/*.dll
+extensions/supatype_mask/**/*.a
+extensions/supatype_mask/test/_out/
+extensions/supatype_mask/regression.diffs
+extensions/supatype_mask/regression.out
+extensions/supatype_mask/results/

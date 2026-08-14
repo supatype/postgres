@@ -56,7 +56,7 @@ jobs:
             WHERE name IN (
               'pgcrypto','uuid-ossp','pg_stat_statements',
               'pg_cron','pg_net',
-              'postgis','vector','pg_graphql','pgjwt'
+              'postgis','vector','pg_graphql','pgjwt','supatype_mask'
             )
             ORDER BY name;
           "
@@ -75,6 +75,66 @@ jobs:
           docker exec -e PGPASSWORD=testpassword pg_test psql -U supatype_admin -d postgres -c "
             SHOW pg_guard.privileged_role;
           "
+
+      - name: Verify supatype_mask masks a column
+        env:
+          # migrate.sh bootstraps the database named after POSTGRES_USER, which is where
+          # `CREATE EXTENSION supatype_mask` landed. `postgres` has the preloaded library
+          # but not the extension, so the deny assertion below needs this one.
+          PGDATABASE: supatype_admin
+        run: |
+          # End to end rather than "is it installed": the failure mode that matters is a
+          # column that quietly comes back unmasked, and only a real query catches it.
+          # supatype_admin is a superuser and therefore exempt, so this runs as a plain
+          # role.
+          run() {
+            docker exec -e PGPASSWORD=testpassword -i pg_test \
+              psql -U supatype_admin -d "$PGDATABASE" "$@"
+          }
+
+          # `pg_isready` succeeds while the entrypoint is still running the bootstrap
+          # migrations -- the server is listening on its private socket throughout. This
+          # extension is created by the *last* migration, so waiting for the extension
+          # itself is the only reliable readiness signal for this step.
+          for i in $(seq 1 60); do
+            [ "$(run -tAc "SELECT count(*) FROM pg_extension WHERE extname = 'supatype_mask'" 2>/dev/null)" = "1" ] && break
+            sleep 2
+          done
+          run -tAc "SELECT extname, extversion FROM pg_extension WHERE extname = 'supatype_mask'"
+          # -tAc with leading SETs prints a "SET" line per command, so take the last.
+          query() { run -tAc "SET ROLE ci_reader; SET ci.uid = '$1'; $2" | tail -1; }
+
+          run -v ON_ERROR_STOP=1 -q <<'SQL'
+            CREATE TABLE ci_mask (id int, secret text, owner text);
+            INSERT INTO ci_mask VALUES (1, 'shhh', 'alice');
+
+            CREATE FUNCTION can_read_ci_mask__secret(ci_mask ci_mask) RETURNS boolean
+              LANGUAGE sql STABLE AS $$
+                SELECT owner = current_setting('ci.uid', true)
+                  FROM (SELECT ($1).*) AS ci_mask;
+              $$;
+
+            SECURITY LABEL FOR supatype ON COLUMN ci_mask.secret
+              IS 'MASK READ public.can_read_ci_mask__secret';
+
+            CREATE ROLE ci_reader;
+            GRANT SELECT ON ci_mask TO ci_reader;
+          SQL
+
+          masked=$(query bob   "SELECT coalesce(secret, '<masked>') FROM ci_mask;")
+          shown=$(query alice  "SELECT secret FROM ci_mask;")
+          # Also exercises the extension's rejection function, not just the library.
+          denied=$(query bob "SELECT count(secret) FROM ci_mask;" 2>&1 || true)
+
+          echo "non-owner sees: $masked"
+          echo "owner sees:     $shown"
+          echo "aggregate:      $denied"
+          test "$masked" = "<masked>" || { echo "FAIL: column was not masked"; exit 1; }
+          test "$shown" = "shhh" || { echo "FAIL: owner could not read the column"; exit 1; }
+          case "$denied" in
+            *"cannot be aggregated"*) ;;
+            *) echo "FAIL: aggregate over a masked column was not rejected"; exit 1 ;;
+          esac
 
       - name: Verify wal2json logical decoding plugin
         run: |

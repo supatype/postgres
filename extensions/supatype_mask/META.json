@@ -1,0 +1,48 @@
+{
+   "name": "supatype_mask",
+   "abstract": "Per-column read masking and write rejection driven by security labels",
+   "description": "Rewrites references to a labelled column into a masking expression in the planner, so a restricted column comes back null rather than making the request fail, and coerces or rejects writes to it per row.",
+   "version": "1.0.0",
+   "maintainer": [
+      "Supatype <dev@supatype.io>"
+   ],
+   "license": "apache_2_0",
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "17.0.0"
+         }
+      }
+   },
+   "provides": {
+     "supatype_mask": {
+       "abstract": "Per-column read masking and write rejection driven by security labels",
+       "file": "src/supatype_mask.c",
+       "version": "1.0.0"
+     }
+   },
+   "resources": {
+      "homepage": "https://github.com/supatype/postgres",
+      "bugtracker": {
+         "web": "https://github.com/supatype/postgres/issues"
+      },
+      "repository": {
+        "url":  "https://github.com/supatype/postgres.git",
+        "web":  "https://github.com/supatype/postgres",
+        "type": "git"
+      }
+   },
+   "generated_by": "Supatype",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "security",
+      "security label",
+      "column",
+      "masking",
+      "row level security",
+      "planner"
+   ]
+}

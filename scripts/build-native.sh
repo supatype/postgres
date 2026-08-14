@@ -34,6 +34,7 @@ BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/pg-build}"
 
 TARGET=""
 PG_GUARD_DIR="${REPO_ROOT}/extensions/pg_guard"
+MASK_DIR="${REPO_ROOT}/extensions/supatype_mask"
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -130,6 +131,7 @@ info "Build dir:    ${BUILD_DIR}"
 info "Jobs:         ${JOBS}"
 info "Cross-build:  ${IS_CROSS}"
 [[ -n "${PG_GUARD_DIR}" ]] && info "pg_guard dir: ${PG_GUARD_DIR}" || warn "pg_guard dir not set — pg_guard will be skipped."
+[[ -n "${MASK_DIR}" ]] && info "mask dir:     ${MASK_DIR}" || warn "supatype_mask dir not set — masking will be skipped."
 echo ""
 
 mkdir -p "${BUILD_DIR}"
@@ -282,6 +284,32 @@ else
   find "${PG_GUARD_DIR}" \( -name "pg_guard.so" -o -name "pg_guard.dylib" \) \
     -exec cp {} "${LIB_DIR}/" \; -print
   info "pg_guard bundled into ${LIB_DIR}."
+fi
+
+# --------------------------------------------------------------------------- #
+# Step 7a — Build and bundle supatype_mask
+# --------------------------------------------------------------------------- #
+info "=== Step 7a: supatype_mask ==="
+
+if [[ "${IS_CROSS}" == "true" ]]; then
+  # A native archive without the masking library is a database whose field rules do
+  # not hold, so this must be loud rather than a silent skip.
+  warn "supatype_mask cross-compilation not supported — the archive will NOT enforce"
+  warn "field-level masking. Do not ship this archive as a masking-capable build."
+elif [[ ! -d "${MASK_DIR}" ]]; then
+  die "supatype_mask directory not found at ${MASK_DIR} — repo may be incomplete."
+else
+  info "Building supatype_mask from ${MASK_DIR}..."
+  PG_CONFIG_BIN="${STAGE_DIR}${INSTALL_PREFIX}/bin/pg_config"
+  [[ -x "${PG_CONFIG_BIN}" ]] || die "pg_config not found at ${PG_CONFIG_BIN}"
+
+  # Unlike pg_guard this ships SQL as well as a library (the rejection function lives
+  # in an extension), so install through PGXS with DESTDIR rather than copying the
+  # shared object — the .control and .sql have to land beside it.
+  make -C "${MASK_DIR}" PG_CONFIG="${PG_CONFIG_BIN}" clean
+  make -C "${MASK_DIR}" PG_CONFIG="${PG_CONFIG_BIN}"
+  make -C "${MASK_DIR}" PG_CONFIG="${PG_CONFIG_BIN}" install DESTDIR="${STAGE_DIR}"
+  info "supatype_mask bundled into ${STAGE_DIR}${INSTALL_PREFIX}."
 fi
 
 # --------------------------------------------------------------------------- #

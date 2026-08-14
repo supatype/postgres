@@ -65,6 +65,28 @@ EOSQL
     DBMATE_MIGRATIONS_DIR="$db/migrations" DATABASE_URL="postgres://supatype_admin:$connect" dbmate --no-dump-schema migrate
 fi
 
+# PostgREST connects as `authenticator`, so it needs a password: pg_hba uses
+# scram-sha-256 for every non-loopback host, which is every containerised path.
+#
+# Created passwordless by the init scripts, so this is what makes it usable at all. Set after
+# the migrations rather than in an init script because only this script sees the environment,
+# and after `20221103090837_revoke_admin.sql` has taken `supatype_admin` back off the role --
+# a login credential should not be handed out while it still inherits superuser.
+#
+# `AUTHENTICATOR_PASSWORD`, not `POSTGRES_PASSWORD`: the latter is the operator's, for direct
+# SQL access, and rotating it must not take the REST API down. Falls back to it only so a
+# hand-rolled stack that never set the new variable still boots -- with a warning, because a
+# shared credential is not the intended posture.
+_auth_pw="${AUTHENTICATOR_PASSWORD:-}"
+if [ -z "$_auth_pw" ]; then
+    echo "$0: WARNING: AUTHENTICATOR_PASSWORD is unset; falling back to POSTGRES_PASSWORD." >&2
+    echo "$0:          Set AUTHENTICATOR_PASSWORD so rotating the database password cannot" >&2
+    echo "$0:          break PostgREST." >&2
+    _auth_pw="$PGPASSWORD"
+fi
+psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
+    -c "ALTER USER authenticator WITH PASSWORD '$_auth_pw'"
+
 # run any post migration script to update role passwords
 postinit="/etc/postgresql.schema.sql"
 if [ -e "$postinit" ]; then

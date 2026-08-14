@@ -54,6 +54,10 @@ RUN ARCH=$(dpkg --print-architecture) \
 COPY extensions/pg_guard/ /tmp/pg_guard/
 RUN cd /tmp/pg_guard && make clean && make && make install && rm -rf /tmp/pg_guard
 
+# supatype_mask — per-column read masking and write rejection (bundled in extensions/)
+COPY extensions/supatype_mask/ /tmp/supatype_mask/
+RUN cd /tmp/supatype_mask && make clean && make && make install && rm -rf /tmp/supatype_mask
+
 # Remove build tools
 RUN apt-get purge -y build-essential git postgresql-server-dev-17 pkg-config libssl-dev libcurl4-openssl-dev \
   && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
@@ -64,6 +68,7 @@ COPY config/postgresql.conf /etc/postgresql/postgresql.conf
 COPY config/pg_hba.conf /etc/postgresql/pg_hba.conf
 COPY config/pg_ident.conf /etc/postgresql/pg_ident.conf
 COPY config/pg_guard.conf /etc/postgresql-custom/pg_guard.conf
+COPY config/supatype_mask.conf /etc/postgresql-custom/supatype_mask.conf
 COPY config/extension-custom-scripts/ /etc/postgresql-custom/extension-custom-scripts/
 
 # Bootstrap migrations: the stock postgres entrypoint only runs *.sh / *.sql in this
