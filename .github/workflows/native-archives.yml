@@ -197,7 +197,11 @@ jobs:
           LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
           SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
           mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
-          make -C extensions/supatype_mask clean
+          # PG_CONFIG on `clean` too: a PGXS makefile resolves `$(PG_CONFIG) --pgxs` for every target,
+          # so `clean` without it fails with "make: pg_config: No such file or directory" wherever the
+          # runner image carries no system PostgreSQL — which is every platform here except
+          # linux-amd64, the one that passed and made this look platform-specific.
+          make -C extensions/supatype_mask clean PG_CONFIG="${PG_CONFIG}"
           make -C extensions/supatype_mask PG_CONFIG="${PG_CONFIG}"
           find extensions/supatype_mask \
             \( -name "supatype_mask.so" -o -name "supatype_mask.dylib" \) \
