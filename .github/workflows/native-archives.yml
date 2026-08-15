@@ -51,7 +51,11 @@ jobs:
             arch: arm64
 
           # macos-13 retired 2025-12-04 — last Intel runner label is macos-15-intel.
-          - target: darwin-x86_64
+          # `darwin-amd64`, matching `linux-amd64` and `windows-amd64`: the archive name comes from
+          # this target, and the CLI asks for `amd64` on every platform (process.arch "x64").
+          # Published as `darwin-x86_64`, the Intel macOS archive could never be found — the CLI
+          # reported "Checksum not found for supatype-pg-17-darwin-amd64".
+          - target: darwin-amd64
             os: macos-15-intel
             platform: darwin
             arch: x86_64
@@ -505,6 +509,18 @@ jobs:
       AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
+      # The tag is the release, not `PG_VERSION` — that is the PostgreSQL source version, and two
+      # releases of the same source (17.2.1, 17.2.2) would otherwise publish into the same
+      # directory. Objects are uploaded `immutable, max-age=1y`, so overwriting one leaves caches
+      # serving a fresh checksums file beside a stale archive until the year is out.
+      - name: Resolve the release version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "::error::This job publishes immutable release artefacts and must run from a tag."
+            exit 1
+          fi
+          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Download all archives
         uses: actions/download-artifact@v4
         with:
@@ -519,7 +535,7 @@ jobs:
           EP="${{ secrets.CDN_ENDPOINT }}"
           EP="${EP%/}"
           BUCKET="${{ secrets.CDN_BUCKET }}"
-          BASE="s3://${BUCKET}/postgres/v${{ env.PG_VERSION }}"
+          BASE="s3://${BUCKET}/postgres/v${RELEASE_VERSION}"
           CACHE_CONTROL="public, max-age=31536000, immutable"
 
           if [[ "${EP}" == *"/${BUCKET}"* ]] || [[ "${EP}" == *"/${BUCKET}/"* ]]; then
@@ -587,6 +603,11 @@ jobs:
       AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
+      # The tag is the release, with its leading `v` stripped: `github.ref_name` is `v17.2.3` and
+      # the CDN path is `postgres/v<version>`, so using it raw publishes to `postgres/vv17.2.3`.
+      - name: Resolve the release version
+        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -620,7 +641,7 @@ jobs:
           EP="${{ secrets.CDN_ENDPOINT }}"
           EP="${EP%/}"
           BUCKET="${{ secrets.CDN_BUCKET }}"
-          BASE="s3://${BUCKET}/postgres/v${{ env.PG_VERSION }}"
+          BASE="s3://${BUCKET}/postgres/v${RELEASE_VERSION}"
           CACHE_CONTROL="public, max-age=31536000, immutable"
           export AWS_RETRY_MODE=standard
           export AWS_MAX_ATTEMPTS=10
@@ -674,8 +695,10 @@ jobs:
           aws configure set default.s3.multipart_chunksize 64MB
           aws configure set default.s3.max_concurrent_requests 1
 
-          printf '{"version":"%s","date":"%s","checksums_url":"https://releases.supatype.io/postgres/v%s/checksums.sha256"}\n' \
-            "${{ env.PG_VERSION }}" "$(date -u +%Y-%m-%d)" "${{ env.PG_VERSION }}" > latest.json
+          # `.com`, not `.io`: the CLI builds its own URL today, so this field is documentation —
+          # and documentation pointing at a host we do not serve is worse than none.
+          printf '{"version":"%s","date":"%s","checksums_url":"https://releases.supatype.com/postgres/v%s/checksums.sha256"}\n' \
+            "${RELEASE_VERSION}" "$(date -u +%Y-%m-%d)" "${RELEASE_VERSION}" > latest.json
 
           for attempt in 1 2 3 4 5; do
             if aws s3 cp latest.json \

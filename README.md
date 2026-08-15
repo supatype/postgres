@@ -125,7 +125,7 @@ For deployments that run PostgreSQL natively (no Docker), pre-built archives are
 | Linux x86-64 | `supatype-pg-17-linux-amd64.tar.gz` |
 | Linux arm64 | `supatype-pg-17-linux-arm64.tar.gz` |
 | macOS Apple Silicon | `supatype-pg-17-darwin-arm64.tar.gz` |
-| macOS Intel | `supatype-pg-17-darwin-x86_64.tar.gz` |
+| macOS Intel | `supatype-pg-17-darwin-amd64.tar.gz` |
 | Windows x64 | `supatype-pg-17-windows-amd64.zip` |
 
 pg_guard is bundled in all archives (except the cross-compiled linux-arm64 build where cross-compilation of the extension is not supported).
