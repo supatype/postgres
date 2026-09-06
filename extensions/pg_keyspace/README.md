@@ -14,8 +14,12 @@ for the full write-up and the concerns matrix.
 > Mode A** — validated on the real base (PG17 + `supatype_mask` + `pg_guard`):
 > load-order assertion, seclabel self-check, RESP `AUTH`→role, keyspace ACL,
 > forced tenant scoping (§4). Mode B (the transparent row cache) and its threat
-> cases are **not** built (P6). Still a POC — auth secrets are compared in clear
-> and credentials load at worker start; don't deploy as-is.
+> cases are **not** built (P6): its `CustomScan` executor node + logical-decoding
+> invalidation are the remaining work, though P6's key §4.3c/§6 concern — how
+> much a row cache can win on a masked table, and the `supacache.get` predicate
+> accelerator — is already benchmarked (`results/p6_maskcost.txt`). Still a POC —
+> auth secrets are compared in clear and credentials load at worker start; don't
+> deploy as-is.
 
 ## What it is
 

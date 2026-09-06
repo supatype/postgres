@@ -400,6 +400,49 @@ restart or a future sinval-driven refresh); secrets are compared in clear (store
 a hash in production); Mode B row-cache threat cases (force_generic_plan,
 masked-column warm cache, decoding worker) are P6, not built.
 
+## 5e. P6 — Mode B (row cache): masked-read cost and the §6 accelerator
+
+P6 (the transparent PostgREST row cache) is a separable, multi-week project
+(§12). Its correct core — a planner hook that substitutes a `CustomScan` reading
+shmem *only at the scan leaf*, so RLS `securityQuals` and `supatype_mask`'s
+`CASE` expressions above it still apply (§4.6) — is the remaining executor build
+(slice 2). The tempting shortcut of rewriting the table RTE to a `VALUES` RTE is
+**rejected**: it drops the relation's `securityQuals` and would silently defeat
+RLS, the exact hole §4.6 warns about.
+
+What slice 1 establishes is the thing §4.3c/§11 explicitly say to benchmark —
+**how much a row cache can actually win on a masked table** — measured on the
+real base (100k-row table, 3 masked columns, non-exempt role, full scan):
+
+| masked-table scan, predicate = | time | vs plain |
+|---|---:|---:|
+| plain (no mask) | 11.6ms | 1× |
+| trivial (inlinable) predicate | 17.9ms | 1.5× |
+| realistic table-lookup predicate | **1113ms** | ~96× |
+| **`supacache.get` (§6) predicate** | **97ms** | ~8× |
+
+Two findings:
+
+1. **A masked read is predicate-bound, not heap-bound (§4.3c).** With a realistic
+   predicate (a lookup per call), the scan is ~96× the plain cost — the heap
+   fetch is noise. A Mode B row cache removes the heap access but *keeps* the
+   predicates, so its win on such a table is far less than the "roughly half"
+   §4.3c estimates. Benchmark masked and unmasked separately, as §4.3c insists.
+
+2. **The real accelerator for masked tables is §6, not the row cache.** Routing
+   the predicate's permission-set lookup through `supacache.get` (in-process
+   shmem) makes the masked scan **11.5× faster** (1113ms → 97ms) — §4.3c's "it
+   can make masked tables substantially faster, provided the cached artefact is a
+   permission set the predicate consults and never the predicate's answer," and
+   §6's "the strongest argument for building this at all." §4.3b is honored: the
+   cache holds the permission *set*, never the predicate's per-row answer, so
+   there is no cross-caller leak.
+
+Remaining P6 work (slices 2–3): the `CustomScan` executor node + the RLS / mask /
+`force_generic_plan` regression suite (§4.7), and the logical-decoding
+invalidation worker (§3.5) + PostgREST end-to-end. Details:
+`results/p6_maskcost.txt`, `bench/run_p6_maskcost.sh`.
+
 ## 6. Concerns validation matrix
 
 ### 6a. Performance & architecture — validated empirically
