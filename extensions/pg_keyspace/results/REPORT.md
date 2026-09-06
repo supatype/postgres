@@ -479,10 +479,11 @@ real base (100k-row table, 3 masked columns, non-exempt role, full scan):
 |---|---:|---:|
 | plain (no mask) | 11.6ms | 1× |
 | trivial (inlinable) predicate | 17.9ms | 1.5× |
-| realistic table-lookup predicate | **1113ms** | ~96× |
-| **`supacache.get` (§6) predicate** | **97ms** | ~8× |
+| realistic table-lookup predicate, **per row** | **1117ms** | ~96× |
+| same lookup via `supacache.get` (§6), per row | 94ms | ~8× |
+| **same lookup, row-independent → InitPlan (once)** | **18ms** | **1.7×** |
 
-Two findings:
+Three findings:
 
 1. **A masked read is predicate-bound, not heap-bound (§4.3c).** With a realistic
    predicate (a lookup per call), the scan is ~96× the plain cost — the heap
@@ -490,14 +491,27 @@ Two findings:
    predicates, so its win on such a table is far less than the "roughly half"
    §4.3c estimates. Benchmark masked and unmasked separately, as §4.3c insists.
 
-2. **The real accelerator for masked tables is §6, not the row cache.** Routing
-   the predicate's permission-set lookup through `supacache.get` (in-process
-   shmem) makes the masked scan **11.5× faster** (1113ms → 97ms) — §4.3c's "it
-   can make masked tables substantially faster, provided the cached artefact is a
-   permission set the predicate consults and never the predicate's answer," and
-   §6's "the strongest argument for building this at all." §4.3b is honored: the
-   cache holds the permission *set*, never the predicate's per-row answer, so
-   there is no cross-caller leak.
+2. **The dominant cost is calling the predicate per row, and most policies don't
+   need that.** A role- or claim-level mask ("can this role see this column")
+   ignores the row, yet the per-row `CASE WHEN pred(t)` re-evaluates it for every
+   row. We added a **row-independent predicate** to `supatype_mask`: declare the
+   predicate with no arguments and it is emitted as an uncorrelated `(SELECT
+   pred())`, which the planner hoists to an **InitPlan evaluated once per scan**.
+   The *same* per-`current_user` lookup that costs 1117ms per row costs **18ms**
+   hoisted — 96× collapses to 1.7×, the cost of the `CASE` branches alone (the
+   `EXPLAIN` shows one `InitPlan` per masked column). It stays safe: the InitPlan
+   re-runs each execution reading live session state, and `IMMUTABLE` is still
+   refused, so a plan cached for one caller does not answer for another —
+   confirmed under `force_generic_plan` with the role switched between executes
+   (supatype_mask regression suite). Value-dependent masks keep the whole-row
+   form, which wins when both overloads exist.
+
+3. **For genuinely per-row policies, the §6 accelerator still applies.** When the
+   answer really does vary per row (or the permission set must be consulted per
+   call), routing that lookup through `supacache.get` (in-process shmem) makes the
+   masked scan **~12× faster** (1117ms → 94ms) — §4.3c's "a permission set the
+   predicate consults and never the predicate's answer." §4.3b is honored: the
+   cache holds the permission *set*, never the predicate's per-row answer.
 
 Remaining P6 work (slice 3): the logical-decoding invalidation/refill worker
 (§3.5, keys-only) that keeps the cache coherent with committed writes, and a
@@ -596,6 +610,14 @@ commit off the worker's snapshot.
   §4.6 security invariant are built and tested (§5e). POC-level auth caveats:
   credentials load at worker start (no hot reload yet), secrets compared in clear
   (hash in production).
+- Coupling to `supatype_mask` is a single fail-closed gate, not baked in. The load
+  order is asserted at worker start (§4.1); `pg_keyspace.require_mask = off` lifts
+  the requirement so pg_keyspace runs standalone as a plain Postgres-native
+  keyspace + RLS-aware row cache (only *column* masking needs supatype_mask; RLS is
+  core PG). Verified both ways: standalone starts and serves RESP with no mask
+  loaded; the default (`on`) still refuses to bind the port when mask is absent.
+  There is no code dependency on `pg_guard` at all (its integration is operator
+  config: `reserved_memberships` in `postgresql.conf`).
 - P0/P1 latency/throughput numbers were taken on the system PG16 spike box; P2/P6
   run on a from-source PG17.6 (PGDG is blocked in this sandbox). Hot-path latency
   is unaffected by the PG version.

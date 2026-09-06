@@ -23,6 +23,10 @@ CREATE OR REPLACE FUNCTION public.can_read_join (r public.bench_masked) RETURNS 
   $$ SELECT coalesce((SELECT allowed FROM public.bench_perms WHERE role = current_user), false) $$;
 CREATE OR REPLACE FUNCTION public.can_read_shmem(r public.bench_masked) RETURNS bool LANGUAGE sql STABLE AS
   $$ SELECT supacache.get('perm:'||current_user) IS NOT NULL $$;
+-- row-INDEPENDENT overload: zero args, SAME body as can_read_join, but supatype_mask
+-- emits it as (SELECT can_read_norow()) -> planner InitPlan -> evaluated ONCE per scan.
+CREATE OR REPLACE FUNCTION public.can_read_norow() RETURNS bool LANGUAGE sql STABLE AS
+  $$ SELECT coalesce((SELECT allowed FROM public.bench_perms WHERE role = current_user), false) $$;
 SELECT supacache.set('perm:bench_user','1'::bytea);
 DROP ROLE IF EXISTS bench_user; CREATE ROLE bench_user LOGIN;
 GRANT SELECT ON public.bench_plain, public.bench_masked, public.bench_perms TO bench_user;
@@ -43,5 +47,6 @@ Q="SELECT count(length(c1)+length(c2)+length(c3)) FROM public.bench_masked"
 echo "# P6 masked-read cost (100k rows, 3 masked columns, min of 5 runs)"
 run "plain, no mask" "SELECT count(length(c1)+length(c2)+length(c3)) FROM public.bench_plain"
 swap can_read_true;  run "masked, predicate = trivial (inlined)"     "$Q"
-swap can_read_join;  run "masked, predicate = table lookup per call" "$Q"
+swap can_read_join;  run "masked, predicate = table lookup per row"  "$Q"
 swap can_read_shmem; run "masked, predicate = supacache.get (§6)"    "$Q"
+swap can_read_norow; run "masked, predicate = row-indep. InitPlan"   "$Q"

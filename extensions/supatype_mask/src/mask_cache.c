@@ -102,19 +102,30 @@ supatype_mask_check_label(const ObjectAddress *object, const char *seclabel) {
 /// an unconditional mask.
 static Oid
 resolve_predicate(const char *name, Oid rowtype, const char *relname,
-                  const char *colname, const char *kind) {
+                  const char *colname, const char *kind, bool *norow) {
   List *qualified;
   Oid   argtypes[1] = {rowtype};
   Oid   funcid;
 
+  *norow    = false;
   qualified = textToQualifiedNameList(cstring_to_text(name));
-  funcid    = LookupFuncName(qualified, 1, argtypes, true);
+
+  // Prefer the whole-row overload `pred(t)` -- the per-row contract. Only when it
+  // does not exist do we accept a zero-argument `pred()`, which declares the
+  // predicate row-independent and lets us hoist it to a once-per-scan InitPlan.
+  funcid = LookupFuncName(qualified, 1, argtypes, true);
+  if (!OidIsValid(funcid)) {
+    funcid = LookupFuncName(qualified, 0, NULL, true);
+    if (OidIsValid(funcid)) *norow = true;
+  }
 
   if (!OidIsValid(funcid)) {
     ereport(WARNING,
             errmsg("supatype_mask: %s predicate \"%s\" for \"%s\".\"%s\" does not exist",
                    kind, name, relname, colname),
-            errdetail("The column is masked unconditionally until the predicate resolves."));
+            errdetail("The column is masked unconditionally until the predicate resolves."),
+            errhint("Define %s(%s) for a per-row rule, or %s() for a row-independent one.",
+                    name, relname, name));
     return InvalidOid;
   }
 
@@ -164,6 +175,8 @@ resolve_column(Oid relid, Oid rowtype, const char *relname, AttrNumber attno,
   col->colcollation = att->attcollation;
   col->read_fn      = InvalidOid;
   col->write_fn     = InvalidOid;
+  col->read_norow   = false;
+  col->write_norow  = false;
   col->force_mask   = true;
 
   if (!parse_mask_label(label, &read_name, &write_name, &detail)) {
@@ -177,11 +190,11 @@ resolve_column(Oid relid, Oid rowtype, const char *relname, AttrNumber attno,
   }
 
   if (read_name != NULL)
-    col->read_fn =
-        resolve_predicate(read_name, rowtype, relname, NameStr(att->attname), "read");
+    col->read_fn = resolve_predicate(read_name, rowtype, relname,
+                                     NameStr(att->attname), "read", &col->read_norow);
   if (write_name != NULL)
-    col->write_fn =
-        resolve_predicate(write_name, rowtype, relname, NameStr(att->attname), "write");
+    col->write_fn = resolve_predicate(write_name, rowtype, relname,
+                                      NameStr(att->attname), "write", &col->write_norow);
 
   // A named predicate that fails to resolve masks the column outright, whichever side
   // it was on: an unresolvable write must not leave the column writable either.

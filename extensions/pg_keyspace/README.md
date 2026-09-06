@@ -149,6 +149,7 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 | `pg_keyspace.ttl_sweep_secs` | 5 | how often the expiry worker drops fully-past TTL partitions |
 | `pg_keyspace.commit_window_us` | 500 | standalone file-batcher window (durability microbench) |
 | `pg_keyspace.rowcache_mb` | 64 | size of the Mode B row-cache segment (separate from Mode A; never RESP-addressable) |
+| `pg_keyspace.require_mask` | `on` | require `supatype_mask` loaded + outermost before serving (§4.1); `off` runs standalone with no mask dependency |
 
 ## Results in one line
 

@@ -1,29 +1,21 @@
 # P6 masked-read cost (100k rows, 3 masked columns, min of 5 runs)
-  plain, no mask                                     11.575 ms
-  masked, predicate = trivial (inlined)              17.917 ms
-  masked, predicate = table lookup per call        1113.032 ms
-  masked, predicate = supacache.get (§6)            97.137 ms
+  plain, no mask                                     12.207 ms
+  masked, predicate = trivial (inlined)              18.960 ms
+  masked, predicate = table lookup per row         1126.932 ms
+  masked, predicate = supacache.get (§6)            97.237 ms
+  masked, predicate = row-indep. InitPlan            18.614 ms
 
-# Interpretation (§4.3c, §6)
-# - plain vs trivial-masked: masking adds ~6ms over 100k rows x 3 cols = ~20ns
-#   per predicate call when the predicate is inlinable. Cheap — but unrealistic.
-# - table-lookup predicate: 1113ms, ~110x the plain scan. With a realistic
-#   predicate (a lookup/join per call) the masked read is PREDICATE-BOUND: the
-#   heap fetch is noise. So a Mode B row cache, which removes the heap access but
-#   KEEPS the predicates, would save almost nothing here — the plan's "Mode B win
-#   on a masked table is roughly half" (§4.3c) is generous; with heavy predicates
-#   it is far less than half. This is the concern §4.3c/§11 says to benchmark.
-# - supacache.get predicate: 97ms, 11.5x FASTER than the table-lookup predicate.
-#   Routing the predicate's permission-set lookup through the in-process shmem
-#   read (§6) is what actually accelerates masked reads. This is §4.3c's
-#   "it can make masked tables substantially faster, provided the cached artefact
-#   is a permission set the predicate consults and never the predicate's answer"
-#   and §6's "the interesting case and the strongest argument for building this."
-#   (§4.3b honored: the cache holds the permission SET, not the predicate's
-#   per-row answer, so there is no cross-caller leak.)
-#
-# Takeaway: for masked tables the product win is NOT the Mode B row cache
-# (predicate-bound), it is the §6 predicate-side accelerator (11x here). The
-# 97ms still pays ~300k supacache.get SQL-function invocations; the raw shmem op
-# is ~9ns (see P0 §6), so most of the 97ms is plpgsql/SQL-function call overhead,
-# not the cache read — a C predicate calling the store directly would be faster.
+# Proof: the row-independent predicate plans as an InitPlan (evaluated once).
+# (per-row predicates appear as a SubPlan/filter re-run for every row)
+           QUERY PLAN           
+--------------------------------
+ Aggregate
+   InitPlan 1
+     ->  Result
+   InitPlan 2
+     ->  Result
+   InitPlan 3
+     ->  Result
+   ->  Seq Scan on bench_masked
+(8 rows)
+

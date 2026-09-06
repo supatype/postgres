@@ -295,6 +295,59 @@ SET ROLE mask_app;
 SELECT * FROM secrets;
 RESET ROLE;
 
+-- ============================================================================
+-- Row-independent predicate.  A zero-argument overload declares that the answer
+-- depends on session state, not the row, so it is emitted as an uncorrelated
+-- (SELECT pred()) that the planner hoists to a once-per-scan InitPlan -- yet it
+-- is still re-evaluated each execution, so a cached plan built for one identity
+-- does not answer for another (the same guarantee as the per-row form).
+-- ============================================================================
+
+CREATE TABLE ri (id int, value text);
+INSERT INTO ri VALUES (1, 'a'), (2, 'b');
+GRANT SELECT ON ri TO mask_app;
+
+-- Only a zero-arg overload exists: that is what declares row-independence.
+CREATE FUNCTION can_read_ri() RETURNS boolean LANGUAGE sql STABLE AS
+  $$ SELECT current_setting('mask.uid', true) = 'alice' $$;
+SECURITY LABEL FOR supatype ON COLUMN ri.value IS 'MASK READ public.can_read_ri';
+
+-- The predicate becomes an InitPlan (evaluated once), not a per-row call.
+SET ROLE mask_app;
+SET mask.uid = 'alice';
+EXPLAIN (COSTS OFF) SELECT id, value FROM ri ORDER BY id;
+SELECT id, value FROM ri ORDER BY id;      -- alice: readable
+SET mask.uid = 'bob';
+SELECT id, value FROM ri ORDER BY id;      -- bob: masked
+RESET ROLE;
+
+-- Plan reuse across callers: the InitPlan re-runs each execution.
+SET plan_cache_mode = force_generic_plan;
+PREPARE ri_leak AS SELECT id, value FROM ri ORDER BY id;
+SET ROLE mask_app;
+SET mask.uid = 'alice';
+EXECUTE ri_leak;                            -- readable
+SET mask.uid = 'bob';
+EXECUTE ri_leak;                            -- masked, same cached plan
+RESET ROLE;
+DEALLOCATE ri_leak;
+RESET plan_cache_mode;
+
+-- When both a whole-row and a zero-arg overload exist, the whole-row (per-row)
+-- form is preferred, so the rule stays row-dependent.
+CREATE FUNCTION can_read_ri(ri ri) RETURNS boolean LANGUAGE sql STABLE AS
+  $$ SELECT ($1).id = 1 $$;
+SECURITY LABEL FOR supatype ON COLUMN ri.value IS 'MASK READ public.can_read_ri';
+SET ROLE mask_app;
+SET mask.uid = 'bob';
+SELECT id, value FROM ri ORDER BY id;      -- per-row: only id = 1 is readable
+RESET ROLE;
+
+SECURITY LABEL FOR supatype ON COLUMN ri.value IS NULL;
+DROP FUNCTION can_read_ri(), can_read_ri(ri);
+REVOKE ALL ON ri FROM mask_app;
+DROP TABLE ri;
+
 DROP VIEW posts_view;
 DROP FUNCTION can_read_posts__salary(posts), can_write_posts__salary(posts),
               can_read_posts__notes(posts), can_write_posts__notes(posts),
