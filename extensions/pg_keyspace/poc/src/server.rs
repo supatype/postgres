@@ -13,12 +13,53 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const EPOLL_MAX: usize = 1024;
 const READ_CHUNK: usize = 64 * 1024;
 
 /// A staged write: (key, value, expires_at_micros).
 pub type PendingWrite = (Vec<u8>, Vec<u8>, i64);
+
+/// Sentinel `expires_at` marking a delete (tombstone) carried through the ring,
+/// so the persistence worker removes the key from the backing table instead of
+/// upserting it — otherwise a deleted key would resurrect on crash recovery.
+pub const DELETE_TOMBSTONE: i64 = -1;
+
+/// Enqueue one record into the ring sharded by key slot (same shard function as
+/// the write path, so a key's writes and deletes always reach the same worker).
+///
+/// No-loss backpressure: if the ring is full, wait (bounded) for the persistence
+/// worker to drain rather than dropping the write. Under sustained overload this
+/// throttles the RESP write path to the drain rate instead of silently losing
+/// durability. The bound only trips if persistence is wedged, in which case the
+/// record is dropped and counted (`ring_stats.dropped`) — a loud, rare event.
+fn shard_push(producers: &[ring::Producer], key: &[u8], val: &[u8], exp: i64) {
+    let n = producers.len();
+    if n == 0 {
+        return;
+    }
+    let shard = if n == 1 {
+        0
+    } else {
+        crc16::key_slot(key) as usize % n
+    };
+    let p = &producers[shard];
+    if p.push(key, val, exp) {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        std::thread::sleep(Duration::from_micros(50));
+        if p.push(key, val, exp) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            p.note_drop(); // persistence wedged: drop + count, rather than hang forever
+            return;
+        }
+    }
+}
 
 // ---- P2 security: RESP AUTH -> role, keyspace ACL, forced tenant scoping ----
 
@@ -413,6 +454,11 @@ impl Worker {
                 for a in &args[1..] {
                     if store.del(a) {
                         count += 1;
+                        if persist_on {
+                            // propagate the delete so it does not resurrect on
+                            // crash recovery (key is already tenant-scoped in eff)
+                            shard_push(&self.producers, a, b"", DELETE_TOMBSTONE);
+                        }
                     }
                 }
                 resp::integer(out, count);
@@ -451,18 +497,9 @@ impl Worker {
         }
 
         if let Some((k, v, e)) = stage {
-            let n = self.producers.len();
-            if n > 0 {
-                // shard by key slot so a given key always lands on the same ring
-                // (and thus the same persistence worker) — no cross-worker key
-                // conflicts on ON CONFLICT.
-                let shard = if n == 1 {
-                    0
-                } else {
-                    crc16::key_slot(&k) as usize % n
-                };
-                self.producers[shard].push(&k, &v, e);
-            }
+            // sharded so a given key always lands on the same ring/persist worker
+            // — no cross-worker key conflicts on ON CONFLICT.
+            shard_push(&self.producers, &k, &v, e);
         }
     }
 

@@ -122,8 +122,7 @@ impl Producer {
             let tail = h.tail.load(Ordering::Relaxed);
             let cap = self.0.mask + 1;
             if cap - (tail - head) < rec as u64 {
-                h.dropped.fetch_add(1, Ordering::Relaxed);
-                return false;
+                return false; // full — caller decides (backpressure vs drop)
             }
             self.0
                 .write_wrapped(tail, &(key.len() as u32).to_le_bytes());
@@ -136,6 +135,12 @@ impl Producer {
             h.pushed.fetch_add(1, Ordering::Relaxed);
             true
         }
+    }
+
+    /// Record that a write was ultimately dropped (persistence wedged past the
+    /// backpressure deadline). Rare and loud; surfaced via `Consumer::stats`.
+    pub fn note_drop(&self) {
+        unsafe { (*self.0.hdr).dropped.fetch_add(1, Ordering::Relaxed) };
     }
 }
 

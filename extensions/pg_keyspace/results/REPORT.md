@@ -294,12 +294,23 @@ N persistence workers and the load client, and, more fundamentally, **all
 workers commit to one Postgres WAL**, so fsync/WAL-insertion serialises. That
 shared-WAL ceiling is the durable-path analogue of §11's "Valkey wins by not
 sharing," and it is exactly why the product bet is per-prefix durability + SQL
-access to the same bytes, not out-writing Valkey. Beyond the drain rate the ring
-absorbs the burst then sheds load (`ring_stats.dropped`); knobs are `ring_mb`
-(burst absorption), `persist_workers` (this table), or producer backpressure
-(no loss). Crash recovery still holds: 8,000 keys recovered in 8ms after a
-SIGQUIT crash. Details in `results/p1_writepath.txt` and
-`results/persist_scaleout.txt`.
+access to the same bytes, not out-writing Valkey. Crash recovery still holds:
+8,000 keys recovered in 8ms after a SIGQUIT crash. Details in
+`results/p1_writepath.txt` and `results/persist_scaleout.txt`.
+
+**No-loss backpressure (correctness).** When the ring fills, the RESP producer
+now *waits* (bounded) for the persistence worker to drain rather than dropping —
+under sustained overload the write path throttles to the drain rate instead of
+silently losing durability. Verified: a 500k-write overload that previously
+dropped ~2.1M records now drops **0** (it takes ~7s, throttled). The bound only
+trips if persistence is wedged, which is then counted in `ring_stats.dropped`
+(loud, rare) rather than hung forever.
+
+**DEL propagation (correctness).** Deletes are carried through the ring as
+tombstones and applied to `supacache.kv` (`key = ANY(...)`), so a deleted key
+does not resurrect on recovery. Verified: `SET keep:*` + `SET/DEL del:*` leaves
+the table with keep=5/del=0, and after a crash the recovered keyspace has the
+kept keys and none of the deleted ones.
 
 ## 5d. P2 — security on the real base
 
@@ -445,18 +456,16 @@ commit off the worker's snapshot.
   (the in-PG version would register N background workers).
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent
   for this purpose and does not affect latency.
-- P1 persistence is now off the event loop (ring + dedicated worker, §5c) with
-  bulk `UNNEST` upserts; the sustained ceiling is one persist worker's SPI rate
-  (~107k/s). Higher needs more persist workers / partitioned rings, or
-  `COPY`-into-staging + merge. Under sustained overload the ring currently sheds
-  load (drops) rather than applying producer backpressure — a deliberate,
-  documented relaxed-tier choice, not yet a no-loss guarantee.
+- P1 persistence is off the event loop (ring + dedicated workers, §5c) with bulk
+  `UNNEST` upserts; the sustained ceiling is the persist workers' shared-WAL rate
+  (~145k/s at 4 workers). Higher needs `COPY`-into-staging + merge. Overload now
+  applies no-loss backpressure (§5c) rather than dropping.
 - Only `relaxed`/async persistence is wired to real tables in-PG so far;
   `durable`/`replicated` sync-ack-to-commit semantics against `supacache.kv`
-  are the next P1 increment (the standalone batcher already characterises their
+  are the next increment (the standalone batcher already characterises their
   fsync cost).
-- DEL is not yet propagated to the backing table (upserts only); TTL partition
-  drop (§3.3) not built.
+- TTL partition drop (§3.3) not built — expired keys are removed from shmem
+  lazily on read but remain in `supacache.kv` until overwritten.
 
 ---
 

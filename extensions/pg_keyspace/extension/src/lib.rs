@@ -638,10 +638,11 @@ fn pg_recover(store: &Store) -> i64 {
     }))
 }
 
-/// Bulk-upsert a drained batch into `supacache.kv` in one transaction (§3.4).
-/// The batch is deduplicated by key (last write wins) so a single `ON CONFLICT`
-/// command never touches the same row twice, then sent as four parallel arrays
-/// through `unnest(...)` — one plan, one execution, one commit for the batch.
+/// Apply a drained batch to `supacache.kv` in one transaction (§3.4). The batch
+/// is deduplicated by key (last op wins), then split into upserts and deletes:
+/// upserts go through a single `unnest(...)` `ON CONFLICT`, deletes through a
+/// single `key = ANY(...)`. A tombstone (`expires_at == DELETE_TOMBSTONE`)
+/// removes the key so a DEL does not resurrect on crash recovery.
 fn bulk_upsert(batch: Vec<server::PendingWrite>) {
     use std::collections::HashMap;
     if batch.is_empty() {
@@ -649,39 +650,56 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>) {
     }
     let mut latest: HashMap<Vec<u8>, (Vec<u8>, i64)> = HashMap::with_capacity(batch.len());
     for (k, v, e) in batch {
-        latest.insert(k, (v, e));
+        latest.insert(k, (v, e)); // last op for a key wins (SET then DEL -> DEL)
     }
-    let n = latest.len();
-    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
-    let mut slots: Vec<i32> = Vec::with_capacity(n);
-    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(n);
-    let mut exps: Vec<i64> = Vec::with_capacity(n);
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut slots: Vec<i32> = Vec::new();
+    let mut vals: Vec<Vec<u8>> = Vec::new();
+    let mut exps: Vec<i64> = Vec::new();
+    let mut del_keys: Vec<Vec<u8>> = Vec::new();
     for (k, (v, e)) in latest {
-        slots.push(crc16::key_slot(&k) as i32);
-        vals.push(v);
-        exps.push(e);
-        keys.push(k);
+        if e == server::DELETE_TOMBSTONE {
+            del_keys.push(k);
+        } else {
+            slots.push(crc16::key_slot(&k) as i32);
+            vals.push(v);
+            exps.push(e);
+            keys.push(k);
+        }
     }
 
     BackgroundWorker::transaction(move || {
         let _ = Spi::connect(|mut client| {
-            let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
-                (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), keys.into_datum()),
-                (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), slots.into_datum()),
-                (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), vals.into_datum()),
-                (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), exps.into_datum()),
-            ];
-            client.update(
-                "INSERT INTO supacache.kv (tenant,key,slot,kind,val,expires_at,version) \
-                 SELECT '', k, s, 's', v, e, 1 \
-                 FROM unnest($1::bytea[], $2::int[], $3::bytea[], $4::bigint[]) \
-                      AS t(k, s, v, e) \
-                 ON CONFLICT (tenant,key) DO UPDATE SET \
-                 val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, \
-                 slot=EXCLUDED.slot, version=supacache.kv.version+1",
-                None,
-                Some(args),
-            )?;
+            if !keys.is_empty() {
+                let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
+                    (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), keys.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), slots.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), vals.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), exps.into_datum()),
+                ];
+                client.update(
+                    "INSERT INTO supacache.kv (tenant,key,slot,kind,val,expires_at,version) \
+                     SELECT '', k, s, 's', v, e, 1 \
+                     FROM unnest($1::bytea[], $2::int[], $3::bytea[], $4::bigint[]) \
+                          AS t(k, s, v, e) \
+                     ON CONFLICT (tenant,key) DO UPDATE SET \
+                     val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, \
+                     slot=EXCLUDED.slot, version=supacache.kv.version+1",
+                    None,
+                    Some(args),
+                )?;
+            }
+            if !del_keys.is_empty() {
+                let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![(
+                    PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID),
+                    del_keys.into_datum(),
+                )];
+                client.update(
+                    "DELETE FROM supacache.kv WHERE tenant = '' AND key = ANY($1::bytea[])",
+                    None,
+                    Some(args),
+                )?;
+            }
             Ok::<(), pgrx::spi::Error>(())
         });
     });
