@@ -1,0 +1,32 @@
+# TTL by partition drop (§3.3) — measured in-PG (PG17)
+#
+# Keys with a TTL persist into supacache.kv_ttl, RANGE-partitioned by expiry
+# time bucket (bucket = expires_at_us / ttl_bucket_secs). A dedicated expiry
+# worker periodically DROPs partitions whose whole bucket is in the past. Shmem
+# expiry stays lazy-on-read. No row-by-row DELETE, so no vacuum churn.
+
+## Lifecycle
+- SET tk:1..2000 EX 2  -> 2000 rows in 1 kv_ttl partition (one bucket).
+- ~seconds later the expiry worker logs "dropped 1 expired TTL partition(s)":
+  partitions 1 -> 0, rows 2000 -> 0, and shmem GET returns nil (lazy expiry).
+- Crash recovery loads only non-expired kv_ttl keys (DISTINCT ON key, latest
+  expiry wins).
+
+## Partition DROP vs row-by-row DELETE (100,000 rows)
+  DROP TABLE <partition>   :   3.2 ms   (O(1) — independent of row count)
+  DELETE FROM <table>      : 141.5 ms   (~44x slower)
+                              + 100,000 dead tuples left for VACUUM
+
+The whole point of §3.3: expiring a bucket of N keys is one O(1) DDL that
+reclaims the space immediately, versus an O(N) DELETE that also creates N dead
+tuples and the vacuum load that "would otherwise kill this design under high key
+churn." Confirmed.
+
+## Notes / limits
+- ttl_bucket_secs=2, ttl_sweep_secs=1 here for a fast demo; production uses
+  minutes/hours per bucket so drops are coarse and rare.
+- A key re-SET with a new TTL into a different bucket leaves an older row in the
+  old bucket until that bucket drops; shmem is authoritative and recovery takes
+  the latest expiry, so reads stay correct.
+- Non-TTL keys still live in the hash-partitioned supacache.kv; only TTL'd keys
+  use the range-partitioned kv_ttl.

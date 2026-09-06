@@ -114,6 +114,8 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 | `pg_keyspace.persist_window_ms` | 10 | how often the persistence worker drains the ring when idle |
 | `pg_keyspace.ring_mb` | 64 | size of each RESP→persistence ring buffer (burst absorption) |
 | `pg_keyspace.persist_workers` | 1 | persistence workers/rings draining in parallel (writes sharded by key slot) |
+| `pg_keyspace.ttl_bucket_secs` | 10 | TTL time-bucket width; TTL'd keys persist to range-partitioned `supacache.kv_ttl` (§3.3) |
+| `pg_keyspace.ttl_sweep_secs` | 5 | how often the expiry worker drops fully-past TTL partitions |
 | `pg_keyspace.commit_window_us` | 500 | standalone file-batcher window (durability microbench) |
 
 ## Results in one line

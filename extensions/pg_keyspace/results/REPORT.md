@@ -332,6 +332,22 @@ for its own commit — the §3.4 lever, on real Postgres commits with correct
 per-write acks. `replicated` is the same path with `synchronous_commit=
 remote_apply` (needs a standby). Details in `results/p1_durable_ack.txt`.
 
+**TTL by partition drop (§3.3).** Keys with a TTL persist into `supacache.kv_ttl`,
+RANGE-partitioned by expiry time bucket; a dedicated **expiry worker** drops
+partitions whose whole bucket is in the past (shmem expiry stays lazy-on-read).
+Verified: 2000 keys with a 2s TTL land in one partition, then the expiry worker
+logs "dropped 1 expired TTL partition(s)" — 2000 rows gone via one DDL. The
+payoff, at 100k rows:
+
+| reclaiming 100k expired keys | time | dead tuples |
+|---|---:|---:|
+| `DROP TABLE` the bucket partition | **3.2ms** (O(1)) | 0 |
+| row-by-row `DELETE` | 141.5ms (~44×) | 100,000 (need VACUUM) |
+
+This is exactly §3.3's reason for existing — "no row-by-row deletion, therefore
+no vacuum churn, which is what would otherwise kill this design under high key
+churn." Details in `results/p1_ttl.txt`.
+
 ## 5d. P2 — security on the real base
 
 The P0/P1 spike ran on the system PG16 for speed. P2 is about the interaction
@@ -408,6 +424,8 @@ masked-column warm cache, decoding worker) are P6, not built.
 | bgworker is a real backend w/ SPI (§3.1) | ✅ `connect_worker_to_spi`, no read-path txn |
 | Persistence off the RESP hot path (§3.1) | ✅ SPSC shmem ring + dedicated persist worker; read tail 170ms→5ms |
 | Bulk batched commit (§3.4) | ✅ deduped `UNNEST` upsert; ~107k durable writes/s per worker |
+| Sync-ack durable/replicated tiers (§3.4) | ✅ OK held until commit; survives `kill -9`; batches ~40× |
+| TTL by partition drop (§3.3) | ✅ expiry worker drops past buckets; 3.2ms vs 141ms DELETE at 100k |
 
 ### 6b. Security model (§4) — P2 done for Mode A on the real base
 
@@ -484,8 +502,9 @@ commit off the worker's snapshot.
   (§5c). `replicated` uses the same path with `synchronous_commit=remote_apply`
   but needs a synchronous standby to exercise. Durability is currently an
   instance GUC; per-prefix tiers (§3.4) are the P5 engine step.
-- TTL partition drop (§3.3) not built — expired keys are removed from shmem
-  lazily on read but remain in `supacache.kv` until overwritten.
+- TTL partition drop (§3.3) is built for TTL'd keys in `supacache.kv_ttl`; bucket
+  width and sweep interval are GUCs. A re-SET into a newer bucket leaves the old
+  row until its bucket drops (shmem authoritative; recovery takes the latest).
 
 ---
 

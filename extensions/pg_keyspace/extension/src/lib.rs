@@ -70,6 +70,13 @@ static GUC_DATABASE: GucSetting<Option<&'static CStr>> =
 static GUC_PERSIST_WINDOW_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static GUC_RING_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 static GUC_PERSIST_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
+// TTL by partition drop (§3.3): time-bucket width and sweep interval.
+static GUC_TTL_BUCKET_SECS: GucSetting<i32> = GucSetting::<i32>::new(10);
+static GUC_TTL_SWEEP_SECS: GucSetting<i32> = GucSetting::<i32>::new(5);
+
+fn ttl_bucket_us() -> i64 {
+    GUC_TTL_BUCKET_SECS.get().max(1) as i64 * 1_000_000
+}
 
 /// Number of persistence workers = number of rings (writes are sharded across
 /// them by key slot).
@@ -206,6 +213,26 @@ pub extern "C" fn _PG_init() {
         GucContext::Postmaster,
         GucFlags::empty(),
     );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.ttl_bucket_secs",
+        "Width of a TTL time-bucket partition, in seconds (§3.3)",
+        "Keys with a TTL persist into supacache.kv_ttl, range-partitioned by expiry bucket.",
+        &GUC_TTL_BUCKET_SECS,
+        1,
+        86_400,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.ttl_sweep_secs",
+        "How often the expiry worker drops fully-past TTL partitions, in seconds",
+        "",
+        &GUC_TTL_SWEEP_SECS,
+        1,
+        3_600,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
 
     // Chain the shmem hooks so the segment is requested and initialised.
     unsafe {
@@ -241,6 +268,13 @@ pub extern "C" fn _PG_init() {
                 .enable_spi_access()
                 .load();
         }
+        // §3.3 expiry worker: drops fully-past TTL partitions.
+        BackgroundWorkerBuilder::new("pg_keyspace: expiry worker")
+            .set_library("pg_keyspace")
+            .set_function("pg_keyspace_expiry_main")
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .enable_spi_access()
+            .load();
     }
 
     log!("pg_keyspace: initialised (shmem hooks + RESP worker registered)");
@@ -457,14 +491,14 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
             std::thread::sleep(idle);
             continue;
         }
-        bulk_upsert(batch, sync_commit);
+        bulk_upsert(batch, sync_commit, ttl_bucket_us());
         consumer.mark_committed(); // release durable acks waiting on these records
     }
     // final drain on shutdown
     let mut tail: Vec<server::PendingWrite> = Vec::new();
     consumer.drain(usize::MAX, |k, v, e| tail.push((k.to_vec(), v.to_vec(), e)));
     if !tail.is_empty() {
-        bulk_upsert(tail, sync_commit);
+        bulk_upsert(tail, sync_commit, ttl_bucket_us());
         consumer.mark_committed();
     }
     log!("pg_keyspace persist: shutting down");
@@ -542,7 +576,30 @@ fn pg_ensure_schema() {
              can_write boolean NOT NULL DEFAULT true, \
              PRIMARY KEY (role_name, prefix))",
         );
+        // §3.3: TTL'd keys persist here, RANGE-partitioned by expiry time bucket,
+        // so expiry is a whole-partition DROP (O(1), no vacuum churn) rather than
+        // row-by-row DELETE. Partitions are created on demand by the persist
+        // worker and dropped by the expiry worker.
+        let _ = Spi::run(
+            "CREATE TABLE IF NOT EXISTS supacache.kv_ttl (\
+             tenant text NOT NULL DEFAULT '', key bytea NOT NULL, slot int NOT NULL, \
+             val bytea, expires_at bigint NOT NULL, bucket bigint NOT NULL, \
+             PRIMARY KEY (bucket, tenant, key)) PARTITION BY RANGE (bucket)",
+        );
     });
+}
+
+/// Ensure the TTL bucket partition for `bucket` exists (idempotent).
+fn ensure_ttl_partition(client: &mut pgrx::spi::SpiClient, bucket: i64) {
+    let _ = client.update(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS supacache.kv_ttl_b{bucket} \
+             PARTITION OF supacache.kv_ttl FOR VALUES FROM ({bucket}) TO ({})",
+            bucket + 1
+        ),
+        None,
+        None,
+    );
 }
 
 /// §4.5 self-check: Mode A backing tables must carry NO `supatype` security
@@ -636,6 +693,8 @@ fn pg_recover(store: &Store) -> i64 {
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
         Spi::connect(|client| {
             let mut cnt = 0i64;
+            // no-TTL keys from kv, then non-expired TTL keys from kv_ttl (latest
+            // expiry per key wins, so a re-SET into a newer bucket takes effect).
             let tup = client.select("SELECT key, val, expires_at FROM supacache.kv", None, None)?;
             for row in tup {
                 let k: Option<Vec<u8>> = row.get(1)?;
@@ -650,19 +709,36 @@ fn pg_recover(store: &Store) -> i64 {
                     cnt += 1;
                 }
             }
+            let tup = client.select(
+                "SELECT DISTINCT ON (key) key, val, expires_at FROM supacache.kv_ttl \
+                 WHERE expires_at > $1 ORDER BY key, expires_at DESC",
+                None,
+                Some(vec![(
+                    PgOid::BuiltIn(PgBuiltInOids::INT8OID),
+                    now.into_datum(),
+                )]),
+            )?;
+            for row in tup {
+                let k: Option<Vec<u8>> = row.get(1)?;
+                let v: Option<Vec<u8>> = row.get(2)?;
+                let e: i64 = row.get::<i64>(3)?.unwrap_or(0);
+                if let (Some(k), Some(v)) = (k, v) {
+                    store.set(&k, &v, (e - now).max(1));
+                    cnt += 1;
+                }
+            }
             Ok::<i64, pgrx::spi::Error>(cnt)
         })
         .unwrap_or(0)
     }))
 }
 
-/// Apply a drained batch to `supacache.kv` in one transaction (§3.4). The batch
-/// is deduplicated by key (last op wins), then split into upserts and deletes:
-/// upserts go through a single `unnest(...)` `ON CONFLICT`, deletes through a
-/// single `key = ANY(...)`. A tombstone (`expires_at == DELETE_TOMBSTONE`)
-/// removes the key so a DEL does not resurrect on crash recovery.
-fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str) {
-    use std::collections::HashMap;
+/// Apply a drained batch in one transaction (§3.4, §3.3). Deduplicated by key
+/// (last op wins), then split three ways: no-TTL upserts -> `supacache.kv`;
+/// TTL'd upserts -> `supacache.kv_ttl` (range-partitioned by expiry bucket, so
+/// expiry is a partition DROP); tombstones -> delete from both.
+fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, bucket_us: i64) {
+    use std::collections::{HashMap, HashSet};
     if batch.is_empty() {
         return;
     }
@@ -670,18 +746,33 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str) {
     for (k, v, e) in batch {
         latest.insert(k, (v, e)); // last op for a key wins (SET then DEL -> DEL)
     }
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    let mut slots: Vec<i32> = Vec::new();
-    let mut vals: Vec<Vec<u8>> = Vec::new();
-    let mut exps: Vec<i64> = Vec::new();
+    // no-TTL upserts -> kv
+    let (mut keys, mut slots, mut vals) =
+        (Vec::<Vec<u8>>::new(), Vec::<i32>::new(), Vec::<Vec<u8>>::new());
+    // TTL upserts -> kv_ttl
+    let (mut tkeys, mut tslots, mut tvals, mut texps, mut tbuckets) = (
+        Vec::<Vec<u8>>::new(),
+        Vec::<i32>::new(),
+        Vec::<Vec<u8>>::new(),
+        Vec::<i64>::new(),
+        Vec::<i64>::new(),
+    );
     let mut del_keys: Vec<Vec<u8>> = Vec::new();
+    let mut buckets_seen: HashSet<i64> = HashSet::new();
     for (k, (v, e)) in latest {
         if e == server::DELETE_TOMBSTONE {
             del_keys.push(k);
+        } else if e > 0 {
+            let b = e / bucket_us;
+            buckets_seen.insert(b);
+            tslots.push(crc16::key_slot(&k) as i32);
+            tvals.push(v);
+            texps.push(e);
+            tbuckets.push(b);
+            tkeys.push(k);
         } else {
             slots.push(crc16::key_slot(&k) as i32);
             vals.push(v);
-            exps.push(e);
             keys.push(k);
         }
     }
@@ -700,16 +791,36 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str) {
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), keys.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), slots.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), vals.into_datum()),
-                    (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), exps.into_datum()),
                 ];
                 client.update(
                     "INSERT INTO supacache.kv (tenant,key,slot,kind,val,expires_at,version) \
-                     SELECT '', k, s, 's', v, e, 1 \
-                     FROM unnest($1::bytea[], $2::int[], $3::bytea[], $4::bigint[]) \
-                          AS t(k, s, v, e) \
+                     SELECT '', k, s, 's', v, 0, 1 \
+                     FROM unnest($1::bytea[], $2::int[], $3::bytea[]) AS t(k, s, v) \
                      ON CONFLICT (tenant,key) DO UPDATE SET \
-                     val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, \
-                     slot=EXCLUDED.slot, version=supacache.kv.version+1",
+                     val=EXCLUDED.val, expires_at=0, slot=EXCLUDED.slot, \
+                     version=supacache.kv.version+1",
+                    None,
+                    Some(args),
+                )?;
+            }
+            if !tkeys.is_empty() {
+                for b in &buckets_seen {
+                    ensure_ttl_partition(&mut client, *b);
+                }
+                let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
+                    (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), tkeys.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), tslots.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), tvals.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), texps.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), tbuckets.into_datum()),
+                ];
+                client.update(
+                    "INSERT INTO supacache.kv_ttl (tenant,key,slot,val,expires_at,bucket) \
+                     SELECT '', k, s, v, e, b \
+                     FROM unnest($1::bytea[], $2::int[], $3::bytea[], $4::bigint[], $5::bigint[]) \
+                          AS t(k, s, v, e, b) \
+                     ON CONFLICT (bucket,tenant,key) DO UPDATE SET \
+                     val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, slot=EXCLUDED.slot",
                     None,
                     Some(args),
                 )?;
@@ -720,7 +831,12 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str) {
                     del_keys.into_datum(),
                 )];
                 client.update(
-                    "DELETE FROM supacache.kv WHERE tenant = '' AND key = ANY($1::bytea[])",
+                    "DELETE FROM supacache.kv WHERE tenant='' AND key = ANY($1::bytea[])",
+                    None,
+                    Some(args.clone()),
+                )?;
+                client.update(
+                    "DELETE FROM supacache.kv_ttl WHERE tenant='' AND key = ANY($1::bytea[])",
                     None,
                     Some(args),
                 )?;
@@ -728,6 +844,78 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str) {
             Ok::<(), pgrx::spi::Error>(())
         });
     });
+}
+
+/// The expiry worker (§3.1, §3.3): periodically DROP TTL partitions whose whole
+/// time bucket is in the past. This is O(1) DDL per partition — no row-by-row
+/// DELETE, no vacuum churn. Shmem expiry stays lazy-on-read.
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_keyspace_expiry_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
+    let dbname = GUC_DATABASE
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("postgres")
+        .to_string();
+    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+    for _ in 0..100 {
+        if pg_table_ready() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let sweep = Duration::from_secs(GUC_TTL_SWEEP_SECS.get().max(1) as u64);
+    log!("pg_keyspace expiry: dropping past TTL partitions every {sweep:?}");
+    while !BackgroundWorker::sigterm_received() {
+        let now_bucket = store::now_micros() / ttl_bucket_us();
+        let dropped = drop_expired_partitions(now_bucket);
+        if dropped > 0 {
+            log!("pg_keyspace expiry: dropped {dropped} expired TTL partition(s)");
+        }
+        std::thread::sleep(sweep);
+    }
+    log!("pg_keyspace expiry: shutting down");
+}
+
+/// DROP every `supacache.kv_ttl_b<N>` partition with N < `now_bucket` (fully
+/// past). Returns how many were dropped. O(1) DDL per partition.
+fn drop_expired_partitions(now_bucket: i64) -> i64 {
+    use std::panic::AssertUnwindSafe;
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        let names: Vec<String> = Spi::connect(|client| {
+            let mut v = Vec::new();
+            let t = client.select(
+                "SELECT c.relname::text FROM pg_inherits i \
+                 JOIN pg_class c ON c.oid = i.inhrelid \
+                 JOIN pg_class p ON p.oid = i.inhparent \
+                 JOIN pg_namespace n ON n.oid = p.relnamespace \
+                 WHERE n.nspname='supacache' AND p.relname='kv_ttl'",
+                None,
+                None,
+            )?;
+            for row in t {
+                if let Some(name) = row.get::<String>(1)? {
+                    v.push(name);
+                }
+            }
+            Ok::<Vec<String>, pgrx::spi::Error>(v)
+        })
+        .unwrap_or_default();
+
+        let mut dropped = 0i64;
+        for name in names {
+            if let Some(nstr) = name.strip_prefix("kv_ttl_b") {
+                if let Ok(bucket) = nstr.parse::<i64>() {
+                    if bucket < now_bucket {
+                        let _ = Spi::run(&format!("DROP TABLE supacache.{name}"));
+                        dropped += 1;
+                    }
+                }
+            }
+        }
+        dropped
+    }))
 }
 
 // ---- the SQL surface (§6): in-backend shared-memory reads/writes ---------
