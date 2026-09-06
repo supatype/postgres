@@ -1,9 +1,10 @@
 # P6 slice 3 — keys-only invalidation (§3.5)
   PASS  cached pk=1 uses the Custom Scan                  
   PASS  cached pk=1 serves the cached row                 
+  (mode: pg_keyspace.rowcache_refill = on)
   PASS  UPDATE target scan is NOT the Custom Scan (needs real ctid)
-  PASS  after UPDATE: pk=1 falls back to a non-cache plan 
-  PASS  after UPDATE: pk=1 read returns the fresh value   
+  PASS  after UPDATE: pk=1 read returns the fresh value (coherent)
+  PASS  refill on: pk=1 stays served from cache with fresh value
   PASS  untouched pk=2 is still served from cache         
   PASS  after DELETE: pk=2 gone (cache + table coherent)  
   PASS  SELECT ... FOR UPDATE does NOT use the cache      

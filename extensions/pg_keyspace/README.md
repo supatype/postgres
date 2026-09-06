@@ -152,7 +152,10 @@ logical-decoding worker keeps the cache coherent: the `supacache_keys` output
 plugin emits only `<relid> <pk>` for each change — never a column value — and the
 worker drops that key, so the next read falls back to the fresh row. Build/install
 the plugin from `plugin/` (`make install`). Populating (`rowcache_put`) is still
-manual — a warm/refill helper; invalidation is automatic.
+manual — a warm/refill helper; invalidation is automatic. With
+`pg_keyspace.rowcache_refill = on` a changed *hot* key is re-read and re-cached
+(stays served from the Custom Scan across writes) instead of being dropped; a
+delete always drops.
 
 Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 
@@ -174,6 +177,7 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 | `pg_keyspace.rowcache_decode` | `off` | enable the keys-only Mode B invalidation worker (§3.5); needs `wal_level=logical`, holds a replication slot |
 | `pg_keyspace.rowcache_slot` | `supacache_rowcache` | replication slot name (created on demand with the `supacache_keys` plugin) |
 | `pg_keyspace.rowcache_decode_ms` | 200 | how often the invalidation worker drains the slot |
+| `pg_keyspace.rowcache_refill` | `off` | on: refill a changed hot key with the current row; off: drop-only (lazy refill on next read) |
 
 ## Results in one line
 

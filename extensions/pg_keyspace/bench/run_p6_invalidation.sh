@@ -40,16 +40,26 @@ chk "cached pk=1 uses the Custom Scan" \
 chk "cached pk=1 serves the cached row" \
     "1|one|sec1" "$($A -c 'SELECT * FROM public.inval WHERE id=1')"
 
-# 2. UPDATE invalidates (and the UPDATE itself must not use the cache)
+# The post-write plan depends on the mode: drop-only falls back to an index scan,
+# refill keeps the row cached. Coherence (a fresh read) holds in BOTH modes.
+refill="$($A -c 'SHOW pg_keyspace.rowcache_refill' | tr -d '[:space:]')"
+echo "  (mode: pg_keyspace.rowcache_refill = $refill)"
+
+# 2. UPDATE stays coherent (and the UPDATE itself must not use the cache)
 chk "UPDATE target scan is NOT the Custom Scan (needs real ctid)" \
     "1" "$(plan 'UPDATE public.inval SET name=$$x$$ WHERE id=1' | grep -cvq 'Custom Scan' && echo 1 || echo 0)"
 $A -c "UPDATE public.inval SET name='one_v2' WHERE id=1;" >/dev/null 2>&1
 sleep 1
-chk "after UPDATE: pk=1 falls back to a non-cache plan" \
-    "0" "$(plan 'SELECT * FROM public.inval WHERE id=1' | grep -c 'Custom Scan')"
-chk "after UPDATE: pk=1 read returns the fresh value" \
+chk "after UPDATE: pk=1 read returns the fresh value (coherent)" \
     "1|one_v2|sec1" "$($A -c 'SELECT * FROM public.inval WHERE id=1')"
-# pk=2 was untouched -> still cached
+if [ "$refill" = "on" ]; then
+  chk "refill on: pk=1 stays served from cache with fresh value" \
+      "Custom Scan (pg_keyspace_rowcache) on inval" "$(plan 'SELECT * FROM public.inval WHERE id=1')"
+else
+  chk "drop-only: pk=1 falls back to a non-cache plan" \
+      "0" "$(plan 'SELECT * FROM public.inval WHERE id=1' | grep -c 'Custom Scan')"
+fi
+# pk=2 was untouched -> still cached in either mode
 chk "untouched pk=2 is still served from cache" \
     "Custom Scan (pg_keyspace_rowcache) on inval" "$(plan 'SELECT * FROM public.inval WHERE id=2')"
 

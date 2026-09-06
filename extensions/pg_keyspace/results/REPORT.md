@@ -552,12 +552,22 @@ owner reads their own row (email visible) from the cache, a non-owner is denied 
 RLS, the cached result equals the non-cached ground truth, and a `PATCH` stays
 coherent via the invalidation worker.
 
-Remaining (not built): a *refill* worker (this one is invalidate-only; refill is
-lazy via the fallback path), and driving the actual PostgREST binary once egress
-allows it. Requirements/limits: needs `wal_level = logical` and holds one
-replication slot (the standard WAL-retention caution, §13 — the worker advances it
-each poll); single-column integer pk only; `pg_keyspace.rowcache_decode` is off by
-default. Details: `results/p6_security.txt` (`bench/run_p6_security.sh`),
+**Refill (`pg_keyspace.rowcache_refill`, opt-in).** By default invalidation is
+drop-only (the next read repopulates lazily). With refill on, a change to a *hot*
+key (one currently cached) re-reads the current row and re-caches it, so the key
+stays served from the Custom Scan across writes; a delete always drops. The
+re-read had to be made cache-*bypassing*: a one-shot/custom plan folds a bound
+`$1` to a `Const`, so parameterizing alone still triggered the pathlist hook and
+the refill read its own stale entry — a stale-forever feedback loop. A per-backend
+`RC_BYPASS` flag, set around the refill read and checked by the hook, fixes it
+(the read hits the live table). Verified in both modes: coherence 10/10 with
+refill on (hot key stays cached, fresh value) and with it off (falls back to a
+fresh index read).
+
+Remaining (not built): driving the actual PostgREST binary once egress allows it.
+Requirements/limits: needs `wal_level = logical` and holds one replication slot
+(the standard WAL-retention caution, §13 — the worker advances it each poll);
+single-column integer pk only; `pg_keyspace.rowcache_decode` is off by default. Details: `results/p6_security.txt` (`bench/run_p6_security.sh`),
 `results/p6_rowcache.txt` (`bench/run_p6_rowcache.sh`),
 `results/p6_maskcost.txt` (`bench/run_p6_maskcost.sh`),
 `results/p6_invalidation.txt` (`bench/run_p6_invalidation.sh`),
@@ -675,7 +685,8 @@ commit off the worker's snapshot.
   warm/refill helper). Only single-column integer primary keys are cached, and
   cached rows with out-of-line (TOASTed) values are not supported (the raw tuple
   carries a toast pointer, not the datum) — POC stores inline rows. The decode
-  worker holds one logical replication slot (WAL-retention caution, §13).
+  worker holds one logical replication slot (WAL-retention caution, §13). Refill
+  (`pg_keyspace.rowcache_refill`) is opt-in; default is drop-only (lazy refill).
 - PostgREST end-to-end uses the real binary — not installed here (its release
   download is blocked by the sandbox egress proxy, 403). Validated instead by
   issuing PostgREST's exact SQL shape (role + JWT claims, `pk = N` select/update).

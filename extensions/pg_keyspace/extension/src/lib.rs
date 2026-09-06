@@ -19,7 +19,7 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 use pgrx::{IntoDatum, PgBuiltInOids, PgOid};
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,6 +97,11 @@ static GUC_ROWCACHE_DECODE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static GUC_ROWCACHE_SLOT: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"supacache_rowcache"));
 static GUC_ROWCACHE_DECODE_MS: GucSetting<i32> = GucSetting::<i32>::new(200);
+/// When on, the invalidation worker REFILLS a changed hot key with the current
+/// row (re-read via SPI, raw bytes) instead of only dropping it, so a hot key
+/// stays served from cache across writes. Off = drop-only (refill is lazy on the
+/// next read). Deleted rows are always dropped, never refilled.
+static GUC_ROWCACHE_REFILL: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
 /// values are raw heap-tuple bytes.
@@ -333,6 +338,15 @@ pub extern "C" fn _PG_init() {
         &GUC_ROWCACHE_DECODE_MS,
         10,
         60_000,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
+        "pg_keyspace.rowcache_refill",
+        "Refill a changed hot key with the current row instead of only dropping it (§3.5)",
+        "Off (default) is drop-only; the next read repopulates lazily. Deleted rows \
+         are always dropped, never refilled.",
+        &GUC_ROWCACHE_REFILL,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -1072,16 +1086,18 @@ pub extern "C" fn pg_keyspace_expiry_main(_arg: pg_sys::Datum) {
 // logical replication slot whose output plugin (`supacache_keys`) emits ONLY
 // `<I|U|D> <relid> <pk>` — never a column value. So this worker cannot store WAL
 // values even in principle (§4.7 "decoding worker stores WAL values"): the values
-// never leave the plugin. Invalidation is drop-only; the next read of a dropped
-// key misses the cache and falls back to the normal masked/RLS index path.
+// never leave the plugin. Changed keys are dropped from the cache; a deleted key
+// stays dropped, and with pg_keyspace.rowcache_refill a still-hot key is re-read
+// and re-cached. Either way the next read is correct.
 
-/// Parse one `supacache_keys` line: `<action> <relid> <pk>` -> (relid, pk).
-fn parse_change(line: &str) -> Option<(u32, i64)> {
+/// Parse one `supacache_keys` line: `<action> <relid> <pk>` -> (action, relid, pk).
+/// action is 'I' (insert), 'U' (update) or 'D' (delete).
+fn parse_change(line: &str) -> Option<(char, u32, i64)> {
     let mut it = line.split_whitespace();
-    let _action = it.next()?; // 'I' | 'U' | 'D' — all invalidate the same way
+    let action = it.next()?.chars().next()?;
     let relid: u32 = it.next()?.parse().ok()?;
     let pk: i64 = it.next()?.parse().ok()?;
-    Some((relid, pk))
+    Some((action, relid, pk))
 }
 
 /// Create the keys-only replication slot if it does not exist yet. Requires
@@ -1121,16 +1137,22 @@ fn ensure_decode_slot(slot: &str) -> Result<(), String> {
     }))
 }
 
-/// Drain all pending changes from the slot and invalidate each key. Returns the
-/// number of cache entries dropped.
+/// Drain all pending changes from the slot and apply them to the row cache.
+/// Returns the number of cache entries touched (dropped or refilled).
+///
+/// Two phases so refill's per-row SPI does not nest inside the get_changes SPI:
+/// phase 1 pulls the change list (advancing the slot) in one transaction; phase 2
+/// applies each change. Only *hot* keys (currently cached) are touched — a change
+/// to an uncached row is ignored, so the cache never fills with cold rows.
 fn drain_invalidations(slot: &str) -> u64 {
     use std::panic::AssertUnwindSafe;
     let view = match rowcache_view() {
         Some(v) => v,
         None => return 0,
     };
-    BackgroundWorker::transaction(AssertUnwindSafe(|| {
-        let mut n = 0u64;
+    // Phase 1: pull the change list.
+    let changes: Vec<(char, u32, i64)> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        let mut out = Vec::new();
         let _ = Spi::connect(|client| {
             let t = client.select(
                 "SELECT data FROM pg_logical_slot_get_changes($1, NULL, NULL)",
@@ -1139,16 +1161,36 @@ fn drain_invalidations(slot: &str) -> u64 {
             )?;
             for row in t {
                 let data: String = row.get::<String>(1)?.unwrap_or_default();
-                if let Some((relid, pk)) = parse_change(&data) {
-                    if view.del(&rc_key(relid, pk)) {
-                        n += 1;
-                    }
+                if let Some(c) = parse_change(&data) {
+                    out.push(c);
                 }
             }
             Ok::<(), pgrx::spi::Error>(())
         });
-        n
-    }))
+        out
+    }));
+
+    // Phase 2: apply. Drop-only unless refill is enabled and the row still exists.
+    let refill = GUC_ROWCACHE_REFILL.get();
+    let mut n = 0u64;
+    for (action, relid, pk) in changes {
+        let key = rc_key(relid, pk);
+        if !matches!(view.get(&key), Lookup::Hit(_)) {
+            continue; // cold key — nothing cached to keep coherent
+        }
+        if refill && action != 'D' {
+            let outcome = BackgroundWorker::transaction(AssertUnwindSafe(|| unsafe {
+                rowcache_refill_locked(pg_sys::Oid::from(relid), pk)
+            }));
+            if !matches!(outcome, Refill::Stored) {
+                view.del(&key); // gone or unresolvable -> invalidate
+            }
+        } else {
+            view.del(&key);
+        }
+        n += 1;
+    }
+    n
 }
 
 #[no_mangle]
@@ -1178,7 +1220,7 @@ pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
     while !BackgroundWorker::sigterm_received() {
         let n = drain_invalidations(&slot);
         if n > 0 {
-            log!("pg_keyspace invalidation: dropped {n} stale row-cache entr(ies)");
+            log!("pg_keyspace invalidation: reconciled {n} changed row-cache entr(ies)");
         }
         std::thread::sleep(poll);
     }
@@ -1371,6 +1413,10 @@ unsafe extern "C" fn rc_pathlist_hook(
     if let Some(prev) = PREV_PATHLIST_HOOK {
         prev(root, rel, rti, rte);
     }
+    // A refill re-read must see the live table, not the cache it is refreshing.
+    if RC_BYPASS.load(Ordering::SeqCst) {
+        return;
+    }
     if (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL
         || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
     {
@@ -1555,12 +1601,49 @@ fn quote_ident(s: &str) -> String {
 
 /// Run a single-row SELECT and return the raw heap-tuple bytes of the first
 /// row (HeapTupleHeader + data), copied out before the SPI context is freed.
-unsafe fn fetch_raw_tuple(query: &str) -> Option<Vec<u8>> {
+/// Set while a refill re-reads a row from the heap: the Mode B pathlist hook
+/// checks it and skips substitution, so the re-read hits the real table and not
+/// the very cache entry we are refreshing (a one-shot/custom plan folds a bound
+/// `$1` to a Const, so parameterizing alone is NOT enough to dodge the hook —
+/// this flag is). Per-backend and single-threaded, so a plain flag is safe.
+static RC_BYPASS: AtomicBool = AtomicBool::new(false);
+
+struct BypassGuard;
+impl BypassGuard {
+    fn new() -> Self {
+        RC_BYPASS.store(true, Ordering::SeqCst);
+        BypassGuard
+    }
+}
+impl Drop for BypassGuard {
+    fn drop(&mut self) {
+        RC_BYPASS.store(false, Ordering::SeqCst);
+    }
+}
+
+/// `rel_q`/`col_q` are already identifier-quoted; `pk` is bound as a parameter.
+/// Runs with the row-cache substitution bypassed (see `RC_BYPASS`) so the read
+/// reflects the live table, never a stale cache entry.
+unsafe fn fetch_raw_tuple(rel_q: &str, col_q: &str, pk: i64) -> Option<Vec<u8>> {
+    let _bypass = BypassGuard::new();
+    let query = format!("SELECT * FROM {rel_q} WHERE {col_q} = $1");
     let q = std::ffi::CString::new(query).ok()?;
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
         return None;
     }
-    let rc = pg_sys::SPI_execute(q.as_ptr(), true, 1);
+    let mut argtypes = [pg_sys::INT8OID];
+    let mut values = [pg_sys::Datum::from(pk)];
+    // read_only = false: take a fresh snapshot so a refill sees the row as of
+    // now (the just-committed change), not the worker transaction's start snapshot.
+    let rc = pg_sys::SPI_execute_with_args(
+        q.as_ptr(),
+        1,
+        argtypes.as_mut_ptr(),
+        values.as_mut_ptr(),
+        std::ptr::null(),
+        false,
+        1,
+    );
     let out = if rc == pg_sys::SPI_OK_SELECT as i32 && pg_sys::SPI_processed >= 1 {
         let tuptable = pg_sys::SPI_tuptable;
         let tup = *(*tuptable).vals.offset(0);
@@ -1573,6 +1656,49 @@ unsafe fn fetch_raw_tuple(query: &str) -> Option<Vec<u8>> {
     };
     pg_sys::SPI_finish();
     out
+}
+
+/// Outcome of refilling one row-cache entry from the live table.
+enum Refill {
+    Stored,  // the current row was read and cached
+    Gone,    // the row no longer exists (deleted) — caller should invalidate
+    Skipped, // relation not registered / not resolvable
+}
+
+/// Read the current row of `relid` where the registered pk column = `pk` and
+/// store its RAW heap-tuple bytes in the row cache. Shared by the SQL
+/// `rowcache_put` surface and the invalidation worker's refill path. Assumes a
+/// transaction is open (SPI usable). The raw bytes are pre-policy; RLS and the
+/// mask re-apply above the Custom Scan on read (§4.6), so this is the same trust
+/// model as the manual put — the decode stream is still keys-only (§3.5).
+unsafe fn rowcache_refill_locked(relid: pg_sys::Oid, pk: i64) -> Refill {
+    let view = match rowcache_view() {
+        Some(v) => v,
+        None => return Refill::Skipped,
+    };
+    let attnum = match view.get(&rc_reg_key(relid.as_u32())) {
+        Lookup::Hit(b) if b.len() >= 2 => i16::from_le_bytes([b[0], b[1]]),
+        _ => return Refill::Skipped,
+    };
+    let attname = pg_sys::get_attname(relid, attnum, false);
+    if attname.is_null() {
+        return Refill::Skipped;
+    }
+    let col = std::ffi::CStr::from_ptr(attname).to_string_lossy().into_owned();
+    let rel_q = match Spi::get_one_with_args::<String>(
+        "SELECT $1::regclass::text",
+        vec![(PgBuiltInOids::OIDOID.oid(), relid.into_datum())],
+    ) {
+        Ok(Some(s)) => s,
+        _ => return Refill::Skipped,
+    };
+    match fetch_raw_tuple(&rel_q, &quote_ident(&col), pk) {
+        Some(bytes) => {
+            view.set(&rc_key(relid.as_u32(), pk), &bytes, 0);
+            Refill::Stored
+        }
+        None => Refill::Gone,
+    }
 }
 
 // ---- the SQL surface (§6): in-backend shared-memory reads/writes ---------
@@ -1797,39 +1923,8 @@ mod supacache {
             Ok(Some(o)) => o,
             _ => return false,
         };
-        let view = match rowcache_view() {
-            Some(v) => v,
-            None => return false,
-        };
-        // must be registered; pk column name comes from the registered attnum
-        let attnum = match view.get(&rc_reg_key(relid.as_u32())) {
-            Lookup::Hit(b) if b.len() >= 2 => i16::from_le_bytes([b[0], b[1]]),
-            _ => return false,
-        };
-        let raw = unsafe {
-            let attname = pg_sys::get_attname(relid, attnum, false);
-            if attname.is_null() {
-                return false;
-            }
-            let col = std::ffi::CStr::from_ptr(attname)
-                .to_string_lossy()
-                .into_owned();
-            // Fully-qualified relation name, identifier-safe.
-            let rel_q = match Spi::get_one_with_args::<String>(
-                "SELECT $1::regclass::text",
-                vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
-            ) {
-                Ok(Some(s)) => s,
-                _ => return false,
-            };
-            let col_q = quote_ident(&col);
-            let query = format!("SELECT * FROM {rel_q} WHERE {col_q} = {pk}::int8");
-            fetch_raw_tuple(&query)
-        };
-        match raw {
-            Some(bytes) => view.set(&rc_key(relid.as_u32(), pk), &bytes, 0),
-            None => false,
-        }
+        // Runs in the caller's SQL transaction, so SPI is available directly.
+        matches!(unsafe { rowcache_refill_locked(relid, pk) }, Refill::Stored)
     }
 
     /// Row-cache occupancy: entries (registrations + rows), bytes used/cap.
