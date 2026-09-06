@@ -1,0 +1,31 @@
+# pg_keyspace P0 benchmark — 2026-09-06T05:21:01Z
+host: 4 cpus, Linux 6.18.44-fc-v24
+redis: redis_version:7.0.15
+datasize=512B keyspace=100000
+
+## Closed-loop latency (-c 1 -P 1), 200k requests, 512B values
+op         server     |          rps  avg(ms)      p50      p99
+set        redis      |     25451.77    0.036    0.039    0.063
+set        pgks       |     27502.75    0.033    0.039    0.055
+get        redis      |     26458.53    0.035    0.039    0.063
+get        pgks       |     26975.99    0.034    0.039    0.063
+incr       redis      |     25409.73    0.036    0.039    0.063
+incr       pgks       |     27045.30    0.034    0.039    0.055
+
+## Pipelined throughput (-c 50 -P 16), 1M requests, 512B values
+op         server     |          rps  p50(ms)      p99
+set        redis      |    537345.50    1.351    2.063
+set        pgks       |    556173.56    1.103    1.823
+get        redis      |    628140.69    1.167    1.671
+get        pgks       |    499500.47    1.599    1.831
+
+## In-backend shared-memory op latency (§6), 5M iters, in-process
+  get:  8.9057674 ns/op
+  set:  11.8402182 ns/op
+  incr: 36.4004072 ns/op
+
+## SQL surface via libpq round-trip (SELECT supacache.get), pgbench
+  latency average = 0.048 ms
+  tps = 20956.640054 (without initial connection time)
+
+raw redis-benchmark outputs in /home/user/postgres/extensions/pg_keyspace/results/raw_*.txt

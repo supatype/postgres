@@ -1,0 +1,5 @@
+# Shared-nothing scale-out (pipelined -c 25 -P 16, 512B), aggregate rps
+workers  |    SET agg rps    GET agg rps
+1        |         568828         603865
+2        |        1098625        1128423
+4        |        2461358        2106536

@@ -1,0 +1,19 @@
+# commit-batcher benchmark, commit_window=500µs, per_thread=20000
+# 'threads' models concurrent slot workers all staging into one window.
+
+Ephemeral   threads=1   ops=20000    |   15511487 ops/s | p50=     0.0us p99=     0.0us max=     2.9us
+Ephemeral   threads=8   ops=160000   |   50484366 ops/s | p50=     0.0us p99=     0.0us max=  1099.5us
+Ephemeral   threads=64  ops=1280000  |   38205455 ops/s | p50=     0.0us p99=     0.0us max=  6435.3us
+
+Relaxed     threads=1   ops=20000    |    4196328 ops/s | p50=     0.2us p99=     0.4us max=    30.7us
+Relaxed     threads=8   ops=160000   |    2143996 ops/s | p50=     0.2us p99=    71.1us max=  5584.7us
+Relaxed     threads=64  ops=1280000  |    1806995 ops/s | p50=     0.2us p99=   630.6us max= 18002.7us
+
+Durable     threads=1   ops=20000    |       1026 ops/s | p50=   950.0us p99=  1373.3us max= 22362.2us
+Durable     threads=8   ops=160000   |       8405 ops/s | p50=   932.9us p99=  1349.8us max=  9533.1us
+Durable     threads=64  ops=1280000  |      38522 ops/s | p50=  1468.6us p99=  3210.8us max= 43376.2us
+
+Replicated  threads=1   ops=2000     |       1885 ops/s | p50=   503.5us p99=   804.7us max=  1874.2us
+Replicated  threads=8   ops=16000    |       5633 ops/s | p50=  1399.9us p99=  3241.8us max=  6227.7us
+Replicated  threads=64  ops=128000   |       5488 ops/s | p50= 11510.5us p99= 34228.0us max= 89955.1us
+

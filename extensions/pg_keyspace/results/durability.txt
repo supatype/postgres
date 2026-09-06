@@ -1,0 +1,7 @@
+# Durability tiers — RESP SET (§3.4), commit_window=500us
+host: 4 cpus; WAL on container fs
+tier         | closed p50(ms)    avg(ms) | concurrent rps(c50)
+ephemeral    |          0.039      0.033 |         86767.89
+relaxed      |          0.039      0.035 |         98376.78
+durable      |          1.039      1.069 |           995.08
+replicated   |          0.591      0.615 |          1800.76
