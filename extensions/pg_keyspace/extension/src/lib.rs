@@ -394,12 +394,23 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
             let producers: Vec<ring::Producer> =
                 (0..nr).map(|i| unsafe { ring::Producer::attach(rbase.add(i * stride)) }).collect();
             worker.set_ring_producers(producers);
-            log!("pg_keyspace worker: persistence ON ({nr} rings -> {nr} workers)");
+            // durable/replicated: hold each write's RESP OK until it commits.
+            let sync_ack = matches!(ks_tier(), Tier::Durable | Tier::Replicated);
+            worker.set_sync_ack(sync_ack);
+            log!(
+                "pg_keyspace worker: persistence ON ({nr} rings -> {nr} workers, sync_ack={sync_ack})"
+            );
         }
     }
 
     log!("pg_keyspace worker: RESP listening on 0.0.0.0:{port} (persisted={persisted})");
-    let _ = worker.run_with(|| !BackgroundWorker::sigterm_received(), 500);
+    // Poll frequently in sync-ack mode so committed durable writes ack promptly.
+    let timeout_ms = if matches!(ks_tier(), Tier::Durable | Tier::Replicated) {
+        2
+    } else {
+        500
+    };
+    let _ = worker.run_with(|| !BackgroundWorker::sigterm_received(), timeout_ms);
     log!("pg_keyspace worker: shutting down");
 }
 
@@ -432,7 +443,12 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
     }
     let consumer = unsafe { ring::Consumer::attach(rbase.add(idx * ring_stride())) };
     let idle = Duration::from_millis(GUC_PERSIST_WINDOW_MS.get().max(1) as u64);
-    log!("pg_keyspace persist {idx}: draining ring {idx} -> supacache.kv (db={dbname})");
+    let sync_commit: &'static str = match ks_tier() {
+        Tier::Durable => "on",
+        Tier::Replicated => "remote_apply", // needs a synchronous standby
+        _ => "off",                          // relaxed: RESP already acked
+    };
+    log!("pg_keyspace persist {idx}: draining ring {idx} -> supacache.kv (synchronous_commit={sync_commit})");
 
     while !BackgroundWorker::sigterm_received() {
         let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
@@ -441,13 +457,15 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
             std::thread::sleep(idle);
             continue;
         }
-        bulk_upsert(batch);
+        bulk_upsert(batch, sync_commit);
+        consumer.mark_committed(); // release durable acks waiting on these records
     }
     // final drain on shutdown
     let mut tail: Vec<server::PendingWrite> = Vec::new();
     consumer.drain(usize::MAX, |k, v, e| tail.push((k.to_vec(), v.to_vec(), e)));
     if !tail.is_empty() {
-        bulk_upsert(tail);
+        bulk_upsert(tail, sync_commit);
+        consumer.mark_committed();
     }
     log!("pg_keyspace persist: shutting down");
 }
@@ -643,7 +661,7 @@ fn pg_recover(store: &Store) -> i64 {
 /// upserts go through a single `unnest(...)` `ON CONFLICT`, deletes through a
 /// single `key = ANY(...)`. A tombstone (`expires_at == DELETE_TOMBSTONE`)
 /// removes the key so a DEL does not resurrect on crash recovery.
-fn bulk_upsert(batch: Vec<server::PendingWrite>) {
+fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str) {
     use std::collections::HashMap;
     if batch.is_empty() {
         return;
@@ -670,6 +688,13 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>) {
 
     BackgroundWorker::transaction(move || {
         let _ = Spi::connect(|mut client| {
+            // Durability tier per §3.4: relaxed=off (async, RESP already acked),
+            // durable=on (fsync), replicated=remote_apply (needs a standby).
+            let _ = client.update(
+                &format!("SET LOCAL synchronous_commit = '{sync_commit}'"),
+                None,
+                None,
+            );
             if !keys.is_empty() {
                 let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), keys.into_datum()),

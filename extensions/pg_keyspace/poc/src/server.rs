@@ -34,10 +34,15 @@ pub const DELETE_TOMBSTONE: i64 = -1;
 /// throttles the RESP write path to the drain rate instead of silently losing
 /// durability. The bound only trips if persistence is wedged, in which case the
 /// record is dropped and counted (`ring_stats.dropped`) — a loud, rare event.
-fn shard_push(producers: &[ring::Producer], key: &[u8], val: &[u8], exp: i64) {
+fn shard_push(
+    producers: &[ring::Producer],
+    key: &[u8],
+    val: &[u8],
+    exp: i64,
+) -> Option<(usize, u64)> {
     let n = producers.len();
     if n == 0 {
-        return;
+        return None;
     }
     let shard = if n == 1 {
         0
@@ -45,18 +50,18 @@ fn shard_push(producers: &[ring::Producer], key: &[u8], val: &[u8], exp: i64) {
         crc16::key_slot(key) as usize % n
     };
     let p = &producers[shard];
-    if p.push(key, val, exp) {
-        return;
+    if let Some(seq) = p.push(key, val, exp) {
+        return Some((shard, seq));
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         std::thread::sleep(Duration::from_micros(50));
-        if p.push(key, val, exp) {
-            return;
+        if let Some(seq) = p.push(key, val, exp) {
+            return Some((shard, seq));
         }
         if Instant::now() >= deadline {
             p.note_drop(); // persistence wedged: drop + count, rather than hang forever
-            return;
+            return None;
         }
     }
 }
@@ -105,6 +110,9 @@ struct Conn {
     role: String,
     tenant: String,
     exempt: bool,
+    // durable sync-ack: (ring, seq) the connection's reply is waiting on. While
+    // non-empty the reply is held (not flushed) and no further commands are read.
+    ack: Vec<(usize, u64)>,
 }
 
 pub struct Worker {
@@ -121,6 +129,8 @@ pub struct Worker {
     producers: Vec<ring::Producer>,
     // P2: when set, RESP AUTH is required and keys are ACL-checked + tenant-scoped.
     auth: Option<AuthConfig>,
+    // durable tier: hold each write's RESP reply until its ring record commits.
+    sync_ack: bool,
 }
 
 impl Worker {
@@ -147,7 +157,13 @@ impl Worker {
             args: Vec::with_capacity(8),
             producers: Vec::new(),
             auth: None,
+            sync_ack: false,
         })
+    }
+
+    /// Durable tier: hold each write's reply until its ring record has committed.
+    pub fn set_sync_ack(&mut self, on: bool) {
+        self.sync_ack = on;
     }
 
     /// Enable P1 persistence: writes are sharded by key slot across these rings,
@@ -202,6 +218,38 @@ impl Worker {
                     }
                 }
             }
+            // Durable tier: release replies whose ring records have committed.
+            if self.sync_ack {
+                self.resolve_acks();
+            }
+        }
+    }
+
+    /// Send the held reply for any connection whose durable write(s) have now
+    /// committed, then resume reading that connection.
+    fn resolve_acks(&mut self) {
+        let ready: Vec<RawFd> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| {
+                !c.ack.is_empty()
+                    && c.ack.iter().all(|&(sh, seq)| {
+                        self.producers.get(sh).map_or(true, |p| p.committed() >= seq)
+                    })
+            })
+            .map(|(fd, _)| *fd)
+            .collect();
+        for fd in ready {
+            if let Some(c) = self.conns.get_mut(&fd) {
+                c.ack.clear();
+            }
+            self.flush(fd);
+            if self.conns.contains_key(&fd) {
+                self.process(fd); // handle any commands buffered behind the ack
+                if self.conns.contains_key(&fd) {
+                    self.flush(fd);
+                }
+            }
         }
     }
 
@@ -230,6 +278,7 @@ impl Worker {
                     role: String::new(),
                     tenant: String::new(),
                     exempt: false,
+                    ack: Vec::new(),
                 },
             );
         }
@@ -269,6 +318,12 @@ impl Worker {
     }
 
     fn process(&mut self, fd: RawFd) {
+        // Do not read more commands while a durable reply is still pending — the
+        // reply must land before the next command's, and this backpressures the
+        // connection to its own commit rate.
+        if self.conns.get(&fd).map(|c| !c.ack.is_empty()).unwrap_or(true) {
+            return;
+        }
         let mut consumed_total = 0usize;
         loop {
             // Parse one command and materialise its args as owned bytes, so the
@@ -296,8 +351,13 @@ impl Worker {
                 Parse::Complete { consumed } => {
                     self.dispatch(fd, &cmd_args);
                     consumed_total += consumed;
-                    if self.conns.get(&fd).map(|c| c.closing).unwrap_or(true) {
-                        break;
+                    let stop = self
+                        .conns
+                        .get(&fd)
+                        .map(|c| c.closing || !c.ack.is_empty())
+                        .unwrap_or(true);
+                    if stop {
+                        break; // durable reply pending or connection closing
                     }
                 }
             }
@@ -352,9 +412,13 @@ impl Worker {
         let batcher = self.batcher.clone();
         let tier = self.tier;
         let persist_on = !self.producers.is_empty();
+        let sync_ack = self.sync_ack;
         // A write to enqueue for persistence (§3.3), applied after the match so
         // it does not tangle with the `out` borrow.
         let mut stage: Option<PendingWrite> = None;
+        // (ring, seq) records enqueued this command; a durable write's reply is
+        // held until all of them commit.
+        let mut acks: Vec<(usize, u64)> = Vec::new();
         let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
 
         match cmd.as_slice() {
@@ -457,7 +521,10 @@ impl Worker {
                         if persist_on {
                             // propagate the delete so it does not resurrect on
                             // crash recovery (key is already tenant-scoped in eff)
-                            shard_push(&self.producers, a, b"", DELETE_TOMBSTONE);
+                            if let Some(sa) = shard_push(&self.producers, a, b"", DELETE_TOMBSTONE)
+                            {
+                                acks.push(sa);
+                            }
                         }
                     }
                 }
@@ -499,7 +566,13 @@ impl Worker {
         if let Some((k, v, e)) = stage {
             // sharded so a given key always lands on the same ring/persist worker
             // — no cross-worker key conflicts on ON CONFLICT.
-            shard_push(&self.producers, &k, &v, e);
+            if let Some(sa) = shard_push(&self.producers, &k, &v, e) {
+                acks.push(sa);
+            }
+        }
+        // Durable tier: hold this command's reply until its record(s) commit.
+        if sync_ack && !acks.is_empty() {
+            self.conns.get_mut(&fd).unwrap().ack = acks;
         }
     }
 
@@ -596,6 +669,10 @@ impl Worker {
             Some(c) => c,
             None => return,
         };
+        // Hold the reply while a durable write is still waiting to commit.
+        if !c.ack.is_empty() {
+            return;
+        }
         while c.wpos < c.wbuf.len() {
             let slice = &c.wbuf[c.wpos..];
             let w = unsafe {

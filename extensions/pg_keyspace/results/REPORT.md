@@ -312,6 +312,26 @@ does not resurrect on recovery. Verified: `SET keep:*` + `SET/DEL del:*` leaves
 the table with keep=5/del=0, and after a crash the recovered keyspace has the
 kept keys and none of the deleted ones.
 
+**Sync-ack durability tiers (`durable`/`replicated`).** `relaxed` returns `OK`
+immediately (async commit, `synchronous_commit=off`). `durable` **holds the
+`OK`** until the write's ring record is committed with `synchronous_commit=on`
+(each record carries a seq; the persist worker publishes a `committed`
+watermark; the RESP worker defers the reply until `committed ≥ seq`).
+
+| tier | closed-loop SET p50 | -c1 rps | -c50 rps (batched) | ack means |
+|---|---:|---:|---:|---|
+| ephemeral | 39µs | 27k | ~500k | in shmem |
+| relaxed | 39µs | 27k | ~85–107k | queued (async) |
+| durable | **2.27ms** | 432 | **17,587** | **committed (fsync)** |
+
+Correctness: after a durable `OK` the row is already in `supacache.kv`, and 50
+acked durable writes all survive a `kill -9` — the ack *means* committed.
+Throughput scales ~40× from c1→c50 because the persist worker amortises the
+fsync across concurrent in-flight durable writes while each client still waits
+for its own commit — the §3.4 lever, on real Postgres commits with correct
+per-write acks. `replicated` is the same path with `synchronous_commit=
+remote_apply` (needs a standby). Details in `results/p1_durable_ack.txt`.
+
 ## 5d. P2 — security on the real base
 
 The P0/P1 spike ran on the system PG16 for speed. P2 is about the interaction
@@ -460,10 +480,10 @@ commit off the worker's snapshot.
   `UNNEST` upserts; the sustained ceiling is the persist workers' shared-WAL rate
   (~145k/s at 4 workers). Higher needs `COPY`-into-staging + merge. Overload now
   applies no-loss backpressure (§5c) rather than dropping.
-- Only `relaxed`/async persistence is wired to real tables in-PG so far;
-  `durable`/`replicated` sync-ack-to-commit semantics against `supacache.kv`
-  are the next increment (the standalone batcher already characterises their
-  fsync cost).
+- `relaxed` and `durable` are wired to real tables with correct ack semantics
+  (§5c). `replicated` uses the same path with `synchronous_commit=remote_apply`
+  but needs a synchronous standby to exercise. Durability is currently an
+  instance GUC; per-prefix tiers (§3.4) are the P5 engine step.
 - TTL partition drop (§3.3) not built — expired keys are removed from shmem
   lazily on read but remain in `supacache.kv` until overwritten.
 

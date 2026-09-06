@@ -1,0 +1,40 @@
+# Durable / sync-ack durability tiers — measured in-PG (PG17 base)
+#
+# relaxed  = async ack: RESP OK returns immediately; the persist worker commits
+#            within a window with synchronous_commit=off.
+# durable  = sync ack:  RESP OK is HELD until the write's ring record is
+#            committed with synchronous_commit=on (fsync).
+# replicated = durable + synchronous_commit=remote_apply (needs a standby; the
+#            mechanism is identical, only the GUC differs).
+#
+# Mechanism: each ring record carries a sequence number; the persist worker
+# publishes a `committed` watermark after each commit; the RESP worker defers the
+# OK (holding the connection, not reading further) until committed >= seq.
+
+## Correctness
+- durable: SET returns OK and the row is ALREADY in supacache.kv (committed
+  before the ack). Verified: count(*) = 1 immediately after OK.
+- Crash survival: 50 acked durable SETs, then kill -9 (immediate) + restart ->
+  all 50 recovered (dk:25 = v25). Every acked durable write survives a crash,
+  because the ack means committed.
+
+## Latency & throughput (single worker, 512B, persist_window=1ms)
+  tier      closed-loop p50    -c1 rps     -c50 rps (batched)
+  ephemeral      39 us          ~27k          ~500k
+  relaxed        39 us          ~27k          ~85-107k   (async ack)
+  durable      2.27 ms           432          17,587     (sync ack, fsync)
+
+- durable single-op latency ~2.3ms is the durability price (fsync + 1ms window +
+  ring round-trip + poll), consistent with the plan's "durable/replicated:
+  documented, not optimised" (§11).
+- durable throughput scales ~40x from -c1 to -c50: the persist worker commits
+  the concurrent in-flight durable writes in shared transactions, amortising the
+  fsync, while each client's OK still waits for ITS record's commit. This is the
+  §3.4 lever ("one fsync amortised across hundreds of operations") realised on
+  real Postgres commits with correct per-write acks.
+
+## Per-prefix durability
+Durability is a Postmaster GUC here (pg_keyspace.durability) for the whole
+instance; the plan's per-prefix tiers (§3.4) map a prefix to a durability by
+partition attribute. The tier machinery (ack semantics + synchronous_commit) is
+proven end-to-end; wiring it per-prefix from the AST is the P5 engine step.

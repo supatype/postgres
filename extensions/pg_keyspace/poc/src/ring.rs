@@ -18,10 +18,12 @@ const REC_HDR: usize = 16; // u32 + u32 + i64
 #[repr(C)]
 struct RingHeader {
     capacity: u64,
-    head: AtomicU64,    // bytes consumed (consumer writes)
-    tail: AtomicU64,    // bytes produced (producer writes)
-    dropped: AtomicU64, // records dropped because the ring was full
-    pushed: AtomicU64,
+    head: AtomicU64,      // bytes consumed (consumer writes)
+    tail: AtomicU64,      // bytes produced (producer writes)
+    dropped: AtomicU64,   // records dropped because the ring was full
+    pushed: AtomicU64,    // total records enqueued (producer); also assigns seq
+    drained: AtomicU64,   // total records read by the consumer
+    committed: AtomicU64, // total records durably committed (persist worker)
 }
 
 fn hdr_bytes() -> usize {
@@ -112,9 +114,10 @@ impl Producer {
         Producer(Ring::new(base))
     }
 
-    /// Enqueue one write. Returns false (and counts a drop) if the ring is full,
-    /// which under sustained overload is the backpressure signal.
-    pub fn push(&self, key: &[u8], val: &[u8], expires: i64) -> bool {
+    /// Enqueue one write. Returns the record's sequence number on success, or
+    /// None if the ring is full (the caller applies backpressure or drops). The
+    /// seq lets a durable write wait until `committed() >= seq`.
+    pub fn push(&self, key: &[u8], val: &[u8], expires: i64) -> Option<u64> {
         let rec = REC_HDR + key.len() + val.len();
         unsafe {
             let h = &*self.0.hdr;
@@ -122,7 +125,7 @@ impl Producer {
             let tail = h.tail.load(Ordering::Relaxed);
             let cap = self.0.mask + 1;
             if cap - (tail - head) < rec as u64 {
-                return false; // full — caller decides (backpressure vs drop)
+                return None; // full — caller decides (backpressure vs drop)
             }
             self.0
                 .write_wrapped(tail, &(key.len() as u32).to_le_bytes());
@@ -132,8 +135,8 @@ impl Producer {
             self.0.write_wrapped(tail + 16, key);
             self.0.write_wrapped(tail + 16 + key.len() as u64, val);
             h.tail.store(tail + rec as u64, Ordering::Release);
-            h.pushed.fetch_add(1, Ordering::Relaxed);
-            true
+            // seq = the record's 1-based index; committed catches up to it.
+            Some(h.pushed.fetch_add(1, Ordering::Relaxed) + 1)
         }
     }
 
@@ -141,6 +144,11 @@ impl Producer {
     /// backpressure deadline). Rare and loud; surfaced via `Consumer::stats`.
     pub fn note_drop(&self) {
         unsafe { (*self.0.hdr).dropped.fetch_add(1, Ordering::Relaxed) };
+    }
+
+    /// The number of records durably committed so far (for durable sync-ack).
+    pub fn committed(&self) -> u64 {
+        unsafe { (*self.0.hdr).committed.load(Ordering::Acquire) }
     }
 }
 
@@ -176,8 +184,19 @@ impl Consumer {
             }
             if count > 0 {
                 h.head.store(head, Ordering::Release);
+                h.drained.fetch_add(count as u64, Ordering::Relaxed);
             }
             count
+        }
+    }
+
+    /// Publish that everything drained so far is now durably committed, so
+    /// durable writes waiting on `committed() >= seq` can be acked.
+    pub fn mark_committed(&self) {
+        unsafe {
+            let h = &*self.0.hdr;
+            let d = h.drained.load(Ordering::Relaxed);
+            h.committed.store(d, Ordering::Release);
         }
     }
 
@@ -212,7 +231,7 @@ mod tests {
         for round in 0..2000u64 {
             let key = format!("key{round}");
             let val = format!("val-{}", round % 7);
-            if prod.push(key.as_bytes(), val.as_bytes(), round as i64) {
+            if prod.push(key.as_bytes(), val.as_bytes(), round as i64).is_some() {
                 produced += 1;
             }
             // drain occasionally so the ring never overflows
