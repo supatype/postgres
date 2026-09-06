@@ -18,11 +18,15 @@ for the full write-up and the concerns matrix.
 > leaf*, so RLS and `supatype_mask` re-apply above it (§4.6). Its security suite
 > passes 10/10 (`results/p6_security.txt`): a non-owner is denied a physically
 > cached foreign row and a non-exempt role gets NULL for a masked column that is
-> genuinely present, unmasked, in the cache. The Custom Scan roughly halves
-> executor time for a single-row pk lookup (`results/p6_rowcache.txt`), and the
-> §4.3c masked-read concern is quantified (`results/p6_maskcost.txt`). The only
-> remaining P6 piece is the logical-decoding invalidation worker (§3.5); the cache
-> is populated here via `supacache.rowcache_put` as a stand-in. Still a POC — auth
+> genuinely present, unmasked, in the cache. Coherence is kept by a **keys-only**
+> logical-decoding worker (§3.5): the `supacache_keys` output plugin emits only
+> `<relid> <pk>` — never a column value — so a write drops the cached key with no
+> way for WAL data to leak (coherence 10/10, `results/p6_invalidation.txt`;
+> PostgREST-pattern 4/4, `results/p6_postgrest_pattern.txt`). The Custom Scan
+> roughly halves executor time for a single-row pk lookup (`results/p6_rowcache.txt`),
+> and the §4.3c masked-read concern is quantified (`results/p6_maskcost.txt`).
+> Remaining P6 items are non-security: a refill worker (invalidation is drop-only)
+> and the real PostgREST binary (blocked by sandbox egress). Still a POC — auth
 > secrets are compared in clear and credentials load at worker start; don't deploy
 > as-is.
 
@@ -71,7 +75,10 @@ extensions/pg_keyspace/
 │   ├── run_p2_threats.sh     Mode A security threat table (§4.7)
 │   ├── run_p6_maskcost.sh    cost of a masked read + §6 accelerator (§4.3c)
 │   ├── run_p6_security.sh    Mode B row-cache RLS/mask/generic-plan suite (§4.6/§4.7)
-│   └── run_p6_rowcache.sh    Mode B Custom Scan vs index-scan latency (§7.1)
+│   ├── run_p6_rowcache.sh    Mode B Custom Scan vs index-scan latency (§7.1)
+│   ├── run_p6_invalidation.sh keys-only decode worker: coherence + no-leak (§3.5)
+│   └── run_p6_postgrest_pattern.sh  PostgREST-shape auth→GET→PATCH→GET (§3.5)
+├── plugin/                    ← supacache_keys: keys-only logical-decoding output plugin (§3.5)
 └── results/                  ← REPORT.md + raw benchmark outputs
 ```
 
@@ -138,8 +145,14 @@ SELECT * FROM supacache.rowcache_stats();
 
 The scan serves the **raw** cached row at the leaf; the relation's RLS quals and
 mask `CASE` expressions re-apply above it, so a role that couldn't see the row (or
-a masked column) via a normal query still can't via the cache (§4.6). Populating
-is manual here — a stand-in for the logical-decoding refill worker (§3.5).
+a masked column) via a normal query still can't via the cache (§4.6).
+
+With `pg_keyspace.rowcache_decode = on` (and `wal_level = logical`), a keys-only
+logical-decoding worker keeps the cache coherent: the `supacache_keys` output
+plugin emits only `<relid> <pk>` for each change — never a column value — and the
+worker drops that key, so the next read falls back to the fresh row. Build/install
+the plugin from `plugin/` (`make install`). Populating (`rowcache_put`) is still
+manual — a warm/refill helper; invalidation is automatic.
 
 Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 
@@ -158,6 +171,9 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 | `pg_keyspace.commit_window_us` | 500 | standalone file-batcher window (durability microbench) |
 | `pg_keyspace.rowcache_mb` | 64 | size of the Mode B row-cache segment (separate from Mode A; never RESP-addressable) |
 | `pg_keyspace.require_mask` | `on` | require `supatype_mask` loaded + outermost before serving (§4.1); `off` runs standalone with no mask dependency |
+| `pg_keyspace.rowcache_decode` | `off` | enable the keys-only Mode B invalidation worker (§3.5); needs `wal_level=logical`, holds a replication slot |
+| `pg_keyspace.rowcache_slot` | `supacache_rowcache` | replication slot name (created on demand with the `supacache_keys` plugin) |
+| `pg_keyspace.rowcache_decode_ms` | 200 | how often the invalidation worker drains the slot |
 
 ## Results in one line
 

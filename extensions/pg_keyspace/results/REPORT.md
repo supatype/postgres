@@ -24,12 +24,17 @@ keyspace ACL, forced tenant scoping, and exempt-role reuse — the full §4.7
 threat table for Mode A passes (§5d). Security was the plan's ship-decider (§14);
 this retires it for Mode A.
 
-**Mode B (P6) now has a working `CustomScan` and passes its §4.6 security suite.**
-A planner hook substitutes the cached row *only at the scan leaf*, so RLS and
+**Mode B (P6) is built end-to-end: `CustomScan` + keys-only invalidation.** A
+planner hook substitutes the cached row *only at the scan leaf*, so RLS and
 `supatype_mask` re-apply above it: a non-owner is denied a physically-cached
 foreign row and a non-exempt role gets NULL for a masked column that is genuinely
-present, unmasked, in the cache (10/10, §5e). The remaining P6 work is the
-logical-decoding invalidation worker (slice 3).
+present, unmasked, in the cache (security 10/10, §5e). A keys-only logical-decoding
+worker (§3.5) keeps it coherent — a purpose-built output plugin emits only
+`<relid> <pk>`, never a column value, so the cache is dropped on write with no way
+for WAL values to leak (coherence 10/10; PostgREST-pattern 4/4). The full §4.7
+threat table now passes as test evidence. Remaining P6 items are non-security: a
+refill worker (invalidation is drop-only) and the real PostgREST binary (blocked
+by sandbox egress).
 
 This report presents *measured* numbers, cross-checks them against the plan's
 targets, and separates what the POC validates empirically from what it
@@ -513,14 +518,50 @@ Three findings:
    predicate consults and never the predicate's answer." §4.3b is honored: the
    cache holds the permission *set*, never the predicate's per-row answer.
 
-Remaining P6 work (slice 3): the logical-decoding invalidation/refill worker
-(§3.5, keys-only) that keeps the cache coherent with committed writes, and a
-PostgREST end-to-end. The populate path here (`supacache.rowcache_put`) is a
-manual stand-in for that worker; the executor node and its security model — the
-parts §4.6 flags as the actual risk — are built and validated above. Details:
-`results/p6_security.txt` (`bench/run_p6_security.sh`),
+### Slice 3 — keys-only invalidation keeps the cache coherent (§3.5)
+
+The row cache holds RAW pre-policy tuples, so it must be dropped the instant the
+underlying row changes. Slice 3 builds the §3.5 worker as a **keys-only** logical
+decoder, and the "keys-only" is structural, not a matter of the worker's
+discipline: a purpose-built output plugin (`supacache_keys`, in `plugin/`) reads
+only the replica-identity key column of each change and emits one line —
+`<I|U|D> <relid> <pk>` — so **no column value ever leaves the plugin**. That
+retires the last §4.7 threat ("decoding worker stores WAL values"): it cannot,
+even in principle. A background worker consumes the slot and drops each changed
+key from the cache; the next read misses and falls back to the normal masked/RLS
+index path (drop-only invalidation — never a re-materialised value).
+
+`bench/run_p6_invalidation.sh` — **10/10** (`results/p6_invalidation.txt`):
+a cached row is served from the Custom Scan; after an `UPDATE` the worker drops it
+and the read returns the fresh value; an untouched key stays cached; `DELETE`
+stays coherent; and the peeked slot stream contains the change record but **zero**
+column values (a `LEAK_CANARY` planted in a column never appears). It also fixed a
+real bug found here: the Custom Scan must **not** be substituted for the scan that
+feeds an `UPDATE`/`DELETE` target or a `SELECT … FOR UPDATE` — those need the real
+heap tuple's ctid to lock (else "failed to fetch tuple being updated"); the
+pathlist hook now skips the result relation and any row-marked rel.
+
+**PostgREST end-to-end.** PostgREST itself could not be installed — its GitHub
+release download is blocked by the sandbox egress proxy (403). But PostgREST is a
+thin REST→SQL layer: it assumes the caller's role + JWT claims and issues plain
+`SELECT … WHERE pk = N` (a `GET`) or `UPDATE … WHERE pk = N` (a `PATCH`). Those
+are exactly the statements the transparent cache serves, so
+`bench/run_p6_postgrest_pattern.sh` issues them in PostgREST's shape against a
+masked + RLS + cached table — **4/4** (`results/p6_postgrest_pattern.txt`): the
+owner reads their own row (email visible) from the cache, a non-owner is denied by
+RLS, the cached result equals the non-cached ground truth, and a `PATCH` stays
+coherent via the invalidation worker.
+
+Remaining (not built): a *refill* worker (this one is invalidate-only; refill is
+lazy via the fallback path), and driving the actual PostgREST binary once egress
+allows it. Requirements/limits: needs `wal_level = logical` and holds one
+replication slot (the standard WAL-retention caution, §13 — the worker advances it
+each poll); single-column integer pk only; `pg_keyspace.rowcache_decode` is off by
+default. Details: `results/p6_security.txt` (`bench/run_p6_security.sh`),
 `results/p6_rowcache.txt` (`bench/run_p6_rowcache.sh`),
-`results/p6_maskcost.txt` (`bench/run_p6_maskcost.sh`).
+`results/p6_maskcost.txt` (`bench/run_p6_maskcost.sh`),
+`results/p6_invalidation.txt` (`bench/run_p6_invalidation.sh`),
+`results/p6_postgrest_pattern.txt` (`bench/run_p6_postgrest_pattern.sh`).
 
 ## 6. Concerns validation matrix
 
@@ -550,6 +591,8 @@ parts §4.6 flags as the actual risk — are built and validated above. Details:
 | TTL by partition drop (§3.3) | ✅ expiry worker drops past buckets; 3.2ms vs 141ms DELETE at 100k |
 | Mode B leaf substitution via planner hook (§7.1, P6) | ✅ `CustomPath`/`CustomScan` chosen for cached `pk = Const`; halves exec time |
 | Mode B `CustomScan` serves shmem, keeps RLS+mask above (§4.6) | ✅ 10/10 security suite; raw row cached, policy re-applied on read |
+| Mode B cache stays coherent with writes (§3.5, P6) | ✅ keys-only decode worker drops changed keys; 10/10 coherence (UPDATE/DELETE/FOR-UPDATE) |
+| Mode B UPDATE/DELETE not broken by the cache (§7.1) | ✅ pathlist hook skips modify-target + row-marked rels (real ctid preserved) |
 
 ### 6b. Security model (§4) — P2 done for Mode A on the real base
 
@@ -568,12 +611,15 @@ P2 is implemented and tested on PG17 + `supatype_mask` + `pg_guard` (§5d). The
 | Mode B: RLS denies a physically-cached foreign row | ✅ tested — RLS `Filter` above the leaf (§5e) |
 | `force_generic_plan` / parameterized warm cache (Mode B) | ✅ tested — const-only path, falls back (§4.3b) |
 | Masked column, warm cache, non-exempt role (Mode B) | ✅ tested — mask `CASE` re-applied, NULL (§5e) |
-| Decoding worker stores WAL values | ⬜ decoding worker not built (P6 slice 3) |
+| **Decoding worker stores WAL values (Mode B §3.5)** | ✅ **impossible — keys-only plugin emits only `<relid> <pk>`; peeked stream has 0 column values (§5e slice 3)** |
 
 Mode A (the Valkey-replacement keyspace) is secured and validated. Mode B's
-`CustomScan` executor and its §4.6 security invariant are now built and tested
-(§5e, 10/10); the only remaining P6 piece is the logical-decoding
-invalidation/refill worker (slice 3).
+`CustomScan` executor, its §4.6 security invariant, and the keys-only
+invalidation worker (§3.5) are all built and tested (§5e: 10/10 security, 10/10
+coherence, 4/4 PostgREST-pattern). The full §4.7 threat table now passes as test
+evidence. Remaining P6 items are non-security: a *refill* worker (invalidation is
+currently drop-only, refill is lazy) and driving the real PostgREST binary
+(blocked by sandbox egress).
 
 ### 6c. Bugs / risks surfaced by building it
 
@@ -621,11 +667,18 @@ commit off the worker's snapshot.
 - P0/P1 latency/throughput numbers were taken on the system PG16 spike box; P2/P6
   run on a from-source PG17.6 (PGDG is blocked in this sandbox). Hot-path latency
   is unaffected by the PG version.
-- Mode B row cache / planner hook is built (P6 slice 2, §7.1), but the cache is
-  populated manually via `supacache.rowcache_put` — a stand-in for the
-  logical-decoding invalidation/refill worker (§3.5), which is not built (slice 3).
-  Cached rows with out-of-line (TOASTed) values are not supported (the raw tuple
-  carries a toast pointer, not the datum) — POC stores inline rows.
+- Mode B row cache is built end-to-end (P6, §7.1): planner-hook `CustomScan`
+  (slice 2) plus a keys-only logical-decoding invalidation worker (slice 3, §3.5,
+  `pg_keyspace.rowcache_decode`, needs `wal_level=logical`). Invalidation is
+  drop-only — a *refill* worker is not built (refill is lazy via the fallback
+  path). The cache is still populated manually via `supacache.rowcache_put` (a
+  warm/refill helper). Only single-column integer primary keys are cached, and
+  cached rows with out-of-line (TOASTed) values are not supported (the raw tuple
+  carries a toast pointer, not the datum) — POC stores inline rows. The decode
+  worker holds one logical replication slot (WAL-retention caution, §13).
+- PostgREST end-to-end uses the real binary — not installed here (its release
+  download is blocked by the sandbox egress proxy, 403). Validated instead by
+  issuing PostgREST's exact SQL shape (role + JWT claims, `pk = N` select/update).
 - Command set is P0-minimal: strings, counters, DEL/EXISTS, TTL on strings.
   Hashes/lists/sorted-sets/pub-sub are P3 (§5).
 - Single in-PG worker; multi-worker scale-out shown via the standalone daemon

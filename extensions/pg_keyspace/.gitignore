@@ -8,3 +8,6 @@ target/
 
 # pgrx
 .pgrx/
+
+# C build objects
+*.o

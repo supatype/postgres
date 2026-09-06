@@ -89,6 +89,15 @@ static GUC_ROWCACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 /// order is still checked either way.
 static GUC_REQUIRE_MASK: GucSetting<bool> = GucSetting::<bool>::new(true);
 
+/// Mode B (P6 §3.5): enable the keys-only logical-decoding invalidation worker,
+/// which consumes a replication slot (output plugin `supacache_keys`) and drops
+/// changed rows from the row cache so it stays coherent with committed writes.
+/// Off by default — it needs `wal_level = logical` and holds a replication slot.
+static GUC_ROWCACHE_DECODE: GucSetting<bool> = GucSetting::<bool>::new(false);
+static GUC_ROWCACHE_SLOT: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(Some(c"supacache_rowcache"));
+static GUC_ROWCACHE_DECODE_MS: GucSetting<i32> = GucSetting::<i32>::new(200);
+
 /// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
 /// values are raw heap-tuple bytes.
 fn rowcache_config() -> Config {
@@ -300,6 +309,33 @@ pub extern "C" fn _PG_init() {
         GucContext::Postmaster,
         GucFlags::empty(),
     );
+    GucRegistry::define_bool_guc(
+        "pg_keyspace.rowcache_decode",
+        "Enable the keys-only Mode B invalidation worker (§3.5)",
+        "Consumes a logical replication slot (plugin supacache_keys) and drops changed \
+         rows from the row cache. Requires wal_level=logical; holds a replication slot.",
+        &GUC_ROWCACHE_DECODE,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.rowcache_slot",
+        "Replication slot name for the Mode B invalidation worker (§3.5)",
+        "Created on demand with the keys-only supacache_keys output plugin.",
+        &GUC_ROWCACHE_SLOT,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.rowcache_decode_ms",
+        "How often the Mode B invalidation worker drains the slot, in ms (§3.5)",
+        "",
+        &GUC_ROWCACHE_DECODE_MS,
+        10,
+        60_000,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
 
     // Mode B: register the custom-scan methods and install the pathlist hook.
     rowcache_planner_init();
@@ -342,6 +378,16 @@ pub extern "C" fn _PG_init() {
         BackgroundWorkerBuilder::new("pg_keyspace: expiry worker")
             .set_library("pg_keyspace")
             .set_function("pg_keyspace_expiry_main")
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .enable_spi_access()
+            .load();
+    }
+
+    // Mode B (§3.5): keys-only invalidation worker keeps the row cache coherent.
+    if GUC_ROWCACHE_DECODE.get() {
+        BackgroundWorkerBuilder::new("pg_keyspace: rowcache invalidation worker")
+            .set_library("pg_keyspace")
+            .set_function("pg_keyspace_invalidation_main")
             .set_restart_time(Some(Duration::from_secs(5)))
             .enable_spi_access()
             .load();
@@ -1018,6 +1064,127 @@ pub extern "C" fn pg_keyspace_expiry_main(_arg: pg_sys::Datum) {
     log!("pg_keyspace expiry: shutting down");
 }
 
+// ==== Mode B: keys-only logical-decoding invalidation worker (§3.5) =========
+//
+// The row cache holds RAW pre-policy tuples, so it MUST be dropped the instant
+// the underlying row changes, or a stale row would be served (masking is still
+// re-applied above, but the *data* would be wrong). We learn what changed from a
+// logical replication slot whose output plugin (`supacache_keys`) emits ONLY
+// `<I|U|D> <relid> <pk>` — never a column value. So this worker cannot store WAL
+// values even in principle (§4.7 "decoding worker stores WAL values"): the values
+// never leave the plugin. Invalidation is drop-only; the next read of a dropped
+// key misses the cache and falls back to the normal masked/RLS index path.
+
+/// Parse one `supacache_keys` line: `<action> <relid> <pk>` -> (relid, pk).
+fn parse_change(line: &str) -> Option<(u32, i64)> {
+    let mut it = line.split_whitespace();
+    let _action = it.next()?; // 'I' | 'U' | 'D' — all invalidate the same way
+    let relid: u32 = it.next()?.parse().ok()?;
+    let pk: i64 = it.next()?.parse().ok()?;
+    Some((relid, pk))
+}
+
+/// Create the keys-only replication slot if it does not exist yet. Requires
+/// `wal_level = logical`; returns Err with the reason otherwise.
+fn ensure_decode_slot(slot: &str) -> Result<(), String> {
+    use std::panic::AssertUnwindSafe;
+    // Check in its own transaction and let it commit first: pg_create_logical_
+    // replication_slot refuses to run once the transaction has been assigned an
+    // xid, so the create must be the sole statement of a fresh transaction.
+    let exists = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    }));
+    if exists {
+        return Ok(());
+    }
+    // Run the create through the READ-ONLY SPI path: pg_create_logical_
+    // replication_slot refuses once the transaction has an xid, and the
+    // read-write path assigns one. Slot creation is not a heap write, so it is
+    // permitted read-only.
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT pg_create_logical_replication_slot($1, 'supacache_keys')",
+                    None,
+                    Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())]),
+                )
+                .map(|_| ())
+        })
+        .map_err(|e| e.to_string())
+    }))
+}
+
+/// Drain all pending changes from the slot and invalidate each key. Returns the
+/// number of cache entries dropped.
+fn drain_invalidations(slot: &str) -> u64 {
+    use std::panic::AssertUnwindSafe;
+    let view = match rowcache_view() {
+        Some(v) => v,
+        None => return 0,
+    };
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        let mut n = 0u64;
+        let _ = Spi::connect(|client| {
+            let t = client.select(
+                "SELECT data FROM pg_logical_slot_get_changes($1, NULL, NULL)",
+                None,
+                Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())]),
+            )?;
+            for row in t {
+                let data: String = row.get::<String>(1)?.unwrap_or_default();
+                if let Some((relid, pk)) = parse_change(&data) {
+                    if view.del(&rc_key(relid, pk)) {
+                        n += 1;
+                    }
+                }
+            }
+            Ok::<(), pgrx::spi::Error>(())
+        });
+        n
+    }))
+}
+
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
+    let dbname = GUC_DATABASE
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("postgres")
+        .to_string();
+    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+    let slot = GUC_ROWCACHE_SLOT
+        .get()
+        .and_then(|c| c.to_str().ok().map(|s| s.to_string()))
+        .unwrap_or_else(|| "supacache_rowcache".to_string());
+
+    if let Err(why) = ensure_decode_slot(&slot) {
+        log!(
+            "pg_keyspace invalidation: cannot create slot '{slot}' \
+             (is wal_level=logical?): {why}; exiting, will retry on restart"
+        );
+        return;
+    }
+    let poll = Duration::from_millis(GUC_ROWCACHE_DECODE_MS.get().max(10) as u64);
+    log!("pg_keyspace invalidation: draining slot '{slot}' every {poll:?} (keys-only §3.5)");
+    while !BackgroundWorker::sigterm_received() {
+        let n = drain_invalidations(&slot);
+        if n > 0 {
+            log!("pg_keyspace invalidation: dropped {n} stale row-cache entr(ies)");
+        }
+        std::thread::sleep(poll);
+    }
+    log!("pg_keyspace invalidation: shutting down (slot '{slot}' retained for resume)");
+}
+
 /// DROP every `supacache.kv_ttl_b<N>` partition with N < `now_bucket` (fully
 /// past). Returns how many were dropped. O(1) DDL per partition.
 fn drop_expired_partitions(now_bucket: i64) -> i64 {
@@ -1207,6 +1374,22 @@ unsafe extern "C" fn rc_pathlist_hook(
     if (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL
         || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
     {
+        return;
+    }
+    // Never substitute the scan that feeds a data-modifying command's target,
+    // or a row locked FOR UPDATE/SHARE: those need the REAL heap tuple (a valid
+    // ctid) to lock and re-fetch. The cache serves a fabricated tuple with no
+    // ctid, which would fail with "failed to fetch tuple being updated".
+    let parse = (*root).parse;
+    if parse.is_null() {
+        return;
+    }
+    if (*parse).commandType != pg_sys::CmdType::CMD_SELECT
+        && (*parse).resultRelation as u32 == rti
+    {
+        return;
+    }
+    if !pg_sys::get_parse_rowmark(parse, rti).is_null() {
         return;
     }
     let relid_u32 = (*rte).relid.as_u32();

@@ -1,0 +1,13 @@
+# P6 slice 3 — keys-only invalidation (§3.5)
+  PASS  cached pk=1 uses the Custom Scan                  
+  PASS  cached pk=1 serves the cached row                 
+  PASS  UPDATE target scan is NOT the Custom Scan (needs real ctid)
+  PASS  after UPDATE: pk=1 falls back to a non-cache plan 
+  PASS  after UPDATE: pk=1 read returns the fresh value   
+  PASS  untouched pk=2 is still served from cache         
+  PASS  after DELETE: pk=2 gone (cache + table coherent)  
+  PASS  SELECT ... FOR UPDATE does NOT use the cache      
+  PASS  keys-only stream carries a change record          
+  PASS  keys-only stream contains NO column value (canary/secret)
+
+# result: 10 passed, 0 failed
