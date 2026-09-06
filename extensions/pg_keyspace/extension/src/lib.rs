@@ -461,11 +461,25 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
         .unwrap_or("postgres")
         .to_string();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
-    pg_ensure_schema();
+
+    // The extension owns the supacache schema; only touch it once CREATE EXTENSION
+    // has run (see extension_installed). Without it there is no SQL surface and no
+    // backing tables, so serve RESP in ephemeral mode until the operator installs it.
+    let ext_ready = extension_installed();
+    if ext_ready {
+        pg_ensure_schema();
+    } else if persisted {
+        log!(
+            "pg_keyspace worker: the pg_keyspace extension is not installed in database \
+             '{dbname}'; run CREATE EXTENSION pg_keyspace and restart to enable persistence. \
+             Serving RESP in ephemeral mode until then."
+        );
+    }
+    let persisted = persisted && ext_ready;
 
     // §4.5 security label self-check: a Mode A backing table must have no
     // `supatype` label. If one was added by hand, FAIL CLOSED.
-    if kv_has_supatype_label() {
+    if ext_ready && kv_has_supatype_label() {
         log!(
             "pg_keyspace worker: REFUSING to start — a supatype security label exists on a \
              supacache relation; Mode A tables must not be masked (§4.5)"
@@ -477,8 +491,10 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
     }
 
     // §4.5 load RESP AUTH + keyspace ACL. When credentials exist, enforcement is
-    // on; when absent, the worker runs in local/no-auth mode (§10 local dev).
-    match load_auth_config() {
+    // on; when absent, the worker runs in local/no-auth mode (§10 local dev). The
+    // credential/ACL tables only exist once the extension is installed; without it
+    // there are no credentials to load, so stay in no-auth mode.
+    match ext_ready.then(load_auth_config).flatten() {
         Some(auth) => {
             let n = auth.creds.len();
             worker.set_auth_config(auth);
@@ -544,12 +560,23 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         .unwrap_or("postgres")
         .to_string();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
-    // The RESP worker owns schema creation; all persist workers wait for it.
+    // The RESP worker owns schema creation (once the extension is installed); all
+    // persist workers wait for it. If the tables never appear — no CREATE EXTENSION
+    // — exit cleanly and let the restart timer re-check, rather than erroring.
+    let mut ready = false;
     for _ in 0..100 {
         if pg_table_ready() {
+            ready = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if !ready {
+        log!(
+            "pg_keyspace persist {idx}: supacache tables not present (extension not \
+             installed in '{dbname}'?); exiting, will re-check on restart"
+        );
+        return;
     }
 
     let rbase = RING_BASE.load(Ordering::Acquire);
@@ -626,6 +653,23 @@ fn check_load_order() -> Result<(), String> {
 fn pg_table_ready() -> bool {
     BackgroundWorker::transaction(|| {
         Spi::get_one::<bool>("SELECT to_regclass('supacache.kv') IS NOT NULL")
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    })
+}
+
+/// True if the `pg_keyspace` extension is installed in the connected database.
+///
+/// `CREATE EXTENSION` owns the `supacache` schema (and supplies the SQL surface).
+/// The worker must not create any schema object before then: a free-standing
+/// `supacache` schema makes the later `CREATE EXTENSION` fail with "schema
+/// supacache is not a member of extension". So the worker gates all of its DDL —
+/// schema, backing tables, recovery — on the extension being present, and runs
+/// RESP-only (ephemeral) until it is.
+fn extension_installed() -> bool {
+    BackgroundWorker::transaction(|| {
+        Spi::get_one::<bool>("SELECT count(*) > 0 FROM pg_extension WHERE extname = 'pg_keyspace'")
             .ok()
             .flatten()
             .unwrap_or(false)
@@ -946,11 +990,20 @@ pub extern "C" fn pg_keyspace_expiry_main(_arg: pg_sys::Datum) {
         .unwrap_or("postgres")
         .to_string();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+    let mut ready = false;
     for _ in 0..100 {
         if pg_table_ready() {
+            ready = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if !ready {
+        log!(
+            "pg_keyspace expiry: supacache tables not present (extension not installed \
+             in '{dbname}'?); exiting, will re-check on restart"
+        );
+        return;
     }
     let sweep = Duration::from_secs(GUC_TTL_SWEEP_SECS.get().max(1) as u64);
     log!("pg_keyspace expiry: dropping past TTL partitions every {sweep:?}");

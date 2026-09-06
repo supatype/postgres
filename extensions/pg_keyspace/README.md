@@ -106,6 +106,14 @@ redis-cli -p 6380 set foo bar
 redis-cli -p 6380 get foo        # "bar" (same shared-memory segment as SQL)
 ```
 
+> **Bootstrap order.** The `supacache` schema and SQL surface are owned by
+> `CREATE EXTENSION`, so run it before relying on persistence or the SQL API. The
+> worker never creates schema objects before the extension exists (doing so would
+> make `CREATE EXTENSION` fail with *"schema supacache is not a member"*); until
+> then it serves RESP in ephemeral mode. With a durable tier set, install the
+> extension in `pg_keyspace.database` and restart once to enable persistence — the
+> log says so if it is missing.
+
 With `pg_keyspace.durability = 'relaxed'` (P1), RESP writes also persist to the
 hash-partitioned `supacache.kv` table and survive a crash — the worker rebuilds
 shmem from the table on startup:
