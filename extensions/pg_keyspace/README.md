@@ -10,20 +10,26 @@ and keep Valkey."*
 for the full write-up and the concerns matrix.
 
 > Scope so far: **P0** (latency/throughput vs Valkey), **P1** (storage,
-> durability, crash recovery, off-event-loop persistence), and **P2 security for
+> durability, crash recovery, off-event-loop persistence), **P2 security for
 > Mode A** — validated on the real base (PG17 + `supatype_mask` + `pg_guard`):
 > load-order assertion, seclabel self-check, RESP `AUTH`→role, keyspace ACL,
-> forced tenant scoping (§4). Mode B (the transparent row cache) and its threat
-> cases are **not** built (P6): its `CustomScan` executor node + logical-decoding
-> invalidation are the remaining work, though P6's key §4.3c/§6 concern — how
-> much a row cache can win on a masked table, and the `supacache.get` predicate
-> accelerator — is already benchmarked (`results/p6_maskcost.txt`). Still a POC —
-> auth secrets are compared in clear and credentials load at worker start; don't
-> deploy as-is.
+> forced tenant scoping (§4) — and **P6 Mode B (the transparent row cache):** a
+> planner hook + `CustomScan` that substitutes a cached row *only at the scan
+> leaf*, so RLS and `supatype_mask` re-apply above it (§4.6). Its security suite
+> passes 10/10 (`results/p6_security.txt`): a non-owner is denied a physically
+> cached foreign row and a non-exempt role gets NULL for a masked column that is
+> genuinely present, unmasked, in the cache. The Custom Scan roughly halves
+> executor time for a single-row pk lookup (`results/p6_rowcache.txt`), and the
+> §4.3c masked-read concern is quantified (`results/p6_maskcost.txt`). The only
+> remaining P6 piece is the logical-decoding invalidation worker (§3.5); the cache
+> is populated here via `supacache.rowcache_put` as a stand-in. Still a POC — auth
+> secrets are compared in clear and credentials load at worker start; don't deploy
+> as-is.
 
 ## What it is
 
-A real Postgres 16 extension, loaded via `shared_preload_libraries`, that:
+A real Postgres extension (built here against PG17.6 for P2/P6; P0/P1 numbers
+came from a PG16 spike box), loaded via `shared_preload_libraries`, that:
 
 - allocates a **Postgres shared-memory segment** (`shmem_request_hook` +
   `shmem_startup_hook`) and lays an open-addressed hash table + size-classed
@@ -61,7 +67,11 @@ extensions/pg_keyspace/
 ├── bench/                    ← benchmark harnesses
 │   ├── run_benchmarks.sh     latency + throughput vs Redis, in-backend §6, libpq
 │   ├── run_durability.sh     per-tier RESP SET (§3.4)
-│   └── run_scaleout.sh       shared-nothing scaling (§3.1)
+│   ├── run_scaleout.sh       shared-nothing scaling (§3.1)
+│   ├── run_p2_threats.sh     Mode A security threat table (§4.7)
+│   ├── run_p6_maskcost.sh    cost of a masked read + §6 accelerator (§4.3c)
+│   ├── run_p6_security.sh    Mode B row-cache RLS/mask/generic-plan suite (§4.6/§4.7)
+│   └── run_p6_rowcache.sh    Mode B Custom Scan vs index-scan latency (§7.1)
 └── results/                  ← REPORT.md + raw benchmark outputs
 ```
 
@@ -106,6 +116,23 @@ SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='foo';  -- 'bar'
 -- kill -9 the cluster, restart:  redis-cli -p 6380 get foo  ->  still "bar"
 ```
 
+**Mode B — transparent row cache (P6, §7.1).** Register a table's primary-key
+column and cache a row; a `pk = Const` lookup is then served from shared memory
+by a `CustomScan`, transparently, with RLS and `supatype_mask` still applied:
+
+```sql
+SELECT supacache.rowcache_register('public.orders', 1);  -- pk is attnum 1
+SELECT supacache.rowcache_put('public.orders', 42);       -- cache row id=42
+EXPLAIN SELECT * FROM public.orders WHERE id = 42;
+--  Custom Scan (pg_keyspace_rowcache) on orders  (Filter: id = 42)
+SELECT * FROM supacache.rowcache_stats();
+```
+
+The scan serves the **raw** cached row at the leaf; the relation's RLS quals and
+mask `CASE` expressions re-apply above it, so a role that couldn't see the row (or
+a masked column) via a normal query still can't via the cache (§4.6). Populating
+is manual here — a stand-in for the logical-decoding refill worker (§3.5).
+
 Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 
 | GUC | default | meaning |
@@ -121,6 +148,7 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 | `pg_keyspace.ttl_bucket_secs` | 10 | TTL time-bucket width; TTL'd keys persist to range-partitioned `supacache.kv_ttl` (§3.3) |
 | `pg_keyspace.ttl_sweep_secs` | 5 | how often the expiry worker drops fully-past TTL partitions |
 | `pg_keyspace.commit_window_us` | 500 | standalone file-batcher window (durability microbench) |
+| `pg_keyspace.rowcache_mb` | 64 | size of the Mode B row-cache segment (separate from Mode A; never RESP-addressable) |
 
 ## Results in one line
 

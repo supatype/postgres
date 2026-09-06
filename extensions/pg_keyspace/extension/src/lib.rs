@@ -48,6 +48,9 @@ use store::{Config, Lookup, Store};
 
 const SEG_NAME: &CStr = c"pg_keyspace_segment";
 const RING_NAME: &CStr = c"pg_keyspace_ring";
+// Mode B row cache lives in its OWN segment — never RESP-addressable (§0: Mode A
+// and Mode B "must not share a code path").
+const ROWCACHE_NAME: &CStr = c"pg_keyspace_rowcache";
 
 // Base address of the Postgres shared-memory segment, published by the startup
 // hook and inherited by every forked backend. Each context rebuilds a cheap
@@ -55,6 +58,8 @@ const RING_NAME: &CStr = c"pg_keyspace_ring";
 static SEG_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // Base of the SPSC persistence ring (RESP worker -> persistence worker).
 static RING_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+// Base of the Mode B row-cache segment (read by the planner-hook custom scan).
+static ROWCACHE_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
 // GUCs (fixed at postmaster start; the segment is sized from them).
 static GUC_PORT: GucSetting<i32> = GucSetting::<i32>::new(6380);
@@ -73,6 +78,40 @@ static GUC_PERSIST_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 // TTL by partition drop (§3.3): time-bucket width and sweep interval.
 static GUC_TTL_BUCKET_SECS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static GUC_TTL_SWEEP_SECS: GucSetting<i32> = GucSetting::<i32>::new(5);
+// Mode B row cache (§7.1) segment size.
+static GUC_ROWCACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
+
+/// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
+/// values are raw heap-tuple bytes.
+fn rowcache_config() -> Config {
+    let mb = GUC_ROWCACHE_MB.get().max(1) as u64;
+    let bytes = mb * 1024 * 1024;
+    let entries = 200_000u32;
+    let buckets = (entries * 2).next_power_of_two();
+    Config {
+        num_partitions: 1,
+        buckets_per_part: buckets,
+        entries_per_part: entries,
+        data_bytes_per_part: bytes,
+    }
+}
+
+/// A row-cache Store view over the Mode B segment (any backend).
+fn rowcache_view() -> Option<Store> {
+    let base = ROWCACHE_BASE.load(Ordering::Acquire);
+    if base.is_null() {
+        return None;
+    }
+    Some(unsafe { Store::from_raw(base, &rowcache_config(), false) })
+}
+
+/// Row-cache key = relid (u32 LE) ++ pk (i64 LE).
+fn rc_key(relid: u32, pk: i64) -> [u8; 12] {
+    let mut k = [0u8; 12];
+    k[..4].copy_from_slice(&relid.to_le_bytes());
+    k[4..].copy_from_slice(&pk.to_le_bytes());
+    k
+}
 
 fn ttl_bucket_us() -> i64 {
     GUC_TTL_BUCKET_SECS.get().max(1) as i64 * 1_000_000
@@ -233,6 +272,19 @@ pub extern "C" fn _PG_init() {
         GucContext::Postmaster,
         GucFlags::empty(),
     );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.rowcache_mb",
+        "Size of the Mode B row-cache shared-memory segment, in MB (§7.1)",
+        "Holds raw heap-tuple bytes keyed by (relid, pk); read by the planner-hook custom scan.",
+        &GUC_ROWCACHE_MB,
+        1,
+        4096,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+
+    // Mode B: register the custom-scan methods and install the pathlist hook.
+    rowcache_planner_init();
 
     // Chain the shmem hooks so the segment is requested and initialised.
     unsafe {
@@ -288,6 +340,7 @@ extern "C" fn ks_shmem_request() {
         }
         pg_sys::RequestAddinShmemSpace(ks_config().total_bytes());
         pg_sys::RequestAddinShmemSpace(ring_total_bytes());
+        pg_sys::RequestAddinShmemSpace(rowcache_config().total_bytes());
     }
 }
 
@@ -323,11 +376,22 @@ extern "C" fn ks_shmem_startup() {
             }
             RING_BASE.store(rptr, Ordering::Release);
         }
+
+        // Mode B row-cache segment (§7.1).
+        let rc_cfg = rowcache_config();
+        let rc_bytes = rc_cfg.total_bytes();
+        let mut rc_found = false;
+        let rcptr = pg_sys::ShmemInitStruct(ROWCACHE_NAME.as_ptr(), rc_bytes, &mut rc_found) as *mut u8;
+        if !rcptr.is_null() {
+            let _ = Store::from_raw(rcptr, &rc_cfg, !rc_found);
+            ROWCACHE_BASE.store(rcptr, Ordering::Release);
+        }
         log!(
-            "pg_keyspace: shmem ready (store {} bytes, {} rings x {} bytes, found={})",
+            "pg_keyspace: shmem ready (store {} bytes, {} rings x {} bytes, rowcache {} bytes, found={})",
             size,
             ring_count(),
             stride,
+            rc_bytes,
             found
         );
     }
@@ -918,6 +982,340 @@ fn drop_expired_partitions(now_bucket: i64) -> i64 {
     }))
 }
 
+// ==== Mode B: transparent row cache via a planner custom scan (§7.1) =======
+//
+// set_rel_pathlist_hook adds a CustomPath for a registered cached relation with
+// a `pk = Const` restriction whose row is currently cached. The CustomScan sets
+// scanrelid = the base rel, so ExecInitCustomScan builds the scan slot from the
+// table's tupdesc AND initialises ps.qual (from plan.qual) and the projection
+// (from plan.targetlist). We pass the rel's restriction clauses through as
+// plan.qual and keep the (already mask-rewritten) targetlist, so ExecScan
+// re-applies RLS quals and the mask CASE to the cached row (§4.6). We serve the
+// RAW row only; never post-policy output.
+
+use core::ffi::c_char;
+
+struct SyncPtr<T>(T);
+unsafe impl<T> Sync for SyncPtr<T> {}
+
+static RC_SCAN_METHODS: SyncPtr<pg_sys::CustomScanMethods> = SyncPtr(pg_sys::CustomScanMethods {
+    CustomName: c"pg_keyspace_rowcache".as_ptr() as *const c_char,
+    CreateCustomScanState: Some(rc_create_state),
+});
+
+static RC_EXEC_METHODS: SyncPtr<pg_sys::CustomExecMethods> = SyncPtr(pg_sys::CustomExecMethods {
+    CustomName: c"pg_keyspace_rowcache".as_ptr() as *const c_char,
+    BeginCustomScan: Some(rc_begin),
+    ExecCustomScan: Some(rc_exec),
+    EndCustomScan: Some(rc_end),
+    ReScanCustomScan: Some(rc_rescan),
+    MarkPosCustomScan: None,
+    RestrPosCustomScan: None,
+    EstimateDSMCustomScan: None,
+    InitializeDSMCustomScan: None,
+    ReInitializeDSMCustomScan: None,
+    InitializeWorkerCustomScan: None,
+    ShutdownCustomScan: None,
+    ExplainCustomScan: None,
+});
+
+static RC_PATH_METHODS: SyncPtr<pg_sys::CustomPathMethods> = SyncPtr(pg_sys::CustomPathMethods {
+    CustomName: c"pg_keyspace_rowcache".as_ptr() as *const c_char,
+    PlanCustomPath: Some(rc_plan),
+    ReparameterizeCustomPathByChild: None,
+});
+
+static mut PREV_PATHLIST_HOOK: pg_sys::set_rel_pathlist_hook_type = None;
+
+/// Execution state; `css` must be first so a `*CustomScanState` aliases it.
+#[repr(C)]
+struct RcScanState {
+    css: pg_sys::CustomScanState,
+    pk: i64,
+    done: bool,
+}
+
+fn rowcache_planner_init() {
+    unsafe {
+        pg_sys::RegisterCustomScanMethods(&RC_SCAN_METHODS.0);
+        PREV_PATHLIST_HOOK = pg_sys::set_rel_pathlist_hook;
+        pg_sys::set_rel_pathlist_hook = Some(rc_pathlist_hook);
+    }
+}
+
+fn rc_reg_key(relid: u32) -> [u8; 5] {
+    let mut k = [0xffu8; 5];
+    k[1..].copy_from_slice(&relid.to_le_bytes());
+    k
+}
+
+/// Find a `pkcol = Const` restriction on the given attnum and return the pk.
+unsafe fn find_pk_const(rel: *mut pg_sys::RelOptInfo, attnum: i16) -> Option<i64> {
+    let cell = (*(*rel).baserestrictinfo).elements;
+    let n = (*(*rel).baserestrictinfo).length;
+    for i in 0..n {
+        let ri = (*cell.offset(i as isize)).ptr_value as *mut pg_sys::RestrictInfo;
+        if ri.is_null() {
+            continue;
+        }
+        let clause = (*ri).clause as *mut pg_sys::Node;
+        if clause.is_null() || (*clause).type_ != pg_sys::NodeTag::T_OpExpr {
+            continue;
+        }
+        let op = clause as *mut pg_sys::OpExpr;
+        // must be the "=" operator
+        let opname = pg_sys::get_opname((*op).opno);
+        if opname.is_null() || CStr::from_ptr(opname).to_bytes() != b"=" {
+            continue;
+        }
+        let args = (*op).args;
+        if args.is_null() || (*args).length != 2 {
+            continue;
+        }
+        let a0 = (*(*args).elements.offset(0)).ptr_value as *mut pg_sys::Node;
+        let a1 = (*(*args).elements.offset(1)).ptr_value as *mut pg_sys::Node;
+        // Skip clauses that aren't `Var = Const` (e.g. an RLS `owner =
+        // CURRENT_USER` predicate) rather than aborting the whole search.
+        let (var, cst) = match classify(a0, a1) {
+            Some(vc) => vc,
+            None => continue,
+        };
+        if (*var).varattno != attnum {
+            continue;
+        }
+        if let Some(pk) = const_i64(cst) {
+            return Some(pk);
+        }
+    }
+    None
+}
+
+/// Return (Var, Const) from a pair in either order, if it is exactly that shape.
+unsafe fn classify(
+    a: *mut pg_sys::Node,
+    b: *mut pg_sys::Node,
+) -> Option<(*mut pg_sys::Var, *mut pg_sys::Const)> {
+    let ta = (*a).type_;
+    let tb = (*b).type_;
+    if ta == pg_sys::NodeTag::T_Var && tb == pg_sys::NodeTag::T_Const {
+        Some((a as *mut pg_sys::Var, b as *mut pg_sys::Const))
+    } else if ta == pg_sys::NodeTag::T_Const && tb == pg_sys::NodeTag::T_Var {
+        Some((b as *mut pg_sys::Var, a as *mut pg_sys::Const))
+    } else {
+        None
+    }
+}
+
+unsafe fn const_i64(cst: *mut pg_sys::Const) -> Option<i64> {
+    if (*cst).constisnull {
+        return None;
+    }
+    match (*cst).consttype {
+        pg_sys::INT8OID => Some((*cst).constvalue.value() as i64),
+        pg_sys::INT4OID => Some((*cst).constvalue.value() as i32 as i64),
+        pg_sys::INT2OID => Some((*cst).constvalue.value() as i16 as i64),
+        _ => None,
+    }
+}
+
+#[pg_guard]
+unsafe extern "C" fn rc_pathlist_hook(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    rti: pg_sys::Index,
+    rte: *mut pg_sys::RangeTblEntry,
+) {
+    if let Some(prev) = PREV_PATHLIST_HOOK {
+        prev(root, rel, rti, rte);
+    }
+    if (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL
+        || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
+    {
+        return;
+    }
+    let relid_u32 = (*rte).relid.as_u32();
+    let view = match rowcache_view() {
+        Some(v) => v,
+        None => return,
+    };
+    let reg = match view.get(&rc_reg_key(relid_u32)) {
+        Lookup::Hit(b) if b.len() >= 2 => [b[0], b[1]],
+        _ => return,
+    };
+    let pk_attnum = i16::from_le_bytes(reg);
+    let pk = match find_pk_const(rel, pk_attnum) {
+        Some(v) => v,
+        None => return,
+    };
+    // Only substitute if the row is actually cached (else normal index path).
+    if !matches!(view.get(&rc_key(relid_u32, pk)), Lookup::Hit(_)) {
+        return;
+    }
+
+    let cpath = pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
+    (*cpath).path.type_ = pg_sys::NodeTag::T_CustomPath;
+    (*cpath).path.pathtype = pg_sys::NodeTag::T_CustomScan;
+    (*cpath).path.parent = rel;
+    (*cpath).path.pathtarget = (*rel).reltarget;
+    (*cpath).path.rows = 1.0;
+    (*cpath).path.startup_cost = 0.0;
+    (*cpath).path.total_cost = 0.0001; // beat the index path so this is chosen
+    (*cpath).methods = &RC_PATH_METHODS.0;
+    // carry pk to execution via a Const in custom_private
+    let pkc = pg_sys::makeConst(
+        pg_sys::INT8OID,
+        -1,
+        pg_sys::InvalidOid,
+        8,
+        pg_sys::Datum::from(pk),
+        false,
+        true,
+    );
+    (*cpath).custom_private = pg_sys::lappend(std::ptr::null_mut(), pkc as *mut core::ffi::c_void);
+    pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
+}
+
+#[pg_guard]
+unsafe extern "C" fn rc_plan(
+    _root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    best_path: *mut pg_sys::CustomPath,
+    tlist: *mut pg_sys::List,
+    clauses: *mut pg_sys::List,
+    custom_plans: *mut pg_sys::List,
+) -> *mut pg_sys::Plan {
+    let cscan = pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
+    (*cscan).scan.plan.type_ = pg_sys::NodeTag::T_CustomScan;
+    (*cscan).scan.plan.targetlist = tlist;
+    // Re-apply the rel's restriction clauses (incl. RLS) above our scan (§4.6).
+    (*cscan).scan.plan.qual = pg_sys::extract_actual_clauses(clauses, false);
+    (*cscan).scan.scanrelid = (*rel).relid;
+    (*cscan).flags = (*best_path).flags;
+    (*cscan).custom_plans = custom_plans;
+    (*cscan).custom_private = (*best_path).custom_private;
+    (*cscan).methods = &RC_SCAN_METHODS.0;
+    cscan as *mut pg_sys::Plan
+}
+
+#[pg_guard]
+unsafe extern "C" fn rc_create_state(cscan: *mut pg_sys::CustomScan) -> *mut pg_sys::Node {
+    let st = pg_sys::palloc0(std::mem::size_of::<RcScanState>()) as *mut RcScanState;
+    (*st).css.ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
+    (*st).css.methods = &RC_EXEC_METHODS.0;
+    // serve the cached tuple through a virtual slot (deform on read)
+    (*st).css.slotOps = &pg_sys::TTSOpsVirtual;
+    let pkc = pg_sys::list_nth((*cscan).custom_private, 0) as *mut pg_sys::Const;
+    (*st).pk = if pkc.is_null() {
+        0
+    } else {
+        (*pkc).constvalue.value() as i64
+    };
+    (*st).done = false;
+    st as *mut pg_sys::Node
+}
+
+#[pg_guard]
+unsafe extern "C" fn rc_begin(
+    node: *mut pg_sys::CustomScanState,
+    _estate: *mut pg_sys::EState,
+    _eflags: core::ffi::c_int,
+) {
+    (node as *mut RcScanState).as_mut().unwrap().done = false;
+}
+
+#[pg_guard]
+unsafe extern "C" fn rc_exec(node: *mut pg_sys::CustomScanState) -> *mut pg_sys::TupleTableSlot {
+    pg_sys::ExecScan(
+        &mut (*node).ss,
+        Some(rc_access),
+        Some(rc_recheck),
+    )
+}
+
+/// Access method: return the cached row once (raw), then an empty slot to end.
+#[pg_guard]
+unsafe extern "C" fn rc_access(ss: *mut pg_sys::ScanState) -> *mut pg_sys::TupleTableSlot {
+    let st = ss as *mut RcScanState;
+    let slot = (*ss).ss_ScanTupleSlot;
+    if (*st).done {
+        return pg_sys::ExecClearTuple(slot);
+    }
+    (*st).done = true;
+    let rel = (*ss).ss_currentRelation;
+    let relid = (*rel).rd_id.as_u32();
+    let view = match rowcache_view() {
+        Some(v) => v,
+        None => return pg_sys::ExecClearTuple(slot),
+    };
+    let bytes = match view.get(&rc_key(relid, (*st).pk)) {
+        Lookup::Hit(b) => b,
+        Lookup::Miss => return pg_sys::ExecClearTuple(slot),
+    };
+    // Copy the cached tuple bytes into an aligned palloc buffer, wrap as a
+    // HeapTuple, deform into the (virtual) scan slot, and store.
+    let n = bytes.len();
+    let buf = pg_sys::palloc(n) as *mut u8;
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
+    let ht = pg_sys::palloc0(std::mem::size_of::<pg_sys::HeapTupleData>()) as *mut pg_sys::HeapTupleData;
+    (*ht).t_len = n as u32;
+    (*ht).t_data = buf as *mut pg_sys::HeapTupleHeaderData;
+    (*ht).t_tableOid = (*rel).rd_id;
+    pg_sys::ExecClearTuple(slot);
+    let tupdesc = (*slot).tts_tupleDescriptor;
+    pg_sys::heap_deform_tuple(ht, tupdesc, (*slot).tts_values, (*slot).tts_isnull);
+    pg_sys::ExecStoreVirtualTuple(slot)
+}
+
+#[pg_guard]
+unsafe extern "C" fn rc_recheck(
+    _ss: *mut pg_sys::ScanState,
+    _slot: *mut pg_sys::TupleTableSlot,
+) -> bool {
+    true
+}
+
+#[pg_guard]
+unsafe extern "C" fn rc_end(_node: *mut pg_sys::CustomScanState) {}
+
+#[pg_guard]
+unsafe extern "C" fn rc_rescan(node: *mut pg_sys::CustomScanState) {
+    (node as *mut RcScanState).as_mut().unwrap().done = false;
+}
+
+/// Quote an SQL identifier (schema/column) via the server's own routine.
+fn quote_ident(s: &str) -> String {
+    let c = match std::ffi::CString::new(s) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    unsafe {
+        let q = pg_sys::quote_identifier(c.as_ptr());
+        std::ffi::CStr::from_ptr(q).to_string_lossy().into_owned()
+    }
+}
+
+/// Run a single-row SELECT and return the raw heap-tuple bytes of the first
+/// row (HeapTupleHeader + data), copied out before the SPI context is freed.
+unsafe fn fetch_raw_tuple(query: &str) -> Option<Vec<u8>> {
+    let q = std::ffi::CString::new(query).ok()?;
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return None;
+    }
+    let rc = pg_sys::SPI_execute(q.as_ptr(), true, 1);
+    let out = if rc == pg_sys::SPI_OK_SELECT as i32 && pg_sys::SPI_processed >= 1 {
+        let tuptable = pg_sys::SPI_tuptable;
+        let tup = *(*tuptable).vals.offset(0);
+        let len = (*tup).t_len as usize;
+        let mut buf = vec![0u8; len];
+        std::ptr::copy_nonoverlapping((*tup).t_data as *const u8, buf.as_mut_ptr(), len);
+        Some(buf)
+    } else {
+        None
+    };
+    pg_sys::SPI_finish();
+    out
+}
+
 // ---- the SQL surface (§6): in-backend shared-memory reads/writes ---------
 
 #[pg_schema]
@@ -1083,6 +1481,122 @@ mod supacache {
             }
         }
         done
+    }
+
+    // ---- Mode B: transparent row cache control surface (§7.1) ------------
+    // The planner custom scan (see the parent module) substitutes a cached row
+    // for a `pk = Const` lookup on a *registered* relation. These functions
+    // register a relation's pk column and populate the cache. Populating is a
+    // POC stand-in for the logical-decoding invalidation/refill worker (§3.5);
+    // it stores the RAW heap-tuple bytes so the scan node re-applies RLS + mask
+    // above it (never post-policy output).
+
+    /// Register `tbl`'s primary-key attribute number so the planner hook will
+    /// consider substituting cached rows for `pk = Const` lookups on it.
+    #[pg_extern]
+    fn rowcache_register(tbl: &str, pk_attnum: i32) -> bool {
+        let relid = match Spi::get_one_with_args::<pg_sys::Oid>(
+            "SELECT $1::regclass::oid",
+            vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
+        ) {
+            Ok(Some(o)) => o,
+            _ => return false,
+        };
+        let view = match rowcache_view() {
+            Some(v) => v,
+            None => return false,
+        };
+        let attn = (pk_attnum as i16).to_le_bytes();
+        view.set(&rc_reg_key(relid.as_u32()), &attn, 0)
+    }
+
+    /// Drop a relation's registration; the planner stops substituting for it.
+    #[pg_extern]
+    fn rowcache_unregister(tbl: &str) -> bool {
+        let relid = match Spi::get_one_with_args::<pg_sys::Oid>(
+            "SELECT $1::regclass::oid",
+            vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
+        ) {
+            Ok(Some(o)) => o,
+            _ => return false,
+        };
+        rowcache_view()
+            .map(|v| v.del(&rc_reg_key(relid.as_u32())))
+            .unwrap_or(false)
+    }
+
+    /// Cache the current row for `tbl` where the registered pk column = `pk`.
+    /// Stores the raw heap-tuple bytes (pre-policy) keyed by (relid, pk).
+    /// POC note: rows with out-of-line (TOASTed) values are not supported —
+    /// the raw tuple would carry a toast pointer, not the datum.
+    #[pg_extern]
+    fn rowcache_put(tbl: &str, pk: i64) -> bool {
+        let relid = match Spi::get_one_with_args::<pg_sys::Oid>(
+            "SELECT $1::regclass::oid",
+            vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
+        ) {
+            Ok(Some(o)) => o,
+            _ => return false,
+        };
+        let view = match rowcache_view() {
+            Some(v) => v,
+            None => return false,
+        };
+        // must be registered; pk column name comes from the registered attnum
+        let attnum = match view.get(&rc_reg_key(relid.as_u32())) {
+            Lookup::Hit(b) if b.len() >= 2 => i16::from_le_bytes([b[0], b[1]]),
+            _ => return false,
+        };
+        let raw = unsafe {
+            let attname = pg_sys::get_attname(relid, attnum, false);
+            if attname.is_null() {
+                return false;
+            }
+            let col = std::ffi::CStr::from_ptr(attname)
+                .to_string_lossy()
+                .into_owned();
+            // Fully-qualified relation name, identifier-safe.
+            let rel_q = match Spi::get_one_with_args::<String>(
+                "SELECT $1::regclass::text",
+                vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
+            ) {
+                Ok(Some(s)) => s,
+                _ => return false,
+            };
+            let col_q = quote_ident(&col);
+            let query = format!("SELECT * FROM {rel_q} WHERE {col_q} = {pk}::int8");
+            fetch_raw_tuple(&query)
+        };
+        match raw {
+            Some(bytes) => view.set(&rc_key(relid.as_u32(), pk), &bytes, 0),
+            None => false,
+        }
+    }
+
+    /// Row-cache occupancy: entries (registrations + rows), bytes used/cap.
+    #[pg_extern]
+    fn rowcache_stats() -> TableIterator<
+        'static,
+        (
+            name!(entries, i64),
+            name!(hits, i64),
+            name!(misses, i64),
+            name!(data_used, i64),
+            name!(data_cap, i64),
+        ),
+    > {
+        let mut rows = Vec::new();
+        if let Some(view) = rowcache_view() {
+            let s = view.stats(0);
+            rows.push((
+                s.entries as i64,
+                s.hits as i64,
+                s.misses as i64,
+                s.data_used as i64,
+                s.data_cap as i64,
+            ));
+        }
+        TableIterator::new(rows)
     }
 
     #[pg_extern]

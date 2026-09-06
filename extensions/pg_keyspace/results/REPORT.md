@@ -22,7 +22,14 @@ extensions), all three loaded together. Implemented and tested: the §4.1
 load-order assertion, the §4.5 security-label self-check, RESP `AUTH`→role, the
 keyspace ACL, forced tenant scoping, and exempt-role reuse — the full §4.7
 threat table for Mode A passes (§5d). Security was the plan's ship-decider (§14);
-this retires it for Mode A (Mode B row-cache cases remain P6).
+this retires it for Mode A.
+
+**Mode B (P6) now has a working `CustomScan` and passes its §4.6 security suite.**
+A planner hook substitutes the cached row *only at the scan leaf*, so RLS and
+`supatype_mask` re-apply above it: a non-owner is denied a physically-cached
+foreign row and a non-exempt role gets NULL for a masked column that is genuinely
+present, unmasked, in the cache (10/10, §5e). The remaining P6 work is the
+logical-decoding invalidation worker (slice 3).
 
 This report presents *measured* numbers, cross-checks them against the plan's
 targets, and separates what the POC validates empirically from what it
@@ -403,14 +410,68 @@ masked-column warm cache, decoding worker) are P6, not built.
 ## 5e. P6 — Mode B (row cache): masked-read cost and the §6 accelerator
 
 P6 (the transparent PostgREST row cache) is a separable, multi-week project
-(§12). Its correct core — a planner hook that substitutes a `CustomScan` reading
-shmem *only at the scan leaf*, so RLS `securityQuals` and `supatype_mask`'s
-`CASE` expressions above it still apply (§4.6) — is the remaining executor build
-(slice 2). The tempting shortcut of rewriting the table RTE to a `VALUES` RTE is
-**rejected**: it drops the relation's `securityQuals` and would silently defeat
-RLS, the exact hole §4.6 warns about.
+(§12). Its correct core is now **built and validated**: a `set_rel_pathlist_hook`
+adds a `CustomPath` for a registered relation with a `pk = Const` restriction
+whose row is cached, and the `CustomScan` substitutes shmem bytes *only at the
+scan leaf* (`scanrelid` = the base rel), so `ExecInitCustomScan` still
+initialises the scan's `qual` and projection from the plan — meaning RLS
+`securityQuals` and `supatype_mask`'s `CASE` expressions **above** the leaf still
+apply (§4.6). The tempting shortcut of rewriting the table RTE to a `VALUES` RTE
+is **rejected**: it drops the relation's `securityQuals` and would silently
+defeat RLS, the exact hole §4.6 warns about.
 
-What slice 1 establishes is the thing §4.3c/§11 explicitly say to benchmark —
+### The security suite — the cache is not a policy bypass (§4.7)
+
+`bench/run_p6_security.sh` proves the leaf-only substitution empirically —
+**10/10** on the real base (`results/p6_security.txt`):
+
+| Mode B §4.7 case | Result |
+|---|---|
+| cached `pk = Const` lookup uses the `CustomScan` node | ✅ plan shows it |
+| RLS: owner sees own cached row | ✅ returned |
+| **RLS: non-owner DENIED a physically-cached foreign row** | ✅ 0 rows (RLS `Filter` above the leaf) |
+| RLS: denial matches non-cached ground truth | ✅ identical |
+| **Masked col, non-exempt role, warm cache** | ✅ NULL — mask `CASE` re-applied |
+| Masked col, exempt `service_role`, warm cache | ✅ real value |
+| the raw secret genuinely IS in the cache | ✅ superuser reads it via the same `CustomScan` |
+| `force_generic_plan` / parameterized `$1` lookup | ✅ falls back to normal plan — no const path |
+
+The decisive rows are the two in bold: the forbidden row and the masked value are
+*physically present, unmasked, in the shmem cache* (a superuser reads them
+straight out via the Custom Scan), yet a non-owner still gets zero rows and a
+non-exempt role still gets NULL — because RLS and the mask run in the scan's
+`qual`/targetlist above the substituted leaf. The cache stores the **raw**
+pre-policy row and policy is enforced on read, exactly as §4.6 requires.
+`force_generic_plan` is a non-issue by construction: the path is only offered for
+a `pk = Const` at plan time, so a parameterized statement never takes it and no
+caller's row is baked into a shared generic plan (§4.3b).
+
+### Latency of the substituted path
+
+`bench/run_p6_rowcache.sh` (`results/p6_rowcache.txt`) compares two identical
+tables — one registered+cached, one not — on a single-row `pk` lookup (200k-row
+table, min of 9, `EXPLAIN ANALYZE` to split planning from execution):
+
+| single-row pk lookup | plan | exec |
+|---|---:|---:|
+| plain, index scan + heap fetch | 0.45ms | 0.091ms |
+| plain, **Mode B Custom Scan (shmem)** | 0.50ms | **0.049ms** |
+| masked (3 cols), index scan + heap | 0.50ms | 0.090ms |
+| masked (3 cols), **Mode B Custom Scan** | 0.52ms | **0.055ms** |
+
+The Custom Scan roughly **halves executor time** (no btree descent, no heap/buffer
+access, no visibility check — just a shmem `memcpy` + `heap_deform_tuple`), and
+the planner hook adds only ~0.05ms. But the honest framing matches slice 1:
+**planning dominates single-query latency** (~0.5ms vs ~0.05ms execution), and
+end-to-end the libpq round trip (~30–50µs+) dominates both. So for an
+*in-Postgres* transparent cache the win is real but modest; the structural payoff
+the plan envisions (§7.1) is serving these reads to PostgREST **without** entering
+the executor/planner at all — which this validates is *safe* to do, since the same
+RLS+mask that a full query applies are what the substituted plan re-applies.
+
+### The masked-read cost (slice 1) — what a row cache can and can't win
+
+What slice 1 established is the thing §4.3c/§11 explicitly say to benchmark —
 **how much a row cache can actually win on a masked table** — measured on the
 real base (100k-row table, 3 masked columns, non-exempt role, full scan):
 
@@ -438,10 +499,14 @@ Two findings:
    cache holds the permission *set*, never the predicate's per-row answer, so
    there is no cross-caller leak.
 
-Remaining P6 work (slices 2–3): the `CustomScan` executor node + the RLS / mask /
-`force_generic_plan` regression suite (§4.7), and the logical-decoding
-invalidation worker (§3.5) + PostgREST end-to-end. Details:
-`results/p6_maskcost.txt`, `bench/run_p6_maskcost.sh`.
+Remaining P6 work (slice 3): the logical-decoding invalidation/refill worker
+(§3.5, keys-only) that keeps the cache coherent with committed writes, and a
+PostgREST end-to-end. The populate path here (`supacache.rowcache_put`) is a
+manual stand-in for that worker; the executor node and its security model — the
+parts §4.6 flags as the actual risk — are built and validated above. Details:
+`results/p6_security.txt` (`bench/run_p6_security.sh`),
+`results/p6_rowcache.txt` (`bench/run_p6_rowcache.sh`),
+`results/p6_maskcost.txt` (`bench/run_p6_maskcost.sh`).
 
 ## 6. Concerns validation matrix
 
@@ -469,6 +534,8 @@ invalidation worker (§3.5) + PostgREST end-to-end. Details:
 | Bulk batched commit (§3.4) | ✅ deduped `UNNEST` upsert; ~107k durable writes/s per worker |
 | Sync-ack durable/replicated tiers (§3.4) | ✅ OK held until commit; survives `kill -9`; batches ~40× |
 | TTL by partition drop (§3.3) | ✅ expiry worker drops past buckets; 3.2ms vs 141ms DELETE at 100k |
+| Mode B leaf substitution via planner hook (§7.1, P6) | ✅ `CustomPath`/`CustomScan` chosen for cached `pk = Const`; halves exec time |
+| Mode B `CustomScan` serves shmem, keeps RLS+mask above (§4.6) | ✅ 10/10 security suite; raw row cached, policy re-applied on read |
 
 ### 6b. Security model (§4) — P2 done for Mode A on the real base
 
@@ -484,13 +551,15 @@ P2 is implemented and tested on PG17 + `supatype_mask` + `pg_guard` (§5d). The
 | Key outside the role's ACL prefix | ✅ read → nil, write → NOPERM |
 | `service_role` exempt (via `supatype_mask.exempt_roles`) | ✅ bypasses ACL + scoping |
 | Tenant grants self `supacache_admin` | ✅ blocked by `pg_guard` (§4.2 config) |
-| `register_keyspace` on a masked relation (Mode B) | ⬜ Mode B not built (P6) |
-| `force_generic_plan`, warm cache, two identities (Mode B) | ⬜ Mode B row cache (P6) |
-| Masked column, warm cache, non-exempt role (Mode B) | ⬜ Mode B (P6) |
-| Decoding worker stores WAL values | ⬜ decoding worker not built (P6) |
+| Mode B: RLS denies a physically-cached foreign row | ✅ tested — RLS `Filter` above the leaf (§5e) |
+| `force_generic_plan` / parameterized warm cache (Mode B) | ✅ tested — const-only path, falls back (§4.3b) |
+| Masked column, warm cache, non-exempt role (Mode B) | ✅ tested — mask `CASE` re-applied, NULL (§5e) |
+| Decoding worker stores WAL values | ⬜ decoding worker not built (P6 slice 3) |
 
-Mode A (the Valkey-replacement keyspace) is secured and validated. Mode B (the
-transparent row cache) and its threat cases remain P6.
+Mode A (the Valkey-replacement keyspace) is secured and validated. Mode B's
+`CustomScan` executor and its §4.6 security invariant are now built and tested
+(§5e, 10/10); the only remaining P6 piece is the logical-decoding
+invalidation/refill worker (slice 3).
 
 ### 6c. Bugs / risks surfaced by building it
 
@@ -523,14 +592,18 @@ commit off the worker's snapshot.
 
 ## 8. Limitations (what this P0 is not)
 
-- Mode A security is done and tested on PG17 (§5d); the remaining security work
-  is Mode B's (P6). POC-level auth caveats: credentials load at worker start (no
-  hot reload yet), secrets compared in clear (hash in production).
-- P0/P1 latency/throughput numbers were taken on the system PG16 spike box; P2
-  runs on a from-source PG17.6 (PGDG is blocked in this sandbox). Hot-path
-  latency is unaffected by the PG version.
-- No Mode B row cache / planner hook (P6, §7.1).
-- No logical-decoding invalidation worker (§3.5).
+- Mode A security is done and tested on PG17 (§5d); Mode B's `CustomScan` and its
+  §4.6 security invariant are built and tested (§5e). POC-level auth caveats:
+  credentials load at worker start (no hot reload yet), secrets compared in clear
+  (hash in production).
+- P0/P1 latency/throughput numbers were taken on the system PG16 spike box; P2/P6
+  run on a from-source PG17.6 (PGDG is blocked in this sandbox). Hot-path latency
+  is unaffected by the PG version.
+- Mode B row cache / planner hook is built (P6 slice 2, §7.1), but the cache is
+  populated manually via `supacache.rowcache_put` — a stand-in for the
+  logical-decoding invalidation/refill worker (§3.5), which is not built (slice 3).
+  Cached rows with out-of-line (TOASTed) values are not supported (the raw tuple
+  carries a toast pointer, not the datum) — POC stores inline rows.
 - Command set is P0-minimal: strings, counters, DEL/EXISTS, TTL on strings.
   Hashes/lists/sorted-sets/pub-sub are P3 (§5).
 - Single in-PG worker; multi-worker scale-out shown via the standalone daemon
