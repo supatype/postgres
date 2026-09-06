@@ -17,6 +17,7 @@ use core::ffi::c_void;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
+use pgrx::{IntoDatum, PgBuiltInOids, PgOid};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
@@ -38,7 +39,7 @@ mod batcher;
 #[path = "../../poc/src/server.rs"]
 mod server;
 
-use batcher::{Batcher, Tier};
+use batcher::Tier;
 use store::{Config, Lookup, Store};
 
 const SEG_NAME: &CStr = c"pg_keyspace_segment";
@@ -55,6 +56,11 @@ static GUC_VAL_BYTES: GucSetting<i32> = GucSetting::<i32>::new(512);
 static GUC_DURABILITY: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"ephemeral"));
 static GUC_COMMIT_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
+// P1 persistence: which database holds supacache.kv, and how often the worker
+// flushes staged writes to it in one batched transaction.
+static GUC_DATABASE: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(Some(c"postgres"));
+static GUC_PERSIST_WINDOW_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 
 static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C" fn()> = None;
 static mut PREV_SHMEM_STARTUP_HOOK: Option<unsafe extern "C" fn()> = None;
@@ -134,8 +140,26 @@ pub extern "C" fn _PG_init() {
     GucRegistry::define_string_guc(
         "pg_keyspace.durability",
         "Durability tier for RESP writes: ephemeral|relaxed|durable|replicated",
-        "ephemeral keeps writes shmem-only; logged tiers hand off to the commit batcher (§3.4).",
+        "ephemeral keeps writes shmem-only; non-ephemeral persists to supacache.kv (§3.3).",
         &GUC_DURABILITY,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.database",
+        "Database that holds the supacache.kv backing tables",
+        "",
+        &GUC_DATABASE,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.persist_window_ms",
+        "How often the worker flushes staged writes to supacache.kv, in ms",
+        "Larger windows batch more writes per transaction (§3.4).",
+        &GUC_PERSIST_WINDOW_MS,
+        1,
+        60_000,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -148,13 +172,20 @@ pub extern "C" fn _PG_init() {
         pg_sys::shmem_startup_hook = Some(ks_shmem_startup);
     }
 
-    // Register the RESP slot worker (a real Postgres background worker).
-    BackgroundWorkerBuilder::new("pg_keyspace: RESP slot worker")
+    // Register the RESP slot worker (a real Postgres background worker). When a
+    // logged durability tier is configured it needs an SPI database connection
+    // to persist into supacache.kv; ephemeral needs only shared memory.
+    let persisted = ks_tier() != Tier::Ephemeral;
+    let builder = BackgroundWorkerBuilder::new("pg_keyspace: RESP slot worker")
         .set_library("pg_keyspace")
         .set_function("pg_keyspace_worker_main")
-        .set_restart_time(Some(Duration::from_secs(2)))
-        .enable_shmem_access(None)
-        .load();
+        .set_restart_time(Some(Duration::from_secs(2)));
+    let builder = if persisted {
+        builder.enable_spi_access()
+    } else {
+        builder.enable_shmem_access(None)
+    };
+    builder.load();
 
     log!("pg_keyspace: initialised (shmem hooks + RESP worker registered)");
 }
@@ -208,39 +239,131 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
     }
     let cfg = ks_config();
     let store = Arc::new(unsafe { Store::from_raw(base, &cfg, false) });
-    let tier = ks_tier();
-
-    let batcher = if tier != Tier::Ephemeral {
-        // bgworker cwd is $PGDATA; keep the POC WAL alongside it.
-        match Batcher::new(
-            "pg_keyspace_poc.wal",
-            Duration::from_micros(GUC_COMMIT_WINDOW_US.get().max(0) as u64),
-            Duration::from_micros(200),
-        ) {
-            Ok(b) => Some(Arc::new(b)),
-            Err(e) => {
-                log!("pg_keyspace worker: WAL open failed ({e}); falling back to ephemeral");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let effective_tier = if batcher.is_some() { tier } else { Tier::Ephemeral };
+    let persisted = ks_tier() != Tier::Ephemeral;
 
     let port = GUC_PORT.get() as u16;
-    let mut worker = match server::Worker::new(store, batcher, effective_tier, "0.0.0.0", port) {
+    let mut worker = match server::Worker::new(store.clone(), None, Tier::Ephemeral, "0.0.0.0", port)
+    {
         Ok(w) => w,
         Err(e) => {
             log!("pg_keyspace worker: cannot listen on :{port}: {e}");
             return;
         }
     };
-    log!("pg_keyspace worker: RESP listening on 0.0.0.0:{port} (tier={effective_tier:?})");
 
-    // Run until SIGTERM; poll every 500ms so shutdown is prompt even when idle.
-    let _ = worker.run_with(|| !BackgroundWorker::sigterm_received(), 500);
+    // P1 storage & durability: connect SPI, ensure the backing tables, recover
+    // shmem from them (crash recovery), then persist staged writes each window.
+    if persisted {
+        let dbname = GUC_DATABASE
+            .get()
+            .and_then(|c| c.to_str().ok())
+            .unwrap_or("postgres")
+            .to_string();
+        BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+        pg_ensure_schema();
+        let t0 = std::time::Instant::now();
+        let n = pg_recover(&store);
+        log!(
+            "pg_keyspace worker: recovered {n} keys from supacache.kv in {:?}",
+            t0.elapsed()
+        );
+        let window = Duration::from_millis(GUC_PERSIST_WINDOW_MS.get().max(1) as u64);
+        worker.set_persister(make_persister(), window);
+        log!("pg_keyspace worker: persistence ON (db={dbname}, window={window:?})");
+    }
+
+    log!("pg_keyspace worker: RESP listening on 0.0.0.0:{port} (persisted={persisted})");
+    let timeout_ms = if persisted {
+        GUC_PERSIST_WINDOW_MS.get().max(1)
+    } else {
+        500
+    };
+    let _ = worker.run_with(|| !BackgroundWorker::sigterm_received(), timeout_ms);
     log!("pg_keyspace worker: shutting down");
+}
+
+/// Create the `supacache` schema and the hash-partitioned `supacache.kv`
+/// backing table (§3.3) if absent. Idempotent; runs in one transaction.
+fn pg_ensure_schema() {
+    BackgroundWorker::transaction(|| {
+        let _ = Spi::run("CREATE SCHEMA IF NOT EXISTS supacache");
+        let _ = Spi::run(
+            "CREATE TABLE IF NOT EXISTS supacache.kv (\
+             tenant text NOT NULL DEFAULT '', key bytea NOT NULL, slot int NOT NULL, \
+             kind \"char\" NOT NULL DEFAULT 's', val bytea, \
+             expires_at bigint NOT NULL DEFAULT 0, version bigint NOT NULL DEFAULT 1, \
+             PRIMARY KEY (tenant, key)) PARTITION BY HASH (tenant, key)",
+        );
+        for i in 0..8 {
+            let _ = Spi::run(&format!(
+                "CREATE TABLE IF NOT EXISTS supacache.kv_p{i} PARTITION OF supacache.kv \
+                 FOR VALUES WITH (MODULUS 8, REMAINDER {i})"
+            ));
+        }
+    });
+}
+
+/// Load live keys from `supacache.kv` into shmem at startup (crash recovery).
+/// Expired rows are skipped. Returns the number of keys restored.
+fn pg_recover(store: &Store) -> i64 {
+    use std::panic::AssertUnwindSafe;
+    let now = store::now_micros();
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::connect(|client| {
+            let mut cnt = 0i64;
+            let tup = client.select("SELECT key, val, expires_at FROM supacache.kv", None, None)?;
+            for row in tup {
+                let k: Option<Vec<u8>> = row.get(1)?;
+                let v: Option<Vec<u8>> = row.get(2)?;
+                let e: i64 = row.get::<i64>(3)?.unwrap_or(0);
+                if let (Some(k), Some(v)) = (k, v) {
+                    if e > 0 && e <= now {
+                        continue; // already expired
+                    }
+                    let ttl = if e > 0 { e - now } else { 0 };
+                    store.set(&k, &v, ttl);
+                    cnt += 1;
+                }
+            }
+            Ok::<i64, pgrx::spi::Error>(cnt)
+        })
+        .unwrap_or(0)
+    }))
+}
+
+/// Persister: flush a staged batch of writes into `supacache.kv` in one
+/// transaction — "one fsync amortised across hundreds of operations" (§3.4),
+/// here as one Postgres commit per window against real, SQL-queryable tables.
+fn make_persister() -> server::PersistFn {
+    Box::new(move |writes: &mut Vec<server::PendingWrite>| {
+        if writes.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(writes);
+        BackgroundWorker::transaction(move || {
+            let _ = Spi::connect(|mut client| {
+                for (k, v, e) in &batch {
+                    let slot = crc16::key_slot(k) as i32;
+                    let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
+                        (PgOid::BuiltIn(PgBuiltInOids::BYTEAOID), k.clone().into_datum()),
+                        (PgOid::BuiltIn(PgBuiltInOids::INT4OID), slot.into_datum()),
+                        (PgOid::BuiltIn(PgBuiltInOids::BYTEAOID), v.clone().into_datum()),
+                        (PgOid::BuiltIn(PgBuiltInOids::INT8OID), (*e).into_datum()),
+                    ];
+                    client.update(
+                        "INSERT INTO supacache.kv (tenant,key,slot,kind,val,expires_at,version) \
+                         VALUES ('',$1,$2,'s',$3,$4,1) \
+                         ON CONFLICT (tenant,key) DO UPDATE SET \
+                         val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, \
+                         slot=EXCLUDED.slot, version=supacache.kv.version+1",
+                        None,
+                        Some(args),
+                    )?;
+                }
+                Ok::<(), pgrx::spi::Error>(())
+            });
+        });
+    })
 }
 
 // ---- the SQL surface (§6): in-backend shared-memory reads/writes ---------

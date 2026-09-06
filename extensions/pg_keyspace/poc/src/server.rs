@@ -6,14 +6,25 @@
 
 use crate::batcher::{Batcher, Tier};
 use crate::resp::{self, Parse};
-use crate::store::{Lookup, Store};
+use crate::store::{now_micros, Lookup, Store};
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const EPOLL_MAX: usize = 1024;
 const READ_CHUNK: usize = 64 * 1024;
+
+/// A staged write: (key, value, expires_at_micros). Handed to the persister.
+pub type PendingWrite = (Vec<u8>, Vec<u8>, i64);
+
+/// A persistence sink (P1). The core stages writes and hands the accrued batch
+/// to this callback once per flush window; the extension implements it as a
+/// single batched transaction against `supacache.kv` via SPI (§3.3/§3.4). The
+/// callback drains the vec it is given. Kept as an injected closure so the core
+/// has no Postgres dependency.
+pub type PersistFn = Box<dyn FnMut(&mut Vec<PendingWrite>)>;
 
 struct Conn {
     rbuf: Vec<u8>,
@@ -31,6 +42,10 @@ pub struct Worker {
     epfd: RawFd,
     conns: HashMap<RawFd, Conn>,
     args: Vec<(usize, usize)>,
+    persist: Option<PersistFn>,
+    pending: Vec<PendingWrite>,
+    flush_window: Duration,
+    last_flush: Instant,
 }
 
 impl Worker {
@@ -55,7 +70,34 @@ impl Worker {
             epfd,
             conns: HashMap::new(),
             args: Vec::with_capacity(8),
+            persist: None,
+            pending: Vec::new(),
+            flush_window: Duration::from_millis(10),
+            last_flush: Instant::now(),
         })
+    }
+
+    /// Enable P1 persistence: staged writes are flushed to `f` every `window`.
+    pub fn set_persister(&mut self, f: PersistFn, window: Duration) {
+        self.persist = Some(f);
+        self.flush_window = window;
+        self.pending = Vec::with_capacity(4096);
+    }
+
+    /// Flush staged writes if the window has elapsed. Called from the event loop.
+    fn maybe_flush(&mut self, force: bool) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if !force && self.last_flush.elapsed() < self.flush_window {
+            return;
+        }
+        if let Some(mut f) = self.persist.take() {
+            f(&mut self.pending); // callback drains the batch
+            self.persist = Some(f);
+        }
+        self.pending.clear();
+        self.last_flush = Instant::now();
     }
 
     pub fn run(&mut self) -> io::Result<()> {
@@ -98,6 +140,10 @@ impl Worker {
                         self.flush(fd);
                     }
                 }
+            }
+            // P1: flush staged writes to the backing tables once per window.
+            if self.persist.is_some() {
+                self.maybe_flush(false);
             }
         }
     }
@@ -214,6 +260,10 @@ impl Worker {
         let store = self.store.clone();
         let batcher = self.batcher.clone();
         let tier = self.tier;
+        let persist_on = self.persist.is_some();
+        // A write to stage for persistence (§3.3), applied after the match so it
+        // does not tangle with the `out` borrow.
+        let mut stage: Option<PendingWrite> = None;
         let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
 
         match cmd.as_slice() {
@@ -272,6 +322,10 @@ impl Worker {
                 store.set(&args[1], &args[2], ttl_micros);
                 resp::simple(out, "OK");
                 durable_log(&batcher, tier, &args[1], &args[2]);
+                if persist_on {
+                    let exp = if ttl_micros > 0 { now_micros() + ttl_micros } else { 0 };
+                    stage = Some((args[1].clone(), args[2].clone(), exp));
+                }
             }
             b"SETNX" => {
                 let exists = matches!(store.get(&args[1]), Lookup::Hit(_));
@@ -280,6 +334,9 @@ impl Worker {
                 } else {
                     store.set(&args[1], &args[2], 0);
                     durable_log(&batcher, tier, &args[1], &args[2]);
+                    if persist_on {
+                        stage = Some((args[1].clone(), args[2].clone(), 0));
+                    }
                     1
                 };
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
@@ -292,6 +349,9 @@ impl Worker {
                 };
                 store.set(&args[1], &args[2], 0);
                 durable_log(&batcher, tier, &args[1], &args[2]);
+                if persist_on {
+                    stage = Some((args[1].clone(), args[2].clone(), 0));
+                }
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                 match old {
                     Some(v) => resp::bulk(out, &v),
@@ -328,12 +388,20 @@ impl Worker {
                 match store.incr(&args[1], by) {
                     Some(v) => {
                         resp::integer(out, v);
-                        durable_log(&batcher, tier, &args[1], &itoa(v));
+                        let s = itoa(v);
+                        durable_log(&batcher, tier, &args[1], &s);
+                        if persist_on {
+                            stage = Some((args[1].clone(), s, 0));
+                        }
                     }
                     None => resp::error(out, "ERR value is not an integer or out of range"),
                 }
             }
             _ => resp::error(out, "ERR unknown command"),
+        }
+
+        if let Some(w) = stage {
+            self.pending.push(w);
         }
     }
 

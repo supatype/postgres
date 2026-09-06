@@ -1,4 +1,4 @@
-# pg_keyspace — P0 spike report
+# pg_keyspace — P0 spike report (+ P1 storage/durability in progress)
 
 **Status:** P0 kill criterion **PASSED**. A RESP GET hit served by a Postgres
 background worker over a Postgres shared-memory segment costs **~34µs** on this
@@ -7,6 +7,13 @@ hardware — well under the plan's `< 80µs` kill criterion (§12) and under the
 `shared_preload_libraries`, the SQL surface reads the same segment in-process,
 and the shared-nothing worker design scales to Valkey-class aggregate
 throughput.
+
+**P1 (storage & durability) now landed too:** RESP writes persist to a
+hash-partitioned `supacache.kv` backing table via batched SPI, the same bytes
+are queryable in SQL ("SQL access to the same bytes", §14), and after a hard
+`kill -9` of the whole cluster the worker rebuilds shmem from the tables —
+104k keys recovered in 367ms. See §5b. Security (§4) remains untouched: that is
+P2, the ship-decider.
 
 This report presents *measured* numbers, cross-checks them against the plan's
 targets, and separates what the POC validates empirically from what it
@@ -189,6 +196,58 @@ P1 design note.**
 
 ---
 
+## 5b. P1 — real backing tables, persistence, crash recovery
+
+P0 modelled durability with a stand-in WAL file. P1 makes it real: the in-PG
+worker connects SPI, ensures a hash-partitioned `supacache.kv` table (§3.3),
+and — for any non-ephemeral tier — flushes staged RESP writes into it in one
+batched transaction per window, then rebuilds shmem from the table on startup.
+
+### SQL access to the same bytes (§14 differentiator)
+
+A value written over RESP is immediately in shmem and, within one flush window,
+in `supacache.kv`. All three views agree:
+
+```
+redis-cli -p 6380 set persist:key:42 value-number-42
+SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='persist:key:42';  -- value-number-42
+SELECT convert_from(supacache.get('persist:key:42'),'UTF8');                    -- value-number-42
+```
+
+Writes distribute evenly across the 8 hash partitions (118–134 rows each at
+n=1000). This is the capability Valkey structurally cannot offer.
+
+### Crash recovery (§12 P1)
+
+Hard `kill -9` of the entire cluster (shmem destroyed), then restart:
+
+| Keys | Recovery time | Per key |
+|---:|---:|---:|
+| 5,000 | 6.9 ms | ~1.4µs |
+| 104,290 | 366.9 ms | ~3.5µs |
+
+Postgres replays the committed `supacache.kv` rows in WAL crash recovery first;
+the worker then loads them into a fresh shmem segment. Every key survived and is
+served over RESP after restart.
+
+### Cost of persistence (single worker, 512B)
+
+| | ephemeral | relaxed (persisted) |
+|---|---:|---:|
+| pipelined SET (`-c50 -P16`) | 556k/s | **32.4k/s** |
+| closed-loop SET p50 | 39µs | 39µs |
+| closed-loop SET avg | 33µs | 69µs |
+| GET (unaffected) | 500k/s | 500k/s |
+
+**Reads are unaffected** — still full ephemeral speed. Persisted *write*
+throughput drops ~17× because the POC upserts row-by-row via SPI and the flush
+transaction blocks the single event-loop thread (visible as 18k–52k/s jitter).
+`relaxed`'s async ack keeps write *latency* at ephemeral levels (p50 39µs). The
+finding: production persistence must not upsert row-by-row on the event loop —
+use multi-row `INSERT`/`COPY`, a dedicated I/O worker, or the
+`XACT_EVENT_COMMIT` publication path (§3.5). This is the same class of finding
+as the durable-serialisation one in §5.
+
 ## 6. Concerns validation matrix
 
 ### 6a. Performance & architecture — validated empirically
@@ -206,6 +265,11 @@ P1 design note.**
 | Commit batching amortises fsync (§3.4) | ✅ 38× at 64 committers |
 | bgworker can run an epoll loop inside PG (§3.1) | ✅ runs, binds, serves, shuts down on SIGTERM |
 | PG shared memory segment via hooks (§3.2) | ✅ 713MB segment, shared across backends |
+| Hash-partitioned backing tables (§3.3, P1) | ✅ `supacache.kv`, 8 partitions, even |
+| SQL access to the same bytes (§14, P1) | ✅ RESP write ↔ SELECT ↔ `supacache.get` agree |
+| Batched commit to real tables (§3.4, P1) | ✅ one transaction per window (SPI) |
+| Crash recovery from tables (§12 P1) | ✅ 104k keys reloaded in 367ms after `kill -9` |
+| bgworker is a real backend w/ SPI (§3.1) | ✅ `connect_worker_to_spi`, no read-path txn |
 
 ### 6b. Security model (§4) — NOT implemented in this P0; validated only on paper
 
@@ -269,7 +333,16 @@ commit off the worker's snapshot.
   (the in-PG version would register N background workers).
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent
   for this purpose and does not affect latency.
-- Durability WAL is a POC file, not integrated with Postgres WAL/replication.
+- P1 persistence (in-PG) upserts row-by-row via SPI on the event-loop thread —
+  correct and crash-safe, but write-throughput-limited (§5b). The standalone
+  file batcher (§5) remains the model for raw fsync amortisation. Production
+  needs multi-row/COPY persistence off the event loop.
+- Only `relaxed`/async persistence is wired to real tables in-PG so far;
+  `durable`/`replicated` sync-ack-to-commit semantics against `supacache.kv`
+  are the next P1 increment (the standalone batcher already characterises their
+  fsync cost).
+- DEL is not yet propagated to the backing table (upserts only); TTL partition
+  drop (§3.3) not built.
 
 ---
 

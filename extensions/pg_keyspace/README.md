@@ -88,6 +88,16 @@ redis-cli -p 6380 set foo bar
 redis-cli -p 6380 get foo        # "bar" (same shared-memory segment as SQL)
 ```
 
+With `pg_keyspace.durability = 'relaxed'` (P1), RESP writes also persist to the
+hash-partitioned `supacache.kv` table and survive a crash — the worker rebuilds
+shmem from the table on startup:
+
+```sql
+SELECT count(*) FROM supacache.kv;                       -- rows persisted from RESP
+SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='foo';  -- 'bar'
+-- kill -9 the cluster, restart:  redis-cli -p 6380 get foo  ->  still "bar"
+```
+
 Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 
 | GUC | default | meaning |
@@ -95,8 +105,10 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 | `pg_keyspace.port` | 6380 | RESP listen port |
 | `pg_keyspace.keys` | 1000000 | keyspace capacity (sizes the segment) |
 | `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
-| `pg_keyspace.durability` | `ephemeral` | `ephemeral`\|`relaxed`\|`durable`\|`replicated` (§3.4) |
-| `pg_keyspace.commit_window_us` | 500 | batch window for logged tiers |
+| `pg_keyspace.durability` | `ephemeral` | `ephemeral` = shmem only; any other value persists to `supacache.kv` (§3.3/§3.4) |
+| `pg_keyspace.database` | `postgres` | database holding the `supacache.kv` backing tables |
+| `pg_keyspace.persist_window_ms` | 10 | how often staged writes are flushed to `supacache.kv` in one transaction |
+| `pg_keyspace.commit_window_us` | 500 | standalone file-batcher window (durability microbench) |
 
 ## Results in one line
 
