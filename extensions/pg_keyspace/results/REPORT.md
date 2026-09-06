@@ -8,14 +8,21 @@ hardware — well under the plan's `< 80µs` kill criterion (§12) and under the
 and the shared-nothing worker design scales to Valkey-class aggregate
 throughput.
 
-**P1 (storage & durability) now landed too:** RESP writes persist to a
-hash-partitioned `supacache.kv` backing table, the same bytes are queryable in
-SQL ("SQL access to the same bytes", §14), and after a hard crash the worker
-rebuilds shmem from the tables — 104k keys in 367ms. Persistence runs **off the
-event loop**: the RESP worker enqueues into a shared-memory ring and a dedicated
-persistence worker drains it, so reads stay fast under write load (max GET
-latency 170ms → 5ms) at ~107k sustained durable writes/s. See §5b–§5c. Security
-(§4) remains untouched: that is P2, the ship-decider.
+**P1 (storage & durability):** RESP writes persist to a hash-partitioned
+`supacache.kv` backing table, the same bytes are queryable in SQL ("SQL access
+to the same bytes", §14), and after a hard crash the worker rebuilds shmem from
+the tables — 104k keys in 367ms. Persistence runs **off the event loop**: the
+RESP worker enqueues into a shared-memory ring and dedicated persistence workers
+drain it, so reads stay fast under write load (max GET latency 170ms → 5ms);
+durable writes scale to ~145k/s across 4 persist workers (WAL-bound). See §5b–§5c.
+
+**P2 (security) now validated on the real base.** Moved off the PG16 spike box
+onto **PostgreSQL 17.6 + `supatype_mask` + `pg_guard`** (this repo's actual
+extensions), all three loaded together. Implemented and tested: the §4.1
+load-order assertion, the §4.5 security-label self-check, RESP `AUTH`→role, the
+keyspace ACL, forced tenant scoping, and exempt-role reuse — the full §4.7
+threat table for Mode A passes (§5d). Security was the plan's ship-decider (§14);
+this retires it for Mode A (Mode B row-cache cases remain P6).
 
 This report presents *measured* numbers, cross-checks them against the plan's
 targets, and separates what the POC validates empirically from what it
@@ -294,6 +301,58 @@ absorbs the burst then sheds load (`ring_stats.dropped`); knobs are `ring_mb`
 SIGQUIT crash. Details in `results/p1_writepath.txt` and
 `results/persist_scaleout.txt`.
 
+## 5d. P2 — security on the real base
+
+The P0/P1 spike ran on the system PG16 for speed. P2 is about the interaction
+with `pg_guard` and `supatype_mask` (§4), so it must run on the real stack. The
+sandbox blocks the PGDG apt repo, so PostgreSQL **17.6 was built from source**
+and `pg_guard` + `supatype_mask` (this repo's C extensions) were built against
+it; pg_keyspace was rebuilt for pg17. All three load together:
+
+```
+shared_preload_libraries  = 'pg_keyspace, supatype_mask'   # ks BEFORE mask (§4.1)
+session_preload_libraries = 'pg_guard'
+supatype_mask.exempt_roles = 'service_role'                # reused by pg_keyspace (§4.5)
+pg_guard.reserved_memberships = '…, supacache_admin'       # §4.2
+```
+
+**Coexistence proven:** with pg_keyspace serving RESP, a `supatype`-masked
+column returns NULL to a non-exempt role and the value to a superuser — the mask
+still runs, unaffected by pg_keyspace.
+
+**Mechanisms added to pg_keyspace:**
+
+- **Load-order assertion (§4.1):** the RESP worker parses
+  `shared_preload_libraries` and refuses to bind unless `supatype_mask` is
+  present *and* after `pg_keyspace` (outermost). Fail-closed — it parks.
+- **Seclabel self-check (§4.5):** at startup it counts `supatype` labels on
+  `supacache` relations; any → refuse. A Mode A table must never be masked.
+- **RESP `AUTH` → role/tenant** from `supacache.resp_credential`, **keyspace
+  ACL** from `supacache.acl` (prefix × read/write). Credentials present ⇒
+  enforcement on; absent ⇒ local/no-auth mode (§10).
+- **Forced tenant scoping (§4.4):** every key from a non-exempt role is
+  rewritten `{tenant}:{key}` — a client cannot express another tenant's key.
+- **Exempt roles** read from `supatype_mask.exempt_roles` (single source, §4.5).
+
+**§4.7 threat table — all Mode A cases pass** (`results/p2_security.txt`, and
+`bench/run_p2_threats.sh` = 9/9):
+
+| Case | Result |
+|---|---|
+| `shared_preload_libraries` misordered | ✅ worker refuses; RESP port not bound |
+| `supatype` label on a `supacache` relation | ✅ refuses at startup; recovers when removed |
+| RESP data command, no `AUTH` | ✅ `NOAUTH` |
+| RESP `AUTH` wrong password | ✅ not authenticated (gated cmd → `NOAUTH`) |
+| RESP client requests another tenant's key | ✅ isolated — sees nil, not the other tenant's value |
+| key outside the role's ACL prefix | ✅ read → nil, write → `NOPERM` |
+| `service_role` (exempt) | ✅ bypasses ACL + scoping, sees the raw key |
+| tenant grants itself `supacache_admin` | ✅ blocked by `pg_guard` |
+
+**Caveats (POC-level):** credentials/ACL load at worker start (a change needs a
+restart or a future sinval-driven refresh); secrets are compared in clear (store
+a hash in production); Mode B row-cache threat cases (force_generic_plan,
+masked-column warm cache, decoding worker) are P6, not built.
+
 ## 6. Concerns validation matrix
 
 ### 6a. Performance & architecture — validated empirically
@@ -319,26 +378,27 @@ SIGQUIT crash. Details in `results/p1_writepath.txt` and
 | Persistence off the RESP hot path (§3.1) | ✅ SPSC shmem ring + dedicated persist worker; read tail 170ms→5ms |
 | Bulk batched commit (§3.4) | ✅ deduped `UNNEST` upsert; ~107k durable writes/s per worker |
 
-### 6b. Security model (§4) — NOT implemented in this P0; validated only on paper
+### 6b. Security model (§4) — P2 done for Mode A on the real base
 
-The plan is explicit (§12) that security is **P2** and *"the phase that decides
-whether the project ships."* This spike implements none of it. The §4.7 threat
-table is design analysis here, not test evidence:
+P2 is implemented and tested on PG17 + `supatype_mask` + `pg_guard` (§5d). The
+§4.7 threat table is now test evidence for Mode A, not analysis:
 
-| §4.7 case | Status in POC |
+| §4.7 case | Status |
 |---|---|
-| `shared_preload_libraries` misordered vs `supatype_mask` | ❌ not implemented (load-order assertion is P2) |
-| `register_keyspace` on a `supatype`-labelled relation | ❌ no `register_keyspace` / seclabel check yet |
-| Seclabel added after registration → fail closed | ❌ not implemented |
-| RESP client requests another tenant's key | ❌ no tenant scoping / AUTH yet (single namespace) |
-| Tenant grants self `supacache_admin` | ❌ pg_guard reserved-membership config, P2 |
-| `force_generic_plan`, warm cache, two identities | ❌ Mode B row cache not built (P6) |
-| Masked column, warm cache, non-exempt role | ❌ Mode B, P6 |
-| Decoding worker stores WAL values | ❌ decoding worker not built (P1/P6) |
+| `shared_preload_libraries` misordered vs `supatype_mask` | ✅ worker refuses (load-order assertion) |
+| Security label on a `supacache` relation → fail closed | ✅ refuses at startup; reversible |
+| RESP client requests another tenant's key | ✅ forced tenant scoping isolates it |
+| RESP `AUTH` (missing / wrong / valid) | ✅ NOAUTH / not-authed / authed |
+| Key outside the role's ACL prefix | ✅ read → nil, write → NOPERM |
+| `service_role` exempt (via `supatype_mask.exempt_roles`) | ✅ bypasses ACL + scoping |
+| Tenant grants self `supacache_admin` | ✅ blocked by `pg_guard` (§4.2 config) |
+| `register_keyspace` on a masked relation (Mode B) | ⬜ Mode B not built (P6) |
+| `force_generic_plan`, warm cache, two identities (Mode B) | ⬜ Mode B row cache (P6) |
+| Masked column, warm cache, non-exempt role (Mode B) | ⬜ Mode B (P6) |
+| Decoding worker stores WAL values | ⬜ decoding worker not built (P6) |
 
-**Do not read this POC as evidence the security model holds.** It is evidence
-that the *performance* substrate the security model sits on is fast enough to be
-worth securing.
+Mode A (the Valkey-replacement keyspace) is secured and validated. Mode B (the
+transparent row cache) and its threat cases remain P6.
 
 ### 6c. Bugs / risks surfaced by building it
 
@@ -371,8 +431,12 @@ commit off the worker's snapshot.
 
 ## 8. Limitations (what this P0 is not)
 
-- No security: no AUTH, no keyspace ACL, no tenant scoping, no `supatype_mask`
-  integration, no load-order assertion (all P2, §4).
+- Mode A security is done and tested on PG17 (§5d); the remaining security work
+  is Mode B's (P6). POC-level auth caveats: credentials load at worker start (no
+  hot reload yet), secrets compared in clear (hash in production).
+- P0/P1 latency/throughput numbers were taken on the system PG16 spike box; P2
+  runs on a from-source PG17.6 (PGDG is blocked in this sandbox). Hot-path
+  latency is unaffected by the PG version.
 - No Mode B row cache / planner hook (P6, §7.1).
 - No logical-decoding invalidation worker (§3.5).
 - Command set is P0-minimal: strings, counters, DEL/EXISTS, TTL on strings.
@@ -412,6 +476,12 @@ bash extensions/pg_keyspace/bench/run_benchmarks.sh   # latency, throughput, §6
 bash extensions/pg_keyspace/bench/run_durability.sh   # per-tier RESP SET
 bash extensions/pg_keyspace/bench/run_scaleout.sh     # shared-nothing scaling
 ./extensions/pg_keyspace/poc/target/release/durability_bench  # batcher amortisation
+
+# P2 security, on the real base (PG17 + supatype_mask + pg_guard):
+#   build pg_guard + supatype_mask against a PG17 pg_config, build pg_keyspace
+#   with --features pg17, load all three (order: pg_keyspace, supatype_mask;
+#   pg_guard in session_preload), then:
+bash extensions/pg_keyspace/bench/run_p2_threats.sh   # §4.7 access-control tests
 ```
 
 Raw `redis-benchmark` outputs are in `results/raw_*.txt`; summaries in

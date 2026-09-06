@@ -9,7 +9,7 @@ use crate::crc16;
 use crate::resp::{self, Parse};
 use crate::ring;
 use crate::store::{now_micros, Lookup, Store};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -20,12 +20,50 @@ const READ_CHUNK: usize = 64 * 1024;
 /// A staged write: (key, value, expires_at_micros).
 pub type PendingWrite = (Vec<u8>, Vec<u8>, i64);
 
+// ---- P2 security: RESP AUTH -> role, keyspace ACL, forced tenant scoping ----
+
+/// A RESP credential (§4.5): maps an AUTH username to a Postgres role + tenant.
+#[derive(Clone)]
+pub struct Cred {
+    pub secret: String,
+    pub role: String,
+    pub tenant: String,
+}
+
+/// One keyspace ACL rule: a role may read/write keys under `prefix` (§4.5).
+#[derive(Clone)]
+pub struct AclRule {
+    pub prefix: Vec<u8>,
+    pub can_read: bool,
+    pub can_write: bool,
+}
+
+/// The full auth configuration, loaded from SQL by the extension and handed to
+/// the worker. When present, RESP AUTH is required for keyed commands; when
+/// absent, the worker runs in local/no-auth mode (matches §10 local dev).
+pub struct AuthConfig {
+    pub creds: HashMap<String, Cred>,
+    pub acl: HashMap<String, Vec<AclRule>>,
+    pub exempt: HashSet<String>, // roles that bypass ACL + scoping (§4.5)
+}
+
+enum Deny {
+    NoAuth,
+    Perm,
+    Nil,
+}
+
 struct Conn {
     rbuf: Vec<u8>,
     wbuf: Vec<u8>,
     wpos: usize,
     want_write: bool,
     closing: bool,
+    // auth state (only meaningful when the worker has an AuthConfig)
+    authed: bool,
+    role: String,
+    tenant: String,
+    exempt: bool,
 }
 
 pub struct Worker {
@@ -40,6 +78,8 @@ pub struct Worker {
     // rings (sharded by key slot) and a dedicated persistence worker drains each
     // — the RESP path never touches SPI. Multiple rings scale durable writes.
     producers: Vec<ring::Producer>,
+    // P2: when set, RESP AUTH is required and keys are ACL-checked + tenant-scoped.
+    auth: Option<AuthConfig>,
 }
 
 impl Worker {
@@ -65,6 +105,7 @@ impl Worker {
             conns: HashMap::new(),
             args: Vec::with_capacity(8),
             producers: Vec::new(),
+            auth: None,
         })
     }
 
@@ -72,6 +113,11 @@ impl Worker {
     /// each drained by its own persistence worker.
     pub fn set_ring_producers(&mut self, producers: Vec<ring::Producer>) {
         self.producers = producers;
+    }
+
+    /// Enable P2 access control: RESP AUTH required, keyspace ACL + tenant scope.
+    pub fn set_auth_config(&mut self, auth: AuthConfig) {
+        self.auth = Some(auth);
     }
 
     pub fn run(&mut self) -> io::Result<()> {
@@ -139,6 +185,10 @@ impl Worker {
                     wpos: 0,
                     want_write: false,
                     closing: false,
+                    authed: false,
+                    role: String::new(),
+                    tenant: String::new(),
+                    exempt: false,
                 },
             );
         }
@@ -227,6 +277,36 @@ impl Worker {
         let nargs = args.len();
         let mut cmd = args[0].clone();
         cmd.make_ascii_uppercase();
+
+        // ---- P2: AUTH command ----
+        if cmd == b"AUTH" {
+            self.handle_auth(fd, args);
+            return;
+        }
+
+        // ---- P2: auth gate + forced tenant scoping for keyed commands ----
+        // `eff` holds the args actually used below; key positions are rewritten
+        // to `{tenant}:{key}` for non-exempt authenticated roles.
+        let mut eff: Vec<Vec<u8>> = Vec::new();
+        let key_idxs = key_indices(&cmd, nargs);
+        if self.auth.is_some() && !key_idxs.is_empty() {
+            eff = args.to_vec();
+            if let Err(d) = self.apply_auth(fd, &cmd, &key_idxs, &mut eff) {
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                match d {
+                    Deny::NoAuth => resp::error(out, "NOAUTH Authentication required."),
+                    Deny::Perm => resp::error(
+                        out,
+                        "NOPERM this user has no permissions to access one of the keys used as arguments",
+                    ),
+                    Deny::Nil => resp::nil(out),
+                }
+                return;
+            }
+        }
+        // From here on, use the (possibly scoped) args.
+        let args: &[Vec<u8>] = if eff.is_empty() { args } else { &eff };
+
         let store = self.store.clone();
         let batcher = self.batcher.clone();
         let tier = self.tier;
@@ -386,6 +466,94 @@ impl Worker {
         }
     }
 
+    /// RESP `AUTH [user] pass` — resolve the credential and set the connection's
+    /// role/tenant/exempt state (§4.5). Computed in two phases so the borrow of
+    /// `self.auth` is released before the connection is mutated.
+    fn handle_auth(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        enum R {
+            Ok(String, String, bool),
+            Wrong,
+            BadArgs,
+            NoCfg,
+        }
+        let r = match &self.auth {
+            None => R::NoCfg,
+            Some(cfg) => {
+                if args.len() < 2 {
+                    R::BadArgs
+                } else {
+                    let (user, pass): (String, &Vec<u8>) = if args.len() >= 3 {
+                        (String::from_utf8_lossy(&args[1]).into_owned(), &args[2])
+                    } else {
+                        ("default".to_string(), &args[1])
+                    };
+                    match cfg.creds.get(&user) {
+                        Some(c) if c.secret.as_bytes() == pass.as_slice() => {
+                            R::Ok(c.role.clone(), c.tenant.clone(), cfg.exempt.contains(&c.role))
+                        }
+                        _ => R::Wrong,
+                    }
+                }
+            }
+        };
+        let c = self.conns.get_mut(&fd).unwrap();
+        match r {
+            R::NoCfg => resp::simple(&mut c.wbuf, "OK"),
+            R::BadArgs => resp::error(&mut c.wbuf, "ERR wrong number of arguments for 'auth'"),
+            R::Wrong => resp::error(
+                &mut c.wbuf,
+                "WRONGPASS invalid username-password pair or user is disabled.",
+            ),
+            R::Ok(role, tenant, exempt) => {
+                c.authed = true;
+                c.role = role;
+                c.tenant = tenant;
+                c.exempt = exempt;
+                resp::simple(&mut c.wbuf, "OK");
+            }
+        }
+    }
+
+    /// Enforce the keyspace ACL and rewrite each key to `{tenant}:{key}` for a
+    /// non-exempt authenticated role (§4.4/§4.5). Exempt roles (service_role,
+    /// per `supatype_mask.exempt_roles`) bypass both. Returns the denial kind on
+    /// the first key the role may not touch.
+    fn apply_auth(
+        &self,
+        fd: RawFd,
+        cmd: &[u8],
+        key_idxs: &[usize],
+        eff: &mut [Vec<u8>],
+    ) -> Result<(), Deny> {
+        let cfg = self.auth.as_ref().unwrap();
+        let conn = &self.conns[&fd];
+        if !conn.authed {
+            return Err(Deny::NoAuth);
+        }
+        if conn.exempt {
+            return Ok(()); // service_role / superuser: no scope, no ACL
+        }
+        let rules = cfg.acl.get(&conn.role);
+        let write = is_write_cmd(cmd);
+        for &i in key_idxs {
+            let key = &eff[i];
+            let ok = rules.map_or(false, |rs| {
+                rs.iter().any(|r| {
+                    key.starts_with(&r.prefix) && if write { r.can_write } else { r.can_read }
+                })
+            });
+            if !ok {
+                return Err(if cmd == b"GET" { Deny::Nil } else { Deny::Perm });
+            }
+            let mut scoped = Vec::with_capacity(conn.tenant.len() + 1 + key.len());
+            scoped.extend_from_slice(conn.tenant.as_bytes());
+            scoped.push(b':');
+            scoped.extend_from_slice(key);
+            eff[i] = scoped;
+        }
+        Ok(())
+    }
+
     fn flush(&mut self, fd: RawFd) {
         let c = match self.conns.get_mut(&fd) {
             Some(c) => c,
@@ -442,6 +610,41 @@ impl Worker {
 #[inline]
 fn itoa(n: i64) -> Vec<u8> {
     n.to_string().into_bytes()
+}
+
+/// Which argument positions of a command are keys (for ACL + tenant scoping).
+fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
+    match cmd {
+        b"GET" | b"SET" | b"SETNX" | b"GETSET" | b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY"
+        | b"TTL" | b"EXPIRE" | b"PERSIST" | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL" => {
+            if nargs > 1 {
+                vec![1]
+            } else {
+                vec![]
+            }
+        }
+        b"DEL" | b"UNLINK" | b"EXISTS" | b"MGET" => (1..nargs).collect(),
+        _ => vec![],
+    }
+}
+
+/// Commands that write (need `can_write` in the ACL).
+fn is_write_cmd(cmd: &[u8]) -> bool {
+    matches!(
+        cmd,
+        b"SET" | b"SETNX"
+            | b"GETSET"
+            | b"INCR"
+            | b"DECR"
+            | b"INCRBY"
+            | b"DECRBY"
+            | b"DEL"
+            | b"UNLINK"
+            | b"EXPIRE"
+            | b"PERSIST"
+            | b"APPEND"
+            | b"GETDEL"
+    )
 }
 
 /// Hand a write to the commit batcher for logged tiers (§3.4). Ephemeral writes

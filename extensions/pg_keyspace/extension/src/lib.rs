@@ -42,6 +42,8 @@ mod ring;
 mod server;
 
 use batcher::Tier;
+use server::{AclRule, AuthConfig, Cred};
+use std::collections::{HashMap, HashSet};
 use store::{Config, Lookup, Store};
 
 const SEG_NAME: &CStr = c"pg_keyspace_segment";
@@ -216,17 +218,15 @@ pub extern "C" fn _PG_init() {
     // Register the RESP slot worker (a real Postgres background worker). When a
     // logged durability tier is configured it needs an SPI database connection
     // to persist into supacache.kv; ephemeral needs only shared memory.
+    // The RESP worker always needs SPI now: for recovery (persisted tiers) and
+    // to load the RESP AUTH credentials / keyspace ACL (§4.5) at startup.
     let persisted = ks_tier() != Tier::Ephemeral;
-    let builder = BackgroundWorkerBuilder::new("pg_keyspace: RESP slot worker")
+    BackgroundWorkerBuilder::new("pg_keyspace: RESP slot worker")
         .set_library("pg_keyspace")
         .set_function("pg_keyspace_worker_main")
-        .set_restart_time(Some(Duration::from_secs(2)));
-    let builder = if persisted {
-        builder.enable_spi_access()
-    } else {
-        builder.enable_shmem_access(None)
-    };
-    builder.load();
+        .set_restart_time(Some(Duration::from_secs(2)))
+        .enable_spi_access()
+        .load();
 
     // Dedicated persistence workers: each drains its own ring and bulk-upserts
     // into supacache.kv, so the RESP worker never touches SPI on the hot path.
@@ -306,6 +306,18 @@ extern "C" fn ks_shmem_startup() {
 pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
 
+    // §4.1 load-order assertion: supatype_mask must be loaded AFTER pg_keyspace
+    // (outermost) so the Query is masked before pg_keyspace ever sees it. If the
+    // operator misordered shared_preload_libraries, FAIL CLOSED — park without
+    // binding the RESP port rather than serve on an unverified security posture.
+    if let Err(why) = check_load_order() {
+        log!("pg_keyspace worker: REFUSING to start — {why}");
+        while !BackgroundWorker::sigterm_received() {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        return;
+    }
+
     let base = SEG_BASE.load(Ordering::Acquire);
     if base.is_null() {
         log!("pg_keyspace worker: shared segment not ready, exiting");
@@ -325,18 +337,44 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
         }
     };
 
-    // P1 storage & durability: connect SPI only to recover shmem from the
-    // backing tables at startup (crash recovery); all steady-state persistence
-    // is offloaded to the persistence worker via the ring, so the RESP hot path
-    // never touches SPI.
+    // Connect SPI (always): needed to create/read the schema, run the §4.5
+    // security self-check, load RESP AUTH credentials, and recover from tables.
+    let dbname = GUC_DATABASE
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("postgres")
+        .to_string();
+    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+    pg_ensure_schema();
+
+    // §4.5 security label self-check: a Mode A backing table must have no
+    // `supatype` label. If one was added by hand, FAIL CLOSED.
+    if kv_has_supatype_label() {
+        log!(
+            "pg_keyspace worker: REFUSING to start — a supatype security label exists on a \
+             supacache relation; Mode A tables must not be masked (§4.5)"
+        );
+        while !BackgroundWorker::sigterm_received() {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        return;
+    }
+
+    // §4.5 load RESP AUTH + keyspace ACL. When credentials exist, enforcement is
+    // on; when absent, the worker runs in local/no-auth mode (§10 local dev).
+    match load_auth_config() {
+        Some(auth) => {
+            let n = auth.creds.len();
+            worker.set_auth_config(auth);
+            log!("pg_keyspace worker: AUTH enforced ({n} credentials, ACL + tenant scoping on)");
+        }
+        None => log!("pg_keyspace worker: no RESP credentials configured — local/no-auth mode"),
+    }
+
+    // P1 storage & durability: recover shmem from the tables at startup; the
+    // steady-state persistence is offloaded to the persistence worker via the
+    // ring, so the RESP hot path never touches SPI.
     if persisted {
-        let dbname = GUC_DATABASE
-            .get()
-            .and_then(|c| c.to_str().ok())
-            .unwrap_or("postgres")
-            .to_string();
-        BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
-        // wait (bounded) for the persistence worker to create the table
         for _ in 0..30 {
             if pg_table_ready() {
                 break;
@@ -352,13 +390,11 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
         let rbase = RING_BASE.load(Ordering::Acquire);
         if !rbase.is_null() {
             let stride = ring_stride();
-            let n = ring_count();
+            let nr = ring_count();
             let producers: Vec<ring::Producer> =
-                (0..n).map(|i| unsafe { ring::Producer::attach(rbase.add(i * stride)) }).collect();
+                (0..nr).map(|i| unsafe { ring::Producer::attach(rbase.add(i * stride)) }).collect();
             worker.set_ring_producers(producers);
-            log!("pg_keyspace worker: persistence ON ({n} rings -> {n} workers, db={dbname})");
-        } else {
-            log!("pg_keyspace worker: ring not ready; running ephemeral");
+            log!("pg_keyspace worker: persistence ON ({nr} rings -> {nr} workers)");
         }
     }
 
@@ -381,16 +417,12 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         .unwrap_or("postgres")
         .to_string();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
-    // Worker 0 owns schema creation; the others wait for it (avoids concurrent DDL).
-    if idx == 0 {
-        pg_ensure_schema();
-    } else {
-        for _ in 0..50 {
-            if pg_table_ready() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+    // The RESP worker owns schema creation; all persist workers wait for it.
+    for _ in 0..100 {
+        if pg_table_ready() {
+            break;
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     let rbase = RING_BASE.load(Ordering::Acquire);
@@ -418,6 +450,37 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         bulk_upsert(tail);
     }
     log!("pg_keyspace persist: shutting down");
+}
+
+/// §4.1: verify `supatype_mask` is present in shared_preload_libraries AND
+/// loaded after `pg_keyspace` (so it is the outermost planner hook). Returns
+/// Err with a human-readable reason when the posture is wrong.
+fn check_load_order() -> Result<(), String> {
+    let spl = unsafe {
+        let s = pg_sys::GetConfigOption(c"shared_preload_libraries".as_ptr(), true, false);
+        if s.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(s).to_string_lossy().into_owned()
+        }
+    };
+    let libs: Vec<&str> = spl.split(',').map(|s| s.trim()).collect();
+    let ks = libs.iter().position(|&x| x == "pg_keyspace");
+    let mask = libs.iter().position(|&x| x == "supatype_mask");
+    match (ks, mask) {
+        (None, _) => Err(format!(
+            "pg_keyspace not found in shared_preload_libraries ('{spl}')"
+        )),
+        (_, None) => Err(format!(
+            "supatype_mask not in shared_preload_libraries ('{spl}'); \
+             RESP would serve rows the mask never rewrote"
+        )),
+        (Some(k), Some(m)) if k >= m => Err(format!(
+            "supatype_mask (pos {m}) must load AFTER pg_keyspace (pos {k}) so it is \
+             outermost; fix the order in shared_preload_libraries ('{spl}')"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// True if supacache.kv exists yet (created by the persistence worker).
@@ -448,7 +511,103 @@ fn pg_ensure_schema() {
                  FOR VALUES WITH (MODULUS 8, REMAINDER {i})"
             ));
         }
+        // P2: RESP credential -> role/tenant map (§4.5) and keyspace ACL.
+        let _ = Spi::run(
+            "CREATE TABLE IF NOT EXISTS supacache.resp_credential (\
+             username text PRIMARY KEY, secret text NOT NULL, \
+             role_name text NOT NULL, tenant text NOT NULL DEFAULT '')",
+        );
+        let _ = Spi::run(
+            "CREATE TABLE IF NOT EXISTS supacache.acl (\
+             role_name text NOT NULL, prefix text NOT NULL, \
+             can_read boolean NOT NULL DEFAULT true, \
+             can_write boolean NOT NULL DEFAULT true, \
+             PRIMARY KEY (role_name, prefix))",
+        );
     });
+}
+
+/// §4.5 self-check: Mode A backing tables must carry NO `supatype` security
+/// label — access control for the keyspace is the ACL layer, not masking. If a
+/// label was added by hand, refuse to serve (fail closed). Returns true if any
+/// `supacache.*` relation has a `supatype` label.
+fn kv_has_supatype_label() -> bool {
+    BackgroundWorker::transaction(|| {
+        Spi::get_one::<i64>(
+            "SELECT count(*) FROM pg_seclabel l \
+             JOIN pg_class c ON c.oid = l.objoid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE l.provider = 'supatype' AND n.nspname = 'supacache'",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+            > 0
+    })
+}
+
+/// Load RESP credentials + keyspace ACL from SQL (§4.5). Returns None when no
+/// credentials are configured — the worker then runs in local/no-auth mode.
+/// Exempt roles come from `supatype_mask.exempt_roles` so the two never drift.
+fn load_auth_config() -> Option<AuthConfig> {
+    use std::panic::AssertUnwindSafe;
+    let exempt: HashSet<String> = {
+        let raw = unsafe {
+            let s = pg_sys::GetConfigOption(c"supatype_mask.exempt_roles".as_ptr(), true, false);
+            if s.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(s).to_string_lossy().into_owned()
+            }
+        };
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        let mut creds: HashMap<String, Cred> = HashMap::new();
+        let mut acl: HashMap<String, Vec<AclRule>> = HashMap::new();
+        let _ = Spi::connect(|client| {
+            let t = client.select(
+                "SELECT username, secret, role_name, tenant FROM supacache.resp_credential",
+                None,
+                None,
+            )?;
+            for row in t {
+                let u: String = row.get::<String>(1)?.unwrap_or_default();
+                let s: String = row.get::<String>(2)?.unwrap_or_default();
+                let r: String = row.get::<String>(3)?.unwrap_or_default();
+                let tn: String = row.get::<String>(4)?.unwrap_or_default();
+                if !u.is_empty() {
+                    creds.insert(u, Cred { secret: s, role: r, tenant: tn });
+                }
+            }
+            let t = client.select(
+                "SELECT role_name, prefix, can_read, can_write FROM supacache.acl",
+                None,
+                None,
+            )?;
+            for row in t {
+                let r: String = row.get::<String>(1)?.unwrap_or_default();
+                let p: String = row.get::<String>(2)?.unwrap_or_default();
+                let cr: bool = row.get::<bool>(3)?.unwrap_or(false);
+                let cw: bool = row.get::<bool>(4)?.unwrap_or(false);
+                acl.entry(r).or_default().push(AclRule {
+                    prefix: p.into_bytes(),
+                    can_read: cr,
+                    can_write: cw,
+                });
+            }
+            Ok::<(), pgrx::spi::Error>(())
+        });
+        if creds.is_empty() {
+            None
+        } else {
+            Some(AuthConfig { creds, acl, exempt })
+        }
+    }))
 }
 
 /// Load live keys from `supacache.kv` into shmem at startup (crash recovery).

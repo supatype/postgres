@@ -9,10 +9,13 @@ and keep Valkey."*
 **It is under 80µs. It ties Valkey.** See [`results/REPORT.md`](results/REPORT.md)
 for the full write-up and the concerns matrix.
 
-> This is a performance/architecture spike. It implements **none** of the
-> security model (§4) — no AUTH, no tenant isolation, no `supatype_mask`
-> integration. That is P2, and per §14 it is the phase that decides whether the
-> project ships. Do not deploy this.
+> Scope so far: **P0** (latency/throughput vs Valkey), **P1** (storage,
+> durability, crash recovery, off-event-loop persistence), and **P2 security for
+> Mode A** — validated on the real base (PG17 + `supatype_mask` + `pg_guard`):
+> load-order assertion, seclabel self-check, RESP `AUTH`→role, keyspace ACL,
+> forced tenant scoping (§4). Mode B (the transparent row cache) and its threat
+> cases are **not** built (P6). Still a POC — auth secrets are compared in clear
+> and credentials load at worker start; don't deploy as-is.
 
 ## What it is
 
@@ -117,5 +120,6 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 
 Latency **34µs** (ties Valkey, kill criterion was `<80µs`); single-worker
 throughput **500–556k/s**; 4-worker **2.46M/s** (Valkey-class); in-backend read
-**9ns** (§6, 100× better than projected). Full report and the
+**9ns** (§6, 100× better than projected); durable writes **145k/s** across 4
+persist workers; **P2 security 9/9** on the real PG17 base. Full report and the
 concerns/threat matrix: [`results/REPORT.md`](results/REPORT.md).

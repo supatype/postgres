@@ -1,0 +1,64 @@
+# P2 security — validated on the real base (PG17.6 + supatype_mask + pg_guard)
+#
+# Base: PostgreSQL 17.6 built from source, with pg_guard and supatype_mask
+# (this repo's C extensions) and pg_keyspace all loaded:
+#   shared_preload_libraries = 'pg_keyspace, supatype_mask'   (pg_keyspace BEFORE
+#                              mask, so the mask is the outermost planner hook, §4.1)
+#   session_preload_libraries = 'pg_guard'
+#   supatype_mask.exempt_roles = 'service_role'               (reused by pg_keyspace, §4.5)
+#   pg_guard.reserved_memberships = '..., supacache_admin'    (§4.2)
+#
+# Coexistence proven first: a masked column returns NULL to a non-exempt role
+# and the value to a superuser, while pg_keyspace serves RESP — all three
+# extensions active at once.
+
+## §4.7 threat table — results
+
+| Case                                                        | Expected                         | Result |
+|-------------------------------------------------------------|----------------------------------|--------|
+| shared_preload_libraries misordered (mask before ks)        | refuse to start workers          | PASS — worker logs "REFUSING … supatype_mask (pos 0) must load AFTER pg_keyspace (pos 1)"; RESP port not bound |
+| supatype security label on a supacache relation             | fail closed at startup           | PASS — worker refuses; removing the label + restart recovers |
+| RESP data command with no AUTH                              | denied                           | PASS — "NOAUTH Authentication required." |
+| RESP AUTH with wrong password                               | not authenticated                | PASS — WRONGPASS; a subsequent gated GET returns NOAUTH |
+| RESP client requests another tenant's key                  | not addressable (isolated)       | PASS — alice's `session:1` (ta:) and bob's `session:1` (tb:) are distinct; bob sees nil, then his own value; alice's is unchanged |
+| Role reads/writes a key outside its ACL prefix             | denied                           | PASS — GET unlisted prefix → nil; SET unlisted or read-only prefix → NOPERM |
+| service_role (exempt) access                                | bypasses ACL + tenant scoping    | PASS — svc reads the raw scoped key `ta:session:1` directly (sees everything, §4.5) |
+| Tenant grants itself supacache_admin                       | blocked by pg_guard              | PASS — "supacache_admin role memberships are reserved, only superusers can grant them" |
+
+## Transcript (abridged)
+
+  unauth GET session:1                 -> NOAUTH Authentication required.
+  AUTH alice wrong; GET session:1      -> NOAUTH (wrong password did not authenticate)
+  AUTH alice pw1; SET session:1 A      -> OK        (stored as ta:session:1)
+  AUTH alice pw1; GET session:1        -> A
+  AUTH bob   pw2; GET session:1        -> (nil)     (tb: namespace, isolated)
+  AUTH bob   pw2; SET session:1 B; GET -> B
+  AUTH alice pw1; GET session:1        -> A         (unaffected by bob)
+  AUTH alice pw1; GET other:1          -> (nil)     (no ACL for other: → read denied)
+  AUTH alice pw1; SET other:1 x        -> NOPERM
+  AUTH alice pw1; SET ro:1 x           -> NOPERM    (ro: is read-only for tenant_a)
+  AUTH svc   pw3; GET ta:session:1     -> A         (exempt: no scoping, no ACL)
+  (misordered preload)                 -> worker REFUSING; 6381 not listening
+  (label on supacache.kv.val)          -> worker REFUSING; recovers when removed
+  attacker: GRANT supacache_admin TO attacker -> ERROR (pg_guard reserved membership)
+
+## Mechanisms (pg_keyspace side)
+
+- Load-order assertion: the RESP worker parses shared_preload_libraries and
+  refuses to bind unless supatype_mask is present AND positioned after
+  pg_keyspace. Fail-closed: it parks without serving.
+- Seclabel self-check: at startup the worker counts supatype labels on supacache
+  relations (pg_seclabel); any → refuse.
+- AUTH → role/tenant from supacache.resp_credential; keyspace ACL from
+  supacache.acl (prefix, can_read, can_write). Both loaded at startup; presence
+  of credentials turns enforcement on (absence = local/no-auth mode, §10).
+- Forced tenant scoping: every key from a non-exempt role is rewritten
+  {tenant}:{key}; a client cannot express another tenant's key.
+- Exempt roles come from supatype_mask.exempt_roles (single source of truth, §4.5).
+
+## Not covered here (out of P2 scope for a Mode-A POC)
+- Mode B row-cache cases (force_generic_plan two-identity, masked-column warm
+  cache, decoding-worker WAL values) — those are P6.
+- Credential/ACL hot-reload (loaded at worker start; a reload needs a restart or
+  a future sinval-driven refresh) and password hashing (secrets are compared in
+  clear here; production should store a hash).
