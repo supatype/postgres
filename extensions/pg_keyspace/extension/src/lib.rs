@@ -67,9 +67,20 @@ static GUC_DATABASE: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"postgres"));
 static GUC_PERSIST_WINDOW_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static GUC_RING_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
+static GUC_PERSIST_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 
-fn ring_bytes() -> usize {
+/// Number of persistence workers = number of rings (writes are sharded across
+/// them by key slot).
+fn ring_count() -> usize {
+    GUC_PERSIST_WORKERS.get().max(1) as usize
+}
+/// Bytes for one ring (header + power-of-two capacity).
+fn ring_stride() -> usize {
     ring::bytes_for((GUC_RING_MB.get().max(1) as usize) * 1024 * 1024)
+}
+/// Total shared memory for all rings, laid out contiguously.
+fn ring_total_bytes() -> usize {
+    ring_count() * ring_stride()
 }
 
 static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C" fn()> = None;
@@ -175,11 +186,21 @@ pub extern "C" fn _PG_init() {
     );
     GucRegistry::define_int_guc(
         "pg_keyspace.ring_mb",
-        "Size of the RESP->persistence ring buffer, in MB",
+        "Size of each RESP->persistence ring buffer, in MB",
         "Absorbs write bursts so the RESP path never blocks on persistence.",
         &GUC_RING_MB,
         1,
         4096,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.persist_workers",
+        "Number of persistence workers (and rings) draining writes in parallel",
+        "Writes are sharded by key slot; more workers scale durable throughput.",
+        &GUC_PERSIST_WORKERS,
+        1,
+        16,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -207,15 +228,19 @@ pub extern "C" fn _PG_init() {
     };
     builder.load();
 
-    // Dedicated persistence worker: drains the ring and bulk-upserts into
-    // supacache.kv, so the RESP worker never touches SPI on the hot path.
+    // Dedicated persistence workers: each drains its own ring and bulk-upserts
+    // into supacache.kv, so the RESP worker never touches SPI on the hot path.
+    // Each is passed its ring index as the bgworker argument.
     if persisted {
-        BackgroundWorkerBuilder::new("pg_keyspace: persistence worker")
-            .set_library("pg_keyspace")
-            .set_function("pg_keyspace_persist_main")
-            .set_restart_time(Some(Duration::from_secs(2)))
-            .enable_spi_access()
-            .load();
+        for i in 0..ring_count() {
+            BackgroundWorkerBuilder::new(&format!("pg_keyspace: persistence worker {i}"))
+                .set_library("pg_keyspace")
+                .set_function("pg_keyspace_persist_main")
+                .set_argument((i as i32).into_datum())
+                .set_restart_time(Some(Duration::from_secs(2)))
+                .enable_spi_access()
+                .load();
+        }
     }
 
     log!("pg_keyspace: initialised (shmem hooks + RESP worker registered)");
@@ -228,7 +253,7 @@ extern "C" fn ks_shmem_request() {
             prev();
         }
         pg_sys::RequestAddinShmemSpace(ks_config().total_bytes());
-        pg_sys::RequestAddinShmemSpace(ring_bytes());
+        pg_sys::RequestAddinShmemSpace(ring_total_bytes());
     }
 }
 
@@ -249,21 +274,26 @@ extern "C" fn ks_shmem_startup() {
         let _view = Store::from_raw(ptr, &cfg, !found);
         SEG_BASE.store(ptr, Ordering::Release);
 
-        // Persistence ring segment.
-        let rbytes = ring_bytes();
+        // Persistence ring segment: N contiguous rings of `ring_stride()` bytes.
+        let rbytes = ring_total_bytes();
+        let stride = ring_stride();
+        let cap = (GUC_RING_MB.get().max(1) as usize) * 1024 * 1024;
         let mut rfound = false;
         let rptr = pg_sys::ShmemInitStruct(RING_NAME.as_ptr(), rbytes, &mut rfound) as *mut u8;
         if !rptr.is_null() {
             if !rfound {
                 std::ptr::write_bytes(rptr, 0, rbytes);
-                ring::init(rptr, (GUC_RING_MB.get().max(1) as usize) * 1024 * 1024);
+                for i in 0..ring_count() {
+                    ring::init(rptr.add(i * stride), cap);
+                }
             }
             RING_BASE.store(rptr, Ordering::Release);
         }
         log!(
-            "pg_keyspace: shmem ready (store {} bytes, ring {} bytes, found={})",
+            "pg_keyspace: shmem ready (store {} bytes, {} rings x {} bytes, found={})",
             size,
-            rbytes,
+            ring_count(),
+            stride,
             found
         );
     }
@@ -321,8 +351,12 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
         );
         let rbase = RING_BASE.load(Ordering::Acquire);
         if !rbase.is_null() {
-            worker.set_ring_producer(unsafe { ring::Producer::attach(rbase) });
-            log!("pg_keyspace worker: persistence ON (ring -> persistence worker, db={dbname})");
+            let stride = ring_stride();
+            let n = ring_count();
+            let producers: Vec<ring::Producer> =
+                (0..n).map(|i| unsafe { ring::Producer::attach(rbase.add(i * stride)) }).collect();
+            worker.set_ring_producers(producers);
+            log!("pg_keyspace worker: persistence ON ({n} rings -> {n} workers, db={dbname})");
         } else {
             log!("pg_keyspace worker: ring not ready; running ephemeral");
         }
@@ -338,24 +372,35 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
 /// RESP worker's event loop is never blocked by Postgres.
 #[no_mangle]
 #[pg_guard]
-pub extern "C" fn pg_keyspace_persist_main(_arg: pg_sys::Datum) {
+pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
+    let idx = unsafe { i32::from_datum(arg, false) }.unwrap_or(0).max(0) as usize;
     let dbname = GUC_DATABASE
         .get()
         .and_then(|c| c.to_str().ok())
         .unwrap_or("postgres")
         .to_string();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
-    pg_ensure_schema();
+    // Worker 0 owns schema creation; the others wait for it (avoids concurrent DDL).
+    if idx == 0 {
+        pg_ensure_schema();
+    } else {
+        for _ in 0..50 {
+            if pg_table_ready() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 
     let rbase = RING_BASE.load(Ordering::Acquire);
     if rbase.is_null() {
-        log!("pg_keyspace persist: ring not ready, exiting");
+        log!("pg_keyspace persist {idx}: ring not ready, exiting");
         return;
     }
-    let consumer = unsafe { ring::Consumer::attach(rbase) };
+    let consumer = unsafe { ring::Consumer::attach(rbase.add(idx * ring_stride())) };
     let idle = Duration::from_millis(GUC_PERSIST_WINDOW_MS.get().max(1) as u64);
-    log!("pg_keyspace persist: draining ring -> supacache.kv (db={dbname})");
+    log!("pg_keyspace persist {idx}: draining ring {idx} -> supacache.kv (db={dbname})");
 
     while !BackgroundWorker::sigterm_received() {
         let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
@@ -559,9 +604,16 @@ mod supacache {
         let base = RING_BASE.load(Ordering::Acquire);
         let mut rows = Vec::new();
         if !base.is_null() {
-            let c = unsafe { ring::Consumer::attach(base) };
-            let (pushed, dropped, backlog) = c.stats();
-            rows.push((pushed as i64, dropped as i64, backlog as i64));
+            let stride = ring_stride();
+            let (mut p, mut d, mut b) = (0i64, 0i64, 0i64);
+            for i in 0..ring_count() {
+                let c = unsafe { ring::Consumer::attach(base.add(i * stride)) };
+                let (pushed, dropped, backlog) = c.stats();
+                p += pushed as i64;
+                d += dropped as i64;
+                b += backlog as i64;
+            }
+            rows.push((p, d, b));
         }
         TableIterator::new(rows)
     }

@@ -270,13 +270,29 @@ blocked by persistence. Residual p99 (~1.75ms) is event-loop CPU contention from
 the 50-connection write flood, not persistence; a second slot worker (§3.1 P4)
 removes it.
 
-**Sustained persistence:** one persistence worker drains **~107k writes/s** with
-zero drops for bursts that fit the ring (100k writes committed in 0.93s). Beyond
-the drain rate the ring absorbs the burst then sheds load (`ring_stats.dropped`);
-knobs are `ring_mb` (burst absorption), more persistence workers (higher
-ceiling), or producer backpressure (no loss). Crash recovery still holds:
-8,000 keys recovered in 8ms after a SIGQUIT crash. Details in
-`results/p1_writepath.txt`.
+**Sustained persistence and worker scale-out.** Writes are sharded by CRC16 slot
+across N rings, each drained by its own persistence worker (so a key always
+lands on the same worker — no cross-worker `ON CONFLICT` contention). Sustained
+durable throughput (300k distinct upserts, `-r 5M`, so almost no dedup savings —
+the hard case), zero drops:
+
+| Persistence workers | Durable writes/s | Scaling |
+|---:|---:|---:|
+| 1 | 57.7k | 1.0× |
+| 2 | 103.0k | 1.8× |
+| 4 | 145.1k | 2.5× |
+
+It scales, but sub-linearly at 4 — the 4-vCPU box is shared by the RESP worker,
+N persistence workers and the load client, and, more fundamentally, **all
+workers commit to one Postgres WAL**, so fsync/WAL-insertion serialises. That
+shared-WAL ceiling is the durable-path analogue of §11's "Valkey wins by not
+sharing," and it is exactly why the product bet is per-prefix durability + SQL
+access to the same bytes, not out-writing Valkey. Beyond the drain rate the ring
+absorbs the burst then sheds load (`ring_stats.dropped`); knobs are `ring_mb`
+(burst absorption), `persist_workers` (this table), or producer backpressure
+(no loss). Crash recovery still holds: 8,000 keys recovered in 8ms after a
+SIGQUIT crash. Details in `results/p1_writepath.txt` and
+`results/persist_scaleout.txt`.
 
 ## 6. Concerns validation matrix
 

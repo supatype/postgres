@@ -109,7 +109,8 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 | `pg_keyspace.durability` | `ephemeral` | `ephemeral` = shmem only; any other value persists to `supacache.kv` (§3.3/§3.4) |
 | `pg_keyspace.database` | `postgres` | database holding the `supacache.kv` backing tables |
 | `pg_keyspace.persist_window_ms` | 10 | how often the persistence worker drains the ring when idle |
-| `pg_keyspace.ring_mb` | 64 | size of the RESP→persistence ring buffer (burst absorption) |
+| `pg_keyspace.ring_mb` | 64 | size of each RESP→persistence ring buffer (burst absorption) |
+| `pg_keyspace.persist_workers` | 1 | persistence workers/rings draining in parallel (writes sharded by key slot) |
 | `pg_keyspace.commit_window_us` | 500 | standalone file-batcher window (durability microbench) |
 
 ## Results in one line

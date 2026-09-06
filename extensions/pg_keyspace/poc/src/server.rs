@@ -5,6 +5,7 @@
 //! path the P0 kill criterion measures.
 
 use crate::batcher::{Batcher, Tier};
+use crate::crc16;
 use crate::resp::{self, Parse};
 use crate::ring;
 use crate::store::{now_micros, Lookup, Store};
@@ -35,9 +36,10 @@ pub struct Worker {
     epfd: RawFd,
     conns: HashMap<RawFd, Conn>,
     args: Vec<(usize, usize)>,
-    // P1: when set, every write is enqueued into the shared-memory ring and a
-    // separate persistence worker drains it — the RESP path never touches SPI.
-    producer: Option<ring::Producer>,
+    // P1: when non-empty, every write is enqueued into one of these shared-memory
+    // rings (sharded by key slot) and a dedicated persistence worker drains each
+    // — the RESP path never touches SPI. Multiple rings scale durable writes.
+    producers: Vec<ring::Producer>,
 }
 
 impl Worker {
@@ -62,14 +64,14 @@ impl Worker {
             epfd,
             conns: HashMap::new(),
             args: Vec::with_capacity(8),
-            producer: None,
+            producers: Vec::new(),
         })
     }
 
-    /// Enable P1 persistence: every write is enqueued into `producer` (a
-    /// shared-memory ring drained by a separate persistence worker).
-    pub fn set_ring_producer(&mut self, producer: ring::Producer) {
-        self.producer = Some(producer);
+    /// Enable P1 persistence: writes are sharded by key slot across these rings,
+    /// each drained by its own persistence worker.
+    pub fn set_ring_producers(&mut self, producers: Vec<ring::Producer>) {
+        self.producers = producers;
     }
 
     pub fn run(&mut self) -> io::Result<()> {
@@ -228,7 +230,7 @@ impl Worker {
         let store = self.store.clone();
         let batcher = self.batcher.clone();
         let tier = self.tier;
-        let persist_on = self.producer.is_some();
+        let persist_on = !self.producers.is_empty();
         // A write to enqueue for persistence (§3.3), applied after the match so
         // it does not tangle with the `out` borrow.
         let mut stage: Option<PendingWrite> = None;
@@ -369,8 +371,17 @@ impl Worker {
         }
 
         if let Some((k, v, e)) = stage {
-            if let Some(p) = &self.producer {
-                p.push(&k, &v, e);
+            let n = self.producers.len();
+            if n > 0 {
+                // shard by key slot so a given key always lands on the same ring
+                // (and thus the same persistence worker) — no cross-worker key
+                // conflicts on ON CONFLICT.
+                let shard = if n == 1 {
+                    0
+                } else {
+                    crc16::key_slot(&k) as usize % n
+                };
+                self.producers[shard].push(&k, &v, e);
             }
         }
     }
