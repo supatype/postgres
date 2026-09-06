@@ -9,11 +9,13 @@ and the shared-nothing worker design scales to Valkey-class aggregate
 throughput.
 
 **P1 (storage & durability) now landed too:** RESP writes persist to a
-hash-partitioned `supacache.kv` backing table via batched SPI, the same bytes
-are queryable in SQL ("SQL access to the same bytes", §14), and after a hard
-`kill -9` of the whole cluster the worker rebuilds shmem from the tables —
-104k keys recovered in 367ms. See §5b. Security (§4) remains untouched: that is
-P2, the ship-decider.
+hash-partitioned `supacache.kv` backing table, the same bytes are queryable in
+SQL ("SQL access to the same bytes", §14), and after a hard crash the worker
+rebuilds shmem from the tables — 104k keys in 367ms. Persistence runs **off the
+event loop**: the RESP worker enqueues into a shared-memory ring and a dedicated
+persistence worker drains it, so reads stay fast under write load (max GET
+latency 170ms → 5ms) at ~107k sustained durable writes/s. See §5b–§5c. Security
+(§4) remains untouched: that is P2, the ship-decider.
 
 This report presents *measured* numbers, cross-checks them against the plan's
 targets, and separates what the POC validates empirically from what it
@@ -239,14 +241,42 @@ served over RESP after restart.
 | closed-loop SET avg | 33µs | 69µs |
 | GET (unaffected) | 500k/s | 500k/s |
 
-**Reads are unaffected** — still full ephemeral speed. Persisted *write*
-throughput drops ~17× because the POC upserts row-by-row via SPI and the flush
-transaction blocks the single event-loop thread (visible as 18k–52k/s jitter).
-`relaxed`'s async ack keeps write *latency* at ephemeral levels (p50 39µs). The
-finding: production persistence must not upsert row-by-row on the event loop —
-use multi-row `INSERT`/`COPY`, a dedicated I/O worker, or the
-`XACT_EVENT_COMMIT` publication path (§3.5). This is the same class of finding
-as the durable-serialisation one in §5.
+**Reads are unaffected** — still full ephemeral speed. The first cut of
+persisted *writes* was row-by-row SPI upserts on the event-loop thread: 32k/s
+and, worse, reads stalled behind each flush (GET max latency **170ms** under
+write load). That finding drove the write-path optimization in §5c.
+
+## 5c. P1 write-path optimization (measured)
+
+Two changes turned the naive persisted-write path into a decoupled one:
+
+1. **Bulk `UNNEST` upsert** — one deduped multi-row `INSERT … ON CONFLICT` per
+   batch instead of a statement per row: **32k → 85k/s**.
+2. **Off the event loop** — the RESP worker now only enqueues each write into a
+   lock-free single-producer/single-consumer **shared-memory ring** (~ns); a
+   **dedicated persistence background worker** (its own process + SPI) drains the
+   ring and bulk-upserts. The RESP event loop never touches SPI.
+
+Read latency under heavy concurrent write load (GET `-c1 -P1`, SET `-c50 -P16`):
+
+| | baseline | inline flush | ring + worker |
+|---|---:|---:|---:|
+| GET avg | 33µs | 241µs | 82µs |
+| GET p99 | 55µs | 1.80ms | 1.75ms |
+| GET **max** | 375µs | **170.8ms** | **4.95ms** |
+
+The catastrophic 170ms tail is **gone** (34× better) — reads are no longer
+blocked by persistence. Residual p99 (~1.75ms) is event-loop CPU contention from
+the 50-connection write flood, not persistence; a second slot worker (§3.1 P4)
+removes it.
+
+**Sustained persistence:** one persistence worker drains **~107k writes/s** with
+zero drops for bursts that fit the ring (100k writes committed in 0.93s). Beyond
+the drain rate the ring absorbs the burst then sheds load (`ring_stats.dropped`);
+knobs are `ring_mb` (burst absorption), more persistence workers (higher
+ceiling), or producer backpressure (no loss). Crash recovery still holds:
+8,000 keys recovered in 8ms after a SIGQUIT crash. Details in
+`results/p1_writepath.txt`.
 
 ## 6. Concerns validation matrix
 
@@ -270,6 +300,8 @@ as the durable-serialisation one in §5.
 | Batched commit to real tables (§3.4, P1) | ✅ one transaction per window (SPI) |
 | Crash recovery from tables (§12 P1) | ✅ 104k keys reloaded in 367ms after `kill -9` |
 | bgworker is a real backend w/ SPI (§3.1) | ✅ `connect_worker_to_spi`, no read-path txn |
+| Persistence off the RESP hot path (§3.1) | ✅ SPSC shmem ring + dedicated persist worker; read tail 170ms→5ms |
+| Bulk batched commit (§3.4) | ✅ deduped `UNNEST` upsert; ~107k durable writes/s per worker |
 
 ### 6b. Security model (§4) — NOT implemented in this P0; validated only on paper
 
@@ -333,10 +365,12 @@ commit off the worker's snapshot.
   (the in-PG version would register N background workers).
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent
   for this purpose and does not affect latency.
-- P1 persistence (in-PG) upserts row-by-row via SPI on the event-loop thread —
-  correct and crash-safe, but write-throughput-limited (§5b). The standalone
-  file batcher (§5) remains the model for raw fsync amortisation. Production
-  needs multi-row/COPY persistence off the event loop.
+- P1 persistence is now off the event loop (ring + dedicated worker, §5c) with
+  bulk `UNNEST` upserts; the sustained ceiling is one persist worker's SPI rate
+  (~107k/s). Higher needs more persist workers / partitioned rings, or
+  `COPY`-into-staging + merge. Under sustained overload the ring currently sheds
+  load (drops) rather than applying producer backpressure — a deliberate,
+  documented relaxed-tier choice, not yet a no-loss guarantee.
 - Only `relaxed`/async persistence is wired to real tables in-PG so far;
   `durable`/`replicated` sync-ack-to-commit semantics against `supacache.kv`
   are the next P1 increment (the standalone batcher already characterises their

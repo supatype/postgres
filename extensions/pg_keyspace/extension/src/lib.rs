@@ -36,6 +36,8 @@ mod store;
 mod resp;
 #[path = "../../poc/src/batcher.rs"]
 mod batcher;
+#[path = "../../poc/src/ring.rs"]
+mod ring;
 #[path = "../../poc/src/server.rs"]
 mod server;
 
@@ -43,11 +45,14 @@ use batcher::Tier;
 use store::{Config, Lookup, Store};
 
 const SEG_NAME: &CStr = c"pg_keyspace_segment";
+const RING_NAME: &CStr = c"pg_keyspace_ring";
 
 // Base address of the Postgres shared-memory segment, published by the startup
 // hook and inherited by every forked backend. Each context rebuilds a cheap
 // `Store` view over it on demand.
 static SEG_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+// Base of the SPSC persistence ring (RESP worker -> persistence worker).
+static RING_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
 // GUCs (fixed at postmaster start; the segment is sized from them).
 static GUC_PORT: GucSetting<i32> = GucSetting::<i32>::new(6380);
@@ -61,6 +66,11 @@ static GUC_COMMIT_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
 static GUC_DATABASE: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"postgres"));
 static GUC_PERSIST_WINDOW_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
+static GUC_RING_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
+
+fn ring_bytes() -> usize {
+    ring::bytes_for((GUC_RING_MB.get().max(1) as usize) * 1024 * 1024)
+}
 
 static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C" fn()> = None;
 static mut PREV_SHMEM_STARTUP_HOOK: Option<unsafe extern "C" fn()> = None;
@@ -155,11 +165,21 @@ pub extern "C" fn _PG_init() {
     );
     GucRegistry::define_int_guc(
         "pg_keyspace.persist_window_ms",
-        "How often the worker flushes staged writes to supacache.kv, in ms",
-        "Larger windows batch more writes per transaction (§3.4).",
+        "How often the persistence worker drains the ring when idle, in ms",
+        "Under load it drains continuously; this only bounds idle latency.",
         &GUC_PERSIST_WINDOW_MS,
         1,
         60_000,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.ring_mb",
+        "Size of the RESP->persistence ring buffer, in MB",
+        "Absorbs write bursts so the RESP path never blocks on persistence.",
+        &GUC_RING_MB,
+        1,
+        4096,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -187,6 +207,17 @@ pub extern "C" fn _PG_init() {
     };
     builder.load();
 
+    // Dedicated persistence worker: drains the ring and bulk-upserts into
+    // supacache.kv, so the RESP worker never touches SPI on the hot path.
+    if persisted {
+        BackgroundWorkerBuilder::new("pg_keyspace: persistence worker")
+            .set_library("pg_keyspace")
+            .set_function("pg_keyspace_persist_main")
+            .set_restart_time(Some(Duration::from_secs(2)))
+            .enable_spi_access()
+            .load();
+    }
+
     log!("pg_keyspace: initialised (shmem hooks + RESP worker registered)");
 }
 
@@ -196,8 +227,8 @@ extern "C" fn ks_shmem_request() {
         if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
             prev();
         }
-        let size = ks_config().total_bytes();
-        pg_sys::RequestAddinShmemSpace(size);
+        pg_sys::RequestAddinShmemSpace(ks_config().total_bytes());
+        pg_sys::RequestAddinShmemSpace(ring_bytes());
     }
 }
 
@@ -217,9 +248,22 @@ extern "C" fn ks_shmem_startup() {
         // First backend (postmaster) initialises; the rest just publish the base.
         let _view = Store::from_raw(ptr, &cfg, !found);
         SEG_BASE.store(ptr, Ordering::Release);
+
+        // Persistence ring segment.
+        let rbytes = ring_bytes();
+        let mut rfound = false;
+        let rptr = pg_sys::ShmemInitStruct(RING_NAME.as_ptr(), rbytes, &mut rfound) as *mut u8;
+        if !rptr.is_null() {
+            if !rfound {
+                std::ptr::write_bytes(rptr, 0, rbytes);
+                ring::init(rptr, (GUC_RING_MB.get().max(1) as usize) * 1024 * 1024);
+            }
+            RING_BASE.store(rptr, Ordering::Release);
+        }
         log!(
-            "pg_keyspace: shmem segment ready ({} bytes, found={})",
+            "pg_keyspace: shmem ready (store {} bytes, ring {} bytes, found={})",
             size,
+            rbytes,
             found
         );
     }
@@ -251,8 +295,10 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
         }
     };
 
-    // P1 storage & durability: connect SPI, ensure the backing tables, recover
-    // shmem from them (crash recovery), then persist staged writes each window.
+    // P1 storage & durability: connect SPI only to recover shmem from the
+    // backing tables at startup (crash recovery); all steady-state persistence
+    // is offloaded to the persistence worker via the ring, so the RESP hot path
+    // never touches SPI.
     if persisted {
         let dbname = GUC_DATABASE
             .get()
@@ -260,26 +306,83 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
             .unwrap_or("postgres")
             .to_string();
         BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
-        pg_ensure_schema();
+        // wait (bounded) for the persistence worker to create the table
+        for _ in 0..30 {
+            if pg_table_ready() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let t0 = std::time::Instant::now();
         let n = pg_recover(&store);
         log!(
             "pg_keyspace worker: recovered {n} keys from supacache.kv in {:?}",
             t0.elapsed()
         );
-        let window = Duration::from_millis(GUC_PERSIST_WINDOW_MS.get().max(1) as u64);
-        worker.set_persister(make_persister(), window);
-        log!("pg_keyspace worker: persistence ON (db={dbname}, window={window:?})");
+        let rbase = RING_BASE.load(Ordering::Acquire);
+        if !rbase.is_null() {
+            worker.set_ring_producer(unsafe { ring::Producer::attach(rbase) });
+            log!("pg_keyspace worker: persistence ON (ring -> persistence worker, db={dbname})");
+        } else {
+            log!("pg_keyspace worker: ring not ready; running ephemeral");
+        }
     }
 
     log!("pg_keyspace worker: RESP listening on 0.0.0.0:{port} (persisted={persisted})");
-    let timeout_ms = if persisted {
-        GUC_PERSIST_WINDOW_MS.get().max(1)
-    } else {
-        500
-    };
-    let _ = worker.run_with(|| !BackgroundWorker::sigterm_received(), timeout_ms);
+    let _ = worker.run_with(|| !BackgroundWorker::sigterm_received(), 500);
     log!("pg_keyspace worker: shutting down");
+}
+
+/// The dedicated persistence worker: drains the ring and bulk-upserts into
+/// `supacache.kv`. Runs in its own process with its own SPI connection, so the
+/// RESP worker's event loop is never blocked by Postgres.
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_keyspace_persist_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
+    let dbname = GUC_DATABASE
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("postgres")
+        .to_string();
+    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+    pg_ensure_schema();
+
+    let rbase = RING_BASE.load(Ordering::Acquire);
+    if rbase.is_null() {
+        log!("pg_keyspace persist: ring not ready, exiting");
+        return;
+    }
+    let consumer = unsafe { ring::Consumer::attach(rbase) };
+    let idle = Duration::from_millis(GUC_PERSIST_WINDOW_MS.get().max(1) as u64);
+    log!("pg_keyspace persist: draining ring -> supacache.kv (db={dbname})");
+
+    while !BackgroundWorker::sigterm_received() {
+        let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
+        consumer.drain(20_000, |k, v, e| batch.push((k.to_vec(), v.to_vec(), e)));
+        if batch.is_empty() {
+            std::thread::sleep(idle);
+            continue;
+        }
+        bulk_upsert(batch);
+    }
+    // final drain on shutdown
+    let mut tail: Vec<server::PendingWrite> = Vec::new();
+    consumer.drain(usize::MAX, |k, v, e| tail.push((k.to_vec(), v.to_vec(), e)));
+    if !tail.is_empty() {
+        bulk_upsert(tail);
+    }
+    log!("pg_keyspace persist: shutting down");
+}
+
+/// True if supacache.kv exists yet (created by the persistence worker).
+fn pg_table_ready() -> bool {
+    BackgroundWorker::transaction(|| {
+        Spi::get_one::<bool>("SELECT to_regclass('supacache.kv') IS NOT NULL")
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    })
 }
 
 /// Create the `supacache` schema and the hash-partitioned `supacache.kv`
@@ -331,39 +434,53 @@ fn pg_recover(store: &Store) -> i64 {
     }))
 }
 
-/// Persister: flush a staged batch of writes into `supacache.kv` in one
-/// transaction — "one fsync amortised across hundreds of operations" (§3.4),
-/// here as one Postgres commit per window against real, SQL-queryable tables.
-fn make_persister() -> server::PersistFn {
-    Box::new(move |writes: &mut Vec<server::PendingWrite>| {
-        if writes.is_empty() {
-            return;
-        }
-        let batch = std::mem::take(writes);
-        BackgroundWorker::transaction(move || {
-            let _ = Spi::connect(|mut client| {
-                for (k, v, e) in &batch {
-                    let slot = crc16::key_slot(k) as i32;
-                    let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
-                        (PgOid::BuiltIn(PgBuiltInOids::BYTEAOID), k.clone().into_datum()),
-                        (PgOid::BuiltIn(PgBuiltInOids::INT4OID), slot.into_datum()),
-                        (PgOid::BuiltIn(PgBuiltInOids::BYTEAOID), v.clone().into_datum()),
-                        (PgOid::BuiltIn(PgBuiltInOids::INT8OID), (*e).into_datum()),
-                    ];
-                    client.update(
-                        "INSERT INTO supacache.kv (tenant,key,slot,kind,val,expires_at,version) \
-                         VALUES ('',$1,$2,'s',$3,$4,1) \
-                         ON CONFLICT (tenant,key) DO UPDATE SET \
-                         val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, \
-                         slot=EXCLUDED.slot, version=supacache.kv.version+1",
-                        None,
-                        Some(args),
-                    )?;
-                }
-                Ok::<(), pgrx::spi::Error>(())
-            });
+/// Bulk-upsert a drained batch into `supacache.kv` in one transaction (§3.4).
+/// The batch is deduplicated by key (last write wins) so a single `ON CONFLICT`
+/// command never touches the same row twice, then sent as four parallel arrays
+/// through `unnest(...)` — one plan, one execution, one commit for the batch.
+fn bulk_upsert(batch: Vec<server::PendingWrite>) {
+    use std::collections::HashMap;
+    if batch.is_empty() {
+        return;
+    }
+    let mut latest: HashMap<Vec<u8>, (Vec<u8>, i64)> = HashMap::with_capacity(batch.len());
+    for (k, v, e) in batch {
+        latest.insert(k, (v, e));
+    }
+    let n = latest.len();
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut slots: Vec<i32> = Vec::with_capacity(n);
+    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut exps: Vec<i64> = Vec::with_capacity(n);
+    for (k, (v, e)) in latest {
+        slots.push(crc16::key_slot(&k) as i32);
+        vals.push(v);
+        exps.push(e);
+        keys.push(k);
+    }
+
+    BackgroundWorker::transaction(move || {
+        let _ = Spi::connect(|mut client| {
+            let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
+                (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), keys.into_datum()),
+                (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), slots.into_datum()),
+                (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), vals.into_datum()),
+                (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), exps.into_datum()),
+            ];
+            client.update(
+                "INSERT INTO supacache.kv (tenant,key,slot,kind,val,expires_at,version) \
+                 SELECT '', k, s, 's', v, e, 1 \
+                 FROM unnest($1::bytea[], $2::int[], $3::bytea[], $4::bigint[]) \
+                      AS t(k, s, v, e) \
+                 ON CONFLICT (tenant,key) DO UPDATE SET \
+                 val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, \
+                 slot=EXCLUDED.slot, version=supacache.kv.version+1",
+                None,
+                Some(args),
+            )?;
+            Ok::<(), pgrx::spi::Error>(())
         });
-    })
+    });
 }
 
 // ---- the SQL surface (§6): in-backend shared-memory reads/writes ---------
@@ -426,6 +543,27 @@ mod supacache {
     #[pg_extern]
     fn ping() -> &'static str {
         "PONG"
+    }
+
+    /// Persistence ring diagnostics: total writes enqueued, writes dropped due
+    /// to ring-full backpressure, and current unconsumed backlog in bytes.
+    #[pg_extern]
+    fn ring_stats() -> TableIterator<
+        'static,
+        (
+            name!(pushed, i64),
+            name!(dropped, i64),
+            name!(backlog_bytes, i64),
+        ),
+    > {
+        let base = RING_BASE.load(Ordering::Acquire);
+        let mut rows = Vec::new();
+        if !base.is_null() {
+            let c = unsafe { ring::Consumer::attach(base) };
+            let (pushed, dropped, backlog) = c.stats();
+            rows.push((pushed as i64, dropped as i64, backlog as i64));
+        }
+        TableIterator::new(rows)
     }
 
     // ---- in-backend micro-benchmarks (§6) --------------------------------

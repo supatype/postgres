@@ -17,6 +17,7 @@
 pub mod batcher;
 pub mod crc16;
 pub mod resp;
+pub mod ring;
 pub mod server;
 pub mod shmem;
 pub mod store;

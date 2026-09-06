@@ -41,13 +41,14 @@ extensions/pg_keyspace/
 │   │   ├── resp.rs           RESP2 codec (§5)
 │   │   ├── server.rs         epoll event loop, RESP dispatch (§3.1)
 │   │   ├── batcher.rs        commit batching, four durability tiers (§3.4)
+│   │   ├── ring.rs           SPSC shmem ring: RESP worker -> persistence worker (P1)
 │   │   ├── crc16.rs          cluster slot hashing (§3.1)
 │   │   └── bin/
 │   │       ├── pgkeyspaced.rs        standalone daemon (scale-out demo)
 │   │       └── durability_bench.rs   isolated batcher amortisation benchmark
 │   └── Cargo.toml
 ├── extension/                ← the pgrx extension (compiles poc/src verbatim via #[path])
-│   ├── src/lib.rs            _PG_init, shmem hooks, background worker, supacache.* SQL
+│   ├── src/lib.rs            _PG_init, shmem hooks, RESP worker, persistence worker, supacache.* SQL
 │   ├── Cargo.toml
 │   └── pg_keyspace.control
 ├── bench/                    ← benchmark harnesses
@@ -107,7 +108,8 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 | `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
 | `pg_keyspace.durability` | `ephemeral` | `ephemeral` = shmem only; any other value persists to `supacache.kv` (§3.3/§3.4) |
 | `pg_keyspace.database` | `postgres` | database holding the `supacache.kv` backing tables |
-| `pg_keyspace.persist_window_ms` | 10 | how often staged writes are flushed to `supacache.kv` in one transaction |
+| `pg_keyspace.persist_window_ms` | 10 | how often the persistence worker drains the ring when idle |
+| `pg_keyspace.ring_mb` | 64 | size of the RESP→persistence ring buffer (burst absorption) |
 | `pg_keyspace.commit_window_us` | 500 | standalone file-batcher window (durability microbench) |
 
 ## Results in one line
