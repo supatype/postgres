@@ -9,7 +9,7 @@ use crate::batcher::{Batcher, Tier};
 use crate::crc16;
 use crate::resp::{self, Parse};
 use crate::ring;
-use crate::store::{now_micros, Lookup, Store, KIND_HASH, KIND_LIST};
+use crate::store::{now_micros, Lookup, Store, KIND_HASH, KIND_LIST, KIND_ZSET};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::{Read, Write};
@@ -1082,6 +1082,248 @@ impl Worker {
                 save_list(&store, &args[1], &l, exp);
                 resp::simple(out, "OK");
             }
+            // ---- P3 §5: sorted sets --------------------------------------
+            b"ZADD" => {
+                // ZADD key [NX|XX] [CH] score member [score member ...]
+                if nargs < 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'zadd'");
+                    return;
+                }
+                let mut i = 2;
+                let (mut nx, mut xx, mut ch) = (false, false, false);
+                while i < nargs {
+                    match args[i].to_ascii_uppercase().as_slice() {
+                        b"NX" => { nx = true; i += 1; }
+                        b"XX" => { xx = true; i += 1; }
+                        b"CH" => { ch = true; i += 1; }
+                        _ => break,
+                    }
+                }
+                if nx && xx {
+                    resp::error(out, "ERR XX and NX options at the same time are not compatible");
+                    return;
+                }
+                if i >= nargs || (nargs - i) % 2 != 0 {
+                    resp::error(out, "ERR syntax error");
+                    return;
+                }
+                // validate all scores first (atomic-ish)
+                let mut pairs: Vec<(f64, &[u8])> = Vec::new();
+                let mut j = i;
+                while j + 1 < nargs {
+                    match aggr::parse_score(&args[j]) {
+                        Some(s) => pairs.push((s, &args[j + 1])),
+                        None => {
+                            resp::error(out, "ERR value is not a valid float");
+                            return;
+                        }
+                    }
+                    j += 2;
+                }
+                let (mut z, exp) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let (mut added, mut changed) = (0i64, 0i64);
+                for (s, m) in pairs {
+                    let exists = z.score(m).is_some();
+                    if (nx && exists) || (xx && !exists) {
+                        continue;
+                    }
+                    let (was_added, was_changed) = z.add(m, s);
+                    if was_added {
+                        added += 1;
+                    }
+                    if was_changed {
+                        changed += 1;
+                    }
+                }
+                save_zset(&store, &args[1], &z, exp);
+                resp::integer(out, if ch { changed } else { added });
+            }
+            b"ZSCORE" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'zscore'");
+                    return;
+                }
+                let (z, _) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                match z.score(&args[2]) {
+                    Some(s) => resp::bulk(out, aggr::fmt_score(s).as_bytes()),
+                    None => resp::nil(out),
+                }
+            }
+            b"ZMSCORE" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'zmscore'");
+                    return;
+                }
+                let (z, _) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::array_header(out, nargs - 2);
+                for m in &args[2..] {
+                    match z.score(m) {
+                        Some(s) => resp::bulk(out, aggr::fmt_score(s).as_bytes()),
+                        None => resp::nil(out),
+                    }
+                }
+            }
+            b"ZCARD" => {
+                let (z, _) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::integer(out, z.len() as i64);
+            }
+            b"ZREM" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'zrem'");
+                    return;
+                }
+                let (mut z, exp) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let mut removed = 0i64;
+                for m in &args[2..] {
+                    if z.remove(m) {
+                        removed += 1;
+                    }
+                }
+                save_zset(&store, &args[1], &z, exp);
+                resp::integer(out, removed);
+            }
+            b"ZINCRBY" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'zincrby'");
+                    return;
+                }
+                let by = match aggr::parse_score(&args[2]) {
+                    Some(s) => s,
+                    None => {
+                        resp::error(out, "ERR value is not a valid float");
+                        return;
+                    }
+                };
+                let (mut z, exp) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let next = z.score(&args[3]).unwrap_or(0.0) + by;
+                z.add(&args[3], next);
+                save_zset(&store, &args[1], &z, exp);
+                resp::bulk(out, aggr::fmt_score(next).as_bytes());
+            }
+            b"ZRANK" | b"ZREVRANK" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments");
+                    return;
+                }
+                let (z, _) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                match z.rank(&args[2]) {
+                    Some(r) => {
+                        let r = if cmd == b"ZREVRANK" { z.len() - 1 - r } else { r };
+                        resp::integer(out, r as i64);
+                    }
+                    None => resp::nil(out),
+                }
+            }
+            b"ZRANGE" | b"ZREVRANGE" => {
+                if nargs < 4 {
+                    resp::error(out, "ERR wrong number of arguments");
+                    return;
+                }
+                let start: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let stop: i64 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let withscores = args[4..].iter().any(|a| a.eq_ignore_ascii_case(b"WITHSCORES"));
+                let rev = cmd == b"ZREVRANGE"
+                    || args[4..].iter().any(|a| a.eq_ignore_ascii_case(b"REV"));
+                let (z, _) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let mut items = z.sorted();
+                if rev {
+                    items.reverse();
+                }
+                let (lo, hi) = aggr::rank_bounds(items.len(), start, stop);
+                let slice = &items[lo..hi];
+                resp::array_header(out, if withscores { slice.len() * 2 } else { slice.len() });
+                for (m, s) in slice {
+                    resp::bulk(out, m);
+                    if withscores {
+                        resp::bulk(out, aggr::fmt_score(*s).as_bytes());
+                    }
+                }
+            }
+            b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE" => {
+                if nargs < 4 {
+                    resp::error(out, "ERR wrong number of arguments");
+                    return;
+                }
+                let rev = cmd == b"ZREVRANGEBYSCORE";
+                // for REV, args are (max min); normalise to (min, max)
+                let (minb, maxb) = if rev { (&args[3], &args[2]) } else { (&args[2], &args[3]) };
+                let (min, max) = match (aggr::ScoreBound::parse(minb), aggr::ScoreBound::parse(maxb)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => {
+                        resp::error(out, "ERR min or max is not a float");
+                        return;
+                    }
+                };
+                let withscores = args[4..].iter().any(|a| a.eq_ignore_ascii_case(b"WITHSCORES"));
+                // optional LIMIT offset count
+                let mut offset = 0usize;
+                let mut count: Option<usize> = None;
+                for w in 4..nargs {
+                    if args[w].eq_ignore_ascii_case(b"LIMIT") && w + 2 < nargs {
+                        offset = std::str::from_utf8(&args[w + 1]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let c: i64 = std::str::from_utf8(&args[w + 2]).ok().and_then(|s| s.parse().ok()).unwrap_or(-1);
+                        count = if c < 0 { None } else { Some(c as usize) };
+                    }
+                }
+                let (z, _) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let mut items = z.by_score(&min, &max);
+                if rev {
+                    items.reverse();
+                }
+                let items: Vec<_> = items.into_iter().skip(offset).take(count.unwrap_or(usize::MAX)).collect();
+                resp::array_header(out, if withscores { items.len() * 2 } else { items.len() });
+                for (m, s) in &items {
+                    resp::bulk(out, m);
+                    if withscores {
+                        resp::bulk(out, aggr::fmt_score(*s).as_bytes());
+                    }
+                }
+            }
+            b"ZCOUNT" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'zcount'");
+                    return;
+                }
+                let (min, max) = match (aggr::ScoreBound::parse(&args[2]), aggr::ScoreBound::parse(&args[3])) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => {
+                        resp::error(out, "ERR min or max is not a float");
+                        return;
+                    }
+                };
+                let (z, _) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::integer(out, z.by_score(&min, &max).len() as i64);
+            }
             _ => resp::error(out, "ERR unknown command"),
         }
 
@@ -1397,6 +1639,28 @@ fn save_list(store: &Store, key: &[u8], l: &aggr::List, exp: i64) {
     }
 }
 
+/// Load the sorted set at `key` (empty if absent). Returns None and writes
+/// `WRONGTYPE` to `out` if the key holds a non-zset value.
+fn load_zset(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::ZSet, i64)> {
+    match store.get_typed(key) {
+        None => Some((aggr::ZSet::new(), 0)),
+        Some((KIND_ZSET, exp, v)) => Some((aggr::ZSet::decode(v), exp)),
+        Some(_) => {
+            resp::error(out, WRONGTYPE);
+            None
+        }
+    }
+}
+
+/// Store a sorted set back, or delete the key if it became empty.
+fn save_zset(store: &Store, key: &[u8], z: &aggr::ZSet, exp: i64) {
+    if z.is_empty() {
+        store.del(key);
+    } else {
+        store.set_typed(key, &z.encode(), remaining_ttl(exp), KIND_ZSET);
+    }
+}
+
 /// Which argument positions of a command are keys (for ACL + tenant scoping).
 fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
     match cmd {
@@ -1406,7 +1670,10 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
         | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
         | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY"
         | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"LPOP" | b"RPOP" | b"LLEN"
-        | b"LINDEX" | b"LRANGE" | b"LSET" | b"LTRIM" => {
+        | b"LINDEX" | b"LRANGE" | b"LSET" | b"LTRIM"
+        | b"ZADD" | b"ZSCORE" | b"ZMSCORE" | b"ZCARD" | b"ZREM" | b"ZINCRBY"
+        | b"ZRANK" | b"ZREVRANK" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE"
+        | b"ZREVRANGEBYSCORE" | b"ZCOUNT" => {
             if nargs > 1 {
                 vec![1]
             } else {
@@ -1449,6 +1716,10 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"RPOP"
             | b"LSET"
             | b"LTRIM"
+            // P3 zset mutations
+            | b"ZADD"
+            | b"ZREM"
+            | b"ZINCRBY"
     )
 }
 

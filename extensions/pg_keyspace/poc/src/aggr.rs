@@ -196,9 +196,225 @@ impl List {
     }
 }
 
+// ---- Sorted set -----------------------------------------------------------
+
+/// Format a score the way clients expect: integers without a decimal point,
+/// `inf`/`-inf` for infinities, else the shortest string that round-trips.
+/// (Redis uses `%.17g`, which prints more digits for inexact doubles; this
+/// round-trips identically and is cleaner. Tests use exact scores.)
+pub fn fmt_score(s: f64) -> String {
+    if s.is_infinite() {
+        return if s > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    if s == s.trunc() && s.abs() < 1e17 {
+        return format!("{}", s as i64);
+    }
+    format!("{s}")
+}
+
+/// Parse a score, accepting `inf`/`+inf`/`-inf`/`infinity`.
+pub fn parse_score(b: &[u8]) -> Option<f64> {
+    let s = std::str::from_utf8(b).ok()?.trim();
+    match s.to_ascii_lowercase().as_str() {
+        "inf" | "+inf" | "infinity" | "+infinity" => Some(f64::INFINITY),
+        "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
+        _ => s.parse::<f64>().ok(),
+    }
+}
+
+/// One bound of a score range (`ZRANGEBYSCORE`): value + inclusivity. `(` prefix
+/// means exclusive; `-inf`/`+inf` are accepted.
+pub struct ScoreBound {
+    pub value: f64,
+    pub inclusive: bool,
+}
+
+impl ScoreBound {
+    pub fn parse(b: &[u8]) -> Option<ScoreBound> {
+        if b.first() == Some(&b'(') {
+            Some(ScoreBound {
+                value: parse_score(&b[1..])?,
+                inclusive: false,
+            })
+        } else {
+            Some(ScoreBound {
+                value: parse_score(b)?,
+                inclusive: true,
+            })
+        }
+    }
+}
+
+/// A Redis sorted set: unique members each with an f64 score. Stored unordered;
+/// range/rank ops sort a view by (score, member) — the Redis total order.
+#[derive(Default)]
+pub struct ZSet {
+    pub members: Vec<(Vec<u8>, f64)>,
+}
+
+impl ZSet {
+    pub fn new() -> ZSet {
+        ZSet { members: Vec::new() }
+    }
+
+    pub fn decode(mut buf: &[u8]) -> ZSet {
+        let mut z = ZSet::new();
+        while let Some(m) = take_bytes(&mut buf) {
+            if buf.len() < 8 {
+                break;
+            }
+            let mut s = [0u8; 8];
+            s.copy_from_slice(&buf[..8]);
+            buf = &buf[8..];
+            z.members.push((m.to_vec(), f64::from_le_bytes(s)));
+        }
+        z
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (m, s) in &self.members {
+            put_bytes(&mut out, m);
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    pub fn score(&self, member: &[u8]) -> Option<f64> {
+        self.members.iter().find(|(m, _)| m == member).map(|(_, s)| *s)
+    }
+
+    /// Insert or update. Returns (added, changed).
+    pub fn add(&mut self, member: &[u8], score: f64) -> (bool, bool) {
+        if let Some(e) = self.members.iter_mut().find(|(m, _)| m == member) {
+            let changed = e.1 != score;
+            e.1 = score;
+            (false, changed)
+        } else {
+            self.members.push((member.to_vec(), score));
+            (true, true)
+        }
+    }
+
+    pub fn remove(&mut self, member: &[u8]) -> bool {
+        if let Some(i) = self.members.iter().position(|(m, _)| m == member) {
+            self.members.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A copy of the members in sorted (score asc, then member bytewise) order.
+    pub fn sorted(&self) -> Vec<(Vec<u8>, f64)> {
+        let mut v = self.members.clone();
+        v.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    /// 0-based rank of a member in ascending order, or None if absent.
+    pub fn rank(&self, member: &[u8]) -> Option<usize> {
+        self.sorted().iter().position(|(m, _)| m == member)
+    }
+
+    /// Members with `min <= score <= max` (honoring exclusivity), sorted asc.
+    pub fn by_score(&self, min: &ScoreBound, max: &ScoreBound) -> Vec<(Vec<u8>, f64)> {
+        self.sorted()
+            .into_iter()
+            .filter(|(_, s)| {
+                (if min.inclusive { *s >= min.value } else { *s > min.value })
+                    && (if max.inclusive { *s <= max.value } else { *s < max.value })
+            })
+            .collect()
+    }
+}
+
+/// Normalise a `[start, stop]` inclusive rank range over `n` elements to a
+/// half-open `[lo, hi)`; empty range -> lo == hi.
+pub fn rank_bounds(n: usize, start: i64, stop: i64) -> (usize, usize) {
+    let n = n as i64;
+    if n == 0 {
+        return (0, 0);
+    }
+    let mut s = if start < 0 { n + start } else { start };
+    let mut e = if stop < 0 { n + stop } else { stop };
+    if s < 0 {
+        s = 0;
+    }
+    if e >= n {
+        e = n - 1;
+    }
+    if s > e || s >= n {
+        return (0, 0);
+    }
+    (s as usize, (e + 1) as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zset_add_score_range_rank() {
+        let mut z = ZSet::new();
+        assert_eq!(z.add(b"a", 1.0), (true, true));
+        assert_eq!(z.add(b"b", 3.0), (true, true));
+        assert_eq!(z.add(b"c", 2.0), (true, true));
+        assert_eq!(z.add(b"a", 1.0), (false, false)); // no change
+        assert_eq!(z.add(b"a", 5.0), (false, true)); // changed
+        assert_eq!(z.score(b"b"), Some(3.0));
+        // sorted by score: c(2), b(3), a(5)
+        let s: Vec<_> = z.sorted().into_iter().map(|(m, _)| m).collect();
+        assert_eq!(s, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
+        assert_eq!(z.rank(b"c"), Some(0));
+        assert_eq!(z.rank(b"a"), Some(2));
+        assert_eq!(z.rank(b"zz"), None);
+
+        // ties break by member bytewise
+        let mut z2 = ZSet::new();
+        z2.add(b"y", 1.0);
+        z2.add(b"x", 1.0);
+        let s2: Vec<_> = z2.sorted().into_iter().map(|(m, _)| m).collect();
+        assert_eq!(s2, vec![b"x".to_vec(), b"y".to_vec()]);
+
+        // by_score inclusive/exclusive
+        let lo = ScoreBound { value: 3.0, inclusive: true };
+        let hi = ScoreBound { value: f64::INFINITY, inclusive: true };
+        let r: Vec<_> = z.by_score(&lo, &hi).into_iter().map(|(m, _)| m).collect();
+        assert_eq!(r, vec![b"b".to_vec(), b"a".to_vec()]); // 3 and 5
+        let lo_ex = ScoreBound { value: 3.0, inclusive: false };
+        let r2: Vec<_> = z.by_score(&lo_ex, &hi).into_iter().map(|(m, _)| m).collect();
+        assert_eq!(r2, vec![b"a".to_vec()]); // >3 only
+
+        // encode/decode round-trip
+        let z3 = ZSet::decode(&z.encode());
+        assert_eq!(z3.len(), 3);
+        assert_eq!(z3.score(b"a"), Some(5.0));
+    }
+
+    #[test]
+    fn score_formatting_and_parse() {
+        assert_eq!(fmt_score(1.0), "1");
+        assert_eq!(fmt_score(-2.0), "-2");
+        assert_eq!(fmt_score(1.5), "1.5");
+        assert_eq!(fmt_score(f64::INFINITY), "inf");
+        assert_eq!(fmt_score(f64::NEG_INFINITY), "-inf");
+        assert_eq!(parse_score(b"3"), Some(3.0));
+        assert_eq!(parse_score(b"-inf"), Some(f64::NEG_INFINITY));
+        assert_eq!(parse_score(b"+inf"), Some(f64::INFINITY));
+        assert!(parse_score(b"abc").is_none());
+        assert_eq!(rank_bounds(5, 1, 3), (1, 4));
+        assert_eq!(rank_bounds(5, -2, -1), (3, 5));
+        assert_eq!(rank_bounds(5, 3, 1), (0, 0));
+    }
 
     #[test]
     fn list_push_pop_range() {

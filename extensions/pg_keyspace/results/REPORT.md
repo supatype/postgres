@@ -724,7 +724,12 @@ commit off the worker's snapshot.
   - lists — `LPUSH/RPUSH/LPUSHX/RPUSHX/LPOP/RPOP/LLEN/LINDEX/LRANGE/LSET/LTRIM`
     with negative-index and count semantics (`run_p3_lists.sh`, 24/24, redis
     parity; 507k RPUSH/s across small lists);
-  - `TYPE` reports string/hash/list/none.
+  - sorted sets — `ZADD` (NX/XX/CH), `ZSCORE/ZMSCORE/ZCARD/ZREM/ZINCRBY/ZRANK/
+    ZREVRANK/ZRANGE/ZREVRANGE/ZRANGEBYSCORE/ZREVRANGEBYSCORE/ZCOUNT` with
+    WITHSCORES, REV, LIMIT, exclusive `(` and `±inf` bounds, and (score, member)
+    tie ordering (`run_p3_zsets.sh`, 29/29, redis parity; 401k ZADD/s across small
+    zsets);
+  - `TYPE` reports string/hash/list/zset/none.
 
   Aggregates are stored as a compact length-prefixed blob in the slab (Redis's
   small-collection philosophy), so ops are O(n) on the collection — a fit for
@@ -732,7 +737,7 @@ commit off the worker's snapshot.
   blob-rewrite worst case by design; a native shmem structure for very large
   collections is a later upgrade. Aggregate values are currently in-memory only
   (not persisted): the P1 ring carries no type tag, so durable aggregates are a
-  follow-up. Sorted sets and pub/sub remain to build (§5).
+  follow-up. Pub/sub remains to build (§5).
 - Single in-PG worker; multi-worker scale-out shown via the standalone daemon
   (the in-PG version would register N background workers).
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent
