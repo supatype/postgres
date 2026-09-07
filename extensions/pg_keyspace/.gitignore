@@ -11,3 +11,6 @@ target/
 
 # C build objects
 *.o
+
+# Redis runtime dump artifact (written by a redis-server during benches)
+dump.rdb
