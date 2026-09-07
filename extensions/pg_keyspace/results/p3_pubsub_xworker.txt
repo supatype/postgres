@@ -1,0 +1,13 @@
+# P3 cross-worker pub/sub (§5) — worker0=:6390 worker1=:6391
+  PASS  PUBLISH on w0 reaches 1 subscriber on w1            
+  PASS  w1 subscriber received the w0 payload               
+  PASS  PUBLISH on w1 reaches 1 subscriber on w0            
+  PASS  w0 subscriber received the w1 payload               
+  PASS  PUBLISH news.tech on w0 matches w1 pattern          
+  PASS  w1 pattern sub received the pmessage                
+  PASS  PUBLISH counts local+remote subscribers (2)         
+  PASS  local subscriber got it                             
+  PASS  remote subscriber got it                            
+  PASS  PUBLISH with no subscribers -> 0                    
+
+# result: 10 passed, 0 failed

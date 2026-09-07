@@ -38,6 +38,8 @@ mod resp;
 mod batcher;
 #[path = "../../poc/src/ring.rs"]
 mod ring;
+#[path = "../../poc/src/pubsub.rs"]
+mod pubsub;
 #[path = "../../poc/src/aggr.rs"]
 mod aggr;
 #[path = "../../poc/src/server.rs"]

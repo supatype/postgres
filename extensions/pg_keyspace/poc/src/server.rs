@@ -7,6 +7,7 @@
 use crate::aggr;
 use crate::batcher::{Batcher, Tier};
 use crate::crc16;
+use crate::pubsub;
 use crate::resp::{self, Parse};
 use crate::ring;
 use crate::store::{now_micros, Lookup, Store, KIND_HASH, KIND_LIST, KIND_ZSET};
@@ -224,6 +225,11 @@ pub struct Worker {
     // PUBLISH fans out without scanning every connection. Local to this worker.
     channels: HashMap<Vec<u8>, HashSet<RawFd>>,
     patterns: HashMap<Vec<u8>, HashSet<RawFd>>,
+    // P3 cross-worker pub/sub (§5): when workers share a process (the scale-out
+    // daemon), a shared Bus routes a PUBLISH to subscribers on *other* workers.
+    // `None` for the single-worker in-PG extension (local delivery only).
+    bus: Option<Arc<pubsub::Bus>>,
+    worker_id: usize,
 }
 
 impl Worker {
@@ -254,7 +260,20 @@ impl Worker {
             tls_config: None,
             channels: HashMap::new(),
             patterns: HashMap::new(),
+            bus: None,
+            worker_id: 0,
         })
+    }
+
+    /// Join a cross-worker pub/sub Bus as worker `worker_id`. The Bus's wake
+    /// eventfd is added to this worker's epoll set so remote deliveries arrive
+    /// promptly. Only used by the multi-worker daemon; the in-PG extension runs
+    /// a single worker and never calls this.
+    pub fn set_bus(&mut self, bus: Arc<pubsub::Bus>, worker_id: usize) {
+        let wfd = bus.wake_fd(worker_id);
+        let _ = epoll_add(self.epfd, wfd, libc::EPOLLIN as u32);
+        self.bus = Some(bus);
+        self.worker_id = worker_id;
     }
 
     /// Durable tier: hold each write's reply until its ring record has committed.
@@ -319,6 +338,14 @@ impl Worker {
                 let fd = ev.u64 as RawFd;
                 if fd == self.listen_fd {
                     self.accept_all();
+                } else if self.bus.as_ref().map_or(false, |b| fd == b.wake_fd(self.worker_id)) {
+                    // A remote worker published to a channel/pattern we hold a
+                    // subscriber for: drain the inbox and deliver locally (never
+                    // re-broadcast — deliver_local is local-only).
+                    let msgs = self.bus.as_ref().unwrap().drain(self.worker_id);
+                    for (channel, msg) in msgs {
+                        self.deliver_local(&channel, &msg);
+                    }
                 } else {
                     let flags = ev.events;
                     if flags & (libc::EPOLLIN as u32) != 0 {
@@ -1490,10 +1517,17 @@ impl Worker {
         }
         let word: &[u8] = if pattern { b"psubscribe" } else { b"subscribe" };
         for ch in &args[1..] {
-            if pattern {
-                self.patterns.entry(ch.clone()).or_default().insert(fd);
+            let fresh = if pattern {
+                self.patterns.entry(ch.clone()).or_default().insert(fd)
             } else {
-                self.channels.entry(ch.clone()).or_default().insert(fd);
+                self.channels.entry(ch.clone()).or_default().insert(fd)
+            };
+            // Advertise the new subscriber to the cross-worker routing table so
+            // remote PUBLISHes reach it (once per genuinely-new fd+key).
+            if fresh {
+                if let Some(bus) = &self.bus {
+                    bus.subscribe(self.worker_id, ch, pattern);
+                }
             }
             let count = {
                 let c = self.conns.get_mut(&fd).unwrap();
@@ -1548,17 +1582,32 @@ impl Worker {
             return;
         }
         for ch in &list {
-            if pattern {
-                if let Some(set) = self.patterns.get_mut(ch) {
-                    set.remove(&fd);
-                    if set.is_empty() {
-                        self.patterns.remove(ch);
+            let removed = if pattern {
+                match self.patterns.get_mut(ch) {
+                    Some(set) => {
+                        let r = set.remove(&fd);
+                        if set.is_empty() {
+                            self.patterns.remove(ch);
+                        }
+                        r
                     }
+                    None => false,
                 }
-            } else if let Some(set) = self.channels.get_mut(ch) {
-                set.remove(&fd);
-                if set.is_empty() {
-                    self.channels.remove(ch);
+            } else {
+                match self.channels.get_mut(ch) {
+                    Some(set) => {
+                        let r = set.remove(&fd);
+                        if set.is_empty() {
+                            self.channels.remove(ch);
+                        }
+                        r
+                    }
+                    None => false,
+                }
+            };
+            if removed {
+                if let Some(bus) = &self.bus {
+                    bus.unsubscribe(self.worker_id, ch, pattern);
                 }
             }
             let count = {
@@ -1592,36 +1641,53 @@ impl Worker {
             return;
         }
         let channel = args[1].clone();
-        let msg = &args[2];
+        let msg = args[2].clone();
+        // Deliver to subscribers on this worker, then (if part of a scale-out
+        // Bus) route to subscribers on the other workers.
+        let mut receivers = self.deliver_local(&channel, &msg) as i64;
+        if let Some(bus) = self.bus.clone() {
+            receivers += bus.publish(self.worker_id, &channel, &msg, |p, c| glob_match(p, c)) as i64;
+        }
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::integer(out, receivers);
+        self.flush(fd);
+    }
+
+    /// Deliver `msg` to every subscriber *on this worker* — direct channel
+    /// subscribers and pattern subscribers whose glob matches — and flush them.
+    /// Returns the local receiver count. Local-only: it never touches the Bus,
+    /// so it is safe to call both for a PUBLISH originating here and for a
+    /// message routed in from another worker (no re-broadcast loop).
+    fn deliver_local(&mut self, channel: &[u8], msg: &[u8]) -> usize {
         // Collect targets first (releases the channels/patterns borrows).
         let mut targets: Vec<(RawFd, Option<Vec<u8>>)> = Vec::new();
-        if let Some(set) = self.channels.get(&channel) {
+        if let Some(set) = self.channels.get(channel) {
             for &sfd in set {
                 targets.push((sfd, None));
             }
         }
         for (pat, set) in &self.patterns {
-            if glob_match(pat, &channel) {
+            if glob_match(pat, channel) {
                 for &sfd in set {
                     targets.push((sfd, Some(pat.clone())));
                 }
             }
         }
-        let mut receivers = 0i64;
+        let mut receivers = 0usize;
         for (sfd, pat) in &targets {
             if let Some(c) = self.conns.get_mut(sfd) {
                 match pat {
                     None => {
                         resp::array_header(&mut c.wbuf, 3);
                         resp::bulk(&mut c.wbuf, b"message");
-                        resp::bulk(&mut c.wbuf, &channel);
+                        resp::bulk(&mut c.wbuf, channel);
                         resp::bulk(&mut c.wbuf, msg);
                     }
                     Some(p) => {
                         resp::array_header(&mut c.wbuf, 4);
                         resp::bulk(&mut c.wbuf, b"pmessage");
                         resp::bulk(&mut c.wbuf, p);
-                        resp::bulk(&mut c.wbuf, &channel);
+                        resp::bulk(&mut c.wbuf, channel);
                         resp::bulk(&mut c.wbuf, msg);
                     }
                 }
@@ -1635,9 +1701,7 @@ impl Worker {
                 self.flush(*sfd);
             }
         }
-        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-        resp::integer(out, receivers);
-        self.flush(fd);
+        receivers
     }
 
     /// Enforce the keyspace ACL and rewrite each key to `{tenant}:{key}` for a
@@ -1821,21 +1885,33 @@ impl Worker {
 
     fn close(&mut self, fd: RawFd) {
         // P3: drop this fd from every channel/pattern it was subscribed to.
-        if let Some(c) = self.conns.get(&fd) {
-            for ch in c.subs.iter() {
-                if let Some(set) = self.channels.get_mut(ch) {
-                    set.remove(&fd);
-                    if set.is_empty() {
-                        self.channels.remove(ch);
+        // Take the subscription sets out so we can mutate the reverse indexes and
+        // the Bus without holding a borrow on self.conns.
+        let (subs, psubs) = match self.conns.get_mut(&fd) {
+            Some(c) => (std::mem::take(&mut c.subs), std::mem::take(&mut c.psubs)),
+            None => (HashSet::new(), HashSet::new()),
+        };
+        for ch in &subs {
+            if let Some(set) = self.channels.get_mut(ch) {
+                if set.remove(&fd) {
+                    if let Some(bus) = &self.bus {
+                        bus.unsubscribe(self.worker_id, ch, false);
                     }
                 }
+                if set.is_empty() {
+                    self.channels.remove(ch);
+                }
             }
-            for pat in c.psubs.iter() {
-                if let Some(set) = self.patterns.get_mut(pat) {
-                    set.remove(&fd);
-                    if set.is_empty() {
-                        self.patterns.remove(pat);
+        }
+        for pat in &psubs {
+            if let Some(set) = self.patterns.get_mut(pat) {
+                if set.remove(&fd) {
+                    if let Some(bus) = &self.bus {
+                        bus.unsubscribe(self.worker_id, pat, true);
                     }
+                }
+                if set.is_empty() {
+                    self.patterns.remove(pat);
                 }
             }
         }

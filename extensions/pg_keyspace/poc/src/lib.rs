@@ -17,6 +17,7 @@
 pub mod aggr;
 pub mod batcher;
 pub mod crc16;
+pub mod pubsub;
 pub mod resp;
 pub mod ring;
 pub mod server;

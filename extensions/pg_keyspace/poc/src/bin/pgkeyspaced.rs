@@ -11,6 +11,7 @@
 //!               [--wal-dir /tmp]
 
 use pgks::batcher::{Batcher, Tier};
+use pgks::pubsub::Bus;
 use pgks::server::Worker;
 use pgks::store::{Config, Store};
 use std::sync::Arc;
@@ -114,6 +115,10 @@ fn main() {
         a.commit_window_us,
     );
 
+    // Cross-worker pub/sub: workers are threads of this process, so they share
+    // one Bus. A PUBLISH on any worker reaches subscribers on all workers (§5).
+    let bus = Arc::new(Bus::new(a.workers as usize));
+
     let mut handles = Vec::new();
     for w in 0..a.workers {
         let seg_name = format!("pgks_w{w}_{}", std::process::id());
@@ -139,6 +144,7 @@ fn main() {
         let host = a.host.clone();
         let port = a.port + w as u16;
         let tier = a.tier;
+        let bus = bus.clone();
         let h = std::thread::Builder::new()
             .name(format!("slot-worker-{w}"))
             .spawn(move || {
@@ -147,6 +153,7 @@ fn main() {
                         eprintln!("worker {w}: listen {host}:{port} failed: {e}");
                         std::process::exit(1);
                     });
+                worker.set_bus(bus, w as usize);
                 println!("worker {w} listening on {host}:{port}");
                 if let Err(e) = worker.run() {
                     eprintln!("worker {w} exited: {e}");
