@@ -89,6 +89,15 @@ static GUC_ROWCACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 /// order is still checked either way.
 static GUC_REQUIRE_MASK: GucSetting<bool> = GucSetting::<bool>::new(true);
 
+/// TLS for the RESP wire (§4.5): when both a cert and key file are set, every
+/// RESP connection is wrapped in TLS, so the AUTH password and values are
+/// encrypted in transit. Empty (default) = plaintext (put TLS termination in
+/// front, or set these).
+static GUC_TLS_CERT: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+static GUC_TLS_KEY: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+
 /// Mode B (P6 §3.5): enable the keys-only logical-decoding invalidation worker,
 /// which consumes a replication slot (output plugin `supacache_keys`) and drops
 /// changed rows from the row cache so it stays coherent with committed writes.
@@ -305,6 +314,23 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
 
+    GucRegistry::define_string_guc(
+        "pg_keyspace.tls_cert_file",
+        "PEM certificate file for RESP TLS (§4.5); set with tls_key_file to enable TLS",
+        "When both cert and key are set, the RESP port serves TLS so the AUTH password \
+         is encrypted on the wire. Empty = plaintext.",
+        &GUC_TLS_CERT,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.tls_key_file",
+        "PEM private-key file for RESP TLS (§4.5); set with tls_cert_file to enable TLS",
+        "",
+        &GUC_TLS_KEY,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
     GucRegistry::define_bool_guc(
         "pg_keyspace.require_mask",
         "Require supatype_mask to be loaded (and outermost) before serving (§4.1)",
@@ -512,6 +538,37 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
             return;
         }
     };
+
+    // §4.5 TLS: if a cert+key are configured, wrap the RESP wire in TLS. If TLS
+    // was requested but the files fail to load, FAIL CLOSED — park rather than
+    // fall back to plaintext on an operator who asked for encryption.
+    let tls_cert = GUC_TLS_CERT.get().and_then(|c| c.to_str().ok().map(str::to_string));
+    let tls_key = GUC_TLS_KEY.get().and_then(|c| c.to_str().ok().map(str::to_string));
+    match (tls_cert.as_deref().filter(|s| !s.is_empty()), tls_key.as_deref().filter(|s| !s.is_empty())) {
+        (Some(cert), Some(key)) => match server::load_tls_config(cert, key) {
+            Ok(cfg) => {
+                worker.set_tls_config(cfg);
+                log!("pg_keyspace worker: RESP TLS enabled (cert '{cert}')");
+            }
+            Err(e) => {
+                log!("pg_keyspace worker: REFUSING to start — TLS requested but cert/key \
+                      failed to load ({e}); fix pg_keyspace.tls_cert_file/tls_key_file");
+                while !BackgroundWorker::sigterm_received() {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                return;
+            }
+        },
+        (None, None) => {}
+        _ => {
+            log!("pg_keyspace worker: REFUSING to start — set BOTH pg_keyspace.tls_cert_file \
+                  and pg_keyspace.tls_key_file, or neither");
+            while !BackgroundWorker::sigterm_received() {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            return;
+        }
+    }
 
     // Connect SPI (always): needed to create/read the schema, run the §4.5
     // security self-check, load RESP AUTH credentials, and recover from tables.

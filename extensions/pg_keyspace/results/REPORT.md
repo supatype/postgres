@@ -420,11 +420,21 @@ still runs, unaffected by pg_keyspace.
   then `SELECT pg_reload_conf()`. Verified: a new credential works, and a removed
   one stops working, without bouncing the worker. `run_p2_threats.sh` now
   self-seeds this way instead of requiring a restart.
+- **TLS on the wire.** With `pg_keyspace.tls_cert_file` + `tls_key_file` set, every
+  RESP connection is wrapped in a **rustls** TLS session (integrated into the
+  epoll loop: ciphertext on the socket, plaintext in the per-connection buffers),
+  so the AUTH password and all values are encrypted in transit — closing the last
+  §4.5 wire caveat. TLS misconfiguration fails closed (the worker refuses to bind
+  rather than serve plaintext). `bench/run_p2_tls.sh` = 7/7
+  (`results/p2_tls.txt`): a plaintext client is rejected on the TLS port, the
+  server cert validates against its CA (a *verified* handshake, not just
+  `--insecure`), and AUTH + SET/GET round-trip over TLS. Stock `redis-cli --tls`
+  drives it unmodified.
 
-Residual POC caveat: RESP AUTH still sends the password in the clear over TCP
-(no TLS) — hashing protects the table at rest, not the wire. Mode B row-cache
-threat cases (force_generic_plan, masked-column warm cache, decoding worker) are
-covered in §5e.
+Mode B row-cache threat cases (force_generic_plan, masked-column warm cache,
+decoding worker) are covered in §5e. No residual RESP-security caveats remain
+beyond the POC's clear-text-comparison-free, TLS-fronted posture; a production
+deployment would still add cert rotation and a real CA.
 
 ## 5e. P6 — Mode B (row cache): masked-read cost and the §6 accelerator
 
@@ -679,8 +689,9 @@ commit off the worker's snapshot.
 - Mode A security is done and tested on PG17 (§5d); Mode B's `CustomScan` and its
   §4.6 security invariant are built and tested (§5e). Auth hardening done (§5d):
   secrets are stored as salted SHA-256 and verified in constant time
-  (`supacache.set_credential`), and credentials hot-reload on SIGHUP. Residual:
-  RESP AUTH sends the password in clear over TCP (no TLS on the wire yet).
+  (`supacache.set_credential`), credentials hot-reload on SIGHUP, and the RESP
+  wire is TLS-wrapped (rustls) so the AUTH password is encrypted in transit.
+  Production would still add cert rotation and a managed CA.
 - Coupling to `supatype_mask` is a single fail-closed gate, not baked in. The load
   order is asserted at worker start (§4.1); `pg_keyspace.require_mask = off` lifts
   the requirement so pg_keyspace runs standalone as a plain Postgres-native

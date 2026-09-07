@@ -28,9 +28,10 @@ for the full write-up and the concerns matrix.
 > Remaining P6 items are non-security: the real PostgREST binary (blocked by
 > sandbox egress). Auth is hardened: RESP secrets are stored as salted SHA-256 and
 > verified in constant time (`supacache.set_credential`), and credentials
-> hot-reload on `SELECT pg_reload_conf()` (`results/p2_hardening.txt`, 10/10).
-> Still a POC — RESP AUTH sends the password in the clear over TCP (no TLS on the
-> wire yet); don't deploy as-is.
+> hot-reload on `SELECT pg_reload_conf()` (`results/p2_hardening.txt`, 10/10), and
+> the RESP wire is TLS-wrapped (rustls) when a cert+key are configured, so the
+> AUTH password is encrypted in transit (`results/p2_tls.txt`, 7/7). Still a POC
+> (self-signed cert, no rotation/managed CA); don't deploy as-is.
 
 ## What it is
 
@@ -76,6 +77,7 @@ extensions/pg_keyspace/
 │   ├── run_scaleout.sh       shared-nothing scaling (§3.1)
 │   ├── run_p2_threats.sh     Mode A security threat table (§4.7)
 │   ├── run_p2_hardening.sh   hashed AUTH secrets + credential hot-reload (§4.5)
+│   ├── run_p2_tls.sh         native TLS on the RESP wire (§4.5)
 │   ├── run_p6_maskcost.sh    cost of a masked read + §6 accelerator (§4.3c)
 │   ├── run_p6_security.sh    Mode B row-cache RLS/mask/generic-plan suite (§4.6/§4.7)
 │   ├── run_p6_rowcache.sh    Mode B Custom Scan vs index-scan latency (§7.1)
@@ -174,8 +176,18 @@ redis-cli -p 6380 --user alice -a s3cret GET session:1   # authed; NOAUTH withou
 
 The worker verifies with a constant-time compare and enforces the keyspace ACL +
 forced tenant scoping. (A bare plaintext secret in `resp_credential` still works
-for local/dev.) AUTH is sent in the clear over TCP — put TLS in front in
-production.
+for local/dev.)
+
+**TLS.** Point `tls_cert_file`/`tls_key_file` at a PEM cert + key and the RESP
+port serves TLS (native rustls, so the AUTH password is encrypted on the wire);
+stock clients connect with `--tls`:
+
+```bash
+redis-cli --tls --cacert server.pem --user alice -a s3cret -p 6380 GET session:1
+```
+
+Both GUCs must be set (or neither); a bad cert/key makes the worker fail closed
+(refuse to bind) rather than fall back to plaintext.
 
 Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 
@@ -194,6 +206,8 @@ Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 | `pg_keyspace.commit_window_us` | 500 | standalone file-batcher window (durability microbench) |
 | `pg_keyspace.rowcache_mb` | 64 | size of the Mode B row-cache segment (separate from Mode A; never RESP-addressable) |
 | `pg_keyspace.require_mask` | `on` | require `supatype_mask` loaded + outermost before serving (§4.1); `off` runs standalone with no mask dependency |
+| `pg_keyspace.tls_cert_file` | *(empty)* | PEM cert; set with `tls_key_file` to serve RESP over TLS (§4.5). Empty = plaintext |
+| `pg_keyspace.tls_key_file` | *(empty)* | PEM private key (PKCS#8/RSA/EC) paired with `tls_cert_file` |
 | `pg_keyspace.rowcache_decode` | `off` | enable the keys-only Mode B invalidation worker (§3.5); needs `wal_level=logical`, holds a replication slot |
 | `pg_keyspace.rowcache_slot` | `supacache_rowcache` | replication slot name (created on demand with the `supacache_keys` plugin) |
 | `pg_keyspace.rowcache_decode_ms` | 200 | how often the invalidation worker drains the slot |

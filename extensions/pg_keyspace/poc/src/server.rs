@@ -11,6 +11,7 @@ use crate::ring;
 use crate::store::{now_micros, Lookup, Store};
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -179,6 +180,9 @@ struct Conn {
     // durable sync-ack: (ring, seq) the connection's reply is waiting on. While
     // non-empty the reply is held (not flushed) and no further commands are read.
     ack: Vec<(usize, u64)>,
+    // When set, this connection is TLS: ciphertext on the socket, plaintext in
+    // rbuf/wbuf. `wpos` then counts wbuf bytes already fed to the TLS writer.
+    tls: Option<Box<rustls::ServerConnection>>,
 }
 
 pub struct Worker {
@@ -197,6 +201,9 @@ pub struct Worker {
     auth: Option<AuthConfig>,
     // durable tier: hold each write's RESP reply until its ring record commits.
     sync_ack: bool,
+    // P2 TLS: when set, every accepted connection is wrapped in a TLS session so
+    // the RESP wire is encrypted (the AUTH password is otherwise sent in clear).
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Worker {
@@ -224,12 +231,19 @@ impl Worker {
             producers: Vec::new(),
             auth: None,
             sync_ack: false,
+            tls_config: None,
         })
     }
 
     /// Durable tier: hold each write's reply until its ring record has committed.
     pub fn set_sync_ack(&mut self, on: bool) {
         self.sync_ack = on;
+    }
+
+    /// Enable TLS: every accepted connection is wrapped in a server-side TLS
+    /// session, so the RESP wire (including the AUTH password) is encrypted.
+    pub fn set_tls_config(&mut self, cfg: Arc<rustls::ServerConfig>) {
+        self.tls_config = Some(cfg);
     }
 
     /// Enable P1 persistence: writes are sharded by key slot across these rings,
@@ -336,6 +350,17 @@ impl Worker {
                 unsafe { libc::close(cfd) };
                 continue;
             }
+            let tls = match &self.tls_config {
+                Some(cfg) => match rustls::ServerConnection::new(cfg.clone()) {
+                    Ok(s) => Some(Box::new(s)),
+                    Err(_) => {
+                        let _ = epoll_del(self.epfd, cfd);
+                        unsafe { libc::close(cfd) };
+                        continue;
+                    }
+                },
+                None => None,
+            };
             self.conns.insert(
                 cfd,
                 Conn {
@@ -349,34 +374,42 @@ impl Worker {
                     tenant: String::new(),
                     exempt: false,
                     ack: Vec::new(),
+                    tls,
                 },
             );
         }
     }
 
     fn on_readable(&mut self, fd: RawFd) {
-        let mut scratch = [0u8; READ_CHUNK];
-        loop {
-            let r = unsafe {
-                libc::read(fd, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len())
-            };
-            if r > 0 {
-                let c = self.conns.get_mut(&fd).unwrap();
-                c.rbuf.extend_from_slice(&scratch[..r as usize]);
-                if (r as usize) < scratch.len() {
-                    break; // drained the socket
-                }
-            } else if r == 0 {
-                self.close(fd);
-                return;
-            } else {
-                let e = io::Error::last_os_error();
-                match e.raw_os_error() {
-                    Some(libc::EAGAIN) => break,
-                    Some(libc::EINTR) => continue,
-                    _ => {
-                        self.close(fd);
-                        return;
+        let is_tls = self.conns.get(&fd).map(|c| c.tls.is_some()).unwrap_or(false);
+        if is_tls {
+            if self.tls_read(fd) {
+                return; // connection closed during TLS read
+            }
+        } else {
+            let mut scratch = [0u8; READ_CHUNK];
+            loop {
+                let r = unsafe {
+                    libc::read(fd, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len())
+                };
+                if r > 0 {
+                    let c = self.conns.get_mut(&fd).unwrap();
+                    c.rbuf.extend_from_slice(&scratch[..r as usize]);
+                    if (r as usize) < scratch.len() {
+                        break; // drained the socket
+                    }
+                } else if r == 0 {
+                    self.close(fd);
+                    return;
+                } else {
+                    let e = io::Error::last_os_error();
+                    match e.raw_os_error() {
+                        Some(libc::EAGAIN) => break,
+                        Some(libc::EINTR) => continue,
+                        _ => {
+                            self.close(fd);
+                            return;
+                        }
                     }
                 }
             }
@@ -384,6 +417,69 @@ impl Worker {
         self.process(fd);
         if self.conns.contains_key(&fd) {
             self.flush(fd);
+        }
+    }
+
+    /// Pump ciphertext from the socket through the TLS session into `rbuf`
+    /// (plaintext). Returns true if the connection was closed (EOF or TLS error).
+    /// Handshake round-trips flow through here too — the response is sent by the
+    /// subsequent `flush` (which drains `tls.wants_write()`).
+    fn tls_read(&mut self, fd: RawFd) -> bool {
+        enum Res {
+            Ok,
+            Close,
+        }
+        let res = {
+            let c = match self.conns.get_mut(&fd) {
+                Some(c) => c,
+                None => return true,
+            };
+            let tls = c.tls.as_mut().unwrap();
+            let mut sock = FdIo(fd);
+            let mut eof = false;
+            let mut res = Res::Ok;
+            loop {
+                match tls.read_tls(&mut sock) {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        if tls.process_new_packets().is_err() {
+                            res = Res::Close;
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        res = Res::Close;
+                        break;
+                    }
+                }
+            }
+            if matches!(res, Res::Ok) {
+                let mut tmp = [0u8; READ_CHUNK];
+                loop {
+                    match tls.reader().read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => c.rbuf.extend_from_slice(&tmp[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+                if eof && c.rbuf.is_empty() {
+                    res = Res::Close;
+                }
+            }
+            res
+        };
+        match res {
+            Res::Ok => false,
+            Res::Close => {
+                self.close(fd);
+                true
+            }
         }
     }
 
@@ -735,6 +831,10 @@ impl Worker {
     }
 
     fn flush(&mut self, fd: RawFd) {
+        if self.conns.get(&fd).map(|c| c.tls.is_some()).unwrap_or(false) {
+            self.flush_tls(fd);
+            return;
+        }
         let c = match self.conns.get_mut(&fd) {
             Some(c) => c,
             None => return,
@@ -781,6 +881,91 @@ impl Worker {
         }
         if c.closing {
             self.close(fd);
+        }
+    }
+
+    /// TLS write path: feed pending plaintext (`wbuf`) into the TLS session, then
+    /// drain the resulting ciphertext to the socket. Also drives handshake writes
+    /// (when `wbuf` is empty but the session `wants_write`).
+    fn flush_tls(&mut self, fd: RawFd) {
+        enum Act {
+            None,
+            WantWrite,
+            Done,
+            Close,
+        }
+        let act = {
+            let c = match self.conns.get_mut(&fd) {
+                Some(c) => c,
+                None => return,
+            };
+            if !c.ack.is_empty() {
+                return; // hold reply until its durable write commits
+            }
+            let tls = c.tls.as_mut().unwrap();
+            // Feed not-yet-encrypted plaintext into the session (in-memory).
+            if c.wpos < c.wbuf.len() {
+                if let Ok(n) = tls.writer().write(&c.wbuf[c.wpos..]) {
+                    c.wpos += n;
+                }
+            }
+            // Drain ciphertext (handshake and/or app data) to the socket.
+            let mut sock = FdIo(fd);
+            let mut act = Act::None;
+            while tls.wants_write() {
+                match tls.write_tls(&mut sock) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        act = Act::WantWrite;
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        act = Act::Close;
+                        break;
+                    }
+                }
+            }
+            if matches!(act, Act::None) {
+                if c.wpos >= c.wbuf.len() && !tls.wants_write() {
+                    c.wbuf.clear();
+                    c.wpos = 0;
+                    act = Act::Done;
+                } else {
+                    // short plaintext buffering or pending ciphertext: keep going
+                    act = Act::WantWrite;
+                }
+            }
+            act
+        };
+        match act {
+            Act::WantWrite => {
+                if self.conns.get(&fd).map(|c| !c.want_write).unwrap_or(false) {
+                    let _ = epoll_mod(self.epfd, fd, (libc::EPOLLIN | libc::EPOLLOUT) as u32);
+                    if let Some(c) = self.conns.get_mut(&fd) {
+                        c.want_write = true;
+                    }
+                }
+            }
+            Act::Done => {
+                let (ww, closing) = self
+                    .conns
+                    .get(&fd)
+                    .map(|c| (c.want_write, c.closing))
+                    .unwrap_or((false, false));
+                if ww {
+                    let _ = epoll_mod(self.epfd, fd, libc::EPOLLIN as u32);
+                    if let Some(c) = self.conns.get_mut(&fd) {
+                        c.want_write = false;
+                    }
+                }
+                if closing {
+                    self.close(fd);
+                }
+            }
+            Act::Close => self.close(fd),
+            Act::None => {}
         }
     }
 
@@ -844,6 +1029,87 @@ fn durable_log(batcher: &Option<Arc<Batcher>>, tier: Tier, key: &[u8], val: &[u8
             b.commit(tier, &rec);
         }
     }
+}
+
+// ---- TLS ----------------------------------------------------------------
+
+/// A `Read`/`Write` adapter over a raw non-blocking fd for `rustls`' buffered
+/// `read_tls`/`write_tls`. `EAGAIN` surfaces as `WouldBlock`, which rustls
+/// handles by processing whatever it already has.
+struct FdIo(RawFd);
+
+impl Read for FdIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let r = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if r >= 0 {
+            Ok(r as usize)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+impl Write for FdIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let w = unsafe { libc::write(self.0, buf.as_ptr() as *const libc::c_void, buf.len()) };
+        if w >= 0 {
+            Ok(w as usize)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Build a rustls server config from PEM cert + key files (§4.5 TLS). Accepts a
+/// PKCS#8, RSA, or SEC1/EC private key. Used by the extension when both
+/// `pg_keyspace.tls_cert_file` and `pg_keyspace.tls_key_file` are set.
+pub fn load_tls_config(cert_path: &str, key_path: &str) -> io::Result<Arc<rustls::ServerConfig>> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let mut cert_rd = BufReader::new(File::open(cert_path)?);
+    let certs: Vec<rustls::Certificate> = rustls_pemfile::certs(&mut cert_rd)?
+        .into_iter()
+        .map(rustls::Certificate)
+        .collect();
+    if certs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no certificates in {cert_path}"),
+        ));
+    }
+
+    let key = {
+        let der = {
+            let mut rd = BufReader::new(File::open(key_path)?);
+            let mut k = rustls_pemfile::pkcs8_private_keys(&mut rd)?;
+            if k.is_empty() {
+                let mut rd = BufReader::new(File::open(key_path)?);
+                k = rustls_pemfile::rsa_private_keys(&mut rd)?;
+            }
+            if k.is_empty() {
+                let mut rd = BufReader::new(File::open(key_path)?);
+                k = rustls_pemfile::ec_private_keys(&mut rd)?;
+            }
+            k.into_iter().next().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("no private key in {key_path}"),
+                )
+            })?
+        };
+        rustls::PrivateKey(der)
+    };
+
+    let config = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(Arc::new(config))
 }
 
 // ---- socket / epoll helpers ---------------------------------------------
