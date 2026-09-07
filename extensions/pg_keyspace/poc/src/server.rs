@@ -9,7 +9,7 @@ use crate::batcher::{Batcher, Tier};
 use crate::crc16;
 use crate::resp::{self, Parse};
 use crate::ring;
-use crate::store::{now_micros, Lookup, Store, KIND_HASH};
+use crate::store::{now_micros, Lookup, Store, KIND_HASH, KIND_LIST};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::{Read, Write};
@@ -927,6 +927,161 @@ impl Worker {
                 store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
                 resp::integer(out, next);
             }
+            // ---- P3 §5: lists --------------------------------------------
+            b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments");
+                    return;
+                }
+                let xonly = cmd == b"LPUSHX" || cmd == b"RPUSHX";
+                let left = cmd == b"LPUSH" || cmd == b"LPUSHX";
+                let (mut l, exp) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if xonly && l.is_empty() {
+                    resp::integer(out, 0); // *PUSHX no-ops on a missing key
+                    return;
+                }
+                for v in &args[2..] {
+                    if left {
+                        l.lpush(v);
+                    } else {
+                        l.rpush(v);
+                    }
+                }
+                let n = l.len() as i64;
+                save_list(&store, &args[1], &l, exp);
+                resp::integer(out, n);
+            }
+            b"LPOP" | b"RPOP" => {
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments");
+                    return;
+                }
+                // optional count argument (Redis 6.2+): returns an array
+                let count: Option<i64> = if nargs >= 3 {
+                    match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+                        Some(n) if n >= 0 => Some(n),
+                        _ => {
+                            resp::error(out, "ERR value is out of range, must be positive");
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let (mut l, exp) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let left = cmd == b"LPOP";
+                match count {
+                    None => {
+                        let popped = if left { l.lpop() } else { l.rpop() };
+                        match popped {
+                            Some(v) => resp::bulk(out, &v),
+                            None => resp::nil(out),
+                        }
+                    }
+                    Some(c) => {
+                        if l.is_empty() {
+                            resp::nil(out);
+                            return;
+                        }
+                        let mut taken = Vec::new();
+                        for _ in 0..c {
+                            match if left { l.lpop() } else { l.rpop() } {
+                                Some(v) => taken.push(v),
+                                None => break,
+                            }
+                        }
+                        resp::array_header(out, taken.len());
+                        for v in &taken {
+                            resp::bulk(out, v);
+                        }
+                    }
+                }
+                save_list(&store, &args[1], &l, exp);
+            }
+            b"LLEN" => {
+                let (l, _) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::integer(out, l.len() as i64);
+            }
+            b"LINDEX" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'lindex'");
+                    return;
+                }
+                let i: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let (l, _) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                match l.real_index(i) {
+                    Some(idx) => resp::bulk(out, &l.items[idx]),
+                    None => resp::nil(out),
+                }
+            }
+            b"LRANGE" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'lrange'");
+                    return;
+                }
+                let start: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let stop: i64 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let (l, _) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let (lo, hi) = l.range_bounds(start, stop);
+                resp::array_header(out, hi - lo);
+                for v in &l.items[lo..hi] {
+                    resp::bulk(out, v);
+                }
+            }
+            b"LSET" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'lset'");
+                    return;
+                }
+                let i: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let (mut l, exp) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if l.is_empty() {
+                    resp::error(out, "ERR no such key");
+                    return;
+                }
+                match l.real_index(i) {
+                    Some(idx) => {
+                        l.items[idx] = args[3].clone();
+                        save_list(&store, &args[1], &l, exp);
+                        resp::simple(out, "OK");
+                    }
+                    None => resp::error(out, "ERR index out of range"),
+                }
+            }
+            b"LTRIM" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'ltrim'");
+                    return;
+                }
+                let start: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let stop: i64 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let (mut l, exp) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let (lo, hi) = l.range_bounds(start, stop);
+                l.items = l.items[lo..hi].to_vec();
+                save_list(&store, &args[1], &l, exp);
+                resp::simple(out, "OK");
+            }
             _ => resp::error(out, "ERR unknown command"),
         }
 
@@ -1220,14 +1375,38 @@ fn load_hash(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::Hash
     }
 }
 
+/// Load the list at `key` (empty if absent). Returns None and writes `WRONGTYPE`
+/// to `out` if the key holds a non-list value.
+fn load_list(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::List, i64)> {
+    match store.get_typed(key) {
+        None => Some((aggr::List::new(), 0)),
+        Some((KIND_LIST, exp, v)) => Some((aggr::List::decode(v), exp)),
+        Some(_) => {
+            resp::error(out, WRONGTYPE);
+            None
+        }
+    }
+}
+
+/// Store a list back, or delete the key if it became empty (Redis semantics).
+fn save_list(store: &Store, key: &[u8], l: &aggr::List, exp: i64) {
+    if l.is_empty() {
+        store.del(key);
+    } else {
+        store.set_typed(key, &l.encode(), remaining_ttl(exp), KIND_LIST);
+    }
+}
+
 /// Which argument positions of a command are keys (for ACL + tenant scoping).
 fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
     match cmd {
         b"GET" | b"SET" | b"SETNX" | b"GETSET" | b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY"
         | b"TTL" | b"EXPIRE" | b"PERSIST" | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL"
-        // P3 hashes: the key is always the first argument
+        // P3 hashes + lists: the key is always the first argument
         | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
-        | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY" => {
+        | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY"
+        | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"LPOP" | b"RPOP" | b"LLEN"
+        | b"LINDEX" | b"LRANGE" | b"LSET" | b"LTRIM" => {
             if nargs > 1 {
                 vec![1]
             } else {
@@ -1261,6 +1440,15 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"HSETNX"
             | b"HDEL"
             | b"HINCRBY"
+            // P3 list mutations
+            | b"LPUSH"
+            | b"RPUSH"
+            | b"LPUSHX"
+            | b"RPUSHX"
+            | b"LPOP"
+            | b"RPOP"
+            | b"LSET"
+            | b"LTRIM"
     )
 }
 

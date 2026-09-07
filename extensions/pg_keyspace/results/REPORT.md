@@ -717,15 +717,22 @@ commit off the worker's snapshot.
   download is blocked by the sandbox egress proxy, 403). Validated instead by
   issuing PostgREST's exact SQL shape (role + JWT claims, `pk = N` select/update).
 - Command set (§5): strings, counters, DEL/EXISTS, TTL on strings, plus the P3
-  **hash** type — `HSET/HSETNX/HMSET/HGET/HMGET/HDEL/HGETALL/HKEYS/HVALS/HLEN/
-  HEXISTS/HSTRLEN/HINCRBY` and `TYPE` — with full `WRONGTYPE` semantics in both
-  directions (`bench/run_p3_hashes.sh`, 22/22, incl. redis parity; HSET 555k/s,
-  HGET 980k/s pipelined). Aggregates are stored as a compact length-prefixed blob
-  in the slab (Redis's small-collection philosophy), so ops are O(n) on the
-  collection — a fit for cache-sized collections; a native shmem structure for
-  very large ones is a later upgrade. Aggregate values are currently in-memory
-  only (not persisted): the P1 ring carries no type tag, so durable aggregates
-  are a follow-up. Lists, sorted sets, and pub/sub remain to build (§5).
+  **hash** and **list** types with full `WRONGTYPE` semantics in both directions:
+  - hashes — `HSET/HSETNX/HMSET/HGET/HMGET/HDEL/HGETALL/HKEYS/HVALS/HLEN/HEXISTS/
+    HSTRLEN/HINCRBY` (`run_p3_hashes.sh`, 22/22, redis parity; HSET 555k/s, HGET
+    980k/s pipelined);
+  - lists — `LPUSH/RPUSH/LPUSHX/RPUSHX/LPOP/RPOP/LLEN/LINDEX/LRANGE/LSET/LTRIM`
+    with negative-index and count semantics (`run_p3_lists.sh`, 24/24, redis
+    parity; 507k RPUSH/s across small lists);
+  - `TYPE` reports string/hash/list/none.
+
+  Aggregates are stored as a compact length-prefixed blob in the slab (Redis's
+  small-collection philosophy), so ops are O(n) on the collection — a fit for
+  cache-sized collections. Hammering one collection to 100k+ elements is the O(n)
+  blob-rewrite worst case by design; a native shmem structure for very large
+  collections is a later upgrade. Aggregate values are currently in-memory only
+  (not persisted): the P1 ring carries no type tag, so durable aggregates are a
+  follow-up. Sorted sets and pub/sub remain to build (§5).
 - Single in-PG worker; multi-worker scale-out shown via the standalone daemon
   (the in-PG version would register N background workers).
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent

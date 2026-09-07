@@ -66,7 +66,7 @@ extensions/pg_keyspace/
 │   │   ├── server.rs         epoll event loop, RESP dispatch (§3.1)
 │   │   ├── batcher.rs        commit batching, four durability tiers (§3.4)
 │   │   ├── ring.rs           SPSC shmem ring: RESP worker -> persistence worker (P1)
-│   │   ├── aggr.rs           P3 aggregate value types: hashes (§5)
+│   │   ├── aggr.rs           P3 aggregate value types: hashes, lists (§5)
 │   │   ├── crc16.rs          cluster slot hashing (§3.1)
 │   │   └── bin/
 │   │       ├── pgkeyspaced.rs        standalone daemon (scale-out demo)
@@ -84,6 +84,7 @@ extensions/pg_keyspace/
 │   ├── run_p2_hardening.sh   hashed AUTH secrets + credential hot-reload (§4.5)
 │   ├── run_p2_tls.sh         native TLS on the RESP wire (§4.5)
 │   ├── run_p3_hashes.sh      P3 hash type: coverage, WRONGTYPE, redis parity (§5)
+│   ├── run_p3_lists.sh       P3 list type: coverage, WRONGTYPE, redis parity (§5)
 │   ├── run_p6_maskcost.sh    cost of a masked read + §6 accelerator (§4.3c)
 │   ├── run_p6_security.sh    Mode B row-cache RLS/mask/generic-plan suite (§4.6/§4.7)
 │   ├── run_p6_rowcache.sh    Mode B Custom Scan vs index-scan latency (§7.1)

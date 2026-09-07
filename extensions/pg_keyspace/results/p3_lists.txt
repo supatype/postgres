@@ -1,0 +1,30 @@
+# P3 lists (§5)
+  PASS  RPUSH a b c -> 3                              
+  PASS  LPUSH z -> 4                                  
+  PASS  LRANGE 0 -1                                   
+  PASS  LRANGE 1 2                                    
+  PASS  LRANGE -2 -1                                  
+  PASS  LINDEX 0 / -1                                 
+  PASS  LINDEX out of range -> nil                    
+  PASS  LLEN                                          
+  PASS  LPOP                                          
+  PASS  RPOP                                          
+  PASS  LRANGE after pops                             
+  PASS  LSET 0 X                                      
+  PASS  LSET out of range -> err                      
+  PASS  LTRIM 0 0                                     
+  PASS  LRANGE after trim                             
+  PASS  LPOP count 5 drains                           
+  PASS  emptied list deletes key                      
+  PASS  LPUSHX on missing -> 0                        
+  PASS  RPUSHX on missing -> 0                        
+  PASS  TYPE list                                     
+  PASS  RPUSH on a string -> WRONGTYPE                
+  PASS  LRANGE on a string -> WRONGTYPE               
+  PASS  GET on a list -> WRONGTYPE                    
+  PASS  LRANGE matches real redis                     
+
+# throughput (redis-benchmark, 100k RPUSH across 100k small lists, pipeline 16):
+   RPUSH list:__rand_int__ v: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)                                                                                RPUSH list:__rand_int__ v: 606060.56 requests per second, p50=1.071 msec
+
+# result: 24 passed, 0 failed
