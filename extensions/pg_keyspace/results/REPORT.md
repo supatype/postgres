@@ -32,9 +32,10 @@ present, unmasked, in the cache (security 10/10, §5e). A keys-only logical-deco
 worker (§3.5) keeps it coherent — a purpose-built output plugin emits only
 `<relid> <pk>`, never a column value, so the cache is dropped on write with no way
 for WAL values to leak (coherence 10/10; PostgREST-pattern 4/4). The full §4.7
-threat table now passes as test evidence. Remaining P6 items are non-security: a
-refill worker (invalidation is drop-only) and the real PostgREST binary (blocked
-by sandbox egress).
+threat table now passes as test evidence. Mode B is also validated with the real
+**PostgREST v12.2.3** binary driving live HTTP+JWT requests through the cache
+(`run_p6_postgrest_e2e.sh`, 8/8), and the opt-in refill worker keeps hot keys
+served across writes.
 
 This report presents *measured* numbers, cross-checks them against the plan's
 targets, and separates what the POC validates empirically from what it
@@ -568,16 +569,22 @@ feeds an `UPDATE`/`DELETE` target or a `SELECT … FOR UPDATE` — those need th
 heap tuple's ctid to lock (else "failed to fetch tuple being updated"); the
 pathlist hook now skips the result relation and any row-marked rel.
 
-**PostgREST end-to-end.** PostgREST itself could not be installed — its GitHub
-release download is blocked by the sandbox egress proxy (403). But PostgREST is a
-thin REST→SQL layer: it assumes the caller's role + JWT claims and issues plain
-`SELECT … WHERE pk = N` (a `GET`) or `UPDATE … WHERE pk = N` (a `PATCH`). Those
-are exactly the statements the transparent cache serves, so
-`bench/run_p6_postgrest_pattern.sh` issues them in PostgREST's shape against a
-masked + RLS + cached table — **4/4** (`results/p6_postgrest_pattern.txt`): the
-owner reads their own row (email visible) from the cache, a non-owner is denied by
-RLS, the cached result equals the non-cached ground truth, and a `PATCH` stays
-coherent via the invalidation worker.
+**PostgREST end-to-end (real binary).** The actual PostgREST **v12.2.3** binary
+now runs in front of the cluster (`bench/run_p6_postgrest_e2e.sh`, **8/8**,
+`results/p6_postgrest_e2e.txt`): real HTTP requests with HS256-signed JWTs, so
+PostgREST opens a txn, `SET ROLE` from the `role` claim, exposes the token as
+`request.jwt.claims`, and issues the `SELECT`/`UPDATE`. The target table is
+masked (supatype_mask), RLS-protected, and registered in the row cache. The test
+proves, over real HTTP: a `GET` is **served by the Mode B Custom Scan** — the
+cache's own hit counter (`supacache.rowcache_stats`) climbs per request; the
+owner sees their unmasked email while a non-owner gets an empty array (mask + RLS
+still apply on the cached path); the response equals the direct-SQL ground truth;
+and a `PATCH` stays coherent because the keys-only worker invalidates the row.
+The script fetches the static PostgREST release itself, so it is reproducible.
+
+An earlier SQL-shape check (`bench/run_p6_postgrest_pattern.sh`, 4/4,
+`results/p6_postgrest_pattern.txt`) issues the same statement shapes directly and
+remains as a cluster-only smoke test that needs no HTTP layer.
 
 **Refill (`pg_keyspace.rowcache_refill`, opt-in).** By default invalidation is
 drop-only (the next read repopulates lazily). With refill on, a change to a *hot*
@@ -591,7 +598,6 @@ the refill read its own stale entry — a stale-forever feedback loop. A per-bac
 refill on (hot key stays cached, fresh value) and with it off (falls back to a
 fresh index read).
 
-Remaining (not built): driving the actual PostgREST binary once egress allows it.
 Requirements/limits: needs `wal_level = logical` and holds one replication slot
 (the standard WAL-retention caution, §13 — the worker advances it each poll);
 single-column integer pk only; `pg_keyspace.rowcache_decode` is off by default. Details: `results/p6_security.txt` (`bench/run_p6_security.sh`),
