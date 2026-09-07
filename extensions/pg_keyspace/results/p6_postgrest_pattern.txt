@@ -1,7 +1,0 @@
-# P6 — PostgREST access pattern over a masked + RLS + cached table
-  PASS  GET id=1 as owner alice (cached): sees own row + email
-  PASS  GET id=1 as bob (not owner): RLS denies the cached row
-  PASS  owner result matches the non-cached ground truth    
-  PASS  after PATCH: GET id=1 reflects the new value (coherent)
-
-# result: 4 passed, 0 failed

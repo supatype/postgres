@@ -1,9 +1,0 @@
-# P2 TLS cert rotation (§4.5)
-  PASS  SIGHUP swapped the served cert (no restart)   
-  PASS  worker logged a TLS cert reload               
-  PASS  TLS still serves after rotation               
-  PASS  broken cert reload keeps serving              
-  PASS  broken cert reload kept the old cert          
-  PASS  worker logged the reload failure              
-
-# result: 6 passed, 0 failed

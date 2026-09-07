@@ -1,30 +1,0 @@
-# P3 hashes (§5)
-  PASS  HSET returns new-field count                  
-  PASS  HSET counts only new fields                   
-  PASS  HGET existing                                 
-  PASS  HGET missing field -> nil                     
-  PASS  HLEN                                          
-  PASS  HEXISTS present                               
-  PASS  HEXISTS absent                                
-  PASS  HMGET a zzz c                                 
-  PASS  HSETNX on existing -> 0                       
-  PASS  HSETNX on new -> 1                            
-  PASS  HINCRBY new value                             
-  PASS  HSTRLEN                                       
-  PASS  HDEL removes present+absent -> 1              
-  PASS  HKEYS (sorted)                                
-  PASS  TYPE hash                                     
-  PASS  TYPE none                                     
-  PASS  emptying a hash deletes the key               
-  PASS  HGET on a string -> WRONGTYPE                 
-  PASS  GET on a hash -> WRONGTYPE                    
-  PASS  INCR on a hash -> WRONGTYPE                   
-  PASS  binary field/value round-trips                
-  PASS  HGETALL matches real redis                    
-
-# throughput (redis-benchmark, 100k ops, pipeline 16):
-   HSET: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)                                                           HSET: 571428.56 requests per second, p50=0.575 msec
-  
-   hget h a: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)                                                               hget h a: 826446.31 requests per second, p50=0.663 msec
-
-# result: 22 passed, 0 failed

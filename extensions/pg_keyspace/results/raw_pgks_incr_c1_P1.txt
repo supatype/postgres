@@ -1,42 +1,0 @@
-WARNING: Could not fetch server CONFIG
- INCR: rps=0.0 (overall: inf) avg_msec=0.284 (overall: 0.284)                                                             INCR: rps=27012.0 (overall: 27016.0) avg_msec=0.034 (overall: 0.034)                                                                     INCR: rps=26270.9 (overall: 26642.7) avg_msec=0.035 (overall: 0.034)                                                                     INCR: rps=25516.0 (overall: 26267.6) avg_msec=0.036 (overall: 0.035)                                                                     INCR: rps=26408.0 (overall: 26302.7) avg_msec=0.034 (overall: 0.035)                                                                     INCR: rps=27096.0 (overall: 26461.2) avg_msec=0.033 (overall: 0.034)                                                                     INCR: rps=27306.8 (overall: 26602.5) avg_msec=0.034 (overall: 0.034)                                                                     INCR: rps=26556.0 (overall: 26595.9) avg_msec=0.036 (overall: 0.035)                                                                     INCR: rps=27096.0 (overall: 26658.3) avg_msec=0.034 (overall: 0.034)                                                                     INCR: rps=25388.0 (overall: 26517.3) avg_msec=0.037 (overall: 0.035)                                                                     INCR: rps=25488.0 (overall: 26414.5) avg_msec=0.036 (overall: 0.035)                                                                     INCR: rps=27442.2 (overall: 26508.2) avg_msec=0.033 (overall: 0.035)                                                                     INCR: rps=27184.0 (overall: 26564.4) avg_msec=0.034 (overall: 0.035)                                                                     INCR: rps=27476.0 (overall: 26634.5) avg_msec=0.034 (overall: 0.034)                                                                     INCR: rps=26680.0 (overall: 26637.7) avg_msec=0.035 (overall: 0.035)                                                                     INCR: rps=26892.0 (overall: 26654.7) avg_msec=0.035 (overall: 0.035)                                                                     INCR: rps=26557.8 (overall: 26648.6) avg_msec=0.035 (overall: 0.035)                                                                     INCR: rps=26336.0 (overall: 26630.2) avg_msec=0.036 (overall: 0.035)                                                                     INCR: rps=26636.0 (overall: 26630.5) avg_msec=0.035 (overall: 0.035)                                                                     INCR: rps=27892.0 (overall: 26696.9) avg_msec=0.032 (overall: 0.035)                                                                     INCR: rps=28346.6 (overall: 26779.6) avg_msec=0.031 (overall: 0.034)                                                                     INCR: rps=28220.0 (overall: 26848.1) avg_msec=0.031 (overall: 0.034)                                                                     INCR: rps=27076.0 (overall: 26858.5) avg_msec=0.034 (overall: 0.034)                                                                     INCR: rps=30748.0 (overall: 27027.5) avg_msec=0.029 (overall: 0.034)                                                                     INCR: rps=30880.0 (overall: 27187.8) avg_msec=0.029 (overall: 0.034)                                                                     INCR: rps=28039.8 (overall: 27222.0) avg_msec=0.032 (overall: 0.034)                                                                     INCR: rps=25868.0 (overall: 27170.0) avg_msec=0.036 (overall: 0.034)                                                                     INCR: rps=25048.0 (overall: 27091.5) avg_msec=0.037 (overall: 0.034)                                                                     INCR: rps=26052.0 (overall: 27054.4) avg_msec=0.037 (overall: 0.034)                                                                     INCR: rps=27888.4 (overall: 27083.2) avg_msec=0.032 (overall: 0.034)                                                                     ====== INCR ======
-  200000 requests completed in 7.39 seconds
-  1 parallel clients
-  512 bytes payload
-  keep alive: 1
-  multi-thread: no
-
-Latency by percentile distribution:
-0.000% <= 0.007 milliseconds (cumulative count 1)
-50.000% <= 0.039 milliseconds (cumulative count 189942)
-96.875% <= 0.047 milliseconds (cumulative count 195928)
-98.438% <= 0.055 milliseconds (cumulative count 198186)
-99.219% <= 0.063 milliseconds (cumulative count 199043)
-99.609% <= 0.071 milliseconds (cumulative count 199486)
-99.805% <= 0.079 milliseconds (cumulative count 199653)
-99.902% <= 0.103 milliseconds (cumulative count 199826)
-99.951% <= 0.143 milliseconds (cumulative count 199906)
-99.976% <= 0.191 milliseconds (cumulative count 199953)
-99.988% <= 0.239 milliseconds (cumulative count 199979)
-99.994% <= 0.303 milliseconds (cumulative count 199988)
-99.997% <= 0.375 milliseconds (cumulative count 199994)
-99.998% <= 0.543 milliseconds (cumulative count 199997)
-99.999% <= 0.599 milliseconds (cumulative count 199999)
-100.000% <= 1.775 milliseconds (cumulative count 200000)
-100.000% <= 1.775 milliseconds (cumulative count 200000)
-
-Cumulative distribution of latencies:
-99.913% <= 0.103 milliseconds (cumulative count 199826)
-99.983% <= 0.207 milliseconds (cumulative count 199965)
-99.994% <= 0.303 milliseconds (cumulative count 199988)
-99.997% <= 0.407 milliseconds (cumulative count 199994)
-99.997% <= 0.503 milliseconds (cumulative count 199995)
-99.999% <= 0.607 milliseconds (cumulative count 199999)
-100.000% <= 1.807 milliseconds (cumulative count 200000)
-
-Summary:
-  throughput summary: 27045.30 requests per second
-  latency summary (msec):
-          avg       min       p50       p95       p99       max
-        0.034     0.000     0.039     0.047     0.055     1.775
-

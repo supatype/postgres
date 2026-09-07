@@ -1,35 +1,0 @@
-# P3 sorted sets (§5)
-  PASS  ZADD 4 members                                
-  PASS  ZADD existing -> 0 added                      
-  PASS  ZADD CH counts changes                        
-  PASS  ZADD NX returns 0 (existing skipped)          
-  PASS  ZSCORE after NX still 5                       
-  PASS  ZADD XX returns 0 (new skipped)               
-  PASS  XX did not add the new member -> nil          
-  PASS  ZCARD                                         
-  PASS  ZSCORE c                                      
-  PASS  ZSCORE missing -> nil                         
-  PASS  ZRANGE 0 -1                                   
-  PASS  ZRANGE WITHSCORES                             
-  PASS  ZREVRANGE 0 1                                 
-  PASS  ZRANK b / d (tie by member)                   
-  PASS  ZREVRANK a                                    
-  PASS  ZRANGEBYSCORE 2 3                             
-  PASS  ZRANGEBYSCORE (2 +inf                         
-  PASS  ZRANGEBYSCORE LIMIT 1 2                       
-  PASS  ZREVRANGEBYSCORE +inf 2                       
-  PASS  ZCOUNT 2 5                                    
-  PASS  ZCOUNT (2 5                                   
-  PASS  ZINCRBY 10 d -> 12                            
-  PASS  ZMSCORE a d zzz                               
-  PASS  ZREM a b -> 2                                 
-  PASS  TYPE zset                                     
-  PASS  emptied zset deletes key                      
-  PASS  ZADD on a string -> WRONGTYPE                 
-  PASS  GET on a zset -> WRONGTYPE                    
-  PASS  ZRANGE WITHSCORES matches real redis          
-
-# throughput (redis-benchmark, 100k ZADD across 100k small zsets, pipeline 16):
-   ZADD z:__rand_int__ 1 m: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)                                                                              ZADD z:__rand_int__ 1 m: 375939.84 requests per second, p50=1.823 msec
-
-# result: 29 passed, 0 failed
