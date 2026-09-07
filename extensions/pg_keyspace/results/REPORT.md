@@ -850,8 +850,19 @@ commit off the worker's snapshot.
   pub/sub** for the scale-out daemon: an in-process Bus routes a `PUBLISH` on
   one slot worker to subscribers on any worker via a shared routing table and
   per-worker eventfd-woken inboxes (`run_p3_pubsub_xworker.sh`, 10/10).
-- Single in-PG worker; multi-worker scale-out shown via the standalone daemon
-  (the in-PG version would register N background workers).
+- **In-PG multi-worker scale-out** (`pg_keyspace.workers`, §3.1): the extension
+  registers N shared-nothing RESP slot workers, each owning its own shared-memory
+  segment (contiguous in the requested block) and listening on `pg_keyspace.port
+  + its index`; clients shard keys across the ports (Redis-Cluster style).
+  `run_p0_scaleout_inpg.sh` (4/4, 4 workers): the workers are independent (a key
+  on one is invisible on the others; each has its own DBSIZE) and aggregate RESP
+  throughput is ~609k SET/s vs ~105k for one worker — real horizontal scaling
+  inside Postgres, not just in the standalone daemon. Persistence and the Mode B
+  row cache stay single-worker in this slice (the durable ring/recovery is wired
+  only when `workers = 1`), so `workers > 1` runs the ephemeral (Mode A) tier —
+  which is exactly the Valkey-replacement path where horizontal throughput is the
+  claim. The single-worker path (the kill-criterion config, plus durable/rowcache)
+  is unchanged and re-verified green.
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent
   for this purpose and does not affect latency.
 - P1 persistence is off the event loop (ring + dedicated workers, §5c) with bulk

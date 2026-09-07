@@ -69,6 +69,7 @@ static ROWCACHE_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
 // GUCs (fixed at postmaster start; the segment is sized from them).
 static GUC_PORT: GucSetting<i32> = GucSetting::<i32>::new(6380);
+static GUC_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 static GUC_KEYS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 static GUC_VAL_BYTES: GucSetting<i32> = GucSetting::<i32>::new(512);
 static GUC_DURABILITY: GucSetting<Option<&'static CStr>> =
@@ -223,6 +224,22 @@ fn ks_config() -> Config {
     Config::for_capacity(1, keys, val)
 }
 
+/// Number of shared-nothing RESP slot workers (§3.1). Each owns one keyspace
+/// segment of `ks_config().total_bytes()`, laid out contiguously in the shared
+/// block, and listens on `port + index`.
+fn worker_count() -> usize {
+    GUC_WORKERS.get().max(1) as usize
+}
+
+/// Base pointer of worker `w`'s keyspace segment within the contiguous block.
+fn seg_base_for(w: usize) -> *mut u8 {
+    let base = SEG_BASE.load(Ordering::Acquire);
+    if base.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { base.add(w * ks_config().total_bytes()) }
+}
+
 fn ks_tier() -> Tier {
     match GUC_DURABILITY.get().and_then(|c| c.to_str().ok()) {
         Some("relaxed") => Tier::Relaxed,
@@ -266,6 +283,20 @@ pub extern "C" fn _PG_init() {
         &GUC_KEYS,
         1024,
         1_000_000_000,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.workers",
+        "Number of shared-nothing RESP slot workers (§3.1)",
+        "Each worker owns its own shared-memory segment and listens on \
+         pg_keyspace.port + its index; clients shard keys across the ports \
+         (Redis-Cluster style). Aggregate throughput scales ~linearly. Persistence \
+         and the Mode B row cache stay single-worker in this slice, so >1 forces \
+         the ephemeral tier. Changing it needs a restart (it resizes shared memory).",
+        &GUC_WORKERS,
+        1,
+        64,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -445,17 +476,24 @@ pub extern "C" fn _PG_init() {
     // to persist into supacache.kv; ephemeral needs only shared memory.
     // The RESP worker always needs SPI now: for recovery (persisted tiers) and
     // to load the RESP AUTH credentials / keyspace ACL (§4.5) at startup.
-    let persisted = ks_tier() != Tier::Ephemeral;
-    BackgroundWorkerBuilder::new("pg_keyspace: RESP slot worker")
-        .set_library("pg_keyspace")
-        .set_function("pg_keyspace_worker_main")
-        .set_restart_time(Some(Duration::from_secs(2)))
-        .enable_spi_access()
-        .load();
+    // N shared-nothing RESP slot workers (§3.1): each attaches its own keyspace
+    // segment and listens on port + its index. The index is the bgworker arg.
+    let nworkers = worker_count();
+    let persisted = ks_tier() != Tier::Ephemeral && nworkers == 1;
+    for w in 0..nworkers {
+        BackgroundWorkerBuilder::new(&format!("pg_keyspace: RESP slot worker {w}"))
+            .set_library("pg_keyspace")
+            .set_function("pg_keyspace_worker_main")
+            .set_argument((w as i32).into_datum())
+            .set_restart_time(Some(Duration::from_secs(2)))
+            .enable_spi_access()
+            .load();
+    }
 
     // Dedicated persistence workers: each drains its own ring and bulk-upserts
     // into supacache.kv, so the RESP worker never touches SPI on the hot path.
-    // Each is passed its ring index as the bgworker argument.
+    // Each is passed its ring index as the bgworker argument. Persistence stays
+    // single-worker in this slice (multi-worker forces the ephemeral tier).
     if persisted {
         for i in 0..ring_count() {
             BackgroundWorkerBuilder::new(&format!("pg_keyspace: persistence worker {i}"))
@@ -485,7 +523,7 @@ pub extern "C" fn _PG_init() {
             .load();
     }
 
-    log!("pg_keyspace: initialised (shmem hooks + RESP worker registered)");
+    log!("pg_keyspace: initialised (shmem hooks + {nworkers} RESP worker(s) registered)");
 }
 
 #[pg_guard]
@@ -494,7 +532,8 @@ extern "C" fn ks_shmem_request() {
         if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
             prev();
         }
-        pg_sys::RequestAddinShmemSpace(ks_config().total_bytes());
+        // One keyspace segment per shared-nothing slot worker (§3.1), contiguous.
+        pg_sys::RequestAddinShmemSpace(worker_count() * ks_config().total_bytes());
         pg_sys::RequestAddinShmemSpace(ring_total_bytes());
         pg_sys::RequestAddinShmemSpace(rowcache_config().total_bytes());
     }
@@ -508,13 +547,20 @@ extern "C" fn ks_shmem_startup() {
         }
         let cfg = ks_config();
         let size = cfg.total_bytes();
+        let nworkers = worker_count();
+        let block = nworkers * size;
         let mut found = false;
-        let ptr = pg_sys::ShmemInitStruct(SEG_NAME.as_ptr(), size, &mut found) as *mut u8;
+        let ptr = pg_sys::ShmemInitStruct(SEG_NAME.as_ptr(), block, &mut found) as *mut u8;
         if ptr.is_null() {
             error!("pg_keyspace: ShmemInitStruct returned NULL");
         }
-        // First backend (postmaster) initialises; the rest just publish the base.
-        let _view = Store::from_raw(ptr, &cfg, !found);
+        // First backend (postmaster) initialises every worker's segment; the rest
+        // just publish the block base. Each worker uses base + w*size.
+        if !found {
+            for w in 0..nworkers {
+                let _view = Store::from_raw(ptr.add(w * size), &cfg, true);
+            }
+        }
         SEG_BASE.store(ptr, Ordering::Release);
 
         // Persistence ring segment: N contiguous rings of `ring_stride()` bytes.
@@ -557,8 +603,11 @@ extern "C" fn ks_shmem_startup() {
 
 #[no_mangle]
 #[pg_guard]
-pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
+pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
+    // Which shared-nothing slot worker this is: its segment is seg_base_for(w),
+    // its RESP port is pg_keyspace.port + w.
+    let w = unsafe { i32::from_datum(arg, false) }.unwrap_or(0).max(0) as usize;
 
     // §4.1 load-order assertion: supatype_mask must be loaded AFTER pg_keyspace
     // (outermost) so the Query is masked before pg_keyspace ever sees it. If the
@@ -572,16 +621,18 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
         return;
     }
 
-    let base = SEG_BASE.load(Ordering::Acquire);
+    let base = seg_base_for(w);
     if base.is_null() {
-        log!("pg_keyspace worker: shared segment not ready, exiting");
+        log!("pg_keyspace worker {w}: shared segment not ready, exiting");
         return;
     }
     let cfg = ks_config();
     let store = Arc::new(unsafe { Store::from_raw(base, &cfg, false) });
-    let persisted = ks_tier() != Tier::Ephemeral;
+    // Persistence/recovery stay single-worker in this slice; a multi-worker
+    // deployment is shared-nothing ephemeral (Mode A scale-out).
+    let persisted = ks_tier() != Tier::Ephemeral && worker_count() == 1;
 
-    let port = GUC_PORT.get() as u16;
+    let port = GUC_PORT.get() as u16 + w as u16;
     let mut worker = match server::Worker::new(store.clone(), None, Tier::Ephemeral, "0.0.0.0", port)
     {
         Ok(w) => w,
@@ -636,7 +687,11 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
     // backing tables, so serve RESP in ephemeral mode until the operator installs it.
     let ext_ready = extension_installed();
     if ext_ready {
-        pg_ensure_schema();
+        // Only worker 0 runs the (idempotent) DDL, so N workers do not race on
+        // concurrent CREATE ... IF NOT EXISTS at startup.
+        if w == 0 {
+            pg_ensure_schema();
+        }
     } else if persisted {
         log!(
             "pg_keyspace worker: the pg_keyspace extension is not installed in database \

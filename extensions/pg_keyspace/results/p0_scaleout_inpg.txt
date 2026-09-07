@@ -1,0 +1,8 @@
+# P0 in-PG scale-out (§3.1) — 4 RESP slot worker(s) on 6381..6384 (tls=--tls --insecure)
+  PASS  worker 0 serves its own key                       
+  PASS  key is invisible on the other 3 workers           
+  PASS  each worker's DBSIZE moves independently (delta)  
+  INFO  single worker: 104986 SET/s   |   4 workers aggregate: 608830 SET/s
+  PASS  aggregate throughput scales past a single worker  
+
+# result: 4 passed, 0 failed
