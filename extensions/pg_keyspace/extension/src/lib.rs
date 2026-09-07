@@ -1805,6 +1805,16 @@ impl Drop for BypassGuard {
     }
 }
 
+// `toast_flatten_tuple` (access/heaptoast.h) builds a tuple with no out-of-line
+// fields — it is a real exported backend symbol but is not in pgrx's generated
+// bindings, so declare it directly. Links against the running backend.
+extern "C" {
+    fn toast_flatten_tuple(
+        tup: pg_sys::HeapTuple,
+        tuple_desc: pg_sys::TupleDesc,
+    ) -> pg_sys::HeapTuple;
+}
+
 /// Fetch the row matching `where_sql` (a predicate over the pk column using
 /// `$1`) and return (raw heap-tuple bytes, canonical pk bytes of that row's pk
 /// column `col`). `rel_q` is identifier-quoted; `col` is the *unquoted* pk
@@ -1844,10 +1854,27 @@ unsafe fn fetch_row_and_pk(
         let tuptable = pg_sys::SPI_tuptable;
         let tupdesc = (*tuptable).tupdesc;
         let tup = *(*tuptable).vals.offset(0);
-        let len = (*tup).t_len as usize;
+        // If any column is stored out of line (TOASTed), the raw tuple holds a
+        // pointer into the table's toast relation, not the value — caching those
+        // bytes would leave a pointer that dangles once the toast chunks are
+        // vacuumed. Flatten the tuple so every value is inline and the cached
+        // bytes are fully self-contained. `toast_flatten_tuple` pulls in the
+        // external values while leaving cheap inline-compressed ones as-is.
+        let has_external =
+            (*(*tup).t_data).t_infomask & pg_sys::HEAP_HASEXTERNAL as u16 != 0;
+        let flat = if has_external {
+            toast_flatten_tuple(tup, tupdesc)
+        } else {
+            tup
+        };
+        let len = (*flat).t_len as usize;
         let mut buf = vec![0u8; len];
-        std::ptr::copy_nonoverlapping((*tup).t_data as *const u8, buf.as_mut_ptr(), len);
-        // canonical pk of the fetched row
+        std::ptr::copy_nonoverlapping((*flat).t_data as *const u8, buf.as_mut_ptr(), len);
+        if flat != tup {
+            pg_sys::heap_freetuple(flat);
+        }
+        // canonical pk of the fetched row (from the original tuple — pk columns
+        // are never external, and the pk value is identical either way)
         let fno = pg_sys::SPI_fnumber(tupdesc, col_c.as_ptr());
         let mut isnull = false;
         let d = pg_sys::SPI_getbinval(tup, tupdesc, fno, &mut isnull);
@@ -2208,9 +2235,9 @@ mod supacache {
     /// `pk` is `anyelement`, so any pk type works: `rowcache_put('t', 1)`,
     /// `rowcache_put('t', 'a1b2…'::uuid)`, `rowcache_put('t', 'key')`. The row
     /// is keyed by its *canonical* pk (the column type's output text), matching
-    /// the planner hook and the WAL decode path. Stores the raw heap-tuple bytes
-    /// (pre-policy). POC note: rows with out-of-line (TOASTed) values are not
-    /// supported — the raw tuple would carry a toast pointer, not the datum.
+    /// the planner hook and the WAL decode path. Stores the heap-tuple bytes
+    /// (pre-policy), flattened so any out-of-line (TOASTed) column is pulled
+    /// inline and the cached row is self-contained (see `fetch_row_and_pk`).
     #[pg_extern]
     fn rowcache_put(tbl: &str, pk: AnyElement) -> bool {
         let relid = match Spi::get_one_with_args::<pg_sys::Oid>(
@@ -2237,6 +2264,31 @@ mod supacache {
                 }
                 _ => false,
             }
+        }
+    }
+
+    /// Diagnostic: does the *cached* copy of `tbl`'s row `pk` still hold an
+    /// out-of-line (TOASTed) value? Reads the stored tuple's info-mask. Returns
+    /// None if the row isn't cached. After `rowcache_put` this is always `false`
+    /// even when the live row has external values — proof the cache flattened
+    /// them inline (see `bench/run_p6_toast.sh`).
+    #[pg_extern]
+    fn rowcache_cached_has_external(tbl: &str, pk: AnyElement) -> Option<bool> {
+        let relid = Spi::get_one_with_args::<pg_sys::Oid>(
+            "SELECT $1::regclass::oid",
+            vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
+        )
+        .ok()
+        .flatten()?;
+        let view = rowcache_view()?;
+        let canon = unsafe { canon_pk(pk.oid(), pk.datum()) };
+        match view.get(&rc_key(relid.as_u32(), &canon)) {
+            Lookup::Hit(bytes) if bytes.len() >= std::mem::size_of::<pg_sys::HeapTupleHeaderData>() => {
+                let hdr = bytes.as_ptr() as *const pg_sys::HeapTupleHeaderData;
+                let infomask = unsafe { (*hdr).t_infomask };
+                Some(infomask & pg_sys::HEAP_HASEXTERNAL as u16 != 0)
+            }
+            _ => None,
         }
     }
 

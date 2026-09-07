@@ -1,0 +1,12 @@
+# P6 — Mode B row cache for TOASTed rows; refill=on
+  PASS  setup: value is 20000 bytes                           
+  PASS  live row is genuinely TOASTed (toast chunks > 0)      
+  PASS  cached copy is FLATTENED (no external pointer)        
+  PASS  cached row uses the Custom Scan                       
+  PASS  Custom Scan serves the full value (length)            
+  PASS  Custom Scan serves the full value (md5 == ground truth)
+  PASS  after UPDATE: read is the fresh 30000-byte value (coherent)
+  PASS  refill: cached copy is still flattened after UPDATE   
+  PASS  refill: still served from the Custom Scan             
+
+# result: 9 passed, 0 failed

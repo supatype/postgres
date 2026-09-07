@@ -727,8 +727,13 @@ commit off the worker's snapshot.
   registered column is not a single-column primary key (arity guard: a composite
   key could otherwise match the wrong cached row) — verified for uuid and text
   PKs, and the composite-key refusal, in `bench/run_p6_nonint_pk.sh` (14/14).
-  Cached rows with out-of-line (TOASTed) values are still not supported (the raw
-  tuple carries a toast pointer, not the datum) — POC stores inline rows. The
+  **Rows with out-of-line (TOASTed) values are supported**: the tuple is
+  flattened at store time (`toast_flatten_tuple`) so every value is pulled inline
+  and the cached row is self-contained — no toast pointer that could dangle once
+  the toast chunks are vacuumed. Verified in `bench/run_p6_toast.sh` (9/9): a row
+  with a genuinely external 20 KB column caches with `HEAP_HASEXTERNAL` cleared
+  (a `rowcache_cached_has_external` diagnostic), the Custom Scan serves the full
+  value byte-for-byte, and an UPDATE stays coherent and re-flattened. The
   decode worker holds one logical replication slot (WAL-retention caution, §13).
   Refill (`pg_keyspace.rowcache_refill`) is opt-in; default is drop-only (lazy).
 - PostgREST end-to-end uses the real **v12.2.3** binary over live HTTP+JWT
