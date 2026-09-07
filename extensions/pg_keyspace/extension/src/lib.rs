@@ -677,8 +677,32 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
                     None
                 };
                 let n = cfg.as_ref().map(|c| c.creds.len()).unwrap_or(0);
-                log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} credentials)");
-                return server::Tick::Reload(cfg);
+                // Cert rotation (§4.5): re-read the same cert/key paths so an
+                // in-place renewal (e.g. cert-manager) takes effect with no
+                // restart. Only new connections use the new cert. A failed reload
+                // keeps the old cert (never drops TLS mid-flight) and warns.
+                let mut reload = server::Reload {
+                    auth: Some(cfg),
+                    tls: None,
+                };
+                if let (Some(cert), Some(key)) = (
+                    GUC_TLS_CERT.get().and_then(|c| c.to_str().ok().map(str::to_string)).filter(|s| !s.is_empty()),
+                    GUC_TLS_KEY.get().and_then(|c| c.to_str().ok().map(str::to_string)).filter(|s| !s.is_empty()),
+                ) {
+                    match server::load_tls_config(&cert, &key) {
+                        Ok(c) => {
+                            reload.tls = Some(Some(c));
+                            log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} creds) + TLS cert");
+                        }
+                        Err(e) => log!(
+                            "pg_keyspace worker: SIGHUP — reloaded auth ({n} creds); TLS cert \
+                             reload FAILED ({e}), keeping the current cert"
+                        ),
+                    }
+                } else {
+                    log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} credentials)");
+                }
+                return server::Tick::Reload(reload);
             }
             server::Tick::Continue
         },

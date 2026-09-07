@@ -83,6 +83,7 @@ extensions/pg_keyspace/
 │   ├── run_p2_threats.sh     Mode A security threat table (§4.7)
 │   ├── run_p2_hardening.sh   hashed AUTH secrets + credential hot-reload (§4.5)
 │   ├── run_p2_tls.sh         native TLS on the RESP wire (§4.5)
+│   ├── run_p2_certrotate.sh  TLS cert rotation on SIGHUP (§4.5)
 │   ├── run_p3_hashes.sh      P3 hash type: coverage, WRONGTYPE, redis parity (§5)
 │   ├── run_p3_lists.sh       P3 list type: coverage, WRONGTYPE, redis parity (§5)
 │   ├── run_p3_zsets.sh       P3 sorted-set type: coverage, WRONGTYPE, redis parity (§5)

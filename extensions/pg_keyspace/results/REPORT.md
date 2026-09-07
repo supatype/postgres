@@ -425,7 +425,10 @@ still runs, unaffected by pg_keyspace.
   epoll loop: ciphertext on the socket, plaintext in the per-connection buffers),
   so the AUTH password and all values are encrypted in transit — closing the last
   §4.5 wire caveat. TLS misconfiguration fails closed (the worker refuses to bind
-  rather than serve plaintext). `bench/run_p2_tls.sh` = 7/7
+  rather than serve plaintext). **Cert rotation** is in-place: swap the cert/key
+  files and `SELECT pg_reload_conf()` — new connections use the new cert with no
+  restart (the cert-manager model); a broken cert on reload keeps the current one
+  serving (`bench/run_p2_certrotate.sh`, 6/6). `bench/run_p2_tls.sh` = 7/7
   (`results/p2_tls.txt`): a plaintext client is rejected on the TLS port, the
   server cert validates against its CA (a *verified* handshake, not just
   `--insecure`), and AUTH + SET/GET round-trip over TLS. Stock `redis-cli --tls`

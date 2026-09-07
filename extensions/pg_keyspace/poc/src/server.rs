@@ -152,15 +152,24 @@ pub struct AuthConfig {
     pub exempt: HashSet<String>, // roles that bypass ACL + scoping (§4.5)
 }
 
+/// A live config swap applied by `run_with` (SIGHUP hot-reload). Each field is
+/// `Some(new)` to change it or `None` to leave it as-is; the inner `Option` is
+/// the value itself (e.g. `Some(None)` clears auth -> no-auth mode).
+#[derive(Default)]
+pub struct Reload {
+    pub auth: Option<Option<AuthConfig>>,
+    pub tls: Option<Option<Arc<rustls::ServerConfig>>>,
+}
+
 /// Per-iteration control returned by the `run_with` tick closure.
 pub enum Tick {
     /// Keep running.
     Continue,
     /// Stop the event loop (e.g. SIGTERM).
     Stop,
-    /// Replace the auth config live: `Some(cfg)` enforces it, `None` switches to
-    /// no-auth. Used for SIGHUP hot-reload of credentials.
-    Reload(Option<AuthConfig>),
+    /// Hot-reload credentials and/or the TLS cert on SIGHUP. New TLS only affects
+    /// connections accepted after the swap; existing sessions keep their session.
+    Reload(Reload),
 }
 
 enum Deny {
@@ -286,7 +295,14 @@ impl Worker {
         loop {
             match tick() {
                 Tick::Stop => return Ok(()),
-                Tick::Reload(cfg) => self.auth = cfg,
+                Tick::Reload(r) => {
+                    if let Some(a) = r.auth {
+                        self.auth = a;
+                    }
+                    if let Some(t) = r.tls {
+                        self.tls_config = t;
+                    }
+                }
                 Tick::Continue => {}
             }
             let n = unsafe {
