@@ -1027,6 +1027,7 @@ dependencies = [
  "libc",
  "pgrx",
  "pgrx-tests",
+ "sha2",
 ]
 
 [[package]]

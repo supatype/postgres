@@ -69,11 +69,66 @@ fn shard_push(
 // ---- P2 security: RESP AUTH -> role, keyspace ACL, forced tenant scoping ----
 
 /// A RESP credential (§4.5): maps an AUTH username to a Postgres role + tenant.
+///
+/// `secret` is either a hashed verifier `sha256$<salt_hex>$<hash_hex>` (produced
+/// by `supacache.set_credential`, the recommended path — the plaintext is never
+/// stored) or, for local/legacy use, a bare plaintext string. `verify` accepts
+/// both and always compares in constant time.
 #[derive(Clone)]
 pub struct Cred {
     pub secret: String,
     pub role: String,
     pub tenant: String,
+}
+
+/// Constant-time byte comparison — no early exit on the first mismatch, so it
+/// leaks neither which byte differs nor (for equal lengths) how many match.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+impl Cred {
+    /// True if `presented` matches this credential's secret.
+    pub fn verify(&self, presented: &[u8]) -> bool {
+        if let Some(rest) = self.secret.strip_prefix("sha256$") {
+            // sha256$<salt_hex>$<hash_hex>
+            let mut parts = rest.splitn(2, '$');
+            let (salt_hex, hash_hex) = match (parts.next(), parts.next()) {
+                (Some(s), Some(h)) => (s, h),
+                _ => return false,
+            };
+            let (salt, expected) = match (hex_decode(salt_hex), hex_decode(hash_hex)) {
+                (Some(s), Some(h)) => (s, h),
+                _ => return false,
+            };
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&salt);
+            hasher.update(presented);
+            let got = hasher.finalize();
+            ct_eq(got.as_slice(), &expected)
+        } else {
+            // legacy plaintext (local/dev)
+            ct_eq(self.secret.as_bytes(), presented)
+        }
+    }
 }
 
 /// One keyspace ACL rule: a role may read/write keys under `prefix` (§4.5).
@@ -91,6 +146,17 @@ pub struct AuthConfig {
     pub creds: HashMap<String, Cred>,
     pub acl: HashMap<String, Vec<AclRule>>,
     pub exempt: HashSet<String>, // roles that bypass ACL + scoping (§4.5)
+}
+
+/// Per-iteration control returned by the `run_with` tick closure.
+pub enum Tick {
+    /// Keep running.
+    Continue,
+    /// Stop the event loop (e.g. SIGTERM).
+    Stop,
+    /// Replace the auth config live: `Some(cfg)` enforces it, `None` switches to
+    /// no-auth. Used for SIGHUP hot-reload of credentials.
+    Reload(Option<AuthConfig>),
 }
 
 enum Deny {
@@ -178,19 +244,23 @@ impl Worker {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        self.run_with(|| true, -1)
+        self.run_with(|| Tick::Continue, -1)
     }
 
-    /// Run the event loop until `keep_going()` returns false. `timeout_ms`
-    /// bounds each `epoll_wait` so the predicate is polled even when idle
-    /// (a Postgres background worker uses this to notice SIGTERM). `-1` blocks
-    /// indefinitely and never checks the predicate between events.
-    pub fn run_with<F: Fn() -> bool>(&mut self, keep_going: F, timeout_ms: i32) -> io::Result<()> {
+    /// Run the event loop, calling `tick()` once per iteration (and whenever a
+    /// signal interrupts the wait). `timeout_ms` bounds each `epoll_wait` so the
+    /// tick runs even when idle (a Postgres background worker uses this to notice
+    /// SIGTERM/SIGHUP). `Tick::Stop` ends the loop; `Tick::Reload(cfg)` swaps the
+    /// auth config live — the hot-reload hook the extension drives on SIGHUP, so
+    /// credential changes need no restart (`None` = switch to no-auth).
+    pub fn run_with<F: FnMut() -> Tick>(&mut self, mut tick: F, timeout_ms: i32) -> io::Result<()> {
         let mut events: Vec<libc::epoll_event> =
             vec![unsafe { std::mem::zeroed() }; EPOLL_MAX];
         loop {
-            if !keep_going() {
-                return Ok(());
+            match tick() {
+                Tick::Stop => return Ok(()),
+                Tick::Reload(cfg) => self.auth = cfg,
+                Tick::Continue => {}
             }
             let n = unsafe {
                 libc::epoll_wait(self.epfd, events.as_mut_ptr(), EPOLL_MAX as i32, timeout_ms)
@@ -598,7 +668,7 @@ impl Worker {
                         ("default".to_string(), &args[1])
                     };
                     match cfg.creds.get(&user) {
-                        Some(c) if c.secret.as_bytes() == pass.as_slice() => {
+                        Some(c) if c.verify(pass.as_slice()) => {
                             R::Ok(c.role.clone(), c.tenant.clone(), cfg.exempt.contains(&c.role))
                         }
                         _ => R::Wrong,
@@ -870,5 +940,55 @@ fn epoll_del(epfd: RawFd, fd: RawFd) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn cred(secret: &str) -> Cred {
+        Cred { secret: secret.to_string(), role: "r".into(), tenant: "".into() }
+    }
+
+    #[test]
+    fn plaintext_verify() {
+        let c = cred("hunter2");
+        assert!(c.verify(b"hunter2"));
+        assert!(!c.verify(b"hunter3"));
+        assert!(!c.verify(b"hunter2 "));
+    }
+
+    #[test]
+    fn hashed_verify_roundtrip() {
+        // build sha256$<salt>$<hash> exactly as supacache.set_credential does
+        use sha2::{Digest, Sha256};
+        let salt = [0xA1u8, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18];
+        let pass = b"correct horse battery staple";
+        let mut h = Sha256::new();
+        h.update(salt);
+        h.update(pass);
+        let digest = h.finalize();
+        let salt_hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+        let hash_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let c = cred(&format!("sha256${salt_hex}${hash_hex}"));
+        assert!(c.verify(pass));
+        assert!(!c.verify(b"wrong"));
+        assert!(!c.verify(b""));
+    }
+
+    #[test]
+    fn ct_eq_basics() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn malformed_hash_is_rejected() {
+        assert!(!cred("sha256$nothex$deadbeef").verify(b"x"));
+        assert!(!cred("sha256$").verify(b"x"));
+        assert!(!cred("sha256$aa").verify(b"x")); // missing hash segment
     }
 }

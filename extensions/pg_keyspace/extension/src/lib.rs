@@ -602,7 +602,29 @@ pub extern "C" fn pg_keyspace_worker_main(_arg: pg_sys::Datum) {
     } else {
         500
     };
-    let _ = worker.run_with(|| !BackgroundWorker::sigterm_received(), timeout_ms);
+    // SIGHUP hot-reloads RESP credentials + ACL from the table (and refreshes
+    // GUC-derived values like exempt_roles) with no restart: change the creds via
+    // supacache.set_credential, then `SELECT pg_reload_conf()`.
+    let _ = worker.run_with(
+        || {
+            if BackgroundWorker::sigterm_received() {
+                return server::Tick::Stop;
+            }
+            if BackgroundWorker::sighup_received() {
+                unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
+                let cfg = if extension_installed() {
+                    load_auth_config()
+                } else {
+                    None
+                };
+                let n = cfg.as_ref().map(|c| c.creds.len()).unwrap_or(0);
+                log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} credentials)");
+                return server::Tick::Reload(cfg);
+            }
+            server::Tick::Continue
+        },
+        timeout_ms,
+    );
     log!("pg_keyspace worker: shutting down");
 }
 
@@ -1761,6 +1783,45 @@ mod supacache {
     #[pg_extern]
     fn ping() -> &'static str {
         "PONG"
+    }
+
+    /// Register/replace a RESP AUTH credential, storing a SALTED SHA-256 verifier
+    /// (`sha256$<salt>$<hash>`) — the plaintext secret is never written to the
+    /// table (§4.5 hardening). The worker verifies with a constant-time compare
+    /// and picks up the change on `SELECT pg_reload_conf()` (hot reload). Salt is
+    /// 128 bits from `gen_random_uuid()`. Use this instead of inserting into
+    /// `supacache.resp_credential` directly.
+    #[pg_extern]
+    fn set_credential(username: &str, secret: &str, role: &str, tenant: &str) -> bool {
+        let salt = match Spi::get_one::<String>(
+            "SELECT replace(gen_random_uuid()::text, '-', '')",
+        ) {
+            Ok(Some(s)) => s,
+            _ => return false,
+        };
+        let stored = match Spi::get_one_with_args::<String>(
+            "SELECT 'sha256$' || $1 || '$' || encode(sha256(decode($1,'hex') || $2::bytea), 'hex')",
+            vec![
+                (PgBuiltInOids::TEXTOID.oid(), salt.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), secret.into_datum()),
+            ],
+        ) {
+            Ok(Some(s)) => s,
+            _ => return false,
+        };
+        Spi::run_with_args(
+            "INSERT INTO supacache.resp_credential(username, secret, role_name, tenant) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (username) DO UPDATE SET \
+               secret = EXCLUDED.secret, role_name = EXCLUDED.role_name, tenant = EXCLUDED.tenant",
+            Some(vec![
+                (PgBuiltInOids::TEXTOID.oid(), username.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), stored.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), role.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), tenant.into_datum()),
+            ]),
+        )
+        .is_ok()
     }
 
     /// Persistence ring diagnostics: total writes enqueued, writes dropped due

@@ -25,10 +25,12 @@ for the full write-up and the concerns matrix.
 > PostgREST-pattern 4/4, `results/p6_postgrest_pattern.txt`). The Custom Scan
 > roughly halves executor time for a single-row pk lookup (`results/p6_rowcache.txt`),
 > and the §4.3c masked-read concern is quantified (`results/p6_maskcost.txt`).
-> Remaining P6 items are non-security: a refill worker (invalidation is drop-only)
-> and the real PostgREST binary (blocked by sandbox egress). Still a POC — auth
-> secrets are compared in clear and credentials load at worker start; don't deploy
-> as-is.
+> Remaining P6 items are non-security: the real PostgREST binary (blocked by
+> sandbox egress). Auth is hardened: RESP secrets are stored as salted SHA-256 and
+> verified in constant time (`supacache.set_credential`), and credentials
+> hot-reload on `SELECT pg_reload_conf()` (`results/p2_hardening.txt`, 10/10).
+> Still a POC — RESP AUTH sends the password in the clear over TCP (no TLS on the
+> wire yet); don't deploy as-is.
 
 ## What it is
 
@@ -73,6 +75,7 @@ extensions/pg_keyspace/
 │   ├── run_durability.sh     per-tier RESP SET (§3.4)
 │   ├── run_scaleout.sh       shared-nothing scaling (§3.1)
 │   ├── run_p2_threats.sh     Mode A security threat table (§4.7)
+│   ├── run_p2_hardening.sh   hashed AUTH secrets + credential hot-reload (§4.5)
 │   ├── run_p6_maskcost.sh    cost of a masked read + §6 accelerator (§4.3c)
 │   ├── run_p6_security.sh    Mode B row-cache RLS/mask/generic-plan suite (§4.6/§4.7)
 │   ├── run_p6_rowcache.sh    Mode B Custom Scan vs index-scan latency (§7.1)
@@ -156,6 +159,23 @@ manual — a warm/refill helper; invalidation is automatic. With
 `pg_keyspace.rowcache_refill = on` a changed *hot* key is re-read and re-cached
 (stays served from the Custom Scan across writes) instead of being dropped; a
 delete always drops.
+
+**RESP AUTH (§4.5).** Register credentials with the helper — it stores a salted
+SHA-256 verifier, never the plaintext — and hot-reload them without a restart:
+
+```sql
+SELECT supacache.set_credential('alice', 's3cret', 'tenant_a_role', 'tenant_a');
+SELECT pg_reload_conf();   -- the RESP worker reloads creds + ACL on SIGHUP
+```
+
+```bash
+redis-cli -p 6380 --user alice -a s3cret GET session:1   # authed; NOAUTH without it
+```
+
+The worker verifies with a constant-time compare and enforces the keyspace ACL +
+forced tenant scoping. (A bare plaintext secret in `resp_credential` still works
+for local/dev.) AUTH is sent in the clear over TCP — put TLS in front in
+production.
 
 Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
 

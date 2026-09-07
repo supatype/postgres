@@ -407,10 +407,24 @@ still runs, unaffected by pg_keyspace.
 | `service_role` (exempt) | ✅ bypasses ACL + scoping, sees the raw key |
 | tenant grants itself `supacache_admin` | ✅ blocked by `pg_guard` |
 
-**Caveats (POC-level):** credentials/ACL load at worker start (a change needs a
-restart or a future sinval-driven refresh); secrets are compared in clear (store
-a hash in production); Mode B row-cache threat cases (force_generic_plan,
-masked-column warm cache, decoding worker) are P6, not built.
+**Hardening (done).** Two POC caveats are now closed (`bench/run_p2_hardening.sh`
+= 10/10, `results/p2_hardening.txt`):
+
+- **Secrets hashed at rest.** `supacache.set_credential(user, secret, role,
+  tenant)` stores a salted `sha256$<salt>$<hash>` verifier (128-bit salt from
+  `gen_random_uuid()`); the plaintext is never written to the table. The worker
+  verifies with a **constant-time** compare (`Cred::verify`, unit-tested). A bare
+  plaintext secret is still accepted for local/dev (legacy path).
+- **Hot reload, no restart.** The RESP worker reloads credentials + ACL (and
+  refreshes GUC-derived values like `exempt_roles`) on **SIGHUP** — change creds,
+  then `SELECT pg_reload_conf()`. Verified: a new credential works, and a removed
+  one stops working, without bouncing the worker. `run_p2_threats.sh` now
+  self-seeds this way instead of requiring a restart.
+
+Residual POC caveat: RESP AUTH still sends the password in the clear over TCP
+(no TLS) — hashing protects the table at rest, not the wire. Mode B row-cache
+threat cases (force_generic_plan, masked-column warm cache, decoding worker) are
+covered in §5e.
 
 ## 5e. P6 — Mode B (row cache): masked-read cost and the §6 accelerator
 
@@ -663,9 +677,10 @@ commit off the worker's snapshot.
 ## 8. Limitations (what this P0 is not)
 
 - Mode A security is done and tested on PG17 (§5d); Mode B's `CustomScan` and its
-  §4.6 security invariant are built and tested (§5e). POC-level auth caveats:
-  credentials load at worker start (no hot reload yet), secrets compared in clear
-  (hash in production).
+  §4.6 security invariant are built and tested (§5e). Auth hardening done (§5d):
+  secrets are stored as salted SHA-256 and verified in constant time
+  (`supacache.set_credential`), and credentials hot-reload on SIGHUP. Residual:
+  RESP AUTH sends the password in clear over TCP (no TLS on the wire yet).
 - Coupling to `supatype_mask` is a single fail-closed gate, not baked in. The load
   order is asserted at worker start (§4.1); `pg_keyspace.require_mask = off` lifts
   the requirement so pg_keyspace runs standalone as a plain Postgres-native

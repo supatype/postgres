@@ -23,8 +23,12 @@ INSERT INTO supacache.resp_credential(username,secret,role_name,tenant) VALUES
 ON CONFLICT(username) DO UPDATE SET secret=EXCLUDED.secret,role_name=EXCLUDED.role_name,tenant=EXCLUDED.tenant;
 INSERT INTO supacache.acl(role_name,prefix,can_read,can_write) VALUES
   ('tenant_a','session:',true,true),('tenant_b','session:',true,true),('tenant_a','ro:',true,false)
-ON CONFLICT(role_name,prefix) DO UPDATE SET can_read=EXCLUDED.can_read,can_write=EXCLUDED.can_write;" >/dev/null
-echo "NOTE: credential/ACL changes take effect on the next worker (re)start."
+ON CONFLICT(role_name,prefix) DO UPDATE SET can_read=EXCLUDED.can_read,can_write=EXCLUDED.can_write;
+SELECT pg_reload_conf();" >/dev/null
+# Hot reload (P2 hardening): the worker picks up credential/ACL changes on SIGHUP,
+# so pg_reload_conf() applies them with no restart. (secret shown here is stored
+# plaintext to exercise the legacy verify path; supacache.set_credential hashes.)
+sleep 1
 echo
 
 check "unauth data command -> NOAUTH"        "$($R get session:zzz 2>&1 | head -1)" "NOAUTH Authentication required."
