@@ -2,13 +2,49 @@
 //!
 //! Each aggregate is stored in the keyspace as a single self-describing blob in
 //! the slab (the entry's `kind` tags which type it is), decoded on read and
-//! re-encoded on write. This matches Redis's small-collection philosophy
-//! (listpack) — compact and simple, O(n) per op — and is a good fit for a cache
-//! whose collections are small. Very large collections would want a native
-//! shmem structure; that is a later upgrade, not a correctness issue.
+//! re-encoded on write. Encoding is length-prefixed and endian-fixed so a
+//! persisted blob is portable: each element is `len: u32-le` followed by `len`
+//! bytes.
 //!
-//! Encoding is length-prefixed and endian-fixed so a persisted blob is portable:
-//! each element is `len: u32-le` followed by `len` bytes.
+//! ## Native large-collection structure (hashes)
+//!
+//! A small hash is stored inline (a flat listpack-style scan of field/value
+//! pairs) — compact, and O(n) lookup is fine when n is tiny (Redis's
+//! `hash-max-listpack-entries` philosophy). Past a threshold a hash is instead
+//! stored in an **indexed** encoding: an in-value open-addressed bucket table
+//! (bucket heads + chained entries) laid out in the *same* single blob. Point
+//! reads — HGET/HMGET/HEXISTS/HSTRLEN/HLEN — then run in O(1) average instead of
+//! scanning every field, which is the difference that matters on a 10k-field
+//! hash. Crucially the collection remains one keyspace value: it is still
+//! evicted atomically (CLOCK never tears half a hash away), shipped to the
+//! durability ring as one record, and invalidated as one key — so the indexed
+//! form is a pure encoding upgrade with no new failure modes. Writes still
+//! rebuild the blob (O(n), unchanged); it is the reads that go sub-linear.
+//!
+//! The value's first byte is an encoding tag: `H_INLINE` (0) or `H_INDEXED` (1).
+//! Lists and sorted sets keep the inline encoding (ordering makes bucketing them
+//! less useful for a cache; the same technique applies if needed later).
+
+/// A hash with more than this many fields is stored in the indexed encoding.
+/// Mirrors Redis's `hash-max-listpack-entries` default (128).
+pub const HASH_INDEX_THRESHOLD: usize = 128;
+/// ...or if any field/value is longer than this (Redis `hash-max-listpack-value`
+/// is 64; a big member also makes a linear scan expensive).
+pub const HASH_INDEX_VALUE_MAX: usize = 64;
+
+const H_INLINE: u8 = 0;
+const H_INDEXED: u8 = 1;
+
+/// FNV-1a 64-bit — the bucket hash for the indexed encoding. Self-contained so
+/// the blob's layout does not depend on the store's (private) key hash.
+fn fieldhash(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &x in b {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -44,27 +80,44 @@ impl Hash {
         Hash { entries: Vec::new() }
     }
 
-    /// Decode a stored blob. A malformed tail is ignored (returns what parsed),
-    /// so a truncated blob degrades to a shorter hash rather than a panic.
-    pub fn decode(mut buf: &[u8]) -> Hash {
-        let mut h = Hash::new();
-        while let (Some(f), Some(v)) = {
-            let f = take_bytes(&mut buf);
-            let v = if f.is_some() { take_bytes(&mut buf) } else { None };
-            (f, v)
-        } {
-            h.entries.push((f.to_vec(), v.to_vec()));
+    /// Decode a stored blob (either encoding). A malformed tail is ignored
+    /// (returns what parsed), so a truncated blob degrades to a shorter hash
+    /// rather than a panic. Fields come back in insertion order for both
+    /// encodings.
+    pub fn decode(buf: &[u8]) -> Hash {
+        match buf.first() {
+            None => Hash::new(),
+            Some(&H_INDEXED) => decode_indexed(buf),
+            _ => decode_inline(&buf[1..]),
         }
-        h
     }
 
+    /// Encode, choosing the inline or indexed layout by size. The chosen tag is
+    /// the first byte, so a reader can dispatch without a schema.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (f, v) in &self.entries {
-            put_bytes(&mut out, f);
-            put_bytes(&mut out, v);
+        let big = self.entries.len() > HASH_INDEX_THRESHOLD
+            || self
+                .entries
+                .iter()
+                .any(|(f, v)| f.len() > HASH_INDEX_VALUE_MAX || v.len() > HASH_INDEX_VALUE_MAX);
+        self.force_encode(big)
+    }
+
+    /// Encode with an explicit layout choice, bypassing the size heuristic.
+    /// Used by tests and benchmarks to compare the two encodings at one size;
+    /// production code calls `encode`.
+    pub fn force_encode(&self, indexed: bool) -> Vec<u8> {
+        if indexed {
+            encode_indexed(&self.entries)
+        } else {
+            let mut out = Vec::with_capacity(1);
+            out.push(H_INLINE);
+            for (f, v) in &self.entries {
+                put_bytes(&mut out, f);
+                put_bytes(&mut out, v);
+            }
+            out
         }
-        out
     }
 
     pub fn len(&self) -> usize {
@@ -100,6 +153,145 @@ impl Hash {
             true
         } else {
             false
+        }
+    }
+}
+
+// ---- Hash: encoding internals + O(1) raw-buffer point reads ---------------
+
+fn decode_inline(mut buf: &[u8]) -> Hash {
+    let mut h = Hash::new();
+    while let (Some(f), Some(v)) = {
+        let f = take_bytes(&mut buf);
+        let v = if f.is_some() { take_bytes(&mut buf) } else { None };
+        (f, v)
+    } {
+        h.entries.push((f.to_vec(), v.to_vec()));
+    }
+    h
+}
+
+/// Indexed layout: `[H_INDEXED][nbuckets u32][count u32][heads: nbuckets×u32]
+/// [entries]`. Each bucket head is `offset+1` into the entries region (0 =
+/// empty). Each entry is `flen u32, field, vlen u32, val, next u32` where `next`
+/// is the `offset+1` of the next entry in the same bucket (chained, newest
+/// first). The entries region is written in insertion order, so a linear walk
+/// recovers that order.
+fn encode_indexed(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let nbuckets = entries.len().next_power_of_two().max(8);
+    let mask = (nbuckets - 1) as u64;
+    let mut heads = vec![0u32; nbuckets];
+    let mut region: Vec<u8> = Vec::new();
+    for (f, v) in entries {
+        let off = region.len() as u32;
+        let b = (fieldhash(f) & mask) as usize;
+        put_bytes(&mut region, f);
+        put_bytes(&mut region, v);
+        region.extend_from_slice(&heads[b].to_le_bytes()); // next = old head
+        heads[b] = off + 1;
+    }
+    let mut out = Vec::with_capacity(9 + 4 * nbuckets + region.len());
+    out.push(H_INDEXED);
+    out.extend_from_slice(&(nbuckets as u32).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for h in &heads {
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    out.extend_from_slice(&region);
+    out
+}
+
+fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
+    b.get(at..at + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// Parse the entry at `region[off..]`: returns (field, value, next, end-offset).
+fn read_entry(region: &[u8], off: usize) -> Option<(&[u8], &[u8], u32, usize)> {
+    let mut p = off;
+    let fl = rd_u32(region, p)? as usize;
+    p += 4;
+    let f = region.get(p..p + fl)?;
+    p += fl;
+    let vl = rd_u32(region, p)? as usize;
+    p += 4;
+    let v = region.get(p..p + vl)?;
+    p += vl;
+    let next = rd_u32(region, p)?;
+    p += 4;
+    Some((f, v, next, p))
+}
+
+fn decode_indexed(buf: &[u8]) -> Hash {
+    let mut h = Hash::new();
+    let nbuckets = match rd_u32(buf, 1) {
+        Some(n) => n as usize,
+        None => return h,
+    };
+    let region_base = 9 + 4 * nbuckets;
+    let region = match buf.get(region_base..) {
+        Some(r) => r,
+        None => return h,
+    };
+    let mut off = 0usize;
+    while off < region.len() {
+        match read_entry(region, off) {
+            Some((f, v, _next, end)) => {
+                h.entries.push((f.to_vec(), v.to_vec()));
+                off = end;
+            }
+            None => break,
+        }
+    }
+    h
+}
+
+/// O(1)-average point read straight off the stored blob — no full decode. Works
+/// for both encodings (inline falls back to a linear scan, which is what small
+/// hashes want anyway).
+pub fn hash_probe<'a>(buf: &'a [u8], field: &[u8]) -> Option<&'a [u8]> {
+    match buf.first() {
+        None => None,
+        Some(&H_INDEXED) => {
+            let nbuckets = rd_u32(buf, 1)? as usize;
+            let region_base = 9 + 4 * nbuckets;
+            let region = buf.get(region_base..)?;
+            let b = (fieldhash(field) & (nbuckets as u64 - 1)) as usize;
+            let mut head = rd_u32(buf, 9 + 4 * b)?;
+            while head != 0 {
+                let (f, v, next, _) = read_entry(region, (head - 1) as usize)?;
+                if f == field {
+                    return Some(v);
+                }
+                head = next;
+            }
+            None
+        }
+        _ => {
+            let mut p = &buf[1..];
+            loop {
+                let f = take_bytes(&mut p)?;
+                let v = take_bytes(&mut p)?;
+                if f == field {
+                    return Some(v);
+                }
+            }
+        }
+    }
+}
+
+/// O(1) field count for the indexed encoding (header field); O(n) for inline.
+pub fn hash_count(buf: &[u8]) -> usize {
+    match buf.first() {
+        None => 0,
+        Some(&H_INDEXED) => rd_u32(buf, 5).unwrap_or(0) as usize,
+        _ => {
+            let mut p = &buf[1..];
+            let mut n = 0;
+            while take_bytes(&mut p).is_some() && take_bytes(&mut p).is_some() {
+                n += 1;
+            }
+            n
         }
     }
 }
@@ -483,5 +675,77 @@ mod tests {
         h.set(b"\x00\xff", b"\x01\x02\x00");
         let h2 = Hash::decode(&h.encode());
         assert_eq!(h2.get(b"\x00\xff"), Some(&b"\x01\x02\x00"[..]));
+    }
+
+    #[test]
+    fn hash_small_stays_inline() {
+        let mut h = Hash::new();
+        h.set(b"a", b"1");
+        h.set(b"b", b"2");
+        let blob = h.encode();
+        assert_eq!(blob[0], H_INLINE);
+        // point read off the raw blob agrees with a full decode
+        assert_eq!(hash_probe(&blob, b"a"), Some(&b"1"[..]));
+        assert_eq!(hash_probe(&blob, b"b"), Some(&b"2"[..]));
+        assert_eq!(hash_probe(&blob, b"z"), None);
+        assert_eq!(hash_count(&blob), 2);
+    }
+
+    #[test]
+    fn hash_promotes_to_indexed_and_probes() {
+        let mut h = Hash::new();
+        for i in 0..1000u32 {
+            h.set(format!("field-{i}").as_bytes(), format!("val-{i}").as_bytes());
+        }
+        let blob = h.encode();
+        assert_eq!(blob[0], H_INDEXED, "1000 fields must use the indexed layout");
+        assert_eq!(hash_count(&blob), 1000);
+
+        // every field is found by the O(1) raw probe, with the right value
+        for i in 0..1000u32 {
+            let want = format!("val-{i}");
+            assert_eq!(
+                hash_probe(&blob, format!("field-{i}").as_bytes()),
+                Some(want.as_bytes()),
+                "probe miss for field-{i}"
+            );
+        }
+        assert_eq!(hash_probe(&blob, b"field-1000"), None);
+        assert_eq!(hash_probe(&blob, b"absent"), None);
+
+        // full decode round-trips all fields in insertion order
+        let h2 = Hash::decode(&blob);
+        assert_eq!(h2.len(), 1000);
+        assert_eq!(h2.entries[0].0, b"field-0");
+        assert_eq!(h2.entries[999].0, b"field-999");
+        assert_eq!(h2.get(b"field-500"), Some(&b"val-500"[..]));
+    }
+
+    #[test]
+    fn hash_promotes_on_big_value() {
+        // few fields but a long value -> indexed (linear scan of big members is
+        // what the value threshold guards against)
+        let mut h = Hash::new();
+        h.set(b"k", &vec![b'x'; HASH_INDEX_VALUE_MAX + 1]);
+        let blob = h.encode();
+        assert_eq!(blob[0], H_INDEXED);
+        assert_eq!(hash_probe(&blob, b"k").map(|v| v.len()), Some(HASH_INDEX_VALUE_MAX + 1));
+    }
+
+    #[test]
+    fn hash_indexed_binary_safe_and_update() {
+        let mut h = Hash::new();
+        for i in 0..200u32 {
+            h.set(&i.to_le_bytes(), b"\x00\xff\x00");
+        }
+        // overwrite one, delete one, decode-modify-reencode across the threshold
+        let blob = h.encode();
+        let mut h2 = Hash::decode(&blob);
+        assert!(!h2.set(&7u32.to_le_bytes(), b"new")); // existing -> not added
+        assert!(h2.del(&9u32.to_le_bytes()));
+        let blob2 = h2.encode();
+        assert_eq!(hash_probe(&blob2, &7u32.to_le_bytes()), Some(&b"new"[..]));
+        assert_eq!(hash_probe(&blob2, &9u32.to_le_bytes()), None);
+        assert_eq!(hash_count(&blob2), 199);
     }
 }

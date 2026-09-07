@@ -736,21 +736,50 @@ commit off the worker's snapshot.
   - pub/sub — `SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE/PUBLISH` with Redis
     glob pattern matching (`*`, `?`, `[…]`, `\`), the RESP2 subscribe-mode gate,
     per-channel receiver counts, `QUIT`, and NOAUTH enforcement
-    (`run_p3_pubsub.sh`, 11/11). Fan-out is local to the RESP worker (the in-PG
-    deployment is single-worker); cross-worker pub/sub — a shared-memory ring or
-    a `LISTEN`/`NOTIFY` bridge — is a follow-up, as is tenant-scoping channel
-    names (they are a flat namespace in this slice).
+    (`run_p3_pubsub.sh`, 11/11). Fan-out is local to the RESP worker for the
+    single-worker in-PG deployment; the scale-out daemon adds **cross-worker
+    delivery** via a shared in-process Bus (routing table + per-worker
+    eventfd-woken inboxes), so a `PUBLISH` on one worker reaches subscribers on
+    any worker (`run_p3_pubsub_xworker.sh`, 10/10). Tenant-scoping channel names
+    (a flat namespace in this slice) remains a follow-up.
 
   Aggregates are stored as a compact length-prefixed blob in the slab (Redis's
-  small-collection philosophy), so ops are O(n) on the collection — a fit for
-  cache-sized collections. Hammering one collection to 100k+ elements is the O(n)
-  blob-rewrite worst case by design; a native shmem structure for very large
-  collections is a later upgrade. Aggregates are **durable** on a persisted tier:
-  the P1 ring now carries a type tag (packed into the record's free `val_len`
-  byte), so a hash/list/zset persists to `supacache.kv` with its `kind` and
-  recovers as the right type after a crash (`run_p3_durable.sh`, 10/10). The P3
-  command surface (§5) — hashes, lists, sorted sets, pub/sub — is built; what
-  remains there is cross-worker pub/sub.
+  small-collection philosophy). **Hashes now promote to a native large-collection
+  structure**: past a threshold (128 fields, or any field/value > 64 B — Redis's
+  listpack limits) a hash is re-encoded as an in-value open-addressed bucket
+  table (bucket heads + chained entries laid out in the same single blob).
+  Point reads — `HGET`/`HMGET`/`HEXISTS`/`HSTRLEN`/`HLEN` — then run in O(1)
+  average off the raw blob instead of scanning every field. A microbenchmark
+  isolating the structure (`run_p3_bighash.sh` + `examples/bench_hash_probe`)
+  shows the flat-scan encoding growing linearly (≈0.3 µs at 128 fields → ≈100 µs
+  at 50 k) while the indexed encoding stays flat (≈13 ns) — a ≈6,800× point-read
+  speedup at 50 k fields. Crucially the collection stays **one keyspace value**:
+  it is evicted atomically (CLOCK never tears half a hash away), shipped to the
+  durability ring as one record, and invalidated as one key — the indexed form
+  is a pure encoding upgrade with no new failure modes, and it stays exactly
+  Redis-compatible over the whole read/write surface on a 10 k-field hash
+  (`run_p3_bighash.sh`, 20/20 parity vs a real `redis-server`). Lists and sorted
+  sets keep the inline encoding (ordering makes bucketing them less useful for a
+  cache; the same technique applies later if needed).
+
+  Making large collections usable end-to-end also required fixing the slab
+  allocator: OVERSIZED blocks (values > 8 KB) were bump-only and never
+  reclaimed, so rewriting a large value — a hash growing field by field — leaked
+  its old region on every write and exhausted the arena in dozens of writes.
+  The allocator now keeps an **oversized free list** (capacity stored in each
+  block header) and rounds oversized capacity up to a power of two, so a growing
+  value reuses its block in place until the next doubling (amortized O(1) growth)
+  and freed blocks are reclaimed (`store::tests::oversized_value_reuse_does_not_leak`;
+  2,000 rewrites of a 16 KB value in a 4 MB arena).
+
+  Aggregates are **durable** on a persisted tier: the P1 ring carries a type
+  tag (packed into the record's free `val_len` byte), so a hash/list/zset
+  persists to `supacache.kv` with its `kind` and recovers as the right type
+  after a crash (`run_p3_durable.sh`, 10/10). The P3 command surface (§5) —
+  hashes, lists, sorted sets, pub/sub — is built, including **cross-worker
+  pub/sub** for the scale-out daemon: an in-process Bus routes a `PUBLISH` on
+  one slot worker to subscribers on any worker via a shared routing table and
+  per-worker eventfd-woken inboxes (`run_p3_pubsub_xworker.sh`, 10/10).
 - Single in-PG worker; multi-worker scale-out shown via the standalone daemon
   (the in-PG version would register N background workers).
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent

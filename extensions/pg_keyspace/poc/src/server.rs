@@ -887,11 +887,11 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'hget'");
                     return;
                 }
-                let (h, _) = match load_hash(&store, &args[1], out) {
+                let raw = match hash_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                match h.get(&args[2]) {
+                match raw.and_then(|b| aggr::hash_probe(b, &args[2])) {
                     Some(v) => resp::bulk(out, v),
                     None => resp::nil(out),
                 }
@@ -901,13 +901,13 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'hmget'");
                     return;
                 }
-                let (h, _) = match load_hash(&store, &args[1], out) {
+                let raw = match hash_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
                 resp::array_header(out, nargs - 2);
                 for f in &args[2..] {
-                    match h.get(f) {
+                    match raw.and_then(|b| aggr::hash_probe(b, f)) {
                         Some(v) => resp::bulk(out, v),
                         None => resp::nil(out),
                     }
@@ -957,33 +957,36 @@ impl Worker {
                 }
             }
             b"HLEN" => {
-                let (h, _) = match load_hash(&store, &args[1], out) {
+                let raw = match hash_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                resp::integer(out, h.len() as i64);
+                resp::integer(out, raw.map(aggr::hash_count).unwrap_or(0) as i64);
             }
             b"HEXISTS" => {
                 if nargs != 3 {
                     resp::error(out, "ERR wrong number of arguments for 'hexists'");
                     return;
                 }
-                let (h, _) = match load_hash(&store, &args[1], out) {
+                let raw = match hash_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                resp::integer(out, i64::from(h.get(&args[2]).is_some()));
+                resp::integer(out, i64::from(raw.and_then(|b| aggr::hash_probe(b, &args[2])).is_some()));
             }
             b"HSTRLEN" => {
                 if nargs != 3 {
                     resp::error(out, "ERR wrong number of arguments for 'hstrlen'");
                     return;
                 }
-                let (h, _) = match load_hash(&store, &args[1], out) {
+                let raw = match hash_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                resp::integer(out, h.get(&args[2]).map(|v| v.len()).unwrap_or(0) as i64);
+                resp::integer(
+                    out,
+                    raw.and_then(|b| aggr::hash_probe(b, &args[2])).map(|v| v.len()).unwrap_or(0) as i64,
+                );
             }
             b"HINCRBY" => {
                 if nargs != 4 {
@@ -2046,6 +2049,21 @@ fn load_hash(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::Hash
     match store.get_typed(key) {
         None => Some((aggr::Hash::new(), 0)),
         Some((KIND_HASH, exp, v)) => Some((aggr::Hash::decode(v), exp)),
+        Some(_) => {
+            resp::error(out, WRONGTYPE);
+            None
+        }
+    }
+}
+
+/// Borrow the raw hash blob at `key` for an O(1)-average point read (HGET etc.)
+/// without decoding every field. Outer `None` = WRONGTYPE (written to `out`);
+/// inner `None` = key absent. The returned slice is the stored value verbatim,
+/// consumed by `aggr::hash_probe`/`aggr::hash_count`.
+fn hash_raw<'a>(store: &'a Store, key: &[u8], out: &mut Vec<u8>) -> Option<Option<&'a [u8]>> {
+    match store.get_typed(key) {
+        None => Some(None),
+        Some((KIND_HASH, _, v)) => Some(Some(v)),
         Some(_) => {
             resp::error(out, WRONGTYPE);
             None

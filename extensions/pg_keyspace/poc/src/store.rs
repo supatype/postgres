@@ -16,7 +16,7 @@
 
 use crate::shmem::Shmem;
 
-const MAGIC: u64 = 0x70_67_6b_73_5f_76_31_00; // "pgks_v1\0"
+const MAGIC: u64 = 0x70_67_6b_73_5f_76_32_00; // "pgks_v2\0" (v2: oversized free list)
 
 // Size classes for the slab allocator (§3.2 "size-classed, 32B..8KB").
 const CLASS_SIZES: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
@@ -55,13 +55,18 @@ struct PartMeta {
     clock_hand: u32,
     data_bump: u64,
     free_class: [u64; NUM_CLASSES], // offset+1, 0 = none
+    // Free list of reclaimed OVERSIZED blocks (>8KB values). Each free block
+    // stores its capacity at base[0..8] and the next link (base+1, 0=none) at
+    // base[8..16]; this head is that link for the first free block. Without it,
+    // an oversized value that is rewritten (e.g. a large hash growing field by
+    // field) would leak its old region on every write and exhaust the arena.
+    free_oversized: u64,
     hits: u64,
     misses: u64,
     evictions: u64,
     sets: u64,
     tombstones: u64,
     rehashes: u64,
-    _pad: [u64; 1],
 }
 
 #[repr(C)]
@@ -311,13 +316,34 @@ impl Store {
         let meta = self.meta(p);
         let cls = class_for(size);
         if cls == OVERSIZED {
+            // An oversized block is `[cap: u64][data...]`; the returned offset
+            // points at the data (base+8). Capacity is rounded up to a power of
+            // two so a value that grows in place (a large hash gaining fields)
+            // reuses its block until the next doubling — amortized O(1) growth
+            // instead of leaking a fresh region on every write.
             let need = align_up(size, 8) as u64;
-            if (*meta).data_bump + need > self.data_bytes {
+            // First-fit reuse from the oversized free list.
+            let mut link = &mut (*meta).free_oversized as *mut u64;
+            while *link != 0 {
+                let base = *link - 1;
+                let cap = *(self.data_ptr(p).add(base as usize) as *const u64);
+                let next = *(self.data_ptr(p).add(base as usize + 8) as *const u64);
+                if cap >= need {
+                    *link = next; // unlink
+                    return Some((base + 8, OVERSIZED));
+                }
+                link = self.data_ptr(p).add(base as usize + 8) as *mut u64;
+            }
+            // None fit: bump a new block with growth slack.
+            let cap = need.max(16).next_power_of_two();
+            let total = 8 + cap;
+            if (*meta).data_bump + total > self.data_bytes {
                 return None;
             }
-            let off = (*meta).data_bump;
-            (*meta).data_bump += need;
-            return Some((off, OVERSIZED));
+            let base = (*meta).data_bump;
+            (*meta).data_bump += total;
+            *(self.data_ptr(p).add(base as usize) as *mut u64) = cap;
+            return Some((base + 8, OVERSIZED));
         }
         let ci = cls as usize;
         let head = (*meta).free_class[ci];
@@ -339,7 +365,13 @@ impl Store {
 
     unsafe fn slab_free(&self, p: u32, off: u64, cls: u32) {
         if cls == OVERSIZED {
-            return; // bump-only; reclaimed on segment reset (rare in practice)
+            // Push the block (base = off-8, capacity kept at base[0..8]) onto the
+            // oversized free list so a later oversized alloc can reuse it.
+            let base = off - 8;
+            let meta = self.meta(p);
+            *(self.data_ptr(p).add(base as usize + 8) as *mut u64) = (*meta).free_oversized;
+            (*meta).free_oversized = base + 1;
+            return;
         }
         let meta = self.meta(p);
         let ci = cls as usize;
@@ -550,7 +582,14 @@ impl Store {
             let idx = *self.buckets_ptr(p).add(b) - 1;
             let e = self.entries_ptr(p).add(idx as usize);
             let want = class_for(val.len());
-            if want == (*e).val_class && want != OVERSIZED {
+            // Reuse the existing region in place when it still fits: same size
+            // class, or an oversized block whose capacity covers the new length.
+            let reuse = want == (*e).val_class
+                && (want != OVERSIZED || {
+                    let cap = *(self.data_ptr(p).add(((*e).val_off - 8) as usize) as *const u64);
+                    (val.len() as u64) <= cap
+                });
+            if reuse {
                 let vp = self.data_ptr(p).add((*e).val_off as usize);
                 std::ptr::copy_nonoverlapping(val.as_ptr(), vp, val.len());
                 (*e).val_len = val.len() as u32;
@@ -878,5 +917,40 @@ mod tests {
         assert!(st.evictions > 0, "expected evictions, got {}", st.evictions);
         // latest key must still be present
         assert!(matches!(s.get(b"key4999"), Lookup::Hit(_)));
+    }
+
+    #[test]
+    fn oversized_value_reuse_does_not_leak() {
+        // A modest data arena and a single key whose (>8KB) oversized value is
+        // rewritten thousands of times. Before the oversized free list this
+        // leaked a fresh region per write and the arena exhausted in ~dozens of
+        // writes; now the block is reused in place (or reclaimed on regrow), so
+        // every write succeeds and the value reads back correctly.
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 4 * 1024 * 1024, // 4MB: far smaller than 2000×16KB
+        };
+        let s = Store::create("t_oversize_reuse", &cfg).unwrap();
+        let big = vec![b'x'; 16 * 1024]; // 16KB -> OVERSIZED
+        for i in 0..2000u32 {
+            assert!(s.set(b"big", &big, 0), "oversized set {i} failed (arena leak?)");
+        }
+        match s.get(b"big") {
+            Lookup::Hit(v) => assert_eq!(v.len(), 16 * 1024),
+            _ => panic!("miss"),
+        }
+
+        // Grow-then-shrink across doublings, and reuse a freed oversized block
+        // for a different key.
+        assert!(s.set(b"big", &vec![b'y'; 40 * 1024], 0)); // grow (regrow block)
+        assert!(s.set(b"big", &vec![b'z'; 9 * 1024], 0)); // shrink (still oversized)
+        assert!(s.del(b"big")); // frees the oversized block
+        assert!(s.set(b"other", &vec![b'q'; 20 * 1024], 0)); // reuses from free list
+        match s.get(b"other") {
+            Lookup::Hit(v) => assert_eq!(v.len(), 20 * 1024),
+            _ => panic!("miss other"),
+        }
     }
 }
