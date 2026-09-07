@@ -87,6 +87,7 @@ extensions/pg_keyspace/
 │   ├── run_p3_lists.sh       P3 list type: coverage, WRONGTYPE, redis parity (§5)
 │   ├── run_p3_zsets.sh       P3 sorted-set type: coverage, WRONGTYPE, redis parity (§5)
 │   ├── run_p3_pubsub.sh      P3 pub/sub: SUBSCRIBE/PUBLISH, patterns, gate (§5)
+│   ├── run_p3_durable.sh     P3 durable aggregates: persist + crash recovery (§5/§3.3)
 │   ├── run_p6_maskcost.sh    cost of a masked read + §6 accelerator (§4.3c)
 │   ├── run_p6_security.sh    Mode B row-cache RLS/mask/generic-plan suite (§4.6/§4.7)
 │   ├── run_p6_rowcache.sh    Mode B Custom Scan vs index-scan latency (§7.1)

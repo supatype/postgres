@@ -117,7 +117,11 @@ impl Producer {
     /// Enqueue one write. Returns the record's sequence number on success, or
     /// None if the ring is full (the caller applies backpressure or drops). The
     /// seq lets a durable write wait until `committed() >= seq`.
-    pub fn push(&self, key: &[u8], val: &[u8], expires: i64) -> Option<u64> {
+    ///
+    /// `kind` (the value's type tag, §5) is packed into the free top byte of the
+    /// `val_len` field — values are far below the 16MB that byte would encroach
+    /// on — so the record layout and size are unchanged.
+    pub fn push(&self, key: &[u8], val: &[u8], expires: i64, kind: u8) -> Option<u64> {
         let rec = REC_HDR + key.len() + val.len();
         unsafe {
             let h = &*self.0.hdr;
@@ -127,10 +131,10 @@ impl Producer {
             if cap - (tail - head) < rec as u64 {
                 return None; // full — caller decides (backpressure vs drop)
             }
+            let val_field = (val.len() as u32 & 0x00FF_FFFF) | ((kind as u32) << 24);
             self.0
                 .write_wrapped(tail, &(key.len() as u32).to_le_bytes());
-            self.0
-                .write_wrapped(tail + 4, &(val.len() as u32).to_le_bytes());
+            self.0.write_wrapped(tail + 4, &val_field.to_le_bytes());
             self.0.write_wrapped(tail + 8, &expires.to_le_bytes());
             self.0.write_wrapped(tail + 16, key);
             self.0.write_wrapped(tail + 16 + key.len() as u64, val);
@@ -160,7 +164,7 @@ impl Consumer {
 
     /// Drain up to `max` records, calling `f(key, val, expires)` for each.
     /// Returns the number of records consumed.
-    pub fn drain<F: FnMut(&[u8], &[u8], i64)>(&self, max: usize, mut f: F) -> usize {
+    pub fn drain<F: FnMut(&[u8], &[u8], i64, u8)>(&self, max: usize, mut f: F) -> usize {
         unsafe {
             let h = &*self.0.hdr;
             let tail = h.tail.load(Ordering::Acquire);
@@ -170,7 +174,9 @@ impl Consumer {
             while head < tail && count < max {
                 self.0.read_wrapped(head, &mut hdr);
                 let key_len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-                let val_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+                let val_field = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+                let val_len = (val_field & 0x00FF_FFFF) as usize;
+                let kind = (val_field >> 24) as u8;
                 let expires = i64::from_le_bytes([
                     hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
                 ]);
@@ -178,7 +184,7 @@ impl Consumer {
                 let mut val = vec![0u8; val_len];
                 self.0.read_wrapped(head + 16, &mut key);
                 self.0.read_wrapped(head + 16 + key_len as u64, &mut val);
-                f(&key, &val, expires);
+                f(&key, &val, expires, kind);
                 head += (REC_HDR + key_len + val_len) as u64;
                 count += 1;
             }
@@ -231,19 +237,19 @@ mod tests {
         for round in 0..2000u64 {
             let key = format!("key{round}");
             let val = format!("val-{}", round % 7);
-            if prod.push(key.as_bytes(), val.as_bytes(), round as i64).is_some() {
+            if prod.push(key.as_bytes(), val.as_bytes(), round as i64, b's').is_some() {
                 produced += 1;
             }
             // drain occasionally so the ring never overflows
             if round % 3 == 0 {
-                consumed += cons.drain(100, |k, v, e| {
+                consumed += cons.drain(100, |k, v, e, _kind| {
                     assert!(k.starts_with(b"key"));
                     assert!(v.starts_with(b"val-"));
                     let _ = e;
                 }) as u64;
             }
         }
-        consumed += cons.drain(usize::MAX, |_, _, _| {}) as u64;
+        consumed += cons.drain(usize::MAX, |_, _, _, _| {}) as u64;
         assert_eq!(produced, consumed, "every pushed record must be drained");
     }
 }

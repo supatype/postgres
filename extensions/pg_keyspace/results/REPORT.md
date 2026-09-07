@@ -742,10 +742,12 @@ commit off the worker's snapshot.
   small-collection philosophy), so ops are O(n) on the collection — a fit for
   cache-sized collections. Hammering one collection to 100k+ elements is the O(n)
   blob-rewrite worst case by design; a native shmem structure for very large
-  collections is a later upgrade. Aggregate values are currently in-memory only
-  (not persisted): the P1 ring carries no type tag, so durable aggregates are a
-  follow-up. The P3 command surface (§5) — hashes, lists, sorted sets, pub/sub —
-  is now built; what remains there is durable aggregates and cross-worker pub/sub.
+  collections is a later upgrade. Aggregates are **durable** on a persisted tier:
+  the P1 ring now carries a type tag (packed into the record's free `val_len`
+  byte), so a hash/list/zset persists to `supacache.kv` with its `kind` and
+  recovers as the right type after a crash (`run_p3_durable.sh`, 10/10). The P3
+  command surface (§5) — hashes, lists, sorted sets, pub/sub — is built; what
+  remains there is cross-worker pub/sub.
 - Single in-PG worker; multi-worker scale-out shown via the standalone daemon
   (the in-PG version would register N background workers).
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent

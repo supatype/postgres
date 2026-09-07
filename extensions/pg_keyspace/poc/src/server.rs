@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 const EPOLL_MAX: usize = 1024;
 const READ_CHUNK: usize = 64 * 1024;
 
-/// A staged write: (key, value, expires_at_micros).
-pub type PendingWrite = (Vec<u8>, Vec<u8>, i64);
+/// A staged write: (key, value, expires_at_micros, kind). `kind` is the value's
+/// type tag (§5) so aggregates persist and recover as the right type.
+pub type PendingWrite = (Vec<u8>, Vec<u8>, i64, u8);
 
 /// Sentinel `expires_at` marking a delete (tombstone) carried through the ring,
 /// so the persistence worker removes the key from the backing table instead of
@@ -41,6 +42,7 @@ fn shard_push(
     key: &[u8],
     val: &[u8],
     exp: i64,
+    kind: u8,
 ) -> Option<(usize, u64)> {
     let n = producers.len();
     if n == 0 {
@@ -52,13 +54,13 @@ fn shard_push(
         crc16::key_slot(key) as usize % n
     };
     let p = &producers[shard];
-    if let Some(seq) = p.push(key, val, exp) {
+    if let Some(seq) = p.push(key, val, exp, kind) {
         return Some((shard, seq));
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         std::thread::sleep(Duration::from_micros(50));
-        if let Some(seq) = p.push(key, val, exp) {
+        if let Some(seq) = p.push(key, val, exp, kind) {
             return Some((shard, seq));
         }
         if Instant::now() >= deadline {
@@ -693,7 +695,7 @@ impl Worker {
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
                     let exp = if ttl_micros > 0 { now_micros() + ttl_micros } else { 0 };
-                    stage = Some((args[1].clone(), args[2].clone(), exp));
+                    stage = Some((args[1].clone(), args[2].clone(), exp, b's'));
                 }
             }
             b"SETNX" => {
@@ -704,7 +706,7 @@ impl Worker {
                     store.set(&args[1], &args[2], 0);
                     durable_log(&batcher, tier, &args[1], &args[2]);
                     if persist_on {
-                        stage = Some((args[1].clone(), args[2].clone(), 0));
+                        stage = Some((args[1].clone(), args[2].clone(), 0, b's'));
                     }
                     1
                 };
@@ -722,7 +724,7 @@ impl Worker {
                 store.set(&args[1], &args[2], 0);
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
-                    stage = Some((args[1].clone(), args[2].clone(), 0));
+                    stage = Some((args[1].clone(), args[2].clone(), 0, b's'));
                 }
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                 match old {
@@ -738,7 +740,7 @@ impl Worker {
                         if persist_on {
                             // propagate the delete so it does not resurrect on
                             // crash recovery (key is already tenant-scoped in eff)
-                            if let Some(sa) = shard_push(&self.producers, a, b"", DELETE_TOMBSTONE)
+                            if let Some(sa) = shard_push(&self.producers, a, b"", DELETE_TOMBSTONE, b's')
                             {
                                 acks.push(sa);
                             }
@@ -774,7 +776,7 @@ impl Worker {
                         let s = itoa(v);
                         durable_log(&batcher, tier, &args[1], &s);
                         if persist_on {
-                            stage = Some((args[1].clone(), s, 0));
+                            stage = Some((args[1].clone(), s, 0, b's'));
                         }
                     }
                     None => resp::error(out, "ERR value is not an integer or out of range"),
@@ -1371,10 +1373,22 @@ impl Worker {
             _ => resp::error(out, "ERR unknown command"),
         }
 
-        if let Some((k, v, e)) = stage {
+        // P3 durable aggregates (§5/§3.3): a mutation of a hash/list/zset persists
+        // its whole (kind-tagged) blob from the final store state — or a tombstone
+        // if the key was emptied/deleted — so it recovers as the right type.
+        if persist_on && stage.is_none() && is_aggregate_write(&cmd) && nargs >= 2 {
+            stage = match store.get_typed(&args[1]) {
+                Some((kind, exp, blob)) => {
+                    Some((args[1].clone(), blob.to_vec(), exp, kind as u8))
+                }
+                None => Some((args[1].clone(), Vec::new(), DELETE_TOMBSTONE, b's')),
+            };
+        }
+
+        if let Some((k, v, e, kind)) = stage {
             // sharded so a given key always lands on the same ring/persist worker
             // — no cross-worker key conflicts on ON CONFLICT.
-            if let Some(sa) = shard_push(&self.producers, &k, &v, e) {
+            if let Some(sa) = shard_push(&self.producers, &k, &v, e, kind) {
                 acks.push(sa);
             }
         }
@@ -2050,6 +2064,17 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"ZADD"
             | b"ZREM"
             | b"ZINCRBY"
+    )
+}
+
+/// Aggregate (hash/list/zset) mutations — their whole blob is persisted from the
+/// final store state after dispatch (P3 durable aggregates).
+fn is_aggregate_write(cmd: &[u8]) -> bool {
+    matches!(
+        cmd,
+        b"HSET" | b"HMSET" | b"HSETNX" | b"HDEL" | b"HINCRBY"
+            | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"LPOP" | b"RPOP" | b"LSET" | b"LTRIM"
+            | b"ZADD" | b"ZREM" | b"ZINCRBY"
     )
 }
 

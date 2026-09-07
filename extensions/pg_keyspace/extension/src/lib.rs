@@ -736,7 +736,7 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
 
     while !BackgroundWorker::sigterm_received() {
         let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
-        consumer.drain(20_000, |k, v, e| batch.push((k.to_vec(), v.to_vec(), e)));
+        consumer.drain(20_000, |k, v, e, kind| batch.push((k.to_vec(), v.to_vec(), e, kind)));
         if batch.is_empty() {
             std::thread::sleep(idle);
             continue;
@@ -746,7 +746,7 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
     }
     // final drain on shutdown
     let mut tail: Vec<server::PendingWrite> = Vec::new();
-    consumer.drain(usize::MAX, |k, v, e| tail.push((k.to_vec(), v.to_vec(), e)));
+    consumer.drain(usize::MAX, |k, v, e, kind| tail.push((k.to_vec(), v.to_vec(), e, kind)));
     if !tail.is_empty() {
         bulk_upsert(tail, sync_commit, ttl_bucket_us());
         consumer.mark_committed();
@@ -967,17 +967,25 @@ fn pg_recover(store: &Store) -> i64 {
             let mut cnt = 0i64;
             // no-TTL keys from kv, then non-expired TTL keys from kv_ttl (latest
             // expiry per key wins, so a re-SET into a newer bucket takes effect).
-            let tup = client.select("SELECT key, val, expires_at FROM supacache.kv", None, None)?;
+            let tup = client.select(
+                "SELECT key, val, expires_at, kind::text FROM supacache.kv",
+                None,
+                None,
+            )?;
             for row in tup {
                 let k: Option<Vec<u8>> = row.get(1)?;
                 let v: Option<Vec<u8>> = row.get(2)?;
                 let e: i64 = row.get::<i64>(3)?.unwrap_or(0);
+                let kind = row
+                    .get::<String>(4)?
+                    .and_then(|s| s.bytes().next())
+                    .unwrap_or(b's') as u32;
                 if let (Some(k), Some(v)) = (k, v) {
                     if e > 0 && e <= now {
                         continue; // already expired
                     }
                     let ttl = if e > 0 { e - now } else { 0 };
-                    store.set(&k, &v, ttl);
+                    store.set_typed(&k, &v, ttl, kind);
                     cnt += 1;
                 }
             }
@@ -1014,13 +1022,17 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
     if batch.is_empty() {
         return;
     }
-    let mut latest: HashMap<Vec<u8>, (Vec<u8>, i64)> = HashMap::with_capacity(batch.len());
-    for (k, v, e) in batch {
-        latest.insert(k, (v, e)); // last op for a key wins (SET then DEL -> DEL)
+    let mut latest: HashMap<Vec<u8>, (Vec<u8>, i64, u8)> = HashMap::with_capacity(batch.len());
+    for (k, v, e, kind) in batch {
+        latest.insert(k, (v, e, kind)); // last op for a key wins (SET then DEL -> DEL)
     }
-    // no-TTL upserts -> kv
-    let (mut keys, mut slots, mut vals) =
-        (Vec::<Vec<u8>>::new(), Vec::<i32>::new(), Vec::<Vec<u8>>::new());
+    // no-TTL upserts -> kv (with the value's type tag; §5 durable aggregates)
+    let (mut keys, mut slots, mut vals, mut kinds) = (
+        Vec::<Vec<u8>>::new(),
+        Vec::<i32>::new(),
+        Vec::<Vec<u8>>::new(),
+        Vec::<String>::new(),
+    );
     // TTL upserts -> kv_ttl
     let (mut tkeys, mut tslots, mut tvals, mut texps, mut tbuckets) = (
         Vec::<Vec<u8>>::new(),
@@ -1031,10 +1043,12 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
     );
     let mut del_keys: Vec<Vec<u8>> = Vec::new();
     let mut buckets_seen: HashSet<i64> = HashSet::new();
-    for (k, (v, e)) in latest {
+    for (k, (v, e, kind)) in latest {
         if e == server::DELETE_TOMBSTONE {
             del_keys.push(k);
         } else if e > 0 {
+            // TTL'd keys are strings (only SET EX creates them), so kv_ttl needs
+            // no kind column.
             let b = e / bucket_us;
             buckets_seen.insert(b);
             tslots.push(crc16::key_slot(&k) as i32);
@@ -1045,6 +1059,7 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
         } else {
             slots.push(crc16::key_slot(&k) as i32);
             vals.push(v);
+            kinds.push((kind as char).to_string());
             keys.push(k);
         }
     }
@@ -1063,13 +1078,14 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), keys.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), slots.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), vals.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID), kinds.into_datum()),
                 ];
                 client.update(
                     "INSERT INTO supacache.kv (tenant,key,slot,kind,val,expires_at,version) \
-                     SELECT '', k, s, 's', v, 0, 1 \
-                     FROM unnest($1::bytea[], $2::int[], $3::bytea[]) AS t(k, s, v) \
+                     SELECT '', k, s, ki::\"char\", v, 0, 1 \
+                     FROM unnest($1::bytea[], $2::int[], $3::bytea[], $4::text[]) AS t(k, s, v, ki) \
                      ON CONFLICT (tenant,key) DO UPDATE SET \
-                     val=EXCLUDED.val, expires_at=0, slot=EXCLUDED.slot, \
+                     val=EXCLUDED.val, kind=EXCLUDED.kind, expires_at=0, slot=EXCLUDED.slot, \
                      version=supacache.kv.version+1",
                     None,
                     Some(args),
