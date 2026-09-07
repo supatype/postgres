@@ -1,13 +1,17 @@
-# pg_keyspace — P0 spike
+# pg_keyspace
 
-A proof-of-concept for the [pg_keyspace technical plan](../../docs): a
+A Postgres extension implementing the [pg_keyspace technical plan](../../docs): a
 Postgres-native cache and RESP-compatible keyspace intended to replace Valkey in
-the Supatype stack. This is the **P0 spike** from §12 of the plan — the
-throwaway measurement whose kill criterion is *"if a hit is not under 80µs, stop
-and keep Valkey."*
+the Supatype stack, plus a transparent row cache for PostgREST (Mode B). It began
+as the §12 **P0 spike** — the kill-criterion measurement *"if a hit is not under
+80µs, stop and keep Valkey"* — and has since grown through P1–P3 into a working
+extension.
 
-**It is under 80µs. It ties Valkey.** See [`results/REPORT.md`](results/REPORT.md)
-for the full write-up and the concerns matrix.
+**The P0 hit is under 80µs and ties Valkey**, and the phases since are built and
+benchmarked (P1 storage/durability, P2 security + hardening + TLS, Mode B row
+cache, and the start of the P3 command surface). See
+[`results/REPORT.md`](results/REPORT.md) for the full write-up and the concerns
+matrix, and the scope note below for exactly what is and isn't built.
 
 > Scope so far: **P0** (latency/throughput vs Valkey), **P1** (storage,
 > durability, crash recovery, off-event-loop persistence), **P2 security for
@@ -62,6 +66,7 @@ extensions/pg_keyspace/
 │   │   ├── server.rs         epoll event loop, RESP dispatch (§3.1)
 │   │   ├── batcher.rs        commit batching, four durability tiers (§3.4)
 │   │   ├── ring.rs           SPSC shmem ring: RESP worker -> persistence worker (P1)
+│   │   ├── aggr.rs           P3 aggregate value types: hashes (§5)
 │   │   ├── crc16.rs          cluster slot hashing (§3.1)
 │   │   └── bin/
 │   │       ├── pgkeyspaced.rs        standalone daemon (scale-out demo)
@@ -78,6 +83,7 @@ extensions/pg_keyspace/
 │   ├── run_p2_threats.sh     Mode A security threat table (§4.7)
 │   ├── run_p2_hardening.sh   hashed AUTH secrets + credential hot-reload (§4.5)
 │   ├── run_p2_tls.sh         native TLS on the RESP wire (§4.5)
+│   ├── run_p3_hashes.sh      P3 hash type: coverage, WRONGTYPE, redis parity (§5)
 │   ├── run_p6_maskcost.sh    cost of a masked read + §6 accelerator (§4.3c)
 │   ├── run_p6_security.sh    Mode B row-cache RLS/mask/generic-plan suite (§4.6/§4.7)
 │   ├── run_p6_rowcache.sh    Mode B Custom Scan vs index-scan latency (§7.1)

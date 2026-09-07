@@ -30,6 +30,10 @@ const FLAG_OCCUPIED: u32 = 1;
 const FLAG_REF: u32 = 2; // CLOCK reference bit
 
 pub const KIND_STR: u32 = b's' as u32;
+/// P3 aggregate kinds (§5): value blob is a serialized hash/list/sorted-set.
+pub const KIND_HASH: u32 = b'h' as u32;
+pub const KIND_LIST: u32 = b'l' as u32;
+pub const KIND_ZSET: u32 = b'z' as u32;
 
 #[repr(C)]
 struct SegHeader {
@@ -479,6 +483,12 @@ impl Store {
 
     /// SET with optional TTL (micros from now, 0 = none). Overwrites in place.
     pub fn set(&self, key: &[u8], val: &[u8], ttl_micros: i64) -> bool {
+        self.set_typed(key, val, ttl_micros, KIND_STR)
+    }
+
+    /// SET a typed value (P3 aggregates, §5): same as `set` but tags the entry's
+    /// `kind` so `get_typed` can enforce Redis `WRONGTYPE` semantics.
+    pub fn set_typed(&self, key: &[u8], val: &[u8], ttl_micros: i64, kind: u32) -> bool {
         let hash = fnv1a(key);
         let p = self.partition_for_hash(hash);
         let exp = if ttl_micros > 0 {
@@ -488,7 +498,40 @@ impl Store {
         };
         unsafe {
             (*self.meta(p)).sets += 1;
-            self.set_in(p, hash, key, val, exp, KIND_STR)
+            self.set_in(p, hash, key, val, exp, kind)
+        }
+    }
+
+    /// Like `get`, but also returns the entry's `kind` and absolute expiry (0 =
+    /// none) so a caller can enforce `WRONGTYPE` and preserve TTL on read-modify-
+    /// write of an aggregate. Lazy-expires like `get`.
+    pub fn get_typed<'a>(&'a self, key: &[u8]) -> Option<(u32, i64, &'a [u8])> {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            let meta = self.meta(p);
+            match found {
+                None => {
+                    (*meta).misses += 1;
+                    None
+                }
+                Some(b) => {
+                    let idx = *self.buckets_ptr(p).add(b) - 1;
+                    let e = self.entries_ptr(p).add(idx as usize);
+                    let exp = (*e).expires_at;
+                    if exp != 0 && exp <= now_micros() {
+                        self.remove_at(p, b, idx);
+                        (*meta).misses += 1;
+                        return None;
+                    }
+                    (*e).flags |= FLAG_REF;
+                    (*meta).hits += 1;
+                    let vp = self.data_ptr(p).add((*e).val_off as usize);
+                    let val = std::slice::from_raw_parts(vp, (*e).val_len as usize);
+                    Some(((*e).kind, exp, val))
+                }
+            }
         }
     }
 

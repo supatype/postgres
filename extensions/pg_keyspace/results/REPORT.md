@@ -716,8 +716,16 @@ commit off the worker's snapshot.
 - PostgREST end-to-end uses the real binary — not installed here (its release
   download is blocked by the sandbox egress proxy, 403). Validated instead by
   issuing PostgREST's exact SQL shape (role + JWT claims, `pk = N` select/update).
-- Command set is P0-minimal: strings, counters, DEL/EXISTS, TTL on strings.
-  Hashes/lists/sorted-sets/pub-sub are P3 (§5).
+- Command set (§5): strings, counters, DEL/EXISTS, TTL on strings, plus the P3
+  **hash** type — `HSET/HSETNX/HMSET/HGET/HMGET/HDEL/HGETALL/HKEYS/HVALS/HLEN/
+  HEXISTS/HSTRLEN/HINCRBY` and `TYPE` — with full `WRONGTYPE` semantics in both
+  directions (`bench/run_p3_hashes.sh`, 22/22, incl. redis parity; HSET 555k/s,
+  HGET 980k/s pipelined). Aggregates are stored as a compact length-prefixed blob
+  in the slab (Redis's small-collection philosophy), so ops are O(n) on the
+  collection — a fit for cache-sized collections; a native shmem structure for
+  very large ones is a later upgrade. Aggregate values are currently in-memory
+  only (not persisted): the P1 ring carries no type tag, so durable aggregates
+  are a follow-up. Lists, sorted sets, and pub/sub remain to build (§5).
 - Single in-PG worker; multi-worker scale-out shown via the standalone daemon
   (the in-PG version would register N background workers).
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent

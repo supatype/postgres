@@ -14,6 +14,7 @@
 //! durability writes, background-worker registration, planner hook) live on the
 //! write/security paths and are out of scope for a P0 latency spike.
 
+pub mod aggr;
 pub mod batcher;
 pub mod crc16;
 pub mod resp;

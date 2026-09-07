@@ -4,11 +4,12 @@
 //! plus, for logged tiers, a handoff to the commit batcher (§3.4). This is the
 //! path the P0 kill criterion measures.
 
+use crate::aggr;
 use crate::batcher::{Batcher, Tier};
 use crate::crc16;
 use crate::resp::{self, Parse};
 use crate::ring;
-use crate::store::{now_micros, Lookup, Store};
+use crate::store::{now_micros, Lookup, Store, KIND_HASH};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::{Read, Write};
@@ -614,6 +615,9 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'get'");
                     return;
                 }
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
                 match store.get(&args[1]) {
                     Lookup::Hit(v) => resp::bulk(out, v),
                     Lookup::Miss => resp::nil(out),
@@ -664,6 +668,9 @@ impl Worker {
                 resp::integer(out, n);
             }
             b"GETSET" => {
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
                 let old = match store.get(&args[1]) {
                     Lookup::Hit(v) => Some(v.to_vec()),
                     Lookup::Miss => None,
@@ -706,6 +713,9 @@ impl Worker {
                 resp::integer(out, count);
             }
             b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY" => {
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
                 let mut by: i64 = if cmd == b"INCRBY" || cmd == b"DECRBY" {
                     std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0)
                 } else {
@@ -725,6 +735,197 @@ impl Worker {
                     }
                     None => resp::error(out, "ERR value is not an integer or out of range"),
                 }
+            }
+            // ---- P3 §5: TYPE + hashes ------------------------------------
+            b"TYPE" => {
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'type'");
+                } else {
+                    let t = match store.get_typed(&args[1]) {
+                        None => "none",
+                        Some((KIND_HASH, _, _)) => "hash",
+                        Some((k, _, _)) if k == crate::store::KIND_LIST => "list",
+                        Some((k, _, _)) if k == crate::store::KIND_ZSET => "zset",
+                        Some(_) => "string",
+                    };
+                    resp::simple(out, t);
+                }
+            }
+            b"HSET" | b"HMSET" => {
+                // HSET key field value [field value ...]
+                if nargs < 4 || (nargs - 2) % 2 != 0 {
+                    resp::error(out, "ERR wrong number of arguments for 'hset'");
+                    return;
+                }
+                let (mut h, exp) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let mut added = 0i64;
+                let mut i = 2;
+                while i + 1 < nargs {
+                    if h.set(&args[i], &args[i + 1]) {
+                        added += 1;
+                    }
+                    i += 2;
+                }
+                store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                if cmd == b"HMSET" {
+                    resp::simple(out, "OK");
+                } else {
+                    resp::integer(out, added);
+                }
+            }
+            b"HSETNX" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'hsetnx'");
+                    return;
+                }
+                let (mut h, exp) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if h.get(&args[2]).is_some() {
+                    resp::integer(out, 0);
+                } else {
+                    h.set(&args[2], &args[3]);
+                    store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                    resp::integer(out, 1);
+                }
+            }
+            b"HGET" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'hget'");
+                    return;
+                }
+                let (h, _) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                match h.get(&args[2]) {
+                    Some(v) => resp::bulk(out, v),
+                    None => resp::nil(out),
+                }
+            }
+            b"HMGET" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'hmget'");
+                    return;
+                }
+                let (h, _) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::array_header(out, nargs - 2);
+                for f in &args[2..] {
+                    match h.get(f) {
+                        Some(v) => resp::bulk(out, v),
+                        None => resp::nil(out),
+                    }
+                }
+            }
+            b"HDEL" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'hdel'");
+                    return;
+                }
+                let (mut h, exp) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let mut removed = 0i64;
+                for f in &args[2..] {
+                    if h.del(f) {
+                        removed += 1;
+                    }
+                }
+                if h.is_empty() {
+                    store.del(&args[1]); // Redis drops an emptied hash
+                } else {
+                    store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                }
+                resp::integer(out, removed);
+            }
+            b"HGETALL" => {
+                let (h, _) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::array_header(out, h.len() * 2);
+                for (f, v) in &h.entries {
+                    resp::bulk(out, f);
+                    resp::bulk(out, v);
+                }
+            }
+            b"HKEYS" | b"HVALS" => {
+                let (h, _) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::array_header(out, h.len());
+                for (f, v) in &h.entries {
+                    resp::bulk(out, if cmd == b"HKEYS" { f } else { v });
+                }
+            }
+            b"HLEN" => {
+                let (h, _) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::integer(out, h.len() as i64);
+            }
+            b"HEXISTS" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'hexists'");
+                    return;
+                }
+                let (h, _) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::integer(out, i64::from(h.get(&args[2]).is_some()));
+            }
+            b"HSTRLEN" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'hstrlen'");
+                    return;
+                }
+                let (h, _) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::integer(out, h.get(&args[2]).map(|v| v.len()).unwrap_or(0) as i64);
+            }
+            b"HINCRBY" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'hincrby'");
+                    return;
+                }
+                let by: i64 = match std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        resp::error(out, "ERR value is not an integer or out of range");
+                        return;
+                    }
+                };
+                let (mut h, exp) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let cur: i64 = match h.get(&args[2]) {
+                    None => 0,
+                    Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
+                        Some(n) => n,
+                        None => {
+                            resp::error(out, "ERR hash value is not an integer");
+                            return;
+                        }
+                    },
+                };
+                let next = cur + by;
+                h.set(&args[2], &itoa(next));
+                store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                resp::integer(out, next);
             }
             _ => resp::error(out, "ERR unknown command"),
         }
@@ -981,11 +1182,52 @@ fn itoa(n: i64) -> Vec<u8> {
     n.to_string().into_bytes()
 }
 
+const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+
+/// Remaining TTL (micros) to re-apply so a read-modify-write of an aggregate
+/// preserves the key's expiry; 0 (no expiry) stays 0.
+fn remaining_ttl(exp: i64) -> i64 {
+    if exp > 0 {
+        (exp - now_micros()).max(1)
+    } else {
+        0
+    }
+}
+
+/// Guard a string command: returns true if `key` is absent or holds a string;
+/// otherwise writes `WRONGTYPE` and returns false. (A cached aggregate must not
+/// be readable as a raw blob through `GET`/`INCR`/etc.)
+fn check_string(store: &Store, key: &[u8], out: &mut Vec<u8>) -> bool {
+    match store.get_typed(key) {
+        Some((k, _, _)) if k != crate::store::KIND_STR => {
+            resp::error(out, WRONGTYPE);
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Load the hash at `key` (empty if absent). Returns None and writes `WRONGTYPE`
+/// to `out` if the key holds a non-hash value.
+fn load_hash(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::Hash, i64)> {
+    match store.get_typed(key) {
+        None => Some((aggr::Hash::new(), 0)),
+        Some((KIND_HASH, exp, v)) => Some((aggr::Hash::decode(v), exp)),
+        Some(_) => {
+            resp::error(out, WRONGTYPE);
+            None
+        }
+    }
+}
+
 /// Which argument positions of a command are keys (for ACL + tenant scoping).
 fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
     match cmd {
         b"GET" | b"SET" | b"SETNX" | b"GETSET" | b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY"
-        | b"TTL" | b"EXPIRE" | b"PERSIST" | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL" => {
+        | b"TTL" | b"EXPIRE" | b"PERSIST" | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL"
+        // P3 hashes: the key is always the first argument
+        | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
+        | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY" => {
             if nargs > 1 {
                 vec![1]
             } else {
@@ -1013,6 +1255,12 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"PERSIST"
             | b"APPEND"
             | b"GETDEL"
+            // P3 hash mutations
+            | b"HSET"
+            | b"HMSET"
+            | b"HSETNX"
+            | b"HDEL"
+            | b"HINCRBY"
     )
 }
 
