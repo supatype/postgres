@@ -35,6 +35,13 @@ pub const HASH_INDEX_VALUE_MAX: usize = 64;
 const H_INLINE: u8 = 0;
 const H_INDEXED: u8 = 1;
 
+/// A list with more than this many elements uses the indexed encoding (an
+/// explicit offset table), so LINDEX/LRANGE/LLEN are O(1) instead of walking
+/// every length-prefix from the head.
+pub const LIST_INDEX_THRESHOLD: usize = 128;
+const L_INLINE: u8 = 0;
+const L_INDEXED: u8 = 1;
+
 /// FNV-1a 64-bit — the bucket hash for the indexed encoding. Self-contained so
 /// the blob's layout does not depend on the store's (private) key hash.
 fn fieldhash(b: &[u8]) -> u64 {
@@ -311,19 +318,66 @@ impl List {
         List { items: Vec::new() }
     }
 
-    pub fn decode(mut buf: &[u8]) -> List {
-        let mut l = List::new();
-        while let Some(v) = take_bytes(&mut buf) {
-            l.items.push(v.to_vec());
+    /// Decode a stored blob (either encoding), preserving element order.
+    pub fn decode(buf: &[u8]) -> List {
+        match buf.first() {
+            None => List::new(),
+            Some(&L_INDEXED) => {
+                let mut l = List::new();
+                let count = rd_u32(buf, 1).unwrap_or(0) as usize;
+                let data_base = 9 + 4 * count;
+                if let Some(data) = buf.get(data_base..) {
+                    let mut p = data;
+                    while let Some(v) = take_bytes(&mut p) {
+                        l.items.push(v.to_vec());
+                    }
+                }
+                l
+            }
+            _ => {
+                let mut p = &buf[1..];
+                let mut l = List::new();
+                while let Some(v) = take_bytes(&mut p) {
+                    l.items.push(v.to_vec());
+                }
+                l
+            }
         }
-        l
     }
 
+    /// Encode, choosing inline or indexed by size (first byte is the tag).
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for v in &self.items {
-            put_bytes(&mut out, v);
+        self.force_encode(self.items.len() > LIST_INDEX_THRESHOLD)
+    }
+
+    /// Encode with an explicit layout choice (tests/benches compare the two at
+    /// one size). Indexed layout: `[L_INDEXED][count u32][data_len u32]
+    /// [offsets: count×u32][data]`, each offset being the start of an element's
+    /// length-prefix within the data region — so LINDEX(i) is O(1).
+    pub fn force_encode(&self, indexed: bool) -> Vec<u8> {
+        if !indexed {
+            let mut out = Vec::with_capacity(1);
+            out.push(L_INLINE);
+            for v in &self.items {
+                put_bytes(&mut out, v);
+            }
+            return out;
         }
+        let count = self.items.len();
+        let mut data: Vec<u8> = Vec::new();
+        let mut offs: Vec<u32> = Vec::with_capacity(count);
+        for v in &self.items {
+            offs.push(data.len() as u32);
+            put_bytes(&mut data, v);
+        }
+        let mut out = Vec::with_capacity(9 + 4 * count + data.len());
+        out.push(L_INDEXED);
+        out.extend_from_slice(&(count as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        for o in &offs {
+            out.extend_from_slice(&o.to_le_bytes());
+        }
+        out.extend_from_slice(&data);
         out
     }
 
@@ -385,6 +439,52 @@ impl List {
             return (0, 0);
         }
         (s as usize, (e + 1) as usize)
+    }
+}
+
+/// O(1) element count off the raw list blob (indexed: header; inline: walk).
+pub fn list_len(buf: &[u8]) -> usize {
+    match buf.first() {
+        None => 0,
+        Some(&L_INDEXED) => rd_u32(buf, 1).unwrap_or(0) as usize,
+        _ => {
+            let mut p = &buf[1..];
+            let mut n = 0;
+            while take_bytes(&mut p).is_some() {
+                n += 1;
+            }
+            n
+        }
+    }
+}
+
+/// Element at index `i` (0-based, already resolved to be in range) straight off
+/// the raw blob. O(1) for the indexed encoding (offset table), O(i) for inline.
+pub fn list_get(buf: &[u8], i: usize) -> Option<&[u8]> {
+    match buf.first() {
+        None => None,
+        Some(&L_INDEXED) => {
+            let count = rd_u32(buf, 1)? as usize;
+            if i >= count {
+                return None;
+            }
+            let data_base = 9 + 4 * count;
+            let off = rd_u32(buf, 9 + 4 * i)? as usize;
+            let region = buf.get(data_base..)?;
+            let mut p = region.get(off..)?;
+            take_bytes(&mut p)
+        }
+        _ => {
+            let mut p = &buf[1..];
+            let mut idx = 0;
+            loop {
+                let v = take_bytes(&mut p)?;
+                if idx == i {
+                    return Some(v);
+                }
+                idx += 1;
+            }
+        }
     }
 }
 
@@ -635,6 +735,49 @@ mod tests {
         assert_eq!(l2.range_bounds(3, 1), (0, 0)); // empty
         l2.items.clear();
         assert_eq!(l2.range_bounds(0, -1), (0, 0));
+    }
+
+    #[test]
+    fn list_small_stays_inline() {
+        let mut l = List::new();
+        for x in ["a", "b", "c"] {
+            l.rpush(x.as_bytes());
+        }
+        let blob = l.encode();
+        assert_eq!(blob[0], L_INLINE);
+        assert_eq!(list_len(&blob), 3);
+        assert_eq!(list_get(&blob, 0), Some(&b"a"[..]));
+        assert_eq!(list_get(&blob, 2), Some(&b"c"[..]));
+        assert_eq!(list_get(&blob, 3), None);
+    }
+
+    #[test]
+    fn list_promotes_to_indexed_and_indexes() {
+        let mut l = List::new();
+        for i in 0..1000u32 {
+            l.rpush(format!("e{i}").as_bytes());
+        }
+        let blob = l.encode();
+        assert_eq!(blob[0], L_INDEXED, "1000 elements must use the indexed layout");
+        assert_eq!(list_len(&blob), 1000);
+        // O(1) index access agrees with position, at both ends and middle
+        assert_eq!(list_get(&blob, 0), Some(&b"e0"[..]));
+        assert_eq!(list_get(&blob, 500), Some(&b"e500"[..]));
+        assert_eq!(list_get(&blob, 999), Some(&b"e999"[..]));
+        assert_eq!(list_get(&blob, 1000), None);
+        // full decode round-trips in order
+        let l2 = List::decode(&blob);
+        assert_eq!(l2.len(), 1000);
+        assert_eq!(l2.items[0], b"e0");
+        assert_eq!(l2.items[999], b"e999");
+        // binary-safe elements
+        let mut lb = List::new();
+        for _ in 0..200 {
+            lb.rpush(b"\x00\xff\x00");
+        }
+        let bb = lb.encode();
+        assert_eq!(bb[0], L_INDEXED);
+        assert_eq!(list_get(&bb, 7), Some(&b"\x00\xff\x00"[..]));
     }
 
     #[test]

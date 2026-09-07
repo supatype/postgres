@@ -1,0 +1,16 @@
+# P3 native large-list (§5) — 10000 elements, parity vs redis :6379
+  PASS  LLEN matches redis                                
+  PASS  LLEN == N                                         
+  PASS  TYPE is list                                      
+  PASS  LINDEX agrees with redis (spread + negative idx)  
+  PASS  LINDEX out of range -> nil                        
+  PASS  LRANGE tail matches redis                         
+  PASS  LRANGE middle matches redis                       
+  PASS  LRANGE 0 -1 whole list matches (md5)              
+  PASS  LPOP returns the head                             
+  PASS  RPOP returns the tail                             
+  PASS  LLEN after pops == N-2                            
+  PASS  LINDEX 0 now the 2nd elem                         
+  PASS  still ONE key (no index-side pollution)           
+
+# result: 13 passed, 0 failed

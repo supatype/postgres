@@ -1097,11 +1097,11 @@ impl Worker {
                 save_list(&store, &args[1], &l, exp);
             }
             b"LLEN" => {
-                let (l, _) = match load_list(&store, &args[1], out) {
+                let raw = match list_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                resp::integer(out, l.len() as i64);
+                resp::integer(out, raw.map(aggr::list_len).unwrap_or(0) as i64);
             }
             b"LINDEX" => {
                 if nargs != 3 {
@@ -1109,12 +1109,21 @@ impl Worker {
                     return;
                 }
                 let i: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let (l, _) = match load_list(&store, &args[1], out) {
+                let raw = match list_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                match l.real_index(i) {
-                    Some(idx) => resp::bulk(out, &l.items[idx]),
+                let hit = raw.and_then(|b| {
+                    let n = aggr::list_len(b) as i64;
+                    let idx = if i < 0 { n + i } else { i };
+                    if idx >= 0 && idx < n {
+                        aggr::list_get(b, idx as usize)
+                    } else {
+                        None
+                    }
+                });
+                match hit {
+                    Some(v) => resp::bulk(out, v),
                     None => resp::nil(out),
                 }
             }
@@ -1125,14 +1134,21 @@ impl Worker {
                 }
                 let start: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let stop: i64 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let (l, _) = match load_list(&store, &args[1], out) {
+                let raw = match list_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                let (lo, hi) = l.range_bounds(start, stop);
-                resp::array_header(out, hi - lo);
-                for v in &l.items[lo..hi] {
-                    resp::bulk(out, v);
+                match raw {
+                    None => resp::array_header(out, 0),
+                    Some(b) => {
+                        let (lo, hi) = aggr::rank_bounds(aggr::list_len(b), start, stop);
+                        resp::array_header(out, hi - lo);
+                        for idx in lo..hi {
+                            if let Some(v) = aggr::list_get(b, idx) {
+                                resp::bulk(out, v);
+                            }
+                        }
+                    }
                 }
             }
             b"LSET" => {
@@ -2064,6 +2080,20 @@ fn hash_raw<'a>(store: &'a Store, key: &[u8], out: &mut Vec<u8>) -> Option<Optio
     match store.get_typed(key) {
         None => Some(None),
         Some((KIND_HASH, _, v)) => Some(Some(v)),
+        Some(_) => {
+            resp::error(out, WRONGTYPE);
+            None
+        }
+    }
+}
+
+/// Borrow the raw list blob at `key` for O(1) index/length reads (LLEN/LINDEX/
+/// LRANGE) without decoding every element. Outer `None` = WRONGTYPE (written to
+/// `out`); inner `None` = key absent. Consumed by `aggr::list_len`/`list_get`.
+fn list_raw<'a>(store: &'a Store, key: &[u8], out: &mut Vec<u8>) -> Option<Option<&'a [u8]>> {
+    match store.get_typed(key) {
+        None => Some(None),
+        Some((KIND_LIST, _, v)) => Some(Some(v)),
         Some(_) => {
             resp::error(out, WRONGTYPE);
             None
