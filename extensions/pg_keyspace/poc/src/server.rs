@@ -610,8 +610,9 @@ impl Worker {
         }
 
         // ---- P3 pub/sub (§5): handled before keyed-command scoping. Channels
-        // are a flat namespace (not tenant-scoped in this slice), so the reply
-        // echoes the client's channel name unchanged. ----
+        // are tenant-scoped for non-exempt authed roles (same `{tenant}:` prefix
+        // as keys); the scoping is transparent — every reply/message frame echoes
+        // the client's own unscoped name. ----
         match cmd.as_slice() {
             b"SUBSCRIBE" => return self.handle_subscribe(fd, args, false),
             b"PSUBSCRIBE" => return self.handle_subscribe(fd, args, true),
@@ -1552,24 +1553,26 @@ impl Worker {
         }
         let word: &[u8] = if pattern { b"psubscribe" } else { b"subscribe" };
         for ch in &args[1..] {
+            // Store the tenant-scoped name internally; reply with the client's.
+            let eff = self.scope_name(fd, ch);
             let fresh = if pattern {
-                self.patterns.entry(ch.clone()).or_default().insert(fd)
+                self.patterns.entry(eff.clone()).or_default().insert(fd)
             } else {
-                self.channels.entry(ch.clone()).or_default().insert(fd)
+                self.channels.entry(eff.clone()).or_default().insert(fd)
             };
             // Advertise the new subscriber to the cross-worker routing table so
             // remote PUBLISHes reach it (once per genuinely-new fd+key).
             if fresh {
                 if let Some(bus) = &self.bus {
-                    bus.subscribe(self.worker_id, ch, pattern);
+                    bus.subscribe(self.worker_id, &eff, pattern);
                 }
             }
             let count = {
                 let c = self.conns.get_mut(&fd).unwrap();
                 if pattern {
-                    c.psubs.insert(ch.clone());
+                    c.psubs.insert(eff);
                 } else {
-                    c.subs.insert(ch.clone());
+                    c.subs.insert(eff);
                 }
                 c.subs.len() + c.psubs.len()
             };
@@ -1586,18 +1589,27 @@ impl Worker {
     /// none given) and reply with a confirmation per channel.
     fn handle_unsubscribe(&mut self, fd: RawFd, args: &[Vec<u8>], pattern: bool) {
         let word: &[u8] = if pattern { b"punsubscribe" } else { b"unsubscribe" };
-        // Which channels to drop: the named ones, or everything currently held.
-        let list: Vec<Vec<u8>> = if args.len() >= 2 {
-            args[1..].to_vec()
+        // Which channels to drop, as (internal scoped name, client-facing name):
+        // the named ones (scope them), or everything currently held (stored
+        // scoped -> strip the prefix for the reply).
+        let list: Vec<(Vec<u8>, Vec<u8>)> = if args.len() >= 2 {
+            args[1..].iter().map(|a| (self.scope_name(fd, a), a.clone())).collect()
         } else {
+            let prefix = self.conn_prefix(fd);
             self.conns
                 .get(&fd)
                 .map(|c| {
-                    if pattern {
+                    let held: Vec<Vec<u8>> = if pattern {
                         c.psubs.iter().cloned().collect()
                     } else {
                         c.subs.iter().cloned().collect()
-                    }
+                    };
+                    held.into_iter()
+                        .map(|s| {
+                            let facing = strip_scope(&s, &prefix).to_vec();
+                            (s, facing)
+                        })
+                        .collect()
                 })
                 .unwrap_or_default()
         };
@@ -1616,7 +1628,7 @@ impl Worker {
             self.flush(fd);
             return;
         }
-        for ch in &list {
+        for (ch, facing) in &list {
             let removed = if pattern {
                 match self.patterns.get_mut(ch) {
                     Some(set) => {
@@ -1657,7 +1669,7 @@ impl Worker {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
             resp::array_header(out, 3);
             resp::bulk(out, word);
-            resp::bulk(out, ch);
+            resp::bulk(out, facing);
             resp::integer(out, count as i64);
         }
         self.flush(fd);
@@ -1675,7 +1687,7 @@ impl Worker {
             self.flush(fd);
             return;
         }
-        let channel = args[1].clone();
+        let channel = self.scope_name(fd, &args[1]); // tenant-scoped internally
         let msg = args[2].clone();
         // Deliver to subscribers on this worker, then (if part of a scale-out
         // Bus) route to subscribers on the other workers.
@@ -1710,19 +1722,25 @@ impl Worker {
         }
         let mut receivers = 0usize;
         for (sfd, pat) in &targets {
+            // Show each subscriber its OWN unscoped view: strip that connection's
+            // tenant prefix from the channel (and matched pattern). All matches of
+            // a scoped channel share its tenant, so this restores the client's name.
+            let prefix = self.conn_prefix(*sfd);
+            let fch = strip_scope(channel, &prefix);
+            let fpat = pat.as_ref().map(|p| strip_scope(p, &prefix));
             if let Some(c) = self.conns.get_mut(sfd) {
-                match pat {
+                match fpat {
                     None => {
                         resp::array_header(&mut c.wbuf, 3);
                         resp::bulk(&mut c.wbuf, b"message");
-                        resp::bulk(&mut c.wbuf, channel);
+                        resp::bulk(&mut c.wbuf, fch);
                         resp::bulk(&mut c.wbuf, msg);
                     }
                     Some(p) => {
                         resp::array_header(&mut c.wbuf, 4);
                         resp::bulk(&mut c.wbuf, b"pmessage");
                         resp::bulk(&mut c.wbuf, p);
-                        resp::bulk(&mut c.wbuf, channel);
+                        resp::bulk(&mut c.wbuf, fch);
                         resp::bulk(&mut c.wbuf, msg);
                     }
                 }
@@ -1737,6 +1755,37 @@ impl Worker {
             }
         }
         receivers
+    }
+
+    /// The tenant scope prefix (`{tenant}:`) for this connection, or `None` when
+    /// no scoping applies (no auth configured, or an exempt/service role). Pub/sub
+    /// channels are scoped by the same prefix as keys (§4.4/§4.5), so one tenant's
+    /// SUBSCRIBE/PUBLISH cannot reach another's — the isolation keys already have.
+    fn conn_prefix(&self, fd: RawFd) -> Option<Vec<u8>> {
+        if self.auth.is_none() {
+            return None;
+        }
+        let c = self.conns.get(&fd)?;
+        if c.authed && !c.exempt {
+            let mut p = Vec::with_capacity(c.tenant.len() + 1);
+            p.extend_from_slice(c.tenant.as_bytes());
+            p.push(b':');
+            Some(p)
+        } else {
+            None // no auth on this conn, or an exempt role: raw (unscoped) namespace
+        }
+    }
+
+    /// Scope a client-supplied channel/pattern to this connection's tenant
+    /// namespace (a no-op for exempt/no-auth connections).
+    fn scope_name(&self, fd: RawFd, raw: &[u8]) -> Vec<u8> {
+        match self.conn_prefix(fd) {
+            Some(mut p) => {
+                p.extend_from_slice(raw);
+                p
+            }
+            None => raw.to_vec(),
+        }
     }
 
     /// Enforce the keyspace ACL and rewrite each key to `{tenant}:{key}` for a
@@ -1959,6 +2008,15 @@ impl Worker {
 #[inline]
 fn itoa(n: i64) -> Vec<u8> {
     n.to_string().into_bytes()
+}
+
+/// Strip a tenant scope prefix from a channel/pattern for a client-facing frame.
+/// `None` prefix (exempt / no-auth) or a non-matching name is returned as-is.
+fn strip_scope<'a>(name: &'a [u8], prefix: &Option<Vec<u8>>) -> &'a [u8] {
+    match prefix {
+        Some(p) if name.starts_with(p) => &name[p.len()..],
+        _ => name,
+    }
 }
 
 /// Redis-style glob match (PSUBSCRIBE / KEYS semantics): `*` any run, `?` one

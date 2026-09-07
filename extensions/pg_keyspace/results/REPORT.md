@@ -761,8 +761,17 @@ commit off the worker's snapshot.
     single-worker in-PG deployment; the scale-out daemon adds **cross-worker
     delivery** via a shared in-process Bus (routing table + per-worker
     eventfd-woken inboxes), so a `PUBLISH` on one worker reaches subscribers on
-    any worker (`run_p3_pubsub_xworker.sh`, 10/10). Tenant-scoping channel names
-    (a flat namespace in this slice) remains a follow-up.
+    any worker (`run_p3_pubsub_xworker.sh`, 10/10). Channels are **tenant-scoped**:
+    a non-exempt authed role's channel/pattern carries the same `{tenant}:` prefix
+    that isolates its keys (§4.4/§4.5), so one tenant's `SUBSCRIBE`/`PUBLISH`
+    cannot reach another's — transparently, since every reply and `message`/
+    `pmessage` frame echoes the client's own unscoped name. Exempt (service_role)
+    connections use the raw namespace and can address a tenant channel explicitly
+    (e.g. `PUBLISH ta:news`). Verified in `run_p6_pubsub_tenant.sh` (13/13):
+    cross-tenant publishes reach 0 receivers, same-tenant reach the subscriber,
+    the exempt role's raw publish misses a scoped subscriber while an explicit
+    `ta:`-target reaches it, and no scoped name ever leaks to a client (frames and
+    pattern confirmations included).
 
   Aggregates are stored as a compact length-prefixed blob in the slab (Redis's
   small-collection philosophy). **Hashes now promote to a native large-collection

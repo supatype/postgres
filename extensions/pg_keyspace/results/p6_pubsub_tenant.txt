@@ -1,0 +1,16 @@
+# P3/P2 tenant-scoped pub/sub (RESP :6381, tls=--tls --insecure)
+  PASS  bob PUBLISH news -> 0 (isolated from tenant_a)      
+  PASS  alice PUBLISH news -> 1 (same tenant)               
+  PASS  svc PUBLISH news -> 0 (raw namespace, misses ta)    
+  PASS  svc PUBLISH ta:news -> 1 (explicit tenant target)   
+  PASS  alice received her own tenant message               
+  PASS  alice received the explicit-target message          
+  PASS  alice did NOT receive bob's message                 
+  PASS  alice did NOT receive the raw-svc message           
+  PASS  frames show unscoped 'news' (ack + 2 messages)      
+  PASS  no scoped 'ta:news' leaked to the client            
+  PASS  alice PUBLISH news.tech -> 1 (own pattern)          
+  PASS  bob PUBLISH news.tech -> 0 (isolated)               
+  PASS  alice pmessage: unscoped pattern + channel + payload
+
+# result: 13 passed, 0 failed
