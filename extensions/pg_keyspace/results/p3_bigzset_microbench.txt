@@ -1,0 +1,10 @@
+# ZSCORE and ZRANK latency: inline vs indexed (ns/op)
+# members |   score-inl   score-idx      spd |    rank-inl    rank-idx      spd
+      128 |      1937.8         8.7     223x |      7714.8        26.3     294x
+      512 |      7568.3         9.3     817x |     40295.3        39.7    1015x
+     1000 |     14866.5         9.2    1614x |     92457.0        43.8    2109x
+     5000 |    139159.9         9.8   14250x |    780031.6        61.3   12731x
+    10000 |    271352.6        11.3   23972x |   1265227.5        66.9   18905x
+
+# indexed ZSCORE = O(1) bucket lookup; ZRANK = O(log n) binary search
+# over a pre-sorted index (inline re-sorts the whole set each call).

@@ -1254,11 +1254,11 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'zscore'");
                     return;
                 }
-                let (z, _) = match load_zset(&store, &args[1], out) {
+                let raw = match zset_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                match z.score(&args[2]) {
+                match raw.and_then(|b| aggr::zset_score(b, &args[2])) {
                     Some(s) => resp::bulk(out, aggr::fmt_score(s).as_bytes()),
                     None => resp::nil(out),
                 }
@@ -1268,24 +1268,24 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'zmscore'");
                     return;
                 }
-                let (z, _) = match load_zset(&store, &args[1], out) {
+                let raw = match zset_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
                 resp::array_header(out, nargs - 2);
                 for m in &args[2..] {
-                    match z.score(m) {
+                    match raw.and_then(|b| aggr::zset_score(b, m)) {
                         Some(s) => resp::bulk(out, aggr::fmt_score(s).as_bytes()),
                         None => resp::nil(out),
                     }
                 }
             }
             b"ZCARD" => {
-                let (z, _) = match load_zset(&store, &args[1], out) {
+                let raw = match zset_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                resp::integer(out, z.len() as i64);
+                resp::integer(out, raw.map(aggr::zset_card).unwrap_or(0) as i64);
             }
             b"ZREM" => {
                 if nargs < 3 {
@@ -1331,13 +1331,17 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments");
                     return;
                 }
-                let (z, _) = match load_zset(&store, &args[1], out) {
+                let raw = match zset_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                match z.rank(&args[2]) {
+                let (card, rank) = match raw {
+                    Some(b) => (aggr::zset_card(b), aggr::zset_rank(b, &args[2])),
+                    None => (0, None),
+                };
+                match rank {
                     Some(r) => {
-                        let r = if cmd == b"ZREVRANK" { z.len() - 1 - r } else { r };
+                        let r = if cmd == b"ZREVRANK" { card - 1 - r } else { r };
                         resp::integer(out, r as i64);
                     }
                     None => resp::nil(out),
@@ -1353,18 +1357,27 @@ impl Worker {
                 let withscores = args[4..].iter().any(|a| a.eq_ignore_ascii_case(b"WITHSCORES"));
                 let rev = cmd == b"ZREVRANGE"
                     || args[4..].iter().any(|a| a.eq_ignore_ascii_case(b"REV"));
-                let (z, _) = match load_zset(&store, &args[1], out) {
+                let raw = match zset_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                let mut items = z.sorted();
-                if rev {
-                    items.reverse();
-                }
-                let (lo, hi) = aggr::rank_bounds(items.len(), start, stop);
-                let slice = &items[lo..hi];
-                resp::array_header(out, if withscores { slice.len() * 2 } else { slice.len() });
-                for (m, s) in slice {
+                let items: Vec<(Vec<u8>, f64)> = match raw {
+                    None => Vec::new(),
+                    Some(b) => {
+                        let card = aggr::zset_card(b);
+                        let (lo, hi) = aggr::rank_bounds(card, start, stop);
+                        if rev {
+                            // reversed[lo..hi] maps to ascending [card-hi, card-lo), reversed
+                            let mut v = aggr::zset_range_by_rank(b, card - hi, card - lo);
+                            v.reverse();
+                            v
+                        } else {
+                            aggr::zset_range_by_rank(b, lo, hi)
+                        }
+                    }
+                };
+                resp::array_header(out, if withscores { items.len() * 2 } else { items.len() });
+                for (m, s) in &items {
                     resp::bulk(out, m);
                     if withscores {
                         resp::bulk(out, aggr::fmt_score(*s).as_bytes());
@@ -1397,11 +1410,14 @@ impl Worker {
                         count = if c < 0 { None } else { Some(c as usize) };
                     }
                 }
-                let (z, _) = match load_zset(&store, &args[1], out) {
+                let raw = match zset_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                let mut items = z.by_score(&min, &max);
+                let mut items = match raw {
+                    Some(b) => aggr::zset_range_by_score(b, &min, &max),
+                    None => Vec::new(),
+                };
                 if rev {
                     items.reverse();
                 }
@@ -1426,11 +1442,11 @@ impl Worker {
                         return;
                     }
                 };
-                let (z, _) = match load_zset(&store, &args[1], out) {
+                let raw = match zset_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
                 };
-                resp::integer(out, z.by_score(&min, &max).len() as i64);
+                resp::integer(out, raw.map(|b| aggr::zset_count(b, &min, &max)).unwrap_or(0) as i64);
             }
             _ => resp::error(out, "ERR unknown command"),
         }
@@ -2120,6 +2136,21 @@ fn save_list(store: &Store, key: &[u8], l: &aggr::List, exp: i64) {
         store.del(key);
     } else {
         store.set_typed(key, &l.encode(), remaining_ttl(exp), KIND_LIST);
+    }
+}
+
+/// Borrow the raw zset blob at `key` for sub-linear reads (ZSCORE/ZRANK/ZRANGE/
+/// …) without decoding + re-sorting the whole set. Outer `None` = WRONGTYPE
+/// (written to `out`); inner `None` = key absent. Consumed by the `aggr::zset_*`
+/// raw readers.
+fn zset_raw<'a>(store: &'a Store, key: &[u8], out: &mut Vec<u8>) -> Option<Option<&'a [u8]>> {
+    match store.get_typed(key) {
+        None => Some(None),
+        Some((KIND_ZSET, _, v)) => Some(Some(v)),
+        Some(_) => {
+            resp::error(out, WRONGTYPE);
+            None
+        }
     }
 }
 

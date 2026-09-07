@@ -21,9 +21,13 @@
 //! form is a pure encoding upgrade with no new failure modes. Writes still
 //! rebuild the blob (O(n), unchanged); it is the reads that go sub-linear.
 //!
-//! The value's first byte is an encoding tag: `H_INLINE` (0) or `H_INDEXED` (1).
-//! Lists and sorted sets keep the inline encoding (ordering makes bucketing them
-//! less useful for a cache; the same technique applies if needed later).
+//! Every aggregate value's first byte is an encoding tag (inline vs indexed),
+//! so a reader dispatches without a schema. Lists and sorted sets promote the
+//! same way: a large list gains an explicit offset table (O(1) LINDEX/LRANGE
+//! seek, O(1) LLEN); a large sorted set gains a member→score bucket table (O(1)
+//! ZSCORE) plus a pre-sorted offset array (O(log n) ZRANK/ZRANGEBYSCORE, O(k)
+//! ZRANGE). In every case writes rebuild the one blob (O(n)); the reads go
+//! sub-linear, and the collection stays a single atomically-managed value.
 
 /// A hash with more than this many fields is stored in the indexed encoding.
 /// Mirrors Redis's `hash-max-listpack-entries` default (128).
@@ -41,6 +45,14 @@ const H_INDEXED: u8 = 1;
 pub const LIST_INDEX_THRESHOLD: usize = 128;
 const L_INLINE: u8 = 0;
 const L_INDEXED: u8 = 1;
+
+/// A sorted set with more than this many members uses the indexed encoding: a
+/// member→score bucket table (O(1) ZSCORE) plus a pre-sorted offset array
+/// (O(log n) ZRANK/ZRANGEBYSCORE, O(k) ZRANGE), instead of re-sorting the whole
+/// set on every range/rank op.
+pub const ZSET_INDEX_THRESHOLD: usize = 128;
+const Z_INLINE: u8 = 0;
+const Z_INDEXED: u8 = 1;
 
 /// FNV-1a 64-bit — the bucket hash for the indexed encoding. Self-contained so
 /// the blob's layout does not depend on the store's (private) key hash.
@@ -549,26 +561,97 @@ impl ZSet {
         ZSet { members: Vec::new() }
     }
 
-    pub fn decode(mut buf: &[u8]) -> ZSet {
-        let mut z = ZSet::new();
-        while let Some(m) = take_bytes(&mut buf) {
-            if buf.len() < 8 {
-                break;
+    /// Decode a stored blob (either encoding). Members come back in stored order
+    /// (insertion order for inline, sorted order for indexed — callers that need
+    /// a specific order re-sort, and range/rank ops read the blob directly).
+    pub fn decode(buf: &[u8]) -> ZSet {
+        match buf.first() {
+            None => ZSet::new(),
+            Some(&Z_INDEXED) => {
+                let mut z = ZSet::new();
+                let count = rd_u32(buf, 1).unwrap_or(0) as usize;
+                let nbuckets = rd_u32(buf, 5).unwrap_or(0) as usize;
+                let region_base = 9 + 4 * nbuckets + 4 * count;
+                if let Some(region) = buf.get(region_base..) {
+                    let mut off = 0usize;
+                    while off < region.len() {
+                        match zread_entry(region, off) {
+                            Some((m, s, _next, end)) => {
+                                z.members.push((m.to_vec(), s));
+                                off = end;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                z
             }
-            let mut s = [0u8; 8];
-            s.copy_from_slice(&buf[..8]);
-            buf = &buf[8..];
-            z.members.push((m.to_vec(), f64::from_le_bytes(s)));
+            _ => {
+                let mut p = &buf[1..];
+                let mut z = ZSet::new();
+                while let Some(m) = take_bytes(&mut p) {
+                    if p.len() < 8 {
+                        break;
+                    }
+                    let mut s = [0u8; 8];
+                    s.copy_from_slice(&p[..8]);
+                    p = &p[8..];
+                    z.members.push((m.to_vec(), f64::from_le_bytes(s)));
+                }
+                z
+            }
         }
-        z
     }
 
+    /// Encode, choosing inline or indexed by size (first byte is the tag).
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (m, s) in &self.members {
-            put_bytes(&mut out, m);
-            out.extend_from_slice(&s.to_le_bytes());
+        self.force_encode(self.members.len() > ZSET_INDEX_THRESHOLD)
+    }
+
+    /// Encode with an explicit layout choice (tests/benches compare the two).
+    /// Indexed: `[Z_INDEXED][count u32][nbuckets u32][buckets: nbuckets×u32]
+    /// [sorted: count×u32][entries]`. Each entry is `mlen u32, member, score f64,
+    /// next u32` (bucket chain, newest first). `buckets` gives O(1) member→score;
+    /// `sorted` holds entry offsets in (score, member) order for O(log n) rank /
+    /// range-by-score and O(k) range-by-rank. Entries are written in sorted
+    /// order, so `sorted[i]` is the i-th entry's offset.
+    pub fn force_encode(&self, indexed: bool) -> Vec<u8> {
+        if !indexed {
+            let mut out = Vec::with_capacity(1);
+            out.push(Z_INLINE);
+            for (m, s) in &self.members {
+                put_bytes(&mut out, m);
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+            return out;
         }
+        let ordered = self.sorted(); // (score, member) ascending
+        let count = ordered.len();
+        let nbuckets = count.next_power_of_two().max(8);
+        let mask = (nbuckets - 1) as u64;
+        let mut heads = vec![0u32; nbuckets];
+        let mut sorted_offs = Vec::with_capacity(count);
+        let mut region: Vec<u8> = Vec::new();
+        for (m, s) in &ordered {
+            let off = region.len() as u32;
+            sorted_offs.push(off);
+            let b = (fieldhash(m) & mask) as usize;
+            put_bytes(&mut region, m);
+            region.extend_from_slice(&s.to_le_bytes());
+            region.extend_from_slice(&heads[b].to_le_bytes()); // next = old head
+            heads[b] = off + 1;
+        }
+        let mut out = Vec::with_capacity(9 + 4 * nbuckets + 4 * count + region.len());
+        out.push(Z_INDEXED);
+        out.extend_from_slice(&(count as u32).to_le_bytes());
+        out.extend_from_slice(&(nbuckets as u32).to_le_bytes());
+        for h in &heads {
+            out.extend_from_slice(&h.to_le_bytes());
+        }
+        for o in &sorted_offs {
+            out.extend_from_slice(&o.to_le_bytes());
+        }
+        out.extend_from_slice(&region);
         out
     }
 
@@ -626,6 +709,222 @@ impl ZSet {
                     && (if max.inclusive { *s <= max.value } else { *s < max.value })
             })
             .collect()
+    }
+}
+
+// ---- ZSet: indexed-encoding raw readers -----------------------------------
+
+/// Parse the zset entry at `region[off..]`: (member, score, next, end-offset).
+fn zread_entry(region: &[u8], off: usize) -> Option<(&[u8], f64, u32, usize)> {
+    let mlen = rd_u32(region, off)? as usize;
+    let m = region.get(off + 4..off + 4 + mlen)?;
+    let sp = off + 4 + mlen;
+    let sb = region.get(sp..sp + 8)?;
+    let score = f64::from_le_bytes([sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]]);
+    let next = rd_u32(region, sp + 8)?;
+    Some((m, score, next, sp + 12))
+}
+
+// Layout offsets for an indexed zset blob.
+fn z_layout(buf: &[u8]) -> Option<(usize, usize, usize)> {
+    let count = rd_u32(buf, 1)? as usize;
+    let nbuckets = rd_u32(buf, 5)? as usize;
+    let sorted_base = 9 + 4 * nbuckets;
+    let region_base = sorted_base + 4 * count;
+    Some((count, sorted_base, region_base))
+}
+
+/// Total order used by the sorted index: score ascending, then member bytewise.
+fn z_less(es: f64, em: &[u8], score: f64, member: &[u8]) -> bool {
+    match es.partial_cmp(&score) {
+        Some(std::cmp::Ordering::Less) => true,
+        Some(std::cmp::Ordering::Greater) => false,
+        _ => em < member,
+    }
+}
+
+/// O(1) cardinality off the raw blob.
+pub fn zset_card(buf: &[u8]) -> usize {
+    match buf.first() {
+        None => 0,
+        Some(&Z_INDEXED) => rd_u32(buf, 1).unwrap_or(0) as usize,
+        _ => {
+            let mut p = &buf[1..];
+            let mut n = 0;
+            while take_bytes(&mut p).is_some() {
+                if p.len() < 8 {
+                    break;
+                }
+                p = &p[8..];
+                n += 1;
+            }
+            n
+        }
+    }
+}
+
+/// O(1)-average member→score off the raw blob (indexed: bucket chain).
+pub fn zset_score(buf: &[u8], member: &[u8]) -> Option<f64> {
+    match buf.first() {
+        None => None,
+        Some(&Z_INDEXED) => {
+            let nbuckets = rd_u32(buf, 5)? as usize;
+            let (_, _, region_base) = z_layout(buf)?;
+            let region = buf.get(region_base..)?;
+            let b = (fieldhash(member) & (nbuckets as u64 - 1)) as usize;
+            let mut head = rd_u32(buf, 9 + 4 * b)?;
+            while head != 0 {
+                let (m, s, next, _) = zread_entry(region, (head - 1) as usize)?;
+                if m == member {
+                    return Some(s);
+                }
+                head = next;
+            }
+            None
+        }
+        _ => ZSet::decode(buf).score(member),
+    }
+}
+
+// Read the (member, score) at sorted position `i` of an indexed blob.
+fn z_at<'a>(buf: &[u8], sorted_base: usize, region: &'a [u8], i: usize) -> Option<(&'a [u8], f64)> {
+    let off = rd_u32(buf, sorted_base + 4 * i)? as usize;
+    zread_entry(region, off).map(|(m, s, _, _)| (m, s))
+}
+
+/// 0-based rank (ascending) of `member`, or None if absent. O(log n) indexed.
+pub fn zset_rank(buf: &[u8], member: &[u8]) -> Option<usize> {
+    match buf.first() {
+        Some(&Z_INDEXED) => {
+            let score = zset_score(buf, member)?;
+            let (count, sorted_base, region_base) = z_layout(buf)?;
+            let region = buf.get(region_base..)?;
+            // first index whose (score, member) is not less than the target
+            let (mut lo, mut hi) = (0usize, count);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let (em, es) = z_at(buf, sorted_base, region, mid)?;
+                if z_less(es, em, score, member) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            Some(lo)
+        }
+        _ => ZSet::decode(buf).rank(member),
+    }
+}
+
+/// Members in rank range `[lo, hi)` (already normalized), ascending, with scores.
+pub fn zset_range_by_rank(buf: &[u8], lo: usize, hi: usize) -> Vec<(Vec<u8>, f64)> {
+    match buf.first() {
+        Some(&Z_INDEXED) => {
+            let mut out = Vec::new();
+            if let Some((_, sorted_base, region_base)) = z_layout(buf) {
+                if let Some(region) = buf.get(region_base..) {
+                    for i in lo..hi {
+                        if let Some((m, s)) = z_at(buf, sorted_base, region, i) {
+                            out.push((m.to_vec(), s));
+                        }
+                    }
+                }
+            }
+            out
+        }
+        _ => {
+            let s = ZSet::decode(buf).sorted();
+            s.get(lo..hi.min(s.len())).map(|x| x.to_vec()).unwrap_or_default()
+        }
+    }
+}
+
+// Binary search: first sorted index whose score satisfies the lower predicate
+// (`pred` is false for a prefix then true) — used for score-range bounds.
+fn z_lower_bound<F: Fn(f64) -> bool>(
+    buf: &[u8],
+    count: usize,
+    sorted_base: usize,
+    region: &[u8],
+    pred: F,
+) -> usize {
+    let (mut lo, mut hi) = (0usize, count);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        match z_at(buf, sorted_base, region, mid) {
+            Some((_, es)) if pred(es) => hi = mid,
+            _ => lo = mid + 1,
+        }
+    }
+    lo
+}
+
+/// Members with score in [min, max] (honoring exclusivity), ascending. O(log n
+/// + k) indexed.
+pub fn zset_range_by_score(buf: &[u8], min: &ScoreBound, max: &ScoreBound) -> Vec<(Vec<u8>, f64)> {
+    match buf.first() {
+        Some(&Z_INDEXED) => {
+            let (count, sorted_base, region_base) = match z_layout(buf) {
+                Some(x) => x,
+                None => return Vec::new(),
+            };
+            let region = match buf.get(region_base..) {
+                Some(r) => r,
+                None => return Vec::new(),
+            };
+            let minv = min.value;
+            let mininc = min.inclusive;
+            let start = z_lower_bound(buf, count, sorted_base, region, |es| {
+                if mininc {
+                    es >= minv
+                } else {
+                    es > minv
+                }
+            });
+            let maxv = max.value;
+            let maxinc = max.inclusive;
+            // first index whose score is beyond the max bound
+            let end = z_lower_bound(buf, count, sorted_base, region, |es| {
+                if maxinc {
+                    es > maxv
+                } else {
+                    es >= maxv
+                }
+            });
+            let mut out = Vec::new();
+            for i in start..end {
+                if let Some((m, s)) = z_at(buf, sorted_base, region, i) {
+                    out.push((m.to_vec(), s));
+                }
+            }
+            out
+        }
+        _ => ZSet::decode(buf).by_score(min, max),
+    }
+}
+
+/// Count of members with score in [min, max]. O(log n) indexed.
+pub fn zset_count(buf: &[u8], min: &ScoreBound, max: &ScoreBound) -> usize {
+    match buf.first() {
+        Some(&Z_INDEXED) => {
+            let (count, sorted_base, region_base) = match z_layout(buf) {
+                Some(x) => x,
+                None => return 0,
+            };
+            let region = match buf.get(region_base..) {
+                Some(r) => r,
+                None => return 0,
+            };
+            let (minv, mininc, maxv, maxinc) = (min.value, min.inclusive, max.value, max.inclusive);
+            let start = z_lower_bound(buf, count, sorted_base, region, |es| {
+                if mininc { es >= minv } else { es > minv }
+            });
+            let end = z_lower_bound(buf, count, sorted_base, region, |es| {
+                if maxinc { es > maxv } else { es >= maxv }
+            });
+            end.saturating_sub(start)
+        }
+        _ => ZSet::decode(buf).by_score(min, max).len(),
     }
 }
 
@@ -690,6 +989,70 @@ mod tests {
         let z3 = ZSet::decode(&z.encode());
         assert_eq!(z3.len(), 3);
         assert_eq!(z3.score(b"a"), Some(5.0));
+    }
+
+    #[test]
+    fn zset_indexed_matches_inline_at_scale() {
+        // 1000 members with many score ties, to exercise (score, member) order.
+        let mut z = ZSet::new();
+        for i in 0..1000u32 {
+            z.add(format!("m{i:04}").as_bytes(), (i % 10) as f64);
+        }
+        let blob = z.encode();
+        assert_eq!(blob[0], Z_INDEXED, "1000 members must use the indexed layout");
+        assert_eq!(zset_card(&blob), 1000);
+
+        // ZSCORE for every member matches the inline set
+        for i in 0..1000u32 {
+            let m = format!("m{i:04}");
+            assert_eq!(zset_score(&blob, m.as_bytes()), z.score(m.as_bytes()), "score {m}");
+        }
+        assert_eq!(zset_score(&blob, b"absent"), None);
+
+        // the whole sorted order (by rank) equals the inline sorted() ground truth
+        let want = z.sorted();
+        let got = zset_range_by_rank(&blob, 0, 1000);
+        assert_eq!(got, want, "full rank order mismatch");
+
+        // ZRANK for a spread of members
+        for i in (0..1000u32).step_by(37) {
+            let m = format!("m{i:04}");
+            assert_eq!(zset_rank(&blob, m.as_bytes()), z.rank(m.as_bytes()), "rank {m}");
+        }
+        assert_eq!(zset_rank(&blob, b"absent"), None);
+
+        // ZRANGEBYSCORE / ZCOUNT across inclusive & exclusive bounds
+        let cases = [
+            (ScoreBound { value: 3.0, inclusive: true }, ScoreBound { value: 6.0, inclusive: true }),
+            (ScoreBound { value: 3.0, inclusive: false }, ScoreBound { value: 6.0, inclusive: false }),
+            (ScoreBound { value: f64::NEG_INFINITY, inclusive: true }, ScoreBound { value: 0.0, inclusive: true }),
+            (ScoreBound { value: 9.0, inclusive: true }, ScoreBound { value: f64::INFINITY, inclusive: true }),
+        ];
+        for (min, max) in &cases {
+            assert_eq!(zset_range_by_score(&blob, min, max), z.by_score(min, max), "by_score");
+            assert_eq!(zset_count(&blob, min, max), z.by_score(min, max).len(), "count");
+        }
+
+        // decode round-trips as a set (same members+scores, order-independent)
+        let z2 = ZSet::decode(&blob);
+        assert_eq!(z2.len(), 1000);
+        let mut a: Vec<_> = z2.members.clone();
+        let mut b: Vec<_> = z.members.clone();
+        a.sort_by(|x, y| x.0.cmp(&y.0));
+        b.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn zset_small_stays_inline() {
+        let mut z = ZSet::new();
+        z.add(b"a", 1.0);
+        z.add(b"b", 2.0);
+        let blob = z.encode();
+        assert_eq!(blob[0], Z_INLINE);
+        assert_eq!(zset_card(&blob), 2);
+        assert_eq!(zset_score(&blob, b"b"), Some(2.0));
+        assert_eq!(zset_rank(&blob, b"b"), Some(1));
     }
 
     #[test]

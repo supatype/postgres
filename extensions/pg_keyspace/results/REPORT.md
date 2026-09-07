@@ -779,9 +779,23 @@ commit off the worker's snapshot.
   durability ring as one record, and invalidated as one key — the indexed form
   is a pure encoding upgrade with no new failure modes, and it stays exactly
   Redis-compatible over the whole read/write surface on a 10 k-field hash
-  (`run_p3_bighash.sh`, 20/20 parity vs a real `redis-server`). Lists and sorted
-  sets keep the inline encoding (ordering makes bucketing them less useful for a
-  cache; the same technique applies later if needed).
+  (`run_p3_bighash.sh`, 20/20 parity vs a real `redis-server`).
+
+  **Lists and sorted sets promote the same way.** A large list gets an explicit
+  offset table (`[count][offsets…][data]`), so `LINDEX`/`LRANGE` seek in O(1)
+  and `LLEN` is an O(1) header read instead of walking every length-prefix from
+  the head — `examples/bench_list_index` shows inline growing to ≈50 µs at 50 k
+  elements while indexed stays ≈1.4 ns (≈27,000×), with 10 k-element Redis parity
+  in `run_p3_biglist.sh` (13/13). A large sorted set gets a member→score bucket
+  table **and** a pre-sorted offset array, so `ZSCORE` is O(1), `ZRANK` /
+  `ZRANGEBYSCORE` / `ZCOUNT` are O(log n) binary searches, and `ZRANGE` is O(k)
+  — instead of re-sorting the whole set on every call. `examples/bench_zset_ops`
+  shows, at 10 k members, ZSCORE ≈9 ns vs ≈270 µs inline (≈24,000×) and ZRANK
+  ≈55 ns vs ≈1.04 ms inline (≈19,000×); `run_p3_bigzset.sh` (18/18) confirms
+  byte-for-byte Redis parity — including the full (score, member) tie-broken
+  ordering — on a 10 k-member set. As with the hash, both stay a single keyspace
+  value (atomic eviction, one durability record, one invalidation key); writes
+  rebuild the blob (O(n), unchanged) while the reads go sub-linear.
 
   Making large collections usable end-to-end also required fixing the slab
   allocator: OVERSIZED blocks (values > 8 KB) were bump-only and never
