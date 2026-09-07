@@ -600,7 +600,8 @@ fresh index read).
 
 Requirements/limits: needs `wal_level = logical` and holds one replication slot
 (the standard WAL-retention caution, §13 — the worker advances it each poll);
-single-column integer pk only; `pg_keyspace.rowcache_decode` is off by default. Details: `results/p6_security.txt` (`bench/run_p6_security.sh`),
+any single-column primary key (int/uuid/text/…; composite keys refused);
+`pg_keyspace.rowcache_decode` is off by default. Details: `results/p6_security.txt` (`bench/run_p6_security.sh`),
 `results/p6_rowcache.txt` (`bench/run_p6_rowcache.sh`),
 `results/p6_maskcost.txt` (`bench/run_p6_maskcost.sh`),
 `results/p6_invalidation.txt` (`bench/run_p6_invalidation.sh`),
@@ -717,14 +718,23 @@ commit off the worker's snapshot.
   `pg_keyspace.rowcache_decode`, needs `wal_level=logical`). Invalidation is
   drop-only — a *refill* worker is not built (refill is lazy via the fallback
   path). The cache is still populated manually via `supacache.rowcache_put` (a
-  warm/refill helper). Only single-column integer primary keys are cached, and
-  cached rows with out-of-line (TOASTed) values are not supported (the raw tuple
-  carries a toast pointer, not the datum) — POC stores inline rows. The decode
-  worker holds one logical replication slot (WAL-retention caution, §13). Refill
-  (`pg_keyspace.rowcache_refill`) is opt-in; default is drop-only (lazy refill).
-- PostgREST end-to-end uses the real binary — not installed here (its release
-  download is blocked by the sandbox egress proxy, 403). Validated instead by
-  issuing PostgREST's exact SQL shape (role + JWT claims, `pk = N` select/update).
+  warm/refill helper). **Any single-column primary-key type is cached** — int,
+  `uuid`, `text`, etc. The pk is keyed by its *canonical* form (the pk type's
+  output-function text), produced identically by the planner hook, by
+  `rowcache_put`/refill (from the heap tuple), and by the keys-only decode plugin
+  (hex-encoded on the wire so arbitrary bytes survive), so all three agree for
+  the same row regardless of type. `rowcache_register` refuses a table whose
+  registered column is not a single-column primary key (arity guard: a composite
+  key could otherwise match the wrong cached row) — verified for uuid and text
+  PKs, and the composite-key refusal, in `bench/run_p6_nonint_pk.sh` (14/14).
+  Cached rows with out-of-line (TOASTed) values are still not supported (the raw
+  tuple carries a toast pointer, not the datum) — POC stores inline rows. The
+  decode worker holds one logical replication slot (WAL-retention caution, §13).
+  Refill (`pg_keyspace.rowcache_refill`) is opt-in; default is drop-only (lazy).
+- PostgREST end-to-end uses the real **v12.2.3** binary over live HTTP+JWT
+  (`bench/run_p6_postgrest_e2e.sh`, 8/8): the GET is served by the Custom Scan
+  (the cache hit counter climbs), mask + RLS apply on the cached path, and a
+  PATCH stays coherent via the keys-only worker.
 - Command set (§5): strings, counters, DEL/EXISTS, TTL on strings, plus the P3
   **hash** and **list** types with full `WRONGTYPE` semantics in both directions:
   - hashes — `HSET/HSETNX/HMSET/HGET/HMGET/HDEL/HGETALL/HKEYS/HVALS/HLEN/HEXISTS/

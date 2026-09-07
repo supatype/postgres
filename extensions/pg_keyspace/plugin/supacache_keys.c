@@ -9,12 +9,15 @@
  * structural answer: for each INSERT/UPDATE/DELETE it reads ONLY the replica
  * identity key column and emits one line
  *
- *     <I|U|D> <relid> <pk>
+ *     <I|U|D> <relid> <hexpk>
  *
  * No other column is ever read from the tuple, so no column value can leave the
  * plugin — the guarantee holds by construction, not by the worker's discipline.
- * The cache is keyed by (relid, int8 pk), so only single-column integer identity
- * keys are emitted; anything else is skipped (that row simply isn't cacheable).
+ * The cache is keyed by (relid, canonical pk), where the canonical pk is the pk
+ * column type's output-function text (so int, uuid, text, … all work); it is
+ * emitted hex-encoded so an arbitrary-byte value survives the line format. Only
+ * a SINGLE-column replica-identity key is emitted; a composite key is skipped
+ * (that row simply isn't cacheable here).
  */
 #include "postgres.h"
 
@@ -23,6 +26,7 @@
 #include "replication/logical.h"
 #include "replication/output_plugin.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
 
@@ -77,7 +81,10 @@ cb_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
     int         attno;
     bool        isnull;
     Datum       d;
-    int64       pk;
+    Oid         outoid;
+    bool        isvarlena;
+    char       *canon;
+    int         i;
     char        action;
 
     /* The tuple that carries the replica-identity key for this change. */
@@ -117,19 +124,21 @@ cb_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
     tupdesc = RelationGetDescr(relation);
     att = TupleDescAttr(tupdesc, attno - 1);
-    if (att->atttypid != INT2OID && att->atttypid != INT4OID &&
-        att->atttypid != INT8OID)
-        return;                 /* non-integer pk: not cacheable here */
 
     d = heap_getattr(keytuple, attno, tupdesc, &isnull);
     if (isnull)
         return;
-    pk = (att->atttypid == INT8OID) ? DatumGetInt64(d)
-       : (att->atttypid == INT4OID) ? (int64) DatumGetInt32(d)
-                                    : (int64) DatumGetInt16(d);
+
+    /* Canonical pk = the column type's output-function text — identical to what
+     * the planner hook and rowcache_put/refill compute, so all sides agree. */
+    getTypeOutputInfo(att->atttypid, &outoid, &isvarlena);
+    canon = OidOutputFunctionCall(outoid, d);
 
     OutputPluginPrepareWrite(ctx, true);
-    appendStringInfo(ctx->out, "%c %u %lld", action,
-                     RelationGetRelid(relation), (long long) pk);
+    appendStringInfo(ctx->out, "%c %u ", action, RelationGetRelid(relation));
+    /* hex-encode the canonical text so spaces/newlines/etc. survive the line */
+    for (i = 0; canon[i] != '\0'; i++)
+        appendStringInfo(ctx->out, "%02x", (unsigned char) canon[i]);
     OutputPluginWrite(ctx, true);
+    pfree(canon);
 }
