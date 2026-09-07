@@ -1,0 +1,11 @@
+# P1 real synchronous replication (§3.4) — primary :6500, standby :7500
+  PASS  replicated SET -> OK                                
+  PASS  standby WAL has the value immediately after the ack 
+  PASS  primary WAL also has it (durable locally)           
+  PASS  GET reads it back from the primary                  
+  PASS  a spread of 200 writes are all on the standby       
+  PASS  standby WAL size > 0                                
+  INFO  300 replicated SETs in 1.62s (incl. standby ack per commit)
+  PASS  with standby down, a replicated SET does NOT ack    
+
+# result: 7 passed, 0 failed

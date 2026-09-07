@@ -194,7 +194,10 @@ would see.
 
 `relaxed` (async, `synchronous_commit=off` analog) matches `ephemeral` latency
 because the client does not wait for the fsync. `durable` waits ~one commit
-window per write, as designed.
+window per write, as designed. (The `replicated` figure here is from the earlier
+*simulated* stand-in; the standalone daemon's `replicated` tier is now **real
+synchronous replication** — see "The `replicated` tier is real synchronous
+replication" below — where it is correctly slower than `durable`.)
 
 ### Finding: the batcher amortises, but the single worker can't exploit it
 
@@ -215,6 +218,29 @@ operations" (§3.4), confirmed. The mechanism is sound; the integration needs
 one of: (a) multiple slot workers (the real design has N), or (b) deferred acks
 so a single worker keeps serving while a batch settles. **This should be a
 P1 design note.**
+
+### The `replicated` tier is real synchronous replication (not a sleep)
+
+`replicated` was previously modelled with a `sleep(replica_rtt)` stand-in. It is
+now a real standby (`repl.rs`): the batch flusher streams each fsynced WAL batch
+to a standby over a stream socket, the standby appends+fsyncs it to its **own**
+WAL and acks the batch's end sequence, and a `replicated` commit returns only
+once the standby has acked its seq (`synchronous_commit = remote_write`). The
+same `repl::serve` loop backs a co-located loopback standby (default) and the
+standalone **`pgks-replica`** binary (a separate process/host), pointed at with
+`pgkeyspaced --tier replicated --replica-addr <host> --replica-port <p>`.
+
+`run_p1_replication.sh` (7/7) runs a real `pgks-replica` process behind the
+daemon and proves it end to end: the value is on the **standby's** WAL the
+instant the replicated `SET` returns (ack-gated, not a race), 200 writes all
+stream across, and with the standby **killed** a replicated `SET` never acks
+(synchronous rep genuinely waits for the second node). The cost is real and
+honest — `durability_bench` shows replicated p50 ≈1.67 ms vs durable ≈0.99 ms
+(the socket round-trip + a second fsync + a configurable link delay), where the
+earlier simulated path had mis-reported replicated as *faster* than durable.
+Unit tests (`batcher::tests`) assert the payload is on the standby WAL before
+the commit returns, and that an unconfigured standby degrades to local durable
+rather than deadlocking.
 
 ---
 

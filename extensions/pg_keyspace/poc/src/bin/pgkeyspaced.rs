@@ -12,6 +12,7 @@
 
 use pgks::batcher::{Batcher, Tier};
 use pgks::pubsub::Bus;
+use pgks::repl::Replica;
 use pgks::server::Worker;
 use pgks::store::{Config, Store};
 use std::sync::Arc;
@@ -28,6 +29,8 @@ struct Args {
     commit_window_us: u64,
     replica_rtt_us: u64,
     wal_dir: String,
+    replica_addr: Option<String>, // external standby host for the replicated tier
+    replica_port: u16,            // its base port (worker w -> replica_port+w)
 }
 
 impl Default for Args {
@@ -43,6 +46,8 @@ impl Default for Args {
             commit_window_us: 500,
             replica_rtt_us: 200,
             wal_dir: "/tmp".into(),
+            replica_addr: None,
+            replica_port: 7400,
         }
     }
 }
@@ -62,6 +67,8 @@ fn parse_args() -> Args {
             "--shmem-mb" => a.shmem_mb = val(i).parse().unwrap_or(0),
             "--commit-window-us" => a.commit_window_us = val(i).parse().unwrap_or(500),
             "--replica-rtt-us" => a.replica_rtt_us = val(i).parse().unwrap_or(200),
+            "--replica-addr" => a.replica_addr = Some(val(i)),
+            "--replica-port" => a.replica_port = val(i).parse().unwrap_or(7400),
             "--wal-dir" => a.wal_dir = val(i),
             "--tier" => {
                 a.tier = match val(i).as_str() {
@@ -130,14 +137,24 @@ fn main() {
         );
         let batcher = if a.tier != Tier::Ephemeral {
             let wal = format!("{}/pgks_w{w}_{}.wal", a.wal_dir, std::process::id());
-            Some(Arc::new(
-                Batcher::new(
-                    &wal,
-                    Duration::from_micros(a.commit_window_us),
-                    Duration::from_micros(a.replica_rtt_us),
-                )
-                .expect("batcher"),
-            ))
+            let window = Duration::from_micros(a.commit_window_us);
+            // The replicated tier needs a real standby: an external one at
+            // --replica-addr (base+w, one per worker), else a co-located loopback
+            // standby (--replica-rtt-us models the link latency).
+            let b = if a.tier == Tier::Replicated {
+                let replica = if let Some(addr) = &a.replica_addr {
+                    Replica::External(format!("{addr}:{}", a.replica_port + w as u16))
+                } else {
+                    Replica::Loopback {
+                        wal_path: format!("{}/pgks_w{w}_{}.replica.wal", a.wal_dir, std::process::id()),
+                        link_delay: Duration::from_micros(a.replica_rtt_us),
+                    }
+                };
+                Batcher::with_replica(&wal, window, replica).expect("batcher+replica")
+            } else {
+                Batcher::new(&wal, window).expect("batcher")
+            };
+            Some(Arc::new(b))
         } else {
             None
         };

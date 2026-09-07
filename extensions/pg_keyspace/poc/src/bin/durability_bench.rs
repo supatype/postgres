@@ -9,6 +9,7 @@
 //!                         [--threads N] [--per-thread M] [--commit-window-us W]
 
 use pgks::batcher::{Batcher, Tier};
+use pgks::repl::Replica;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,13 @@ fn arg(name: &str, def: &str) -> String {
 
 fn bench(tier: Tier, threads: usize, per_thread: usize, window: Duration) {
     let wal = format!("/tmp/pgks_durbench_{:?}.wal", tier);
-    let batcher = Arc::new(Batcher::new(&wal, window, Duration::from_micros(200)).unwrap());
+    // A real co-located standby so the replicated tier waits on an actual socket
+    // round-trip + a second fsync (200us models the primary<->standby link).
+    let replica = Replica::Loopback {
+        wal_path: format!("/tmp/pgks_durbench_{:?}.replica.wal", tier),
+        link_delay: Duration::from_micros(200),
+    };
+    let batcher = Arc::new(Batcher::with_replica(&wal, window, replica).unwrap());
     let record = vec![b'x'; 64];
 
     let start = Instant::now();
