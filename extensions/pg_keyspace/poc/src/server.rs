@@ -184,6 +184,10 @@ struct Conn {
     // When set, this connection is TLS: ciphertext on the socket, plaintext in
     // rbuf/wbuf. `wpos` then counts wbuf bytes already fed to the TLS writer.
     tls: Option<Box<rustls::ServerConnection>>,
+    // P3 pub/sub (§5): channels and glob patterns this connection is subscribed
+    // to. Non-empty => the connection is in RESP2 subscribe mode.
+    subs: HashSet<Vec<u8>>,
+    psubs: HashSet<Vec<u8>>,
 }
 
 pub struct Worker {
@@ -205,6 +209,10 @@ pub struct Worker {
     // P2 TLS: when set, every accepted connection is wrapped in a TLS session so
     // the RESP wire is encrypted (the AUTH password is otherwise sent in clear).
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    // P3 pub/sub (§5): reverse indexes channel/pattern -> subscriber fds, so a
+    // PUBLISH fans out without scanning every connection. Local to this worker.
+    channels: HashMap<Vec<u8>, HashSet<RawFd>>,
+    patterns: HashMap<Vec<u8>, HashSet<RawFd>>,
 }
 
 impl Worker {
@@ -233,6 +241,8 @@ impl Worker {
             auth: None,
             sync_ack: false,
             tls_config: None,
+            channels: HashMap::new(),
+            patterns: HashMap::new(),
         })
     }
 
@@ -376,6 +386,8 @@ impl Worker {
                     exempt: false,
                     ack: Vec::new(),
                     tls,
+                    subs: HashSet::new(),
+                    psubs: HashSet::new(),
                 },
             );
         }
@@ -549,6 +561,38 @@ impl Worker {
         // ---- P2: AUTH command ----
         if cmd == b"AUTH" {
             self.handle_auth(fd, args);
+            return;
+        }
+
+        // ---- P3 pub/sub (§5): handled before keyed-command scoping. Channels
+        // are a flat namespace (not tenant-scoped in this slice), so the reply
+        // echoes the client's channel name unchanged. ----
+        match cmd.as_slice() {
+            b"SUBSCRIBE" => return self.handle_subscribe(fd, args, false),
+            b"PSUBSCRIBE" => return self.handle_subscribe(fd, args, true),
+            b"UNSUBSCRIBE" => return self.handle_unsubscribe(fd, args, false),
+            b"PUNSUBSCRIBE" => return self.handle_unsubscribe(fd, args, true),
+            b"PUBLISH" => return self.handle_publish(fd, args),
+            _ => {}
+        }
+        // In RESP2 subscribe mode only (P)(UN)SUBSCRIBE / PING / QUIT / RESET run.
+        let subscribed = self
+            .conns
+            .get(&fd)
+            .map(|c| !c.subs.is_empty() || !c.psubs.is_empty())
+            .unwrap_or(false);
+        if subscribed && !matches!(cmd.as_slice(), b"PING" | b"QUIT" | b"RESET") {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(
+                out,
+                "ERR Can't execute command: only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in subscribe context",
+            );
+            return;
+        }
+        if cmd == b"QUIT" {
+            let c = self.conns.get_mut(&fd).unwrap();
+            resp::simple(&mut c.wbuf, "OK");
+            c.closing = true; // flushed then closed by on_readable/flush
             return;
         }
 
@@ -1388,6 +1432,184 @@ impl Worker {
         }
     }
 
+    /// True if the connection may run pub/sub commands (authed, or no auth
+    /// configured). Writes NOAUTH and returns false otherwise.
+    fn pubsub_authed(&mut self, fd: RawFd) -> bool {
+        if self.auth.is_none() {
+            return true;
+        }
+        if self.conns.get(&fd).map(|c| c.authed).unwrap_or(false) {
+            return true;
+        }
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::error(out, "NOAUTH Authentication required.");
+        false
+    }
+
+    /// SUBSCRIBE / PSUBSCRIBE: register the connection on each channel/pattern and
+    /// reply with a confirmation carrying the running subscription count.
+    fn handle_subscribe(&mut self, fd: RawFd, args: &[Vec<u8>], pattern: bool) {
+        if args.len() < 2 {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, "ERR wrong number of arguments");
+            return;
+        }
+        if !self.pubsub_authed(fd) {
+            self.flush(fd);
+            return;
+        }
+        let word: &[u8] = if pattern { b"psubscribe" } else { b"subscribe" };
+        for ch in &args[1..] {
+            if pattern {
+                self.patterns.entry(ch.clone()).or_default().insert(fd);
+            } else {
+                self.channels.entry(ch.clone()).or_default().insert(fd);
+            }
+            let count = {
+                let c = self.conns.get_mut(&fd).unwrap();
+                if pattern {
+                    c.psubs.insert(ch.clone());
+                } else {
+                    c.subs.insert(ch.clone());
+                }
+                c.subs.len() + c.psubs.len()
+            };
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::array_header(out, 3);
+            resp::bulk(out, word);
+            resp::bulk(out, ch);
+            resp::integer(out, count as i64);
+        }
+        self.flush(fd);
+    }
+
+    /// UNSUBSCRIBE / PUNSUBSCRIBE: remove the given channels/patterns (all, if
+    /// none given) and reply with a confirmation per channel.
+    fn handle_unsubscribe(&mut self, fd: RawFd, args: &[Vec<u8>], pattern: bool) {
+        let word: &[u8] = if pattern { b"punsubscribe" } else { b"unsubscribe" };
+        // Which channels to drop: the named ones, or everything currently held.
+        let list: Vec<Vec<u8>> = if args.len() >= 2 {
+            args[1..].to_vec()
+        } else {
+            self.conns
+                .get(&fd)
+                .map(|c| {
+                    if pattern {
+                        c.psubs.iter().cloned().collect()
+                    } else {
+                        c.subs.iter().cloned().collect()
+                    }
+                })
+                .unwrap_or_default()
+        };
+        if list.is_empty() {
+            // Nothing subscribed: Redis still replies with a nil-channel frame.
+            let count = self
+                .conns
+                .get(&fd)
+                .map(|c| c.subs.len() + c.psubs.len())
+                .unwrap_or(0);
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::array_header(out, 3);
+            resp::bulk(out, word);
+            resp::nil(out);
+            resp::integer(out, count as i64);
+            self.flush(fd);
+            return;
+        }
+        for ch in &list {
+            if pattern {
+                if let Some(set) = self.patterns.get_mut(ch) {
+                    set.remove(&fd);
+                    if set.is_empty() {
+                        self.patterns.remove(ch);
+                    }
+                }
+            } else if let Some(set) = self.channels.get_mut(ch) {
+                set.remove(&fd);
+                if set.is_empty() {
+                    self.channels.remove(ch);
+                }
+            }
+            let count = {
+                let c = self.conns.get_mut(&fd).unwrap();
+                if pattern {
+                    c.psubs.remove(ch);
+                } else {
+                    c.subs.remove(ch);
+                }
+                c.subs.len() + c.psubs.len()
+            };
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::array_header(out, 3);
+            resp::bulk(out, word);
+            resp::bulk(out, ch);
+            resp::integer(out, count as i64);
+        }
+        self.flush(fd);
+    }
+
+    /// PUBLISH channel message: deliver to every local channel subscriber and
+    /// every pattern subscriber whose glob matches, returning the delivery count.
+    fn handle_publish(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        if args.len() != 3 {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, "ERR wrong number of arguments for 'publish'");
+            return;
+        }
+        if !self.pubsub_authed(fd) {
+            self.flush(fd);
+            return;
+        }
+        let channel = args[1].clone();
+        let msg = &args[2];
+        // Collect targets first (releases the channels/patterns borrows).
+        let mut targets: Vec<(RawFd, Option<Vec<u8>>)> = Vec::new();
+        if let Some(set) = self.channels.get(&channel) {
+            for &sfd in set {
+                targets.push((sfd, None));
+            }
+        }
+        for (pat, set) in &self.patterns {
+            if glob_match(pat, &channel) {
+                for &sfd in set {
+                    targets.push((sfd, Some(pat.clone())));
+                }
+            }
+        }
+        let mut receivers = 0i64;
+        for (sfd, pat) in &targets {
+            if let Some(c) = self.conns.get_mut(sfd) {
+                match pat {
+                    None => {
+                        resp::array_header(&mut c.wbuf, 3);
+                        resp::bulk(&mut c.wbuf, b"message");
+                        resp::bulk(&mut c.wbuf, &channel);
+                        resp::bulk(&mut c.wbuf, msg);
+                    }
+                    Some(p) => {
+                        resp::array_header(&mut c.wbuf, 4);
+                        resp::bulk(&mut c.wbuf, b"pmessage");
+                        resp::bulk(&mut c.wbuf, p);
+                        resp::bulk(&mut c.wbuf, &channel);
+                        resp::bulk(&mut c.wbuf, msg);
+                    }
+                }
+                receivers += 1;
+            }
+        }
+        // Flush deliveries (dedup fds so a doubly-subscribed conn flushes once).
+        let mut flushed: HashSet<RawFd> = HashSet::new();
+        for (sfd, _) in &targets {
+            if flushed.insert(*sfd) {
+                self.flush(*sfd);
+            }
+        }
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::integer(out, receivers);
+        self.flush(fd);
+    }
+
     /// Enforce the keyspace ACL and rewrite each key to `{tenant}:{key}` for a
     /// non-exempt authenticated role (§4.4/§4.5). Exempt roles (service_role,
     /// per `supatype_mask.exempt_roles`) bypass both. Returns the denial kind on
@@ -1568,6 +1790,25 @@ impl Worker {
     }
 
     fn close(&mut self, fd: RawFd) {
+        // P3: drop this fd from every channel/pattern it was subscribed to.
+        if let Some(c) = self.conns.get(&fd) {
+            for ch in c.subs.iter() {
+                if let Some(set) = self.channels.get_mut(ch) {
+                    set.remove(&fd);
+                    if set.is_empty() {
+                        self.channels.remove(ch);
+                    }
+                }
+            }
+            for pat in c.psubs.iter() {
+                if let Some(set) = self.patterns.get_mut(pat) {
+                    set.remove(&fd);
+                    if set.is_empty() {
+                        self.patterns.remove(pat);
+                    }
+                }
+            }
+        }
         let _ = epoll_del(self.epfd, fd);
         unsafe { libc::close(fd) };
         self.conns.remove(&fd);
@@ -1577,6 +1818,95 @@ impl Worker {
 #[inline]
 fn itoa(n: i64) -> Vec<u8> {
     n.to_string().into_bytes()
+}
+
+/// Redis-style glob match (PSUBSCRIBE / KEYS semantics): `*` any run, `?` one
+/// byte, `[...]` a class (ranges with `-`, negated with `^`), `\` escapes.
+fn glob_match(mut p: &[u8], mut s: &[u8]) -> bool {
+    while let Some(&pc) = p.first() {
+        match pc {
+            b'*' => {
+                while p.first() == Some(&b'*') {
+                    p = &p[1..];
+                }
+                if p.is_empty() {
+                    return true;
+                }
+                loop {
+                    if glob_match(p, s) {
+                        return true;
+                    }
+                    if s.is_empty() {
+                        return false;
+                    }
+                    s = &s[1..];
+                }
+            }
+            b'?' => {
+                if s.is_empty() {
+                    return false;
+                }
+                s = &s[1..];
+                p = &p[1..];
+            }
+            b'[' => {
+                if s.is_empty() {
+                    return false;
+                }
+                let sc = s[0];
+                p = &p[1..];
+                let negate = p.first() == Some(&b'^');
+                if negate {
+                    p = &p[1..];
+                }
+                let mut matched = false;
+                while let Some(&c) = p.first() {
+                    if c == b']' {
+                        break;
+                    }
+                    if c == b'\\' && p.len() >= 2 {
+                        if p[1] == sc {
+                            matched = true;
+                        }
+                        p = &p[2..];
+                    } else if p.len() >= 3 && p[1] == b'-' && p[2] != b']' {
+                        let (lo, hi) = (c.min(p[2]), c.max(p[2]));
+                        if sc >= lo && sc <= hi {
+                            matched = true;
+                        }
+                        p = &p[3..];
+                    } else {
+                        if c == sc {
+                            matched = true;
+                        }
+                        p = &p[1..];
+                    }
+                }
+                if p.first() == Some(&b']') {
+                    p = &p[1..];
+                }
+                if matched == negate {
+                    return false;
+                }
+                s = &s[1..];
+            }
+            b'\\' if p.len() >= 2 => {
+                if s.is_empty() || s[0] != p[1] {
+                    return false;
+                }
+                s = &s[1..];
+                p = &p[2..];
+            }
+            c => {
+                if s.is_empty() || s[0] != c {
+                    return false;
+                }
+                s = &s[1..];
+                p = &p[1..];
+            }
+        }
+    }
+    s.is_empty()
 }
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
@@ -1963,5 +2293,27 @@ mod auth_tests {
         assert!(!cred("sha256$nothex$deadbeef").verify(b"x"));
         assert!(!cred("sha256$").verify(b"x"));
         assert!(!cred("sha256$aa").verify(b"x")); // missing hash segment
+    }
+
+    #[test]
+    fn glob_matches() {
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"news.*", b"news.tech"));
+        assert!(!glob_match(b"news.*", b"sports.x"));
+        assert!(glob_match(b"h?llo", b"hello"));
+        assert!(glob_match(b"h?llo", b"hallo"));
+        assert!(!glob_match(b"h?llo", b"hllo")); // ? needs exactly one byte
+        assert!(glob_match(b"h[ae]llo", b"hello"));
+        assert!(glob_match(b"h[ae]llo", b"hallo"));
+        assert!(!glob_match(b"h[ae]llo", b"hillo"));
+        assert!(glob_match(b"h[a-c]t", b"hbt"));
+        assert!(!glob_match(b"h[a-c]t", b"hdt"));
+        assert!(glob_match(b"h[^x]t", b"hat"));
+        assert!(!glob_match(b"h[^x]t", b"hxt"));
+        assert!(glob_match(b"a\\*b", b"a*b")); // escaped star is literal
+        assert!(!glob_match(b"a\\*b", b"axb"));
+        assert!(glob_match(b"", b""));
+        assert!(!glob_match(b"", b"x"));
+        assert!(glob_match(b"*.*.*", b"a.b.c"));
     }
 }

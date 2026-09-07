@@ -729,7 +729,14 @@ commit off the worker's snapshot.
     WITHSCORES, REV, LIMIT, exclusive `(` and `±inf` bounds, and (score, member)
     tie ordering (`run_p3_zsets.sh`, 29/29, redis parity; 401k ZADD/s across small
     zsets);
-  - `TYPE` reports string/hash/list/zset/none.
+  - `TYPE` reports string/hash/list/zset/none;
+  - pub/sub — `SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE/PUBLISH` with Redis
+    glob pattern matching (`*`, `?`, `[…]`, `\`), the RESP2 subscribe-mode gate,
+    per-channel receiver counts, `QUIT`, and NOAUTH enforcement
+    (`run_p3_pubsub.sh`, 11/11). Fan-out is local to the RESP worker (the in-PG
+    deployment is single-worker); cross-worker pub/sub — a shared-memory ring or
+    a `LISTEN`/`NOTIFY` bridge — is a follow-up, as is tenant-scoping channel
+    names (they are a flat namespace in this slice).
 
   Aggregates are stored as a compact length-prefixed blob in the slab (Redis's
   small-collection philosophy), so ops are O(n) on the collection — a fit for
@@ -737,7 +744,8 @@ commit off the worker's snapshot.
   blob-rewrite worst case by design; a native shmem structure for very large
   collections is a later upgrade. Aggregate values are currently in-memory only
   (not persisted): the P1 ring carries no type tag, so durable aggregates are a
-  follow-up. Pub/sub remains to build (§5).
+  follow-up. The P3 command surface (§5) — hashes, lists, sorted sets, pub/sub —
+  is now built; what remains there is durable aggregates and cross-worker pub/sub.
 - Single in-PG worker; multi-worker scale-out shown via the standalone daemon
   (the in-PG version would register N background workers).
 - `ShmemInitStruct` (PG16) rather than `GetNamedDSMSegment` (PG17); equivalent
