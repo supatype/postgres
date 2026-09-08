@@ -1,0 +1,142 @@
+name: pg_keyspace tests
+
+on:
+  pull_request:
+    paths:
+      - 'extensions/pg_keyspace/**'
+      - '.github/workflows/test-pg-keyspace.yml'
+  push:
+    branches: [main, develop]
+    paths:
+      - 'extensions/pg_keyspace/**'
+      - '.github/workflows/test-pg-keyspace.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PGRX_VERSION: '0.12.9'
+
+jobs:
+  # Job 1 (highest priority): fast, self-contained. Rust unit tests need no
+  # Postgres; the extension build catches compile breaks in the pgrx crate.
+  unit-and-build:
+    name: unit tests + extension build (PG${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            extensions/pg_keyspace/poc/target
+            extensions/pg_keyspace/extension/target
+          key: pgks-cargo-${{ runner.os }}-pg${{ matrix.pg }}-${{ hashFiles('extensions/pg_keyspace/**/Cargo.lock') }}
+
+      # ---- core unit tests: pure Rust, no Postgres needed --------------------
+      - name: Unit tests (poc core)
+        working-directory: extensions/pg_keyspace/poc
+        run: cargo test --locked
+
+      # ---- extension build: needs PG17 headers + libclang (pgrx bindgen) -----
+      - name: Add the PostgreSQL apt repository
+        run: |
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+      - name: Install PostgreSQL ${{ matrix.pg }} + build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} \
+            clang libclang-dev llvm-dev
+
+      - name: Install cargo-pgrx ${{ env.PGRX_VERSION }}
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+
+      - name: Initialise pgrx against the system PostgreSQL ${{ matrix.pg }}
+        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Build the extension (compile check)
+        working-directory: extensions/pg_keyspace/extension
+        run: cargo build --locked --no-default-features --features pg${{ matrix.pg }}
+
+  # Job 2: RESP conformance + integration. Drives the standalone daemon and a
+  # real redis-server the way the bench harnesses do — no Postgres required.
+  integration:
+    name: RESP conformance (daemon + redis)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            extensions/pg_keyspace/poc/target
+          key: pgks-poc-${{ runner.os }}-${{ hashFiles('extensions/pg_keyspace/poc/Cargo.lock') }}
+
+      - name: Install redis (server + tools)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends redis-server redis-tools
+
+      - name: Build daemon + standby binaries
+        working-directory: extensions/pg_keyspace/poc
+        run: cargo build --locked --release --bins
+
+      - name: Start redis (reference for parity checks)
+        run: |
+          redis-server --port 6379 --daemonize yes --save '' --appendonly no
+          for _ in $(seq 1 20); do redis-cli -p 6379 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
+          redis-cli -p 6379 PING
+
+      - name: Run conformance + integration benches
+        working-directory: extensions/pg_keyspace
+        env:
+          DAEMON: ${{ github.workspace }}/extensions/pg_keyspace/poc/target/release/pgkeyspaced
+          REPLICA: ${{ github.workspace }}/extensions/pg_keyspace/poc/target/release/pgks-replica
+        run: |
+          set -u
+          fail=0
+          runbench() {           # runbench <script> [env assignments...]
+            local script="$1"; shift
+            echo "::group::$script"
+            if env "$@" bash "bench/$script"; then echo "OK  $script";
+            else echo "FAIL $script"; fail=1; fi
+            echo "::endgroup::"
+          }
+
+          # Self-contained: each starts its own daemon (and standby) and cleans up.
+          runbench run_p1_replication.sh
+          runbench run_p3_bighash.sh
+          runbench run_p3_biglist.sh
+          runbench run_p3_bigzset.sh
+          runbench run_p3_pubsub_xworker.sh
+
+          # Type conformance + WRONGTYPE + redis parity, against one daemon.
+          "$DAEMON" --workers 1 --port 6400 --keys-per-worker 200000 --shmem-mb 128 \
+            >/tmp/pgks_ci_daemon.log 2>&1 &
+          dpid=$!
+          for _ in $(seq 1 30); do redis-cli -p 6400 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
+          for s in run_p3_hashes.sh run_p3_lists.sh run_p3_zsets.sh run_p3_pubsub.sh; do
+            runbench "$s" RESP=6400
+          done
+          kill $dpid 2>/dev/null || true
+
+          echo "===================================="
+          [ "$fail" -eq 0 ] && echo "all benches passed" || echo "some benches FAILED"
+          exit $fail
