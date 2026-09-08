@@ -29,7 +29,7 @@ prerequisite.
 
 ## Why pg_keyspace?
 
-If you run PostgREST/Supabase-style stacks, you typically also run Valkey/Redis
+If you put PostgREST in front of Postgres, you typically also run Valkey/Redis
 as a *second* stateful service: another thing to deploy, secure, monitor, back
 up, and keep in sync with the database. `pg_keyspace` collapses that into
 Postgres itself.
