@@ -89,12 +89,13 @@ static GUC_TTL_SWEEP_SECS: GucSetting<i32> = GucSetting::<i32>::new(5);
 static GUC_ROWCACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 
 /// Whether the RESP worker requires `supatype_mask` to be loaded (and outermost)
-/// before it will serve (§4.1). Default ON for the Supatype platform, where RESP
-/// must never expose rows the mask would have rewritten. Set OFF to run
-/// pg_keyspace standalone as a plain Postgres-native keyspace + RLS-aware row
-/// cache, with no dependency on supatype_mask. When mask IS present, its load
-/// order is still checked either way.
-static GUC_REQUIRE_MASK: GucSetting<bool> = GucSetting::<bool>::new(true);
+/// before it will serve (§4.1). Default OFF: pg_keyspace runs standalone as a
+/// plain Postgres-native keyspace + RLS-aware row cache, with no dependency on
+/// supatype_mask. Set ON in the Supatype platform, where RESP must never expose
+/// rows the mask would have rewritten — the worker then fails closed unless mask
+/// is loaded and outermost. When mask IS present, its load order is checked
+/// either way.
+static GUC_REQUIRE_MASK: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// TLS for the RESP wire (§4.5): when both a cert and key file are set, every
 /// RESP connection is wrapped in TLS, so the AUTH password and values are
@@ -417,8 +418,9 @@ pub extern "C" fn _PG_init() {
     GucRegistry::define_bool_guc(
         "pg_keyspace.require_mask",
         "Require supatype_mask to be loaded (and outermost) before serving (§4.1)",
-        "On (default) for the Supatype platform. Off runs pg_keyspace standalone \
-         with no supatype_mask dependency; when mask is present its order is still checked.",
+        "Off (default): pg_keyspace runs standalone, no supatype_mask dependency. \
+         On: fail closed unless mask is loaded and outermost (the Supatype platform \
+         sets this). When mask is present its order is checked either way.",
         &GUC_REQUIRE_MASK,
         GucContext::Postmaster,
         GucFlags::empty(),
