@@ -10,7 +10,7 @@ use crate::crc16;
 use crate::pubsub;
 use crate::resp::{self, Parse};
 use crate::ring;
-use crate::store::{now_micros, Lookup, Store, KIND_HASH, KIND_LIST, KIND_ZSET};
+use crate::store::{now_micros, Lookup, Store, KIND_HASH, KIND_LIST, KIND_SET, KIND_ZSET};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::{Read, Write};
@@ -1390,6 +1390,7 @@ impl Worker {
                                         KIND_HASH => b"hashtable",
                                         k if k == crate::store::KIND_LIST => b"quicklist",
                                         k if k == crate::store::KIND_ZSET => b"skiplist",
+                                        k if k == crate::store::KIND_SET => b"hashtable",
                                         // integer strings report "int" as Redis does
                                         _ if std::str::from_utf8(v)
                                             .ok()
@@ -1521,6 +1522,7 @@ impl Worker {
                         Some((KIND_HASH, _, _)) => "hash",
                         Some((k, _, _)) if k == crate::store::KIND_LIST => "list",
                         Some((k, _, _)) if k == crate::store::KIND_ZSET => "zset",
+                        Some((k, _, _)) if k == crate::store::KIND_SET => "set",
                         Some(_) => "string",
                     };
                     resp::simple(out, t);
@@ -2513,6 +2515,246 @@ impl Worker {
                     }
                 }
             }
+            // ---- sets ----------------------------------------------
+            b"SADD" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'sadd'");
+                    return;
+                }
+                let (mut s, exp) = match load_set(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let mut added = 0i64;
+                for m in &args[2..] {
+                    if s.add(m) {
+                        added += 1;
+                    }
+                }
+                save_set(&store, &args[1], &s, exp);
+                resp::integer(out, added);
+            }
+            b"SREM" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'srem'");
+                    return;
+                }
+                let (mut s, exp) = match load_set(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let mut removed = 0i64;
+                for m in &args[2..] {
+                    if s.remove(m) {
+                        removed += 1;
+                    }
+                }
+                save_set(&store, &args[1], &s, exp);
+                resp::integer(out, removed);
+            }
+            b"SCARD" => {
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'scard'");
+                    return;
+                }
+                let raw = match set_raw(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::integer(out, raw.map(aggr::set_card).unwrap_or(0) as i64);
+            }
+            b"SISMEMBER" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'sismember'");
+                    return;
+                }
+                let raw = match set_raw(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let hit = raw.map(|b| aggr::set_contains(b, &args[2])).unwrap_or(false);
+                resp::integer(out, if hit { 1 } else { 0 });
+            }
+            b"SMISMEMBER" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'smismember'");
+                    return;
+                }
+                let raw = match set_raw(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::array_header(out, nargs - 2);
+                for m in &args[2..] {
+                    let hit = raw.map(|b| aggr::set_contains(b, m)).unwrap_or(false);
+                    resp::integer(out, if hit { 1 } else { 0 });
+                }
+            }
+            b"SMEMBERS" => {
+                if nargs != 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'smembers'");
+                    return;
+                }
+                let (s, _) = match load_set(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                resp::array_header(out, s.len());
+                for m in &s.members {
+                    resp::bulk(out, m);
+                }
+            }
+            b"SPOP" => {
+                // SPOP key [count]
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'spop'");
+                    return;
+                }
+                let (mut s, exp) = match load_set(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if nargs < 3 {
+                    if s.is_empty() {
+                        resp::nil(out);
+                        return;
+                    }
+                    let i = (rng_next(&mut rand_seed()) as usize) % s.len();
+                    let m = s.members.remove(i);
+                    save_set(&store, &args[1], &s, exp);
+                    resp::bulk(out, &m);
+                    return;
+                }
+                let count: i64 =
+                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                if count < 0 {
+                    resp::error(out, "ERR value is out of range, must be positive");
+                    return;
+                }
+                if s.is_empty() || count == 0 {
+                    resp::array_header(out, 0);
+                    return;
+                }
+                // distinct indices, removed high→low so earlier removes don't shift
+                let mut idx = pick_indices(s.len(), count, rand_seed());
+                idx.sort_unstable_by(|a, b| b.cmp(a));
+                let mut popped: Vec<Vec<u8>> = Vec::with_capacity(idx.len());
+                for i in idx {
+                    popped.push(s.members.remove(i));
+                }
+                save_set(&store, &args[1], &s, exp);
+                resp::array_header(out, popped.len());
+                for m in &popped {
+                    resp::bulk(out, m);
+                }
+            }
+            b"SRANDMEMBER" => {
+                // SRANDMEMBER key [count]  (count < 0 allows repeats)
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'srandmember'");
+                    return;
+                }
+                let (s, _) = match load_set(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if nargs < 3 {
+                    if s.is_empty() {
+                        resp::nil(out);
+                    } else {
+                        let i = (rng_next(&mut rand_seed()) as usize) % s.len();
+                        resp::bulk(out, &s.members[i]);
+                    }
+                    return;
+                }
+                let count: i64 =
+                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                if s.is_empty() || count == 0 {
+                    resp::array_header(out, 0);
+                    return;
+                }
+                let idx = pick_indices(s.len(), count, rand_seed());
+                resp::array_header(out, idx.len());
+                for i in idx {
+                    resp::bulk(out, &s.members[i]);
+                }
+            }
+            b"SMOVE" => {
+                // SMOVE source destination member
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'smove'");
+                    return;
+                }
+                // Validate both types before mutating either side.
+                let (mut src, sexp) = match load_set(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let (mut dst, dexp) = match load_set(&store, &args[2], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if !src.remove(&args[3]) {
+                    resp::integer(out, 0); // member not in source
+                    return;
+                }
+                dst.add(&args[3]);
+                save_set(&store, &args[1], &src, sexp);
+                save_set(&store, &args[2], &dst, dexp);
+                resp::integer(out, 1);
+                if persist_on {
+                    for k in [&args[1], &args[2]] {
+                        stages.push(match store.get_typed(k) {
+                            Some((kind, exp, blob)) => (k.clone(), blob.to_vec(), exp, kind as u8),
+                            None => (k.clone(), Vec::new(), DELETE_TOMBSTONE, b's'),
+                        });
+                    }
+                }
+            }
+            b"SUNION" | b"SINTER" | b"SDIFF" => {
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments");
+                    return;
+                }
+                let mut sets: Vec<aggr::Set> = Vec::with_capacity(nargs - 1);
+                for k in &args[1..] {
+                    match load_set(&store, k, out) {
+                        Some((s, _)) => sets.push(s),
+                        None => return,
+                    }
+                }
+                let result = set_combine(&cmd, &sets);
+                resp::array_header(out, result.len());
+                for m in &result {
+                    resp::bulk(out, m);
+                }
+            }
+            b"SUNIONSTORE" | b"SINTERSTORE" | b"SDIFFSTORE" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments");
+                    return;
+                }
+                let mut sets: Vec<aggr::Set> = Vec::with_capacity(nargs - 2);
+                for k in &args[2..] {
+                    match load_set(&store, k, out) {
+                        Some((s, _)) => sets.push(s),
+                        None => return,
+                    }
+                }
+                let result = set_combine(&cmd, &sets);
+                // Store at the destination, dropping any prior value/TTL (Redis
+                // clears the destination's TTL on *STORE). Auto-stage persists it.
+                let mut ns = aggr::Set::new();
+                for m in &result {
+                    ns.add(m);
+                }
+                if ns.is_empty() {
+                    store.del(&args[1]);
+                } else {
+                    store.set_typed(&args[1], &ns.encode(), 0, KIND_SET);
+                }
+                resp::integer(out, ns.len() as i64);
+            }
             other => resp::error(
                 out,
                 &format!("ERR unknown command '{}'", String::from_utf8_lossy(other)),
@@ -3355,6 +3597,72 @@ fn save_zset(store: &Store, key: &[u8], z: &aggr::ZSet, exp: i64) {
     }
 }
 
+/// Borrow the raw set blob at `key` for O(1) SISMEMBER/SCARD off the stored
+/// value. Outer `None` = WRONGTYPE (written to `out`); inner `None` = key absent.
+fn set_raw<'a>(store: &'a Store, key: &[u8], out: &mut Vec<u8>) -> Option<Option<&'a [u8]>> {
+    match store.get_typed(key) {
+        None => Some(None),
+        Some((KIND_SET, _, v)) => Some(Some(v)),
+        Some(_) => {
+            resp::error(out, WRONGTYPE);
+            None
+        }
+    }
+}
+
+/// Load the set at `key` (empty if absent). Returns None and writes `WRONGTYPE`
+/// if the key holds a non-set value.
+fn load_set(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::Set, i64)> {
+    match store.get_typed(key) {
+        None => Some((aggr::Set::new(), 0)),
+        Some((KIND_SET, exp, v)) => Some((aggr::Set::decode(v), exp)),
+        Some(_) => {
+            resp::error(out, WRONGTYPE);
+            None
+        }
+    }
+}
+
+/// Store a set back, or delete the key if it became empty (Redis semantics).
+fn save_set(store: &Store, key: &[u8], s: &aggr::Set, exp: i64) {
+    if s.is_empty() {
+        store.del(key);
+    } else {
+        store.set_typed(key, &s.encode(), remaining_ttl(exp), KIND_SET);
+    }
+}
+
+/// Union / intersection / difference of the given sets, selected by the command
+/// name (the plain and *STORE variants share this). INTER/DIFF are computed
+/// relative to the first set; an empty input yields an empty result.
+fn set_combine(cmd: &[u8], sets: &[aggr::Set]) -> Vec<Vec<u8>> {
+    if cmd == b"SUNION" || cmd == b"SUNIONSTORE" {
+        let mut r = aggr::Set::new();
+        for s in sets {
+            for m in &s.members {
+                r.add(m);
+            }
+        }
+        return r.members;
+    }
+    if sets.is_empty() {
+        return Vec::new();
+    }
+    let inter = cmd == b"SINTER" || cmd == b"SINTERSTORE";
+    let mut r = Vec::new();
+    'outer: for m in &sets[0].members {
+        for s in &sets[1..] {
+            // INTER keeps members present in every set; DIFF keeps members in
+            // none of the rest.
+            if s.contains(m) != inter {
+                continue 'outer;
+            }
+        }
+        r.push(m.clone());
+    }
+    r
+}
+
 /// Which argument positions of a command are keys (for ACL + tenant scoping).
 fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
     match cmd {
@@ -3370,7 +3678,10 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
         | b"LINDEX" | b"LRANGE" | b"LSET" | b"LTRIM" | b"LINSERT" | b"LREM" | b"LPOS"
         | b"ZADD" | b"ZSCORE" | b"ZMSCORE" | b"ZCARD" | b"ZREM" | b"ZINCRBY"
         | b"ZRANK" | b"ZREVRANK" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE"
-        | b"ZREVRANGEBYSCORE" | b"ZCOUNT" | b"ZPOPMIN" | b"ZPOPMAX" | b"ZRANDMEMBER" => {
+        | b"ZREVRANGEBYSCORE" | b"ZCOUNT" | b"ZPOPMIN" | b"ZPOPMAX" | b"ZRANDMEMBER"
+        // sets: the key is always the first argument
+        | b"SADD" | b"SREM" | b"SCARD" | b"SISMEMBER" | b"SMISMEMBER" | b"SMEMBERS"
+        | b"SPOP" | b"SRANDMEMBER" => {
             if nargs > 1 {
                 vec![1]
             } else {
@@ -3380,13 +3691,18 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
         b"DEL" | b"UNLINK" | b"EXISTS" | b"MGET" | b"TOUCH" => (1..nargs).collect(),
         // MSET/MSETNX interleave key value key value … — scope every key slot.
         b"MSET" | b"MSETNX" => (1..nargs).step_by(2).collect(),
-        // RENAME/COPY/LMOVE/RPOPLPUSH take a source and destination key.
-        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" => {
+        // RENAME/COPY/LMOVE/RPOPLPUSH/SMOVE take a source and destination key.
+        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" | b"SMOVE" => {
             if nargs > 2 {
                 vec![1, 2]
             } else {
                 vec![]
             }
+        }
+        // Set operations: every argument is a key (dst + sources for the STORE
+        // variants; all operands otherwise).
+        b"SUNION" | b"SINTER" | b"SDIFF" | b"SUNIONSTORE" | b"SINTERSTORE" | b"SDIFFSTORE" => {
+            (1..nargs).collect()
         }
         // OBJECT <SUBCOMMAND> key — the key is the third argument.
         b"OBJECT" => {
@@ -3457,6 +3773,14 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"ZINCRBY"
             | b"ZPOPMIN"
             | b"ZPOPMAX"
+            // set mutations
+            | b"SADD"
+            | b"SREM"
+            | b"SPOP"
+            | b"SMOVE"
+            | b"SUNIONSTORE"
+            | b"SINTERSTORE"
+            | b"SDIFFSTORE"
     )
 }
 
@@ -3469,6 +3793,8 @@ fn is_aggregate_write(cmd: &[u8]) -> bool {
             | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"LPOP" | b"RPOP" | b"LSET" | b"LTRIM"
             | b"LINSERT" | b"LREM"
             | b"ZADD" | b"ZREM" | b"ZINCRBY" | b"ZPOPMIN" | b"ZPOPMAX"
+            // sets: SMOVE stages both keys manually, so it is not auto-staged here
+            | b"SADD" | b"SREM" | b"SPOP" | b"SUNIONSTORE" | b"SINTERSTORE" | b"SDIFFSTORE"
     )
 }
 

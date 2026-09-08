@@ -34,6 +34,8 @@ pub const KIND_STR: u32 = b's' as u32;
 pub const KIND_HASH: u32 = b'h' as u32;
 pub const KIND_LIST: u32 = b'l' as u32;
 pub const KIND_ZSET: u32 = b'z' as u32;
+// 'S' (distinct from KIND_STR 's'): a serialized unordered set of members.
+pub const KIND_SET: u32 = b'S' as u32;
 
 #[repr(C)]
 struct SegHeader {
