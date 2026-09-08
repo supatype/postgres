@@ -4,6 +4,7 @@ ARG PGVECTOR_VERSION=0.8.0
 ARG PG_NET_VERSION=0.14.0
 ARG PG_GRAPHQL_VERSION=1.5.9
 ARG PGJWT_COMMIT=f3d82fd30151e754e19ce5d6a06c71c20689ce3d
+ARG PG_KEYSPACE_VERSION=0.1.0
 
 # PGDG apt repo (for pg_cron, postgis, wal2json, pgsodium)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -50,6 +51,16 @@ RUN ARCH=$(dpkg --print-architecture) \
      -o /tmp/pg_graphql.deb \
   && dpkg -i /tmp/pg_graphql.deb && rm /tmp/pg_graphql.deb
 
+# pg_keyspace — Postgres-native RESP keyspace + PostgREST row cache (Rust/pgrx —
+# pulled prebuilt from a GitHub release like pg_graphql; too slow to compile here).
+# Bundled and creatable, but NOT auto-loaded: it serves RESP only once an operator
+# adds it to shared_preload_libraries (it requires that to run). See
+# /etc/postgresql-custom/pg_keyspace.conf for the settings to enable it.
+RUN ARCH=$(dpkg --print-architecture) \
+  && curl -fsSL "https://github.com/supatype/postgres/releases/download/pg_keyspace-v${PG_KEYSPACE_VERSION}/pg_keyspace-v${PG_KEYSPACE_VERSION}-pg17-${ARCH}-linux-gnu.deb" \
+     -o /tmp/pg_keyspace.deb \
+  && dpkg -i /tmp/pg_keyspace.deb && rm /tmp/pg_keyspace.deb
+
 # pg_guard — role/extension privilege enforcement (bundled in extensions/)
 COPY extensions/pg_guard/ /tmp/pg_guard/
 RUN cd /tmp/pg_guard && make clean && make && make install && rm -rf /tmp/pg_guard
@@ -69,6 +80,7 @@ COPY config/pg_hba.conf /etc/postgresql/pg_hba.conf
 COPY config/pg_ident.conf /etc/postgresql/pg_ident.conf
 COPY config/pg_guard.conf /etc/postgresql-custom/pg_guard.conf
 COPY config/supatype_mask.conf /etc/postgresql-custom/supatype_mask.conf
+COPY config/pg_keyspace.conf /etc/postgresql-custom/pg_keyspace.conf
 COPY config/extension-custom-scripts/ /etc/postgresql-custom/extension-custom-scripts/
 
 # Bootstrap migrations: the stock postgres entrypoint only runs *.sh / *.sql in this
