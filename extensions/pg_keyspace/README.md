@@ -1,233 +1,353 @@
 # pg_keyspace
 
-A Postgres extension implementing the [pg_keyspace technical plan](../../docs): a
-Postgres-native cache and RESP-compatible keyspace intended to replace Valkey in
-the Supatype stack, plus a transparent row cache for PostgREST (Mode B). It began
-as the §12 **P0 spike** — the kill-criterion measurement *"if a hit is not under
-80µs, stop and keep Valkey"* — and has since grown through P1–P3 into a working
-extension.
+**A Redis/Valkey-compatible cache that lives *inside* PostgreSQL.**
 
-**The P0 hit is under 80µs and ties Valkey**, and the phases since are built and
-benchmarked (P1 storage/durability, P2 security + hardening + TLS, Mode B row
-cache, and the start of the P3 command surface). See
-[`results/REPORT.md`](results/REPORT.md) for the full write-up and the concerns
-matrix, and the scope note below for exactly what is and isn't built.
+`pg_keyspace` is a Postgres extension that runs a RESP2 (Redis wire protocol)
+server in a background worker over a shared-memory keyspace, plus a transparent
+row cache for PostgREST. Stock clients — `redis-cli`, `ioredis`, `redis-py`,
+`redis-benchmark` — talk to it unmodified on `:6381`, while the *same bytes* are
+readable and writable from SQL. One system, one thing to run, one security model.
 
-> Scope so far: **P0** (latency/throughput vs Valkey), **P1** (storage,
-> durability, crash recovery, off-event-loop persistence), **P2 security for
-> Mode A** — validated on the real base (PG17 + `supatype_mask` + `pg_guard`):
-> load-order assertion, seclabel self-check, RESP `AUTH`→role, keyspace ACL,
-> forced tenant scoping (§4) — and **P6 Mode B (the transparent row cache):** a
-> planner hook + `CustomScan` that substitutes a cached row *only at the scan
-> leaf*, so RLS and `supatype_mask` re-apply above it (§4.6). Its security suite
-> passes 10/10 (`results/p6_security.txt`): a non-owner is denied a physically
-> cached foreign row and a non-exempt role gets NULL for a masked column that is
-> genuinely present, unmasked, in the cache. Coherence is kept by a **keys-only**
-> logical-decoding worker (§3.5): the `supacache_keys` output plugin emits only
-> `<relid> <pk>` — never a column value — so a write drops the cached key with no
-> way for WAL data to leak (coherence 10/10, `results/p6_invalidation.txt`;
-> PostgREST-pattern 4/4, `results/p6_postgrest_pattern.txt`). The Custom Scan
-> roughly halves executor time for a single-row pk lookup (`results/p6_rowcache.txt`),
-> and the §4.3c masked-read concern is quantified (`results/p6_maskcost.txt`).
-> Remaining P6 items are non-security: the real PostgREST binary (blocked by
-> sandbox egress). Auth is hardened: RESP secrets are stored as salted SHA-256 and
-> verified in constant time (`supacache.set_credential`), and credentials
-> hot-reload on `SELECT pg_reload_conf()` (`results/p2_hardening.txt`, 10/10), and
-> the RESP wire is TLS-wrapped (rustls) when a cert+key are configured, so the
-> AUTH password is encrypted in transit (`results/p2_tls.txt`, 7/7). Still a POC
-> (self-signed cert, no rotation/managed CA); don't deploy as-is.
+It began as a kill-criterion spike — *"if a cache hit is not under 80 µs, stop
+and keep Valkey"* — and the hit came in at **~34 µs, tying Valkey**. It has since
+grown a full command surface, four durability tiers with real crash recovery and
+synchronous replication, a security model that inherits Postgres roles/RLS/column
+masking, a transparent PostgREST row cache, and horizontal multi-worker
+scale-out.
 
-## What it is
+> **Status:** a working extension and an advanced proof of concept, built and
+> benchmarked against PostgreSQL 17.6. Not yet production-hardened (see
+> [Limitations](#limitations)). Don't deploy to production as-is.
 
-A real Postgres extension (built here against PG17.6 for P2/P6; P0/P1 numbers
-came from a PG16 spike box), loaded via `shared_preload_libraries`, that:
+---
 
-- allocates a **Postgres shared-memory segment** (`shmem_request_hook` +
-  `shmem_startup_hook`) and lays an open-addressed hash table + size-classed
-  slab allocator + CLOCK eviction over it (§3.2);
-- runs an **`epoll` RESP event loop in a background worker** (a real Postgres
-  backend) on TCP `:6380`, so stock `redis-cli`/`ioredis`/`redis-benchmark`
-  drive it unmodified (§3.1, §5);
-- exposes a **`supacache.*` SQL surface** that reads the same segment directly
-  in the calling backend — the ~nanosecond in-process path the plan's
-  mask-predicate accelerator depends on (§6);
-- models the **four durability tiers** with a commit batcher (§3.4).
+## Why pg_keyspace?
+
+If you run PostgREST/Supabase-style stacks, you typically also run Valkey/Redis
+as a *second* stateful service: another thing to deploy, secure, monitor, back
+up, and keep in sync with the database. `pg_keyspace` collapses that into
+Postgres itself.
+
+- **One service, not two.** The cache is a background worker inside your existing
+  Postgres. No separate cluster to provision, patch, or page someone about.
+- **The same data, two ways.** A key written over RESP is readable from SQL
+  (`supacache.get`) and vice-versa — the RESP worker and the SQL functions map
+  the *same* shared-memory segment. In-backend reads are **~9 ns** (no socket, no
+  copy), which is the path a mask predicate or a stored function can use directly.
+- **Security you already trust.** RESP `AUTH` maps to a Postgres role; keys are
+  ACL-checked and **force-scoped per tenant** (`{tenant}:{key}`); pub/sub channels
+  are tenant-scoped too. The wire is TLS (native rustls). Nothing is bolted on —
+  it reuses `supatype_mask.exempt_roles` and integrates with `pg_guard`.
+- **A transparent cache for PostgREST (Mode B).** Register a table's primary key
+  and a `WHERE pk = $1` lookup is served from shared memory by a planner
+  `CustomScan` — **no application changes**. RLS and column masking still apply
+  *above* the cached row, and a **keys-only** logical-decoding worker keeps it
+  coherent automatically. No cache-invalidation glue to write and get wrong.
+- **Durability is a dial, per deployment.** `ephemeral` (Valkey-parity, shmem
+  only) → `relaxed` (async persist) → `durable` (fsync before ack) → `replicated`
+  (**real** synchronous streaming to a standby). Writes survive `kill -9` and are
+  rebuilt from Postgres tables on restart.
+- **Real Redis data types**, with native large-collection structures: strings,
+  counters, TTLs, hashes, lists, sorted sets, and pub/sub — and past a threshold,
+  hashes/lists/zsets switch to indexed encodings so `HGET`/`LINDEX`/`ZSCORE`/
+  `ZRANK` stay O(1)/O(log n) at 10 k+ elements instead of O(n).
+- **Horizontal scale-out inside Postgres.** `pg_keyspace.workers = N` runs N
+  shared-nothing slot workers; aggregate throughput scales roughly linearly.
+
+---
+
+## pg_keyspace vs Valkey
+
+Honest, feature-by-feature. Valkey is a mature, battle-tested, best-in-class
+in-memory store; `pg_keyspace` is an early extension that trades a little raw
+ceiling for deep Postgres integration.
+
+| | **pg_keyspace** | **Valkey / Redis** |
+|---|---|---|
+| Deployment | A background worker inside Postgres — no extra service | Separate service/cluster to run & operate |
+| Cache-hit latency (`GET`, closed loop) | **~34–39 µs** (ties Valkey) | ~35–39 µs |
+| Pipelined throughput (1 worker) | ~500–556 k ops/s | ~537–628 k ops/s |
+| Horizontal scale-out | N shared-nothing workers (**2.46 M SET/s** at 4) | Cluster mode / multiple shards |
+| SQL access to the same data | **Yes** — `supacache.*`, ~9 ns in-backend | No (separate datastore) |
+| Transparent PostgREST/row cache | **Yes** — planner `CustomScan`, auto-coherent | No (app-managed) |
+| Auth / ACL / multi-tenant isolation | Postgres roles, keyspace ACL, forced tenant scoping | Redis ACLs (separate user store) |
+| Column masking / RLS on cached rows | **Yes** — re-applied above the cache | N/A |
+| Durability | Tiered: ephemeral→relaxed→durable(fsync)→replicated; crash-recovers from PG tables | RDB / AOF snapshots & log |
+| Synchronous replication | **Yes** — ack held until standby fsync | Async by default (WAIT for quorum) |
+| Data types | strings, hashes, lists, sorted sets, pub/sub (+ TTL) | Full superset (streams, HLL, bitmaps, geo, …) |
+| Raw write ceiling under no-persistence load | Lower (bounded by 1 event loop / worker) | **Higher** — purpose-built |
+| Maturity / ecosystem / ops tooling | Early POC | **Mature**, huge ecosystem |
+
+**Use `pg_keyspace` when** the cache and the database should be one system: you
+want SQL and RESP over the same data, a transparent row cache for PostgREST,
+per-key durability, and Postgres-native security — without operating a second
+stateful service. **Stay on Valkey when** you need maximum single-node write
+throughput, the full command/type surface, or mature cluster operations today.
+
+---
+
+## Benchmarks
+
+Measured on a 4-vCPU Linux box, 512-byte values, against Redis 7.0.15 as the
+reference. Reproduce any of these with the scripts in [`bench/`](bench/) (they
+print their own pass/fail and numbers).
+
+### Latency & throughput vs Redis (`bench/run_benchmarks.sh`)
+
+| Operation | pg_keyspace | Redis 7.0.15 |
+|---|---:|---:|
+| `SET` closed-loop p50 | **39 µs** | 39 µs |
+| `GET` closed-loop p50 | **39 µs** | 39 µs |
+| `SET` pipelined (`-c50 -P16`) | **556 k/s** | 537 k/s |
+| `GET` pipelined (`-c50 -P16`) | 500 k/s | 628 k/s |
+| In-backend SQL read (§6, in-process) | **8.9 ns** | — (n/a) |
+| SQL surface via libpq (`SELECT supacache.get`) | 0.048 ms, 21 k tps | — |
+
+### Horizontal scale-out (`bench/run_scaleout.sh`, aggregate rps)
+
+| Workers | SET agg | GET agg |
+|---:|---:|---:|
+| 1 | 568 k/s | 604 k/s |
+| 2 | 1.10 M/s | 1.13 M/s |
+| 4 | **2.46 M/s** | 2.11 M/s |
+
+In-PG (`pg_keyspace.workers=4`, over TLS): single worker 105 k SET/s → 4-worker
+aggregate **609 k SET/s**, shared-nothing (a key on one worker is invisible on
+the others). — `bench/run_p0_scaleout_inpg.sh`
+
+### Native large collections — indexed vs flat encoding (ns/op)
+
+Past a threshold, collections switch to an indexed in-value structure. Point
+reads go from O(n) to O(1)/O(log n) — dramatic at scale, byte-for-byte
+Redis-compatible (`bench/run_p3_big{hash,list,zset}.sh`, `poc/examples/bench_*`):
+
+| Op | Elements | Flat (inline) | Indexed | Speedup |
+|---|---:|---:|---:|---:|
+| `HGET` | 50 k | 97 µs | **14.9 ns** | 6,528× |
+| `LINDEX` | 50 k | 50 µs | **1.8 ns** | 27,468× |
+| `ZSCORE` | 10 k | 271 µs | **11.3 ns** | 23,972× |
+| `ZRANK` | 10 k | 1,265 µs | **66.9 ns** | 18,905× |
+
+### Durability tiers (`bench/run_durability.sh`)
+
+| Tier | closed-loop p50 | ack means |
+|---|---:|---|
+| ephemeral | 39 µs | in shmem (Valkey-parity) |
+| relaxed | 39 µs | queued, persisted async |
+| durable | 1.04 ms | committed to `supacache.kv` (fsync) |
+| replicated | ~1.67 ms | **fsync + standby ack** (real sync rep) |
+
+- Durable writes are **off the event loop** (a shared-memory ring drained by
+  dedicated persist workers): ~107 k/s sustained per worker, scaling to **145 k/s**
+  across 4 (`bench/run_persist_scaleout.sh`), while reads stay unaffected (write
+  flood tail cut from 170 ms → 5 ms).
+- **Crash recovery:** after `kill -9`, keys rebuild from `supacache.kv` at
+  ~3.5 µs/key; every acked durable write survives.
+- **TTL expiry** is an O(1) partition `DROP` (3.2 ms) vs an O(n) `DELETE`
+  (141 ms for 100 k rows) — no vacuum churn.
+
+### Mode B row cache (masked-read cost, `bench/run_p6_maskcost.sh`)
+
+A row-independent mask predicate plans as an `InitPlan` (evaluated **once** per
+scan): **18.6 ms** for 100 k masked rows vs **1,127 ms** for a naive per-row
+predicate — collapsing a 96× overhead to ~1.5× over the unmasked baseline.
+
+---
+
+## Install & use
+
+Requires PostgreSQL (built/tested against 17.6), `cargo-pgrx` 0.12.9, and — for
+Mode A security — the `supatype_mask` and (optionally) `pg_guard` extensions.
+
+```bash
+# 1. core unit tests (no Postgres needed)
+cd extensions/pg_keyspace/poc && cargo test
+
+# 2. build + install the extension
+cd ../extension
+cargo pgrx install --release --pg-config /path/to/pg_config
+
+# 3. (Mode B invalidation only) build the keys-only decode plugin
+cd ../plugin && make install PG_CONFIG=/path/to/pg_config
+```
+
+Add to `postgresql.conf` and restart:
+
+```ini
+shared_preload_libraries = 'pg_keyspace, supatype_mask'  # pg_keyspace BEFORE mask (§4.1)
+pg_keyspace.port = 6381
+# pg_keyspace.require_mask = off   # to run standalone with no mask dependency
+```
+
+```sql
+CREATE EXTENSION pg_keyspace;
+```
+
+Now stock RESP clients and SQL share one keyspace:
+
+```bash
+redis-cli -p 6381 SET foo bar
+redis-cli -p 6381 GET foo          # "bar"
+```
+```sql
+SELECT convert_from(supacache.get('foo'), 'UTF8');   -- 'bar'  (same segment)
+SELECT * FROM supacache.stats();
+```
+
+Redis data types work as expected (`HSET/HGET`, `LPUSH/LRANGE`, `ZADD/ZRANGE`,
+`SUBSCRIBE/PUBLISH`, `EXPIRE`, …), verified for Redis parity at 10 k-element
+scale.
+
+### Durability & crash recovery
+
+```ini
+pg_keyspace.durability = 'durable'     # ephemeral | relaxed | durable | replicated
+```
+```sql
+SELECT count(*) FROM supacache.kv;     -- RESP writes persisted here
+-- kill -9 the cluster, restart:  redis-cli -p 6381 GET foo  ->  still "bar"
+```
+
+The `replicated` tier means *durable + a synchronous standby ack*. Real
+socket-streamed synchronous replication (the ack is held until the standby has
+fsynced the record) is implemented in the standalone daemon with a companion
+`pgks-replica` standby:
+
+```bash
+# standby:
+pgks-replica --host 0.0.0.0 --port 7400 --workers 1 --wal-dir /var/lib/pgks-standby
+# primary:
+pgkeyspaced --tier replicated --replica-addr standby-host --replica-port 7400
+```
+
+Inside the extension, `pg_keyspace.durability = 'replicated'` runs the durable
+persist path with `synchronous_commit = remote_apply`, so it relies on Postgres's
+own streaming replication for the standby.
+
+### Multi-worker scale-out
+
+```ini
+pg_keyspace.workers = 4     # N shared-nothing workers on port, port+1, … port+N-1
+```
+Clients shard keys across the ports (Redis-Cluster style). Persistence/row-cache
+stay single-worker in this slice, so `workers > 1` runs the ephemeral tier.
+
+### Mode B — transparent PostgREST row cache
+
+```sql
+SELECT supacache.rowcache_register('public.orders', 1);  -- pk = attnum 1 (int/uuid/text)
+SELECT supacache.rowcache_put('public.orders', 42);       -- warm one row
+EXPLAIN SELECT * FROM public.orders WHERE id = 42;
+--  Custom Scan (pg_keyspace_rowcache) on orders
+```
+
+The scan serves the **raw** cached row at the leaf; the relation's RLS quals and
+mask `CASE` expressions re-apply above it, so a role that couldn't see the row (or
+a masked column) via a normal query still can't via the cache. Any single-column
+primary-key type works (int, `uuid`, `text`), and rows with out-of-line (TOASTed)
+values are flattened inline so the cached copy is self-contained. Enable
+automatic coherence:
+
+```ini
+wal_level = logical
+pg_keyspace.rowcache_decode = on     # keys-only decode worker drops changed keys
+pg_keyspace.rowcache_refill = on     # (optional) re-cache a changed hot key instead of dropping
+```
+
+### RESP AUTH, tenant scoping & TLS
+
+```sql
+SELECT supacache.set_credential('alice', 's3cret', 'tenant_a_role', 'tenant_a');
+SELECT pg_reload_conf();   -- worker hot-reloads creds + ACL on SIGHUP, no restart
+```
+```bash
+redis-cli --tls --user alice -a s3cret -p 6381 GET session:1   # NOAUTH without it
+```
+
+Secrets are stored as salted SHA-256 and verified in constant time. Keys and
+pub/sub channels are force-scoped to `{tenant}:` for non-exempt roles, so one
+tenant cannot address or subscribe to another's. Point `tls_cert_file` /
+`tls_key_file` at a PEM cert+key to serve TLS (rotate by swapping the files and
+`SELECT pg_reload_conf()` — no restart).
+
+### Configuration (GUCs)
+
+All are `Postmaster` context (set in `postgresql.conf`).
+
+| GUC | default | meaning |
+|---|---|---|
+| `pg_keyspace.port` | 6380 | RESP listen port (worker *w* uses `port + w`); examples here set 6381 |
+| `pg_keyspace.workers` | 1 | shared-nothing RESP slot workers (§3.1); >1 forces ephemeral |
+| `pg_keyspace.keys` | 1000000 | keyspace capacity per worker (sizes the segment) |
+| `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
+| `pg_keyspace.durability` | `ephemeral` | `ephemeral` \| `relaxed` \| `durable` \| `replicated` |
+| `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables |
+| `pg_keyspace.persist_workers` | 1 | persist workers/rings draining in parallel |
+| `pg_keyspace.ring_mb` | 64 | per-worker RESP→persist ring size (burst absorption) |
+| `pg_keyspace.ttl_bucket_secs` | 10 | TTL time-bucket width (range-partitioned `supacache.kv_ttl`) |
+| `pg_keyspace.require_mask` | `on` | require `supatype_mask` loaded + outermost (§4.1); `off` runs standalone |
+| `pg_keyspace.tls_cert_file` / `tls_key_file` | *(empty)* | PEM cert + key → serve RESP over TLS |
+| `pg_keyspace.rowcache_mb` | 64 | Mode B row-cache segment size (never RESP-addressable) |
+| `pg_keyspace.rowcache_decode` | `off` | keys-only Mode B invalidation worker (needs `wal_level=logical`) |
+| `pg_keyspace.rowcache_refill` | `off` | on: re-cache a changed hot key; off: drop-only (lazy) |
+
+---
 
 ## Layout
 
 ```
 extensions/pg_keyspace/
-├── README.md                 ← you are here
-├── poc/                      ← the shared core (Rust, libc only) + tools
-│   ├── src/
-│   │   ├── store.rs          open-addressed hash, slab allocator, CLOCK eviction (§3.2)
-│   │   ├── shmem.rs          POSIX shmem backing (standalone); PG shmem is used in-extension
-│   │   ├── resp.rs           RESP2 codec (§5)
-│   │   ├── server.rs         epoll event loop, RESP dispatch (§3.1)
-│   │   ├── batcher.rs        commit batching, four durability tiers (§3.4)
-│   │   ├── ring.rs           SPSC shmem ring: RESP worker -> persistence worker (P1)
-│   │   ├── aggr.rs           P3 aggregate value types: hashes, lists, sorted sets (§5)
-│   │   ├── crc16.rs          cluster slot hashing (§3.1)
-│   │   └── bin/
-│   │       ├── pgkeyspaced.rs        standalone daemon (scale-out demo)
-│   │       └── durability_bench.rs   isolated batcher amortisation benchmark
-│   └── Cargo.toml
-├── extension/                ← the pgrx extension (compiles poc/src verbatim via #[path])
-│   ├── src/lib.rs            _PG_init, shmem hooks, RESP worker, persistence worker, supacache.* SQL
-│   ├── Cargo.toml
-│   └── pg_keyspace.control
-├── bench/                    ← benchmark harnesses
-│   ├── run_benchmarks.sh     latency + throughput vs Redis, in-backend §6, libpq
-│   ├── run_durability.sh     per-tier RESP SET (§3.4)
-│   ├── run_scaleout.sh       shared-nothing scaling (§3.1)
-│   ├── run_p2_threats.sh     Mode A security threat table (§4.7)
-│   ├── run_p2_hardening.sh   hashed AUTH secrets + credential hot-reload (§4.5)
-│   ├── run_p2_tls.sh         native TLS on the RESP wire (§4.5)
-│   ├── run_p2_certrotate.sh  TLS cert rotation on SIGHUP (§4.5)
-│   ├── run_p3_hashes.sh      P3 hash type: coverage, WRONGTYPE, redis parity (§5)
-│   ├── run_p3_lists.sh       P3 list type: coverage, WRONGTYPE, redis parity (§5)
-│   ├── run_p3_zsets.sh       P3 sorted-set type: coverage, WRONGTYPE, redis parity (§5)
-│   ├── run_p3_pubsub.sh      P3 pub/sub: SUBSCRIBE/PUBLISH, patterns, gate (§5)
-│   ├── run_p3_durable.sh     P3 durable aggregates: persist + crash recovery (§5/§3.3)
-│   ├── run_p6_maskcost.sh    cost of a masked read + §6 accelerator (§4.3c)
-│   ├── run_p6_security.sh    Mode B row-cache RLS/mask/generic-plan suite (§4.6/§4.7)
-│   ├── run_p6_rowcache.sh    Mode B Custom Scan vs index-scan latency (§7.1)
-│   ├── run_p6_invalidation.sh keys-only decode worker: coherence + no-leak (§3.5)
-│   └── run_p6_postgrest_pattern.sh  PostgREST-shape auth→GET→PATCH→GET (§3.5)
-├── plugin/                    ← supacache_keys: keys-only logical-decoding output plugin (§3.5)
-└── results/                  ← REPORT.md + raw benchmark outputs
+├── poc/                      shared core (Rust, libc only) + tools
+│   └── src/
+│       ├── store.rs          open-addressed hash, size-classed slab, CLOCK eviction (§3.2)
+│       ├── server.rs         epoll RESP2 event loop + command dispatch (§3.1/§5)
+│       ├── resp.rs           RESP2 codec
+│       ├── aggr.rs           hashes/lists/sorted sets, incl. indexed large-collection encodings
+│       ├── pubsub.rs         cross-worker pub/sub bus
+│       ├── batcher.rs        commit batching + the four durability tiers (§3.4)
+│       ├── repl.rs           real synchronous replication to a standby (§3.4)
+│       ├── ring.rs           SPSC shmem ring: RESP worker → persistence worker
+│       ├── crc16.rs          cluster slot hashing
+│       └── bin/
+│           ├── pgkeyspaced.rs      standalone daemon (scale-out demo)
+│           ├── pgks-replica.rs     standalone replication standby
+│           └── durability_bench.rs commit-batcher microbenchmark
+├── extension/                the pgrx extension (compiles poc/src verbatim via #[path])
+│   └── src/lib.rs            _PG_init, shmem hooks, N RESP workers, persist/expiry/invalidation
+│                             workers, Mode B CustomScan, supacache.* SQL surface
+├── plugin/                   supacache_keys: keys-only logical-decoding output plugin (§3.5)
+└── bench/                    reproducible benchmark + conformance harnesses (run_*.sh)
 ```
 
 The extension shares the `poc/src/*.rs` modules **verbatim** (via `#[path]`), so
 the code measured standalone is the same code that runs inside Postgres.
 
-## Build & test
+### Tests & benches
 
-```bash
-# 1. core unit tests (no Postgres needed)
-cd extensions/pg_keyspace/poc
-cargo test
+`cargo test` in `poc/` runs the self-contained unit tests (data structures, slab
+allocator, auth, replication). The `bench/` scripts are integration + conformance
+harnesses grouped by phase — Redis parity for every type (`run_p3_*`), security
+(`run_p2_*`, `run_p6_security.sh`), Mode B coherence for int/uuid/text/TOAST PKs
+(`run_p6_*`), tenant-scoped pub/sub, real synchronous replication
+(`run_p1_replication.sh`), a real PostgREST v12.2.3 end-to-end
+(`run_p6_postgrest_e2e.sh`), and scale-out. Each prints its own `# result: N
+passed, M failed`.
 
-# 2. build + install the extension into a system PostgreSQL 16
-#    (needs postgresql-server-dev-16 and cargo-pgrx 0.12.9 init'd against pg16)
-cd ../extension
-cargo pgrx install --release --pg-config /usr/bin/pg_config
-```
+---
 
-Then in a cluster with `shared_preload_libraries = 'pg_keyspace'`:
+## Limitations
 
-```sql
-CREATE EXTENSION pg_keyspace;
-SELECT supacache.set('k', 'v'::bytea);
-SELECT convert_from(supacache.get('k'), 'UTF8');   -- 'v'
-SELECT * FROM supacache.stats();
-```
+An honest POC, not a production release:
 
-```bash
-redis-cli -p 6380 ping           # PONG  (RESP served by the background worker)
-redis-cli -p 6380 set foo bar
-redis-cli -p 6380 get foo        # "bar" (same shared-memory segment as SQL)
-```
+- **Persistence and the Mode B row cache are single-worker.** `pg_keyspace.workers
+  > 1` runs the ephemeral (Mode A) tier only.
+- **Pub/sub is cross-worker within one process** (the scale-out daemon), not yet
+  cross-*process* for N in-PG background workers.
+- **Mode B caches single-column primary keys** (composite keys are refused); the
+  cache is warmed manually (`rowcache_put`) though invalidation is automatic.
+- Sorted-set score formatting uses Rust's shortest round-trip rather than Redis's
+  `%.17g`, so inexact doubles can print differently (values compare equal).
+- Self-signed TLS by default; no managed CA. Durable/replicated tiers are
+  correct but not throughput-optimised (they serialize on the Postgres WAL).
 
-> **Bootstrap order.** The `supacache` schema and SQL surface are owned by
-> `CREATE EXTENSION`, so run it before relying on persistence or the SQL API. The
-> worker never creates schema objects before the extension exists (doing so would
-> make `CREATE EXTENSION` fail with *"schema supacache is not a member"*); until
-> then it serves RESP in ephemeral mode. With a durable tier set, install the
-> extension in `pg_keyspace.database` and restart once to enable persistence — the
-> log says so if it is missing.
-
-With `pg_keyspace.durability = 'relaxed'` (P1), RESP writes also persist to the
-hash-partitioned `supacache.kv` table and survive a crash — the worker rebuilds
-shmem from the table on startup:
-
-```sql
-SELECT count(*) FROM supacache.kv;                       -- rows persisted from RESP
-SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='foo';  -- 'bar'
--- kill -9 the cluster, restart:  redis-cli -p 6380 get foo  ->  still "bar"
-```
-
-**Mode B — transparent row cache (P6, §7.1).** Register a table's primary-key
-column and cache a row; a `pk = Const` lookup is then served from shared memory
-by a `CustomScan`, transparently, with RLS and `supatype_mask` still applied:
-
-```sql
-SELECT supacache.rowcache_register('public.orders', 1);  -- pk is attnum 1
-SELECT supacache.rowcache_put('public.orders', 42);       -- cache row id=42
-EXPLAIN SELECT * FROM public.orders WHERE id = 42;
---  Custom Scan (pg_keyspace_rowcache) on orders  (Filter: id = 42)
-SELECT * FROM supacache.rowcache_stats();
-```
-
-The scan serves the **raw** cached row at the leaf; the relation's RLS quals and
-mask `CASE` expressions re-apply above it, so a role that couldn't see the row (or
-a masked column) via a normal query still can't via the cache (§4.6).
-
-With `pg_keyspace.rowcache_decode = on` (and `wal_level = logical`), a keys-only
-logical-decoding worker keeps the cache coherent: the `supacache_keys` output
-plugin emits only `<relid> <pk>` for each change — never a column value — and the
-worker drops that key, so the next read falls back to the fresh row. Build/install
-the plugin from `plugin/` (`make install`). Populating (`rowcache_put`) is still
-manual — a warm/refill helper; invalidation is automatic. With
-`pg_keyspace.rowcache_refill = on` a changed *hot* key is re-read and re-cached
-(stays served from the Custom Scan across writes) instead of being dropped; a
-delete always drops.
-
-**RESP AUTH (§4.5).** Register credentials with the helper — it stores a salted
-SHA-256 verifier, never the plaintext — and hot-reload them without a restart:
-
-```sql
-SELECT supacache.set_credential('alice', 's3cret', 'tenant_a_role', 'tenant_a');
-SELECT pg_reload_conf();   -- the RESP worker reloads creds + ACL on SIGHUP
-```
-
-```bash
-redis-cli -p 6380 --user alice -a s3cret GET session:1   # authed; NOAUTH without it
-```
-
-The worker verifies with a constant-time compare and enforces the keyspace ACL +
-forced tenant scoping. (A bare plaintext secret in `resp_credential` still works
-for local/dev.)
-
-**TLS.** Point `tls_cert_file`/`tls_key_file` at a PEM cert + key and the RESP
-port serves TLS (native rustls, so the AUTH password is encrypted on the wire);
-stock clients connect with `--tls`:
-
-```bash
-redis-cli --tls --cacert server.pem --user alice -a s3cret -p 6380 GET session:1
-```
-
-Both GUCs must be set (or neither); a bad cert/key makes the worker fail closed
-(refuse to bind) rather than fall back to plaintext.
-
-Relevant GUCs (all `Postmaster` context — set in `postgresql.conf`):
-
-| GUC | default | meaning |
-|---|---|---|
-| `pg_keyspace.port` | 6380 | RESP listen port |
-| `pg_keyspace.keys` | 1000000 | keyspace capacity (sizes the segment) |
-| `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
-| `pg_keyspace.durability` | `ephemeral` | `ephemeral` = shmem only; any other value persists to `supacache.kv` (§3.3/§3.4) |
-| `pg_keyspace.database` | `postgres` | database holding the `supacache.kv` backing tables |
-| `pg_keyspace.persist_window_ms` | 10 | how often the persistence worker drains the ring when idle |
-| `pg_keyspace.ring_mb` | 64 | size of each RESP→persistence ring buffer (burst absorption) |
-| `pg_keyspace.persist_workers` | 1 | persistence workers/rings draining in parallel (writes sharded by key slot) |
-| `pg_keyspace.ttl_bucket_secs` | 10 | TTL time-bucket width; TTL'd keys persist to range-partitioned `supacache.kv_ttl` (§3.3) |
-| `pg_keyspace.ttl_sweep_secs` | 5 | how often the expiry worker drops fully-past TTL partitions |
-| `pg_keyspace.commit_window_us` | 500 | standalone file-batcher window (durability microbench) |
-| `pg_keyspace.rowcache_mb` | 64 | size of the Mode B row-cache segment (separate from Mode A; never RESP-addressable) |
-| `pg_keyspace.require_mask` | `on` | require `supatype_mask` loaded + outermost before serving (§4.1); `off` runs standalone with no mask dependency |
-| `pg_keyspace.tls_cert_file` | *(empty)* | PEM cert; set with `tls_key_file` to serve RESP over TLS (§4.5). Empty = plaintext |
-| `pg_keyspace.tls_key_file` | *(empty)* | PEM private key (PKCS#8/RSA/EC) paired with `tls_cert_file` |
-| `pg_keyspace.rowcache_decode` | `off` | enable the keys-only Mode B invalidation worker (§3.5); needs `wal_level=logical`, holds a replication slot |
-| `pg_keyspace.rowcache_slot` | `supacache_rowcache` | replication slot name (created on demand with the `supacache_keys` plugin) |
-| `pg_keyspace.rowcache_decode_ms` | 200 | how often the invalidation worker drains the slot |
-| `pg_keyspace.rowcache_refill` | `off` | on: refill a changed hot key with the current row; off: drop-only (lazy refill on next read) |
-
-## Results in one line
-
-Latency **34µs** (ties Valkey, kill criterion was `<80µs`); single-worker
-throughput **500–556k/s**; 4-worker **2.46M/s** (Valkey-class); in-backend read
-**9ns** (§6, 100× better than projected); durable writes **145k/s** across 4
-persist workers; **P2 security 9/9** on the real PG17 base. Full report and the
-concerns/threat matrix: [`results/REPORT.md`](results/REPORT.md).
+Don't deploy to production as-is.
