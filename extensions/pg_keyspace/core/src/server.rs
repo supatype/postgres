@@ -3158,6 +3158,55 @@ impl Worker {
                     });
                 }
             }
+            b"SINTERCARD" => {
+                // SINTERCARD numkeys key [key ...] [LIMIT n]
+                let numkeys: usize = args
+                    .get(1)
+                    .and_then(|a| std::str::from_utf8(a).ok())
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(0);
+                let first_key = 2;
+                if numkeys == 0 || first_key + numkeys > nargs {
+                    resp::error(out, "ERR numkeys should be greater than 0");
+                    return;
+                }
+                let mut limit = usize::MAX;
+                let opt_pos = first_key + numkeys;
+                if opt_pos + 1 < nargs && args[opt_pos].eq_ignore_ascii_case(b"LIMIT") {
+                    let l: i64 = std::str::from_utf8(&args[opt_pos + 1])
+                        .ok()
+                        .and_then(|t| t.parse().ok())
+                        .unwrap_or(0);
+                    if l < 0 {
+                        resp::error(out, "ERR LIMIT can't be negative");
+                        return;
+                    }
+                    if l > 0 {
+                        limit = l as usize;
+                    }
+                }
+                let mut sets: Vec<aggr::Set> = Vec::with_capacity(numkeys);
+                for k in &args[first_key..first_key + numkeys] {
+                    match load_set(&store, k, out) {
+                        Some((s, _)) => sets.push(s),
+                        None => return,
+                    }
+                }
+                // Count members present in every set, stopping early at LIMIT.
+                let mut count = 0usize;
+                'outer: for m in &sets[0].members {
+                    for other in &sets[1..] {
+                        if !other.contains(m) {
+                            continue 'outer;
+                        }
+                    }
+                    count += 1;
+                    if count >= limit {
+                        break;
+                    }
+                }
+                resp::integer(out, count as i64);
+            }
             other => resp::error(
                 out,
                 &format!("ERR unknown command '{}'", String::from_utf8_lossy(other)),
