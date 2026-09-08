@@ -132,7 +132,7 @@ jobs:
             >/tmp/pgks_ci_daemon.log 2>&1 &
           dpid=$!
           for _ in $(seq 1 30); do redis-cli -p 6400 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
-          for s in run_hashes.sh run_lists.sh run_zsets.sh run_pubsub.sh run_ttl_scan.sh run_strings.sh run_keys_admin.sh run_aggr_gaps.sh run_sets.sh; do
+          for s in run_hashes.sh run_lists.sh run_zsets.sh run_pubsub.sh run_ttl_scan.sh run_strings.sh run_keys_admin.sh run_aggr_gaps.sh run_sets.sh run_scans.sh; do
             runbench "$s" RESP=6400
           done
           kill $dpid 2>/dev/null || true

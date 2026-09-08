@@ -2755,6 +2755,80 @@ impl Worker {
                 }
                 resp::integer(out, ns.len() as i64);
             }
+            // ---- container scans -----------------------------------
+            // Each aggregate is one decoded blob, so a single call returns the
+            // whole (optionally MATCH-filtered) collection with next cursor "0"
+            // — a valid Redis SCAN result. COUNT is a hint and ignored.
+            b"HSCAN" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'hscan'");
+                    return;
+                }
+                let (pattern, novalues) = scan_opts(args, 3, true);
+                let (h, _) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let items: Vec<&(Vec<u8>, Vec<u8>)> = h
+                    .entries
+                    .iter()
+                    .filter(|(f, _)| pattern.as_ref().map_or(true, |p| glob_match(p, f)))
+                    .collect();
+                resp::array_header(out, 2);
+                resp::bulk(out, b"0");
+                resp::array_header(out, items.len() * if novalues { 1 } else { 2 });
+                for (f, v) in items {
+                    resp::bulk(out, f);
+                    if !novalues {
+                        resp::bulk(out, v);
+                    }
+                }
+            }
+            b"SSCAN" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'sscan'");
+                    return;
+                }
+                let (pattern, _) = scan_opts(args, 3, false);
+                let (s, _) = match load_set(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let items: Vec<&Vec<u8>> = s
+                    .members
+                    .iter()
+                    .filter(|m| pattern.as_ref().map_or(true, |p| glob_match(p, m)))
+                    .collect();
+                resp::array_header(out, 2);
+                resp::bulk(out, b"0");
+                resp::array_header(out, items.len());
+                for m in items {
+                    resp::bulk(out, m);
+                }
+            }
+            b"ZSCAN" => {
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'zscan'");
+                    return;
+                }
+                let (pattern, _) = scan_opts(args, 3, false);
+                let (z, _) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let items: Vec<&(Vec<u8>, f64)> = z
+                    .members
+                    .iter()
+                    .filter(|(m, _)| pattern.as_ref().map_or(true, |p| glob_match(p, m)))
+                    .collect();
+                resp::array_header(out, 2);
+                resp::bulk(out, b"0");
+                resp::array_header(out, items.len() * 2);
+                for (m, s) in items {
+                    resp::bulk(out, m);
+                    resp::bulk(out, aggr::fmt_score(*s).as_bytes());
+                }
+            }
             other => resp::error(
                 out,
                 &format!("ERR unknown command '{}'", String::from_utf8_lossy(other)),
@@ -3632,6 +3706,31 @@ fn save_set(store: &Store, key: &[u8], s: &aggr::Set, exp: i64) {
     }
 }
 
+/// Parse the trailing options of an H/S/ZSCAN (`[MATCH p] [COUNT n] [NOVALUES]`)
+/// starting at argument `start`. Returns the MATCH pattern (if any) and whether
+/// NOVALUES was given (only meaningful, and only accepted, for HSCAN). COUNT is
+/// a hint we ignore, but is consumed so it isn't mistaken for a pattern.
+fn scan_opts(args: &[Vec<u8>], start: usize, allow_novalues: bool) -> (Option<Vec<u8>>, bool) {
+    let mut pattern = None;
+    let mut novalues = false;
+    let mut i = start;
+    while i < args.len() {
+        match args[i].to_ascii_uppercase().as_slice() {
+            b"MATCH" if i + 1 < args.len() => {
+                pattern = Some(args[i + 1].clone());
+                i += 2;
+            }
+            b"COUNT" if i + 1 < args.len() => i += 2,
+            b"NOVALUES" if allow_novalues => {
+                novalues = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    (pattern, novalues)
+}
+
 /// Union / intersection / difference of the given sets, selected by the command
 /// name (the plain and *STORE variants share this). INTER/DIFF are computed
 /// relative to the first set; an empty input yields an empty result.
@@ -3681,7 +3780,9 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
         | b"ZREVRANGEBYSCORE" | b"ZCOUNT" | b"ZPOPMIN" | b"ZPOPMAX" | b"ZRANDMEMBER"
         // sets: the key is always the first argument
         | b"SADD" | b"SREM" | b"SCARD" | b"SISMEMBER" | b"SMISMEMBER" | b"SMEMBERS"
-        | b"SPOP" | b"SRANDMEMBER" => {
+        | b"SPOP" | b"SRANDMEMBER"
+        // container scans: the key is the first argument
+        | b"HSCAN" | b"SSCAN" | b"ZSCAN" => {
             if nargs > 1 {
                 vec![1]
             } else {
