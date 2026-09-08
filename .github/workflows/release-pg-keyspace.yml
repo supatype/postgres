@@ -1,0 +1,147 @@
+name: Release pg_keyspace
+
+# Cut a release by pushing a tag like `pg_keyspace-v0.1.0` (or run manually with a
+# version). Builds the pgrx extension into a Debian package (the same way
+# pg_graphql is shipped) plus a portable tarball, and attaches them to a GitHub
+# Release. The Dockerfile then pulls the .deb into the supatype/postgres image.
+
+on:
+  push:
+    tags:
+      - 'pg_keyspace-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  PG_MAJOR: '17'
+  PGRX_VERSION: '0.12.9'
+
+jobs:
+  create-release:
+    name: Create the GitHub Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VER="${{ inputs.version }}"
+          else
+            VER="${GITHUB_REF_NAME#pg_keyspace-v}"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=pg_keyspace-v$VER" >> "$GITHUB_OUTPUT"
+      - name: Create release if it does not exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.v.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+          else
+            gh release create "$TAG" \
+              --title "pg_keyspace ${{ steps.v.outputs.version }}" \
+              --target "$GITHUB_SHA" \
+              --generate-notes
+          fi
+
+  build:
+    name: Build .deb (PG${{ env.PG_MAJOR }}, ${{ matrix.arch }})
+    needs: create-release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          # To also ship arm64, add: { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add the PostgreSQL apt repository
+        run: |
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+      - name: Install PostgreSQL ${{ env.PG_MAJOR }} + build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ env.PG_MAJOR }} \
+            postgresql-server-dev-${{ env.PG_MAJOR }} \
+            clang libclang-dev llvm-dev build-essential
+
+      - name: Install cargo-pgrx ${{ env.PGRX_VERSION }}
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+
+      - name: Initialise pgrx
+        run: cargo pgrx init --pg${{ env.PG_MAJOR }} /usr/lib/postgresql/${{ env.PG_MAJOR }}/bin/pg_config
+
+      - name: Package the extension (.so + .control + .sql)
+        working-directory: extensions/pg_keyspace/extension
+        run: cargo pgrx package --pg-config /usr/lib/postgresql/${{ env.PG_MAJOR }}/bin/pg_config
+
+      - name: Build the keys-only decode plugin
+        working-directory: extensions/pg_keyspace/plugin
+        run: make PG_CONFIG=/usr/lib/postgresql/${{ env.PG_MAJOR }}/bin/pg_config
+
+      - name: Assemble the .deb and tarball
+        id: pkg
+        working-directory: extensions/pg_keyspace
+        run: |
+          set -eu
+          VER="${{ needs.create-release.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          PGBIN=/usr/lib/postgresql/${{ env.PG_MAJOR }}/bin/pg_config
+          PKGLIBDIR="$($PGBIN --pkglibdir)"          # /usr/lib/postgresql/17/lib
+
+          ROOT="$(mktemp -d)"
+          # the pgrx package tree is already rooted at usr/...
+          cp -a extension/target/release/pg_keyspace-pg${{ env.PG_MAJOR }}/usr "$ROOT/"
+          # add the decode plugin next to the extension .so
+          install -Dm755 plugin/supacache_keys.so "$ROOT${PKGLIBDIR}/supacache_keys.so"
+
+          NAME="pg_keyspace-v${VER}-pg${{ env.PG_MAJOR }}-${ARCH}-linux-gnu"
+          # portable tarball
+          tar czf "/tmp/${NAME}.tar.gz" -C "$ROOT" usr
+
+          # debian package
+          mkdir -p "$ROOT/DEBIAN"
+          cat > "$ROOT/DEBIAN/control" <<EOF
+          Package: pg-keyspace
+          Version: ${VER}
+          Architecture: ${ARCH}
+          Maintainer: Supatype <nic@titanacademy.io>
+          Depends: postgresql-${{ env.PG_MAJOR }}
+          Section: database
+          Priority: optional
+          Homepage: https://github.com/${{ github.repository }}
+          Description: Postgres-native RESP (Redis-compatible) keyspace + PostgREST row cache
+           A background-worker RESP2 server over a shared-memory keyspace, plus a
+           transparent row cache. Runs standalone; optional supatype_mask integration.
+          EOF
+          dpkg-deb --build --root-owner-group "$ROOT" "/tmp/${NAME}.deb"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.create-release.outputs.tag }}" \
+            "/tmp/${{ steps.pkg.outputs.name }}.deb" \
+            "/tmp/${{ steps.pkg.outputs.name }}.tar.gz" \
+            --clobber
