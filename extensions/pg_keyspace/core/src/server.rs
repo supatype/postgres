@@ -200,6 +200,12 @@ struct Conn {
     // to. Non-empty => the connection is in RESP2 subscribe mode.
     subs: HashSet<Vec<u8>>,
     psubs: HashSet<Vec<u8>>,
+    // transactions: inside MULTI, commands are queued (raw argv) rather than run,
+    // then executed atomically on EXEC. `watch` snapshots (scoped key, version)
+    // at WATCH time; EXEC aborts (null array) if any snapshot no longer matches.
+    in_multi: bool,
+    queued: Vec<Vec<Vec<u8>>>,
+    watch: Vec<(Vec<u8>, Option<u64>)>,
 }
 
 pub struct Worker {
@@ -433,6 +439,9 @@ impl Worker {
                     tls,
                     subs: HashSet::new(),
                     psubs: HashSet::new(),
+                    in_multi: false,
+                    queued: Vec::new(),
+                    watch: Vec::new(),
                 },
             );
         }
@@ -639,6 +648,29 @@ impl Worker {
             let c = self.conns.get_mut(&fd).unwrap();
             resp::simple(&mut c.wbuf, "OK");
             c.closing = true; // flushed then closed by on_readable/flush
+            return;
+        }
+
+        // ---- transactions: MULTI / EXEC / DISCARD / WATCH / UNWATCH ----
+        match cmd.as_slice() {
+            b"MULTI" => return self.handle_multi(fd),
+            b"EXEC" => return self.handle_exec(fd),
+            b"DISCARD" => return self.handle_discard(fd),
+            b"WATCH" => return self.handle_watch(fd, args),
+            b"UNWATCH" => {
+                let c = self.conns.get_mut(&fd).unwrap();
+                c.watch.clear();
+                resp::simple(&mut c.wbuf, "OK");
+                return;
+            }
+            _ => {}
+        }
+        // Inside MULTI, every other command is queued (not run) and answered
+        // `+QUEUED`; the queue is executed atomically by EXEC.
+        if self.conns.get(&fd).map(|c| c.in_multi).unwrap_or(false) {
+            let c = self.conns.get_mut(&fd).unwrap();
+            c.queued.push(args.to_vec());
+            resp::simple(&mut c.wbuf, "QUEUED");
             return;
         }
 
@@ -3126,6 +3158,55 @@ impl Worker {
                     });
                 }
             }
+            b"SINTERCARD" => {
+                // SINTERCARD numkeys key [key ...] [LIMIT n]
+                let numkeys: usize = args
+                    .get(1)
+                    .and_then(|a| std::str::from_utf8(a).ok())
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(0);
+                let first_key = 2;
+                if numkeys == 0 || first_key + numkeys > nargs {
+                    resp::error(out, "ERR numkeys should be greater than 0");
+                    return;
+                }
+                let mut limit = usize::MAX;
+                let opt_pos = first_key + numkeys;
+                if opt_pos + 1 < nargs && args[opt_pos].eq_ignore_ascii_case(b"LIMIT") {
+                    let l: i64 = std::str::from_utf8(&args[opt_pos + 1])
+                        .ok()
+                        .and_then(|t| t.parse().ok())
+                        .unwrap_or(0);
+                    if l < 0 {
+                        resp::error(out, "ERR LIMIT can't be negative");
+                        return;
+                    }
+                    if l > 0 {
+                        limit = l as usize;
+                    }
+                }
+                let mut sets: Vec<aggr::Set> = Vec::with_capacity(numkeys);
+                for k in &args[first_key..first_key + numkeys] {
+                    match load_set(&store, k, out) {
+                        Some((s, _)) => sets.push(s),
+                        None => return,
+                    }
+                }
+                // Count members present in every set, stopping early at LIMIT.
+                let mut count = 0usize;
+                'outer: for m in &sets[0].members {
+                    for other in &sets[1..] {
+                        if !other.contains(m) {
+                            continue 'outer;
+                        }
+                    }
+                    count += 1;
+                    if count >= limit {
+                        break;
+                    }
+                }
+                resp::integer(out, count as i64);
+            }
             other => resp::error(
                 out,
                 &format!("ERR unknown command '{}'", String::from_utf8_lossy(other)),
@@ -3152,6 +3233,83 @@ impl Worker {
         // Durable tier: hold this command's reply until its record(s) commit.
         if sync_ack && !acks.is_empty() {
             self.conns.get_mut(&fd).unwrap().ack = acks;
+        }
+    }
+
+    /// MULTI — open a transaction: subsequent commands queue until EXEC/DISCARD.
+    fn handle_multi(&mut self, fd: RawFd) {
+        let c = self.conns.get_mut(&fd).unwrap();
+        if c.in_multi {
+            resp::error(&mut c.wbuf, "ERR MULTI calls can not be nested");
+            return;
+        }
+        c.in_multi = true;
+        c.queued.clear();
+        resp::simple(&mut c.wbuf, "OK");
+    }
+
+    /// DISCARD — abandon a transaction and drop any WATCHes.
+    fn handle_discard(&mut self, fd: RawFd) {
+        let c = self.conns.get_mut(&fd).unwrap();
+        if !c.in_multi {
+            resp::error(&mut c.wbuf, "ERR DISCARD without MULTI");
+            return;
+        }
+        c.in_multi = false;
+        c.queued.clear();
+        c.watch.clear();
+        resp::simple(&mut c.wbuf, "OK");
+    }
+
+    /// WATCH key [key …] — snapshot each (tenant-scoped) key's version so EXEC
+    /// can abort if it changed. Not allowed once inside MULTI.
+    fn handle_watch(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        if args.len() < 2 {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, "ERR wrong number of arguments for 'watch'");
+            return;
+        }
+        if self.conns.get(&fd).map(|c| c.in_multi).unwrap_or(false) {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, "ERR WATCH inside MULTI is not allowed");
+            return;
+        }
+        for k in &args[1..] {
+            let scoped = self.scope_name(fd, k);
+            let v = self.store.version(&scoped);
+            self.conns.get_mut(&fd).unwrap().watch.push((scoped, v));
+        }
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::simple(out, "OK");
+    }
+
+    /// EXEC — run the queued commands atomically (nothing else runs on this
+    /// single-threaded worker in between), unless a WATCHed key changed, in which
+    /// case the whole transaction aborts with a null array.
+    fn handle_exec(&mut self, fd: RawFd) {
+        if !self.conns.get(&fd).map(|c| c.in_multi).unwrap_or(false) {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, "ERR EXEC without MULTI");
+            return;
+        }
+        let (queued, watch) = {
+            let c = self.conns.get_mut(&fd).unwrap();
+            c.in_multi = false;
+            (std::mem::take(&mut c.queued), std::mem::take(&mut c.watch))
+        };
+        // Abort if any WATCHed key's version no longer matches its snapshot.
+        let aborted = watch.iter().any(|(k, snap)| self.store.version(k) != *snap);
+        if aborted {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::nil_array(out);
+            return;
+        }
+        // The array header, then each queued command's reply appended in order —
+        // re-dispatching applies auth/tenant scoping at execution time.
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::array_header(out, queued.len());
+        for cmd_args in queued {
+            self.dispatch(fd, &cmd_args);
         }
     }
 
