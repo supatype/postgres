@@ -271,11 +271,16 @@ jobs:
           SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
           mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
 
-          # `cargo pgrx package` builds against the given pg_config directly. It
-          # does NOT need `cargo pgrx init` — init runs initdb, which fails against
-          # a staged (DESTDIR) Postgres whose binaries resolve their libpq at an
-          # absolute install prefix that isn't installed yet (the macOS
-          # "Library not loaded: .../libpq.5.dylib" failure).
+          # `cargo pgrx package` builds against --pg-config directly, but it still
+          # requires PGRX_HOME to exist ("$PGRX_HOME does not exist" otherwise).
+          # We must NOT create it with `cargo pgrx init`: init runs initdb, which
+          # fails against a staged (DESTDIR) Postgres whose binaries resolve libpq
+          # at an absolute install prefix that isn't installed yet (the macOS
+          # "Library not loaded: .../libpq.5.dylib" failure). So build a minimal
+          # PGRX_HOME that registers pg17 -> this pg_config — no initdb involved.
+          export PGRX_HOME="${HOME}/.pgrx"
+          mkdir -p "${PGRX_HOME}"
+          printf '[configs]\npg17 = "%s"\n' "${PG_CONFIG}" > "${PGRX_HOME}/config.toml"
           ( cd extensions/pg_keyspace/extension && cargo pgrx package --pg-config "${PG_CONFIG}" )
 
           # pgrx lays the package tree under target/release/pg_keyspace-pg17 at the
