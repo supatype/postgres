@@ -2173,6 +2173,10 @@ impl Worker {
             }
             b"HRANDFIELD" => {
                 // HRANDFIELD key [count [WITHVALUES]]
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'hrandfield'");
+                    return;
+                }
                 let (h, _) = match load_hash(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
@@ -2283,6 +2287,10 @@ impl Worker {
             }
             b"LPOS" => {
                 // LPOS key element [RANK rank] [COUNT num]
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'lpos'");
+                    return;
+                }
                 let mut rank: i64 = 1;
                 let mut count: Option<i64> = None;
                 let mut i = 3;
@@ -2315,7 +2323,7 @@ impl Worker {
                 let mut hits: Vec<i64> = Vec::new();
                 let n = l.items.len();
                 let matches: Vec<usize> =
-                    (0..n).filter(|&j| l.items[j] == args[3]).collect();
+                    (0..n).filter(|&j| l.items[j] == args[2]).collect();
                 let ordered: Vec<usize> = if rank > 0 {
                     matches.clone()
                 } else {
@@ -2440,6 +2448,10 @@ impl Worker {
             // ---- aggregate gaps: sorted set ------------------------
             b"ZPOPMIN" | b"ZPOPMAX" => {
                 // key [count]
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'zpopmin'");
+                    return;
+                }
                 let count: usize = if nargs >= 3 {
                     std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(1)
                 } else {
@@ -2468,6 +2480,10 @@ impl Worker {
             }
             b"ZRANDMEMBER" => {
                 // ZRANDMEMBER key [count [WITHSCORES]]
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'zrandmember'");
+                    return;
+                }
                 let (z, _) = match load_zset(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
