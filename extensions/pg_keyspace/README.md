@@ -8,16 +8,23 @@ row cache for PostgREST. Stock clients — `redis-cli`, `ioredis`, `redis-py`,
 `redis-benchmark` — talk to it unmodified on `:6381`, while the *same bytes* are
 readable and writable from SQL. One system, one thing to run, one security model.
 
-It began as a kill-criterion spike — *"if a cache hit is not under 80 µs, stop
-and keep Valkey"* — and the hit came in at **~34 µs, tying Valkey**. It has since
-grown a full command surface, four durability tiers with real crash recovery and
-synchronous replication, a security model that inherits Postgres roles/RLS/column
-masking, a transparent PostgREST row cache, and horizontal multi-worker
-scale-out.
+It validated its kill criterion up front — *"if a cache hit is not under 80 µs,
+stop"* — coming in at **~34 µs, tying Valkey** — and has grown into a working
+extension: a full command surface, four durability tiers with real crash
+recovery and synchronous replication, native large-collection structures, a
+transparent PostgREST row cache, horizontal multi-worker scale-out, and an
+optional Postgres-native security layer.
 
-> **Status:** a working extension and an advanced proof of concept, built and
-> benchmarked against PostgreSQL 17.6. Not yet production-hardened (see
-> [Limitations](#limitations)). Don't deploy to production as-is.
+**pg_keyspace runs standalone.** It has **no dependency on any other extension** —
+not `supatype_mask`, not `pg_guard`. Load it on its own and it is a
+Postgres-native RESP keyspace + RLS-aware row cache. The Supatype platform can
+*optionally* layer column masking on top (`pg_keyspace.require_mask`, see
+[Security](#resp-auth-tenant-scoping--tls)); that integration is opt-in, not a
+prerequisite.
+
+> **Status:** built and benchmarked against PostgreSQL 17.6. A working extension;
+> some capabilities (persistence, the row cache) are single-worker in this
+> version — see [Current limitations](#current-limitations).
 
 ---
 
@@ -36,12 +43,15 @@ Postgres itself.
   copy), which is the path a mask predicate or a stored function can use directly.
 - **Security you already trust.** RESP `AUTH` maps to a Postgres role; keys are
   ACL-checked and **force-scoped per tenant** (`{tenant}:{key}`); pub/sub channels
-  are tenant-scoped too. The wire is TLS (native rustls). Nothing is bolted on —
-  it reuses `supatype_mask.exempt_roles` and integrates with `pg_guard`.
+  are tenant-scoped too. The wire is TLS (native rustls). All of this is built in
+  and needs no other extension. When `supatype_mask` *is* present, pg_keyspace
+  additionally honours its column masking and `exempt_roles` — an optional layer,
+  never a requirement.
 - **A transparent cache for PostgREST (Mode B).** Register a table's primary key
   and a `WHERE pk = $1` lookup is served from shared memory by a planner
-  `CustomScan` — **no application changes**. RLS and column masking still apply
-  *above* the cached row, and a **keys-only** logical-decoding worker keeps it
+  `CustomScan` — **no application changes**. RLS still applies *above* the cached
+  row (and column masking too, when `supatype_mask` is loaded), and a
+  **keys-only** logical-decoding worker keeps it
   coherent automatically. No cache-invalidation glue to write and get wrong.
 - **Durability is a dial, per deployment.** `ephemeral` (Valkey-parity, shmem
   only) → `relaxed` (async persist) → `durable` (fsync before ack) → `replicated`
@@ -76,7 +86,7 @@ ceiling for deep Postgres integration.
 | Synchronous replication | **Yes** — ack held until standby fsync | Async by default (WAIT for quorum) |
 | Data types | strings, hashes, lists, sorted sets, pub/sub (+ TTL) | Full superset (streams, HLL, bitmaps, geo, …) |
 | Raw write ceiling under no-persistence load | Lower (bounded by 1 event loop / worker) | **Higher** — purpose-built |
-| Maturity / ecosystem / ops tooling | Early POC | **Mature**, huge ecosystem |
+| Maturity / ecosystem / ops tooling | New, focused feature set | **Mature**, huge ecosystem |
 
 **Use `pg_keyspace` when** the cache and the database should be one system: you
 want SQL and RESP over the same data, a transparent row cache for PostgREST,
@@ -156,8 +166,9 @@ predicate — collapsing a 96× overhead to ~1.5× over the unmasked baseline.
 
 ## Install & use
 
-Requires PostgreSQL (built/tested against 17.6), `cargo-pgrx` 0.12.9, and — for
-Mode A security — the `supatype_mask` and (optionally) `pg_guard` extensions.
+Requires only PostgreSQL (built/tested against 17.6) and `cargo-pgrx` 0.12.9.
+`supatype_mask` is **optional** — load it to add column masking; skip it to run
+standalone (`pg_keyspace.require_mask = off`). `pg_guard` is not required at all.
 
 ```bash
 # 1. core unit tests (no Postgres needed)
@@ -171,12 +182,19 @@ cargo pgrx install --release --pg-config /path/to/pg_config
 cd ../plugin && make install PG_CONFIG=/path/to/pg_config
 ```
 
-Add to `postgresql.conf` and restart:
+Add to `postgresql.conf` and restart. **Standalone** (no other extension needed):
+
+```ini
+shared_preload_libraries = 'pg_keyspace'
+pg_keyspace.port = 6381
+pg_keyspace.require_mask = off        # run standalone (no supatype_mask)
+```
+
+To *optionally* add Supatype column masking, load `supatype_mask` after
+`pg_keyspace` and leave `require_mask` on:
 
 ```ini
 shared_preload_libraries = 'pg_keyspace, supatype_mask'  # pg_keyspace BEFORE mask (§4.1)
-pg_keyspace.port = 6381
-# pg_keyspace.require_mask = off   # to run standalone with no mask dependency
 ```
 
 ```sql
@@ -335,9 +353,9 @@ passed, M failed`.
 
 ---
 
-## Limitations
+## Current limitations
 
-An honest POC, not a production release:
+Scoping for this version — the extension works; these are the edges to know:
 
 - **Persistence and the Mode B row cache are single-worker.** `pg_keyspace.workers
   > 1` runs the ephemeral (Mode A) tier only.
@@ -347,7 +365,6 @@ An honest POC, not a production release:
   cache is warmed manually (`rowcache_put`) though invalidation is automatic.
 - Sorted-set score formatting uses Rust's shortest round-trip rather than Redis's
   `%.17g`, so inexact doubles can print differently (values compare equal).
-- Self-signed TLS by default; no managed CA. Durable/replicated tiers are
-  correct but not throughput-optimised (they serialize on the Postgres WAL).
-
-Don't deploy to production as-is.
+- TLS is bring-your-own-cert (in-place rotation on `SIGHUP`; no managed CA). The
+  durable/replicated tiers are correct but not throughput-optimised — they
+  serialize on the Postgres WAL by design.
