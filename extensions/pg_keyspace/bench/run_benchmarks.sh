@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pg_keyspace P0 benchmark harness.
+# pg_keyspace benchmark harness.
 #
 # Compares pg_keyspace (RESP served by a Postgres background worker over a PG
 # shared-memory segment) against Redis/Valkey, on the same host, same client,
@@ -45,7 +45,7 @@ run_one() {
   printf "%s\n" "$rps|$avg|$p50|$p99|$max"
 }
 
-echo "# pg_keyspace P0 benchmark — $(date -u +%FT%TZ)" | tee "$OUT/summary.txt"
+echo "# pg_keyspace benchmark — $(date -u +%FT%TZ)" | tee "$OUT/summary.txt"
 echo "host: $(nproc) cpus, $(uname -sr)" | tee -a "$OUT/summary.txt"
 echo "redis: $(redis-cli -p $REDIS_PORT info server 2>/dev/null | grep -oE 'redis_version:[0-9.]+')" | tee -a "$OUT/summary.txt"
 echo "datasize=${DATASIZE}B keyspace=${KEYSPACE}" | tee -a "$OUT/summary.txt"

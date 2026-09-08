@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P0/P1 §3.1 — in-PG multi-worker scale-out. The extension can run N shared-
+# §3.1 — in-PG multi-worker scale-out. The extension can run N shared-
 # nothing RESP slot workers (pg_keyspace.workers), each owning its own shared-
 # memory segment and listening on pg_keyspace.port + its index. This proves the
 # workers are independent (a key on one is invisible on another) and that
@@ -27,7 +27,7 @@ while [ "$(timeout 2 redis-cli $T -p "$p" PING 2>/dev/null)" = "PONG" ] && [ ${#
   ports+=("$p"); p=$((p+1))
 done
 n=${#ports[@]}
-echo "# P0 in-PG scale-out (§3.1) — $n RESP slot worker(s) on ${ports[0]}..${ports[-1]} (tls=${T:-off})"
+echo "# in-PG scale-out (§3.1) — $n RESP slot worker(s) on ${ports[0]}..${ports[-1]} (tls=${T:-off})"
 [ "$n" -ge 2 ] || { echo "  SKIP  only $n worker(s) — set pg_keyspace.workers>1 and restart"; exit 0; }
 
 # 1. shared-nothing: a uniquely-named key written to worker 0 is invisible on

@@ -1,11 +1,11 @@
-//! pg_keyspace — Postgres-native RESP keyspace, P0 spike as a real extension.
+//! pg_keyspace — a Postgres-native RESP keyspace, packaged as a real extension.
 //!
 //! Loaded via `shared_preload_libraries`, this extension:
 //!   * requests a Postgres shared-memory segment (§3.2) in `shmem_request_hook`
 //!     and initialises the keyspace store over it in `shmem_startup_hook`;
 //!   * registers a background worker (a real Postgres backend) that runs the
-//!     epoll RESP event loop against that segment (§3.1) — the hot path the P0
-//!     kill criterion measures, served on a TCP port for `ioredis`/`redis-cli`;
+//!     epoll RESP event loop against that segment (§3.1) — the read hot path,
+//!     served on a TCP port for `ioredis`/`redis-cli`;
 //!   * exposes the `supacache.*` SQL surface (§6), which reads the *same*
 //!     segment directly in the calling backend — the in-process ~1-2µs path.
 //!
@@ -2231,10 +2231,10 @@ mod supacache {
     // ---- Mode B: transparent row cache control surface (§7.1) ------------
     // The planner custom scan (see the parent module) substitutes a cached row
     // for a `pk = Const` lookup on a *registered* relation. These functions
-    // register a relation's pk column and populate the cache. Populating is a
-    // POC stand-in for the logical-decoding invalidation/refill worker (§3.5);
-    // it stores the RAW heap-tuple bytes so the scan node re-applies RLS + mask
-    // above it (never post-policy output).
+    // register a relation's pk column and populate the cache. Populating here is
+    // the explicit warm/backfill path; the logical-decoding invalidation/refill
+    // worker (§3.5) maintains the cache live. It stores the RAW heap-tuple bytes
+    // so the scan node re-applies RLS + mask above it (never post-policy output).
 
     /// Register `tbl`'s primary-key attribute number so the planner hook will
     /// consider substituting cached rows for `pk = Const` lookups on it.

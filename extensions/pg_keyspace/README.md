@@ -122,7 +122,7 @@ print their own pass/fail and numbers).
 
 In-PG (`pg_keyspace.workers=4`, over TLS): single worker 105 k SET/s → 4-worker
 aggregate **609 k SET/s**, shared-nothing (a key on one worker is invisible on
-the others). — `bench/run_p0_scaleout_inpg.sh`
+the others). — `bench/run_scaleout_inpg.sh`
 
 ### Native large collections — indexed vs flat encoding (ns/op)
 

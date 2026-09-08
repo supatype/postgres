@@ -2,7 +2,7 @@
 name = "pg_keyspace"
 version = "0.1.0"
 edition = "2021"
-description = "Postgres-native cache and RESP-compatible keyspace (P0 spike)"
+description = "Postgres-native RESP (Redis-compatible) keyspace + transparent PostgREST row cache"
 license = "Apache-2.0"
 
 [lib]

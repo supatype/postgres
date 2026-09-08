@@ -2,7 +2,7 @@
 target/
 **/*.rs.bk
 
-# POC runtime artifacts
+# Runtime artifacts
 *.wal
 *.so
 
