@@ -2134,6 +2134,369 @@ impl Worker {
                 };
                 resp::integer(out, raw.map(|b| aggr::zset_count(b, &min, &max)).unwrap_or(0) as i64);
             }
+            // ---- aggregate gaps: hash ------------------------------
+            b"HINCRBYFLOAT" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'hincrbyfloat'");
+                    return;
+                }
+                let by = match aggr::parse_score(&args[3]) {
+                    Some(f) => f,
+                    None => {
+                        resp::error(out, "ERR value is not a valid float");
+                        return;
+                    }
+                };
+                let (mut h, exp) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let cur = match h.get(&args[2]) {
+                    None => 0.0,
+                    Some(v) => match aggr::parse_score(v) {
+                        Some(f) => f,
+                        None => {
+                            resp::error(out, "ERR hash value is not a float");
+                            return;
+                        }
+                    },
+                };
+                let nv = cur + by;
+                if !nv.is_finite() {
+                    resp::error(out, "ERR increment would produce NaN or Infinity");
+                    return;
+                }
+                let s = aggr::fmt_score(nv);
+                h.set(&args[2], s.as_bytes());
+                store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                resp::bulk(out, s.as_bytes());
+            }
+            b"HRANDFIELD" => {
+                // HRANDFIELD key [count [WITHVALUES]]
+                let (h, _) = match load_hash(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if nargs < 3 {
+                    if h.is_empty() {
+                        resp::nil(out);
+                    } else {
+                        let i = (rng_next(&mut rand_seed()) as usize) % h.len();
+                        resp::bulk(out, &h.entries[i].0);
+                    }
+                    return;
+                }
+                let count: i64 =
+                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                let withvals = nargs >= 4 && args[3].eq_ignore_ascii_case(b"WITHVALUES");
+                if h.is_empty() || count == 0 {
+                    resp::array_header(out, 0);
+                    return;
+                }
+                let idx = pick_indices(h.len(), count, rand_seed());
+                resp::array_header(out, idx.len() * if withvals { 2 } else { 1 });
+                for i in idx {
+                    resp::bulk(out, &h.entries[i].0);
+                    if withvals {
+                        resp::bulk(out, &h.entries[i].1);
+                    }
+                }
+            }
+            // ---- aggregate gaps: list ------------------------------
+            b"LINSERT" => {
+                // LINSERT key BEFORE|AFTER pivot element
+                if nargs != 5 {
+                    resp::error(out, "ERR wrong number of arguments for 'linsert'");
+                    return;
+                }
+                let before = match args[2].to_ascii_uppercase().as_slice() {
+                    b"BEFORE" => true,
+                    b"AFTER" => false,
+                    _ => {
+                        resp::error(out, "ERR syntax error");
+                        return;
+                    }
+                };
+                let (mut l, exp) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if l.is_empty() {
+                    resp::integer(out, 0); // key does not exist
+                    return;
+                }
+                match l.items.iter().position(|v| v == &args[3]) {
+                    Some(idx) => {
+                        let at = if before { idx } else { idx + 1 };
+                        l.items.insert(at, args[4].clone());
+                        let n = l.len() as i64;
+                        save_list(&store, &args[1], &l, exp);
+                        resp::integer(out, n);
+                    }
+                    None => resp::integer(out, -1), // pivot not found
+                }
+            }
+            b"LREM" => {
+                // LREM key count element
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'lrem'");
+                    return;
+                }
+                let count: i64 =
+                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                let (mut l, exp) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let mut removed = 0i64;
+                if count >= 0 {
+                    // head → tail; count == 0 removes every match
+                    let mut i = 0;
+                    while i < l.items.len() {
+                        if l.items[i] == args[3] {
+                            l.items.remove(i);
+                            removed += 1;
+                            if count != 0 && removed == count {
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                } else {
+                    // tail → head, up to |count|
+                    let lim = -count;
+                    let mut i = l.items.len();
+                    while i > 0 {
+                        i -= 1;
+                        if l.items[i] == args[3] {
+                            l.items.remove(i);
+                            removed += 1;
+                            if removed == lim {
+                                break;
+                            }
+                        }
+                    }
+                }
+                save_list(&store, &args[1], &l, exp);
+                resp::integer(out, removed);
+            }
+            b"LPOS" => {
+                // LPOS key element [RANK rank] [COUNT num]
+                let mut rank: i64 = 1;
+                let mut count: Option<i64> = None;
+                let mut i = 3;
+                while i + 1 < nargs {
+                    match args[i].to_ascii_uppercase().as_slice() {
+                        b"RANK" => {
+                            rank = std::str::from_utf8(&args[i + 1])
+                                .ok()
+                                .and_then(|t| t.parse().ok())
+                                .unwrap_or(1);
+                        }
+                        b"COUNT" => {
+                            count = std::str::from_utf8(&args[i + 1])
+                                .ok()
+                                .and_then(|t| t.parse().ok());
+                        }
+                        _ => {}
+                    }
+                    i += 2;
+                }
+                if rank == 0 {
+                    resp::error(out, "ERR RANK can't be zero");
+                    return;
+                }
+                let (l, _) = match load_list(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                // Gather matching indices in the search direction.
+                let mut hits: Vec<i64> = Vec::new();
+                let n = l.items.len();
+                let matches: Vec<usize> =
+                    (0..n).filter(|&j| l.items[j] == args[3]).collect();
+                let ordered: Vec<usize> = if rank > 0 {
+                    matches.clone()
+                } else {
+                    matches.iter().rev().cloned().collect()
+                };
+                let skip = (rank.unsigned_abs() as usize).saturating_sub(1);
+                for &m in ordered.iter().skip(skip) {
+                    hits.push(m as i64);
+                    if let Some(c) = count {
+                        if c != 0 && hits.len() as i64 >= c {
+                            break;
+                        }
+                    } else {
+                        break; // no COUNT: first match only
+                    }
+                }
+                match count {
+                    None => match hits.first() {
+                        Some(&p) => resp::integer(out, p),
+                        None => resp::nil(out),
+                    },
+                    Some(_) => {
+                        resp::array_header(out, hits.len());
+                        for p in hits {
+                            resp::integer(out, p);
+                        }
+                    }
+                }
+            }
+            b"LMOVE" | b"RPOPLPUSH" => {
+                // RPOPLPUSH src dst == LMOVE src dst RIGHT LEFT
+                let (from_left, to_left) = if cmd == b"RPOPLPUSH" {
+                    if nargs != 3 {
+                        resp::error(out, "ERR wrong number of arguments for 'rpoplpush'");
+                        return;
+                    }
+                    (false, true)
+                } else {
+                    if nargs != 5 {
+                        resp::error(out, "ERR wrong number of arguments for 'lmove'");
+                        return;
+                    }
+                    let f = match args[3].to_ascii_uppercase().as_slice() {
+                        b"LEFT" => true,
+                        b"RIGHT" => false,
+                        _ => {
+                            resp::error(out, "ERR syntax error");
+                            return;
+                        }
+                    };
+                    let t = match args[4].to_ascii_uppercase().as_slice() {
+                        b"LEFT" => true,
+                        b"RIGHT" => false,
+                        _ => {
+                            resp::error(out, "ERR syntax error");
+                            return;
+                        }
+                    };
+                    (f, t)
+                };
+                let same = args[1] == args[2];
+                if same {
+                    let (mut l, exp) = match load_list(&store, &args[1], out) {
+                        Some(x) => x,
+                        None => return,
+                    };
+                    let val = if from_left { l.lpop() } else { l.rpop() };
+                    match val {
+                        None => {
+                            resp::nil(out);
+                            return;
+                        }
+                        Some(v) => {
+                            if to_left {
+                                l.lpush(&v);
+                            } else {
+                                l.rpush(&v);
+                            }
+                            save_list(&store, &args[1], &l, exp);
+                            resp::bulk(out, &v);
+                        }
+                    }
+                } else {
+                    // Validate both types before mutating either side.
+                    let (mut src, sexp) = match load_list(&store, &args[1], out) {
+                        Some(x) => x,
+                        None => return,
+                    };
+                    let (mut dst, dexp) = match load_list(&store, &args[2], out) {
+                        Some(x) => x,
+                        None => return,
+                    };
+                    let val = if from_left { src.lpop() } else { src.rpop() };
+                    match val {
+                        None => {
+                            resp::nil(out);
+                            return;
+                        }
+                        Some(v) => {
+                            if to_left {
+                                dst.lpush(&v);
+                            } else {
+                                dst.rpush(&v);
+                            }
+                            save_list(&store, &args[1], &src, sexp);
+                            save_list(&store, &args[2], &dst, dexp);
+                            resp::bulk(out, &v);
+                        }
+                    }
+                }
+                // Two-key write: stage both keys' final state (auto-stage only
+                // covers args[1]).
+                if persist_on {
+                    for k in [&args[1], &args[2]] {
+                        stages.push(match store.get_typed(k) {
+                            Some((kind, exp, blob)) => (k.clone(), blob.to_vec(), exp, kind as u8),
+                            None => (k.clone(), Vec::new(), DELETE_TOMBSTONE, b's'),
+                        });
+                    }
+                }
+            }
+            // ---- aggregate gaps: sorted set ------------------------
+            b"ZPOPMIN" | b"ZPOPMAX" => {
+                // key [count]
+                let count: usize = if nargs >= 3 {
+                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(1)
+                } else {
+                    1
+                };
+                let (mut z, exp) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                let sorted = z.sorted(); // ascending
+                let take = count.min(sorted.len());
+                let chosen: Vec<(Vec<u8>, f64)> = if cmd == b"ZPOPMIN" {
+                    sorted[..take].to_vec()
+                } else {
+                    sorted[sorted.len() - take..].iter().rev().cloned().collect()
+                };
+                for (m, _) in &chosen {
+                    z.remove(m);
+                }
+                save_zset(&store, &args[1], &z, exp);
+                resp::array_header(out, chosen.len() * 2);
+                for (m, s) in &chosen {
+                    resp::bulk(out, m);
+                    resp::bulk(out, aggr::fmt_score(*s).as_bytes());
+                }
+            }
+            b"ZRANDMEMBER" => {
+                // ZRANDMEMBER key [count [WITHSCORES]]
+                let (z, _) = match load_zset(&store, &args[1], out) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if nargs < 3 {
+                    if z.is_empty() {
+                        resp::nil(out);
+                    } else {
+                        let i = (rng_next(&mut rand_seed()) as usize) % z.len();
+                        resp::bulk(out, &z.members[i].0);
+                    }
+                    return;
+                }
+                let count: i64 =
+                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                let withscores = nargs >= 4 && args[3].eq_ignore_ascii_case(b"WITHSCORES");
+                if z.is_empty() || count == 0 {
+                    resp::array_header(out, 0);
+                    return;
+                }
+                let idx = pick_indices(z.len(), count, rand_seed());
+                resp::array_header(out, idx.len() * if withscores { 2 } else { 1 });
+                for i in idx {
+                    resp::bulk(out, &z.members[i].0);
+                    if withscores {
+                        resp::bulk(out, aggr::fmt_score(z.members[i].1).as_bytes());
+                    }
+                }
+            }
             other => resp::error(
                 out,
                 &format!("ERR unknown command '{}'", String::from_utf8_lossy(other)),
@@ -2811,6 +3174,41 @@ fn remaining_ttl(exp: i64) -> i64 {
 /// be readable as a raw blob through `GET`/`INCR`/etc.)
 /// Redis GETRANGE slice: inclusive `[start, end]`, negative indices count from
 /// the end; out-of-range or start>end yields an empty slice.
+/// xorshift64* — a tiny, dependency-free PRNG for the *RAND* commands, which
+/// need no cryptographic quality. Seeded from the clock per call site.
+fn rng_next(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+fn rand_seed() -> u64 {
+    ((now_micros() as u64) ^ 0x9E37_79B9_7F4A_7C15) | 1
+}
+
+/// Choose element indices for HRANDFIELD / ZRANDMEMBER. `count >= 0` yields at
+/// most `count` distinct indices (a partial Fisher–Yates shuffle); `count < 0`
+/// yields exactly `|count|` indices with repeats allowed. `n` must be > 0.
+fn pick_indices(n: usize, count: i64, seed: u64) -> Vec<usize> {
+    let mut st = seed;
+    if count < 0 {
+        let k = count.unsigned_abs() as usize;
+        (0..k).map(|_| (rng_next(&mut st) as usize) % n).collect()
+    } else {
+        let k = (count as usize).min(n);
+        let mut idx: Vec<usize> = (0..n).collect();
+        for i in 0..k {
+            let j = i + (rng_next(&mut st) as usize) % (n - i);
+            idx.swap(i, j);
+        }
+        idx.truncate(k);
+        idx
+    }
+}
+
 fn substr(v: &[u8], start: i64, end: i64) -> &[u8] {
     let len = v.len() as i64;
     if len == 0 {
@@ -2951,11 +3349,12 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
         // hashes + lists: the key is always the first argument
         | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
         | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY"
+        | b"HINCRBYFLOAT" | b"HRANDFIELD"
         | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"LPOP" | b"RPOP" | b"LLEN"
-        | b"LINDEX" | b"LRANGE" | b"LSET" | b"LTRIM"
+        | b"LINDEX" | b"LRANGE" | b"LSET" | b"LTRIM" | b"LINSERT" | b"LREM" | b"LPOS"
         | b"ZADD" | b"ZSCORE" | b"ZMSCORE" | b"ZCARD" | b"ZREM" | b"ZINCRBY"
         | b"ZRANK" | b"ZREVRANK" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE"
-        | b"ZREVRANGEBYSCORE" | b"ZCOUNT" => {
+        | b"ZREVRANGEBYSCORE" | b"ZCOUNT" | b"ZPOPMIN" | b"ZPOPMAX" | b"ZRANDMEMBER" => {
             if nargs > 1 {
                 vec![1]
             } else {
@@ -2965,8 +3364,8 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
         b"DEL" | b"UNLINK" | b"EXISTS" | b"MGET" | b"TOUCH" => (1..nargs).collect(),
         // MSET/MSETNX interleave key value key value … — scope every key slot.
         b"MSET" | b"MSETNX" => (1..nargs).step_by(2).collect(),
-        // RENAME/COPY take a source and destination key.
-        b"RENAME" | b"RENAMENX" | b"COPY" => {
+        // RENAME/COPY/LMOVE/RPOPLPUSH take a source and destination key.
+        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" => {
             if nargs > 2 {
                 vec![1, 2]
             } else {
@@ -3022,6 +3421,7 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"HSETNX"
             | b"HDEL"
             | b"HINCRBY"
+            | b"HINCRBYFLOAT"
             // list mutations
             | b"LPUSH"
             | b"RPUSH"
@@ -3031,10 +3431,16 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"RPOP"
             | b"LSET"
             | b"LTRIM"
+            | b"LINSERT"
+            | b"LREM"
+            | b"LMOVE"
+            | b"RPOPLPUSH"
             // zset mutations
             | b"ZADD"
             | b"ZREM"
             | b"ZINCRBY"
+            | b"ZPOPMIN"
+            | b"ZPOPMAX"
     )
 }
 
@@ -3043,9 +3449,10 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
 fn is_aggregate_write(cmd: &[u8]) -> bool {
     matches!(
         cmd,
-        b"HSET" | b"HMSET" | b"HSETNX" | b"HDEL" | b"HINCRBY"
+        b"HSET" | b"HMSET" | b"HSETNX" | b"HDEL" | b"HINCRBY" | b"HINCRBYFLOAT"
             | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"LPOP" | b"RPOP" | b"LSET" | b"LTRIM"
-            | b"ZADD" | b"ZREM" | b"ZINCRBY"
+            | b"LINSERT" | b"LREM"
+            | b"ZADD" | b"ZREM" | b"ZINCRBY" | b"ZPOPMIN" | b"ZPOPMAX"
     )
 }
 
