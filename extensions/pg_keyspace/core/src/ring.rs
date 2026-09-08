@@ -1,6 +1,6 @@
 //! A single-producer/single-consumer byte ring in shared memory, used to hand
 //! writes from the RESP slot worker (producer) to a dedicated persistence worker
-//! (consumer) without ever blocking the event loop on SPI (§3.1's "never block
+//! (consumer) without ever blocking the event loop on SPI ("never block
 //! on a Postgres lock" applied to the persistence path). The producer does a
 //! ~nanosecond enqueue; all Postgres work happens in the other process.
 //!
@@ -118,7 +118,7 @@ impl Producer {
     /// None if the ring is full (the caller applies backpressure or drops). The
     /// seq lets a durable write wait until `committed() >= seq`.
     ///
-    /// `kind` (the value's type tag, §5) is packed into the free top byte of the
+    /// `kind` (the value's type tag) is packed into the free top byte of the
     /// `val_len` field — values are far below the 16MB that byte would encroach
     /// on — so the record layout and size are unchanged.
     pub fn push(&self, key: &[u8], val: &[u8], expires: i64, kind: u8) -> Option<u64> {

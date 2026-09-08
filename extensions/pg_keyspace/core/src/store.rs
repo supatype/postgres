@@ -1,7 +1,7 @@
 //! The shared-memory keyspace store. One `Store` maps the whole segment; it is
 //! carved into `num_partitions` disjoint partitions. Each partition is written
-//! by exactly one slot worker (§3.1), so the hot path takes no locks and no
-//! atomics. Layout, per partition (§3.2):
+//! by exactly one slot worker, so the hot path takes no locks and no
+//! atomics. Layout, per partition:
 //!
 //! ```text
 //! partition {
@@ -18,7 +18,7 @@ use crate::shmem::Shmem;
 
 const MAGIC: u64 = 0x70_67_6b_73_5f_76_32_00; // "pgks_v2\0" (v2: oversized free list)
 
-// Size classes for the slab allocator (§3.2 "size-classed, 32B..8KB").
+// Size classes for the slab allocator ("size-classed, 32B..8KB").
 const CLASS_SIZES: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
 const NUM_CLASSES: usize = CLASS_SIZES.len();
 const OVERSIZED: u32 = u32::MAX; // value larger than 8KB: bump-only ("overflow to heap-only")
@@ -30,7 +30,7 @@ const FLAG_OCCUPIED: u32 = 1;
 const FLAG_REF: u32 = 2; // CLOCK reference bit
 
 pub const KIND_STR: u32 = b's' as u32;
-/// aggregate kinds (§5): value blob is a serialized hash/list/sorted-set.
+/// aggregate kinds: value blob is a serialized hash/list/sorted-set.
 pub const KIND_HASH: u32 = b'h' as u32;
 pub const KIND_LIST: u32 = b'l' as u32;
 pub const KIND_ZSET: u32 = b'z' as u32;
@@ -173,7 +173,7 @@ enum Backing {
     Posix(Shmem),
     /// A raw region owned by someone else — e.g. a Postgres shared-memory
     /// segment from `ShmemInitStruct`, mapped at the same address in every
-    /// backend (§3.2). The store only borrows it.
+    /// backend. The store only borrows it.
     Raw,
 }
 
@@ -482,7 +482,7 @@ impl Store {
     // ---- public API (called only by the owning worker for partition p) ----
 
     /// GET: returns a slice into shmem valid until the next mutation of this
-    /// partition. Lazily expires (§3.3). Updates CLOCK ref bit and stats.
+    /// partition. Lazily expires. Updates CLOCK ref bit and stats.
     pub fn get<'a>(&'a self, key: &[u8]) -> Lookup<'a> {
         let hash = fnv1a(key);
         let p = self.partition_for_hash(hash);
@@ -518,7 +518,7 @@ impl Store {
         self.set_typed(key, val, ttl_micros, KIND_STR)
     }
 
-    /// SET a typed value (aggregates, §5): same as `set` but tags the entry's
+    /// SET a typed value (aggregates): same as `set` but tags the entry's
     /// `kind` so `get_typed` can enforce Redis `WRONGTYPE` semantics.
     pub fn set_typed(&self, key: &[u8], val: &[u8], ttl_micros: i64, kind: u32) -> bool {
         let hash = fnv1a(key);

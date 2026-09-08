@@ -1,10 +1,10 @@
 //! POSIX shared-memory segment. Stands in for the plan's `GetNamedDSMSegment`
-//! (§3.2). The segment is created MAP_SHARED and named, so:
+//!. The segment is created MAP_SHARED and named, so:
 //!
 //!   * each slot worker maps the same segment and operates on its own disjoint
-//!     partition (§3.1 "written by exactly one worker, no locks, no atomics");
+//!     partition ("written by exactly one worker, no locks, no atomics");
 //!   * a *separate* process — modelling a Postgres backend calling
-//!     `supacache.get()` (§6) — can attach the same segment and read an entry
+//!     `supacache.get` — can attach the same segment and read an entry
 //!     directly, with no socket and no copy. `latency_probe --inproc` measures
 //!     exactly that path.
 

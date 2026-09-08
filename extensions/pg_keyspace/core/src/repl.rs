@@ -1,4 +1,4 @@
-//! Real streaming replication for the `replicated` durability tier (§3.4).
+//! Real streaming replication for the `replicated` durability tier.
 //!
 //! The primary ships each fsynced WAL batch to a standby over a stream socket;
 //! the standby appends it to its OWN WAL, fsyncs, and acks the batch's end

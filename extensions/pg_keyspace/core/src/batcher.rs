@@ -1,4 +1,4 @@
-//! Commit batching and the four durability tiers (§3.4). Each slot worker
+//! Commit batching and the four durability tiers. Each slot worker
 //! accumulates writes over `commit_window` and commits them in one transaction:
 //! "one fsync amortised across hundreds of operations". This module models that
 //! against a real on-disk WAL file so the amortisation is measured, not assumed.
@@ -10,7 +10,7 @@
 //! | durable     | appended, one fsync per batch               | its batch fsync    |
 //! | replicated  | batch fsync + streamed to a standby         | fsync + standby ack|
 //!
-//! The `replicated` tier is real synchronous replication (§3.4, `repl.rs`): the
+//! The `replicated` tier is real synchronous replication (`repl.rs`): the
 //! batch flusher streams each fsynced batch to a standby over a socket, the
 //! standby appends+fsyncs it to its own WAL and acks, and a replicated commit
 //! returns only once the standby has acked its sequence.

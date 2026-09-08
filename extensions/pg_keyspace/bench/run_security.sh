@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# §4.6 / §4.7 — Mode B row-cache SECURITY regression suite.
+# Mode B row-cache SECURITY regression suite.
 #
 # The transparent row cache substitutes a CustomScan at the LEAF for a
 # `pk = Const` lookup on a registered, currently-cached relation, serving the
-# RAW cached tuple. The whole safety argument (§4.6) is that RLS quals and the
+# RAW cached tuple. The whole safety argument is that RLS quals and the
 # supatype_mask CASE are re-applied ABOVE the leaf (in the scan's qual and
 # targetlist), so the cache is never a policy bypass. This suite proves it by
 # comparing the cached path against ground truth on the same rows.
@@ -19,7 +19,7 @@ chk() { # chk "label" "expected" "actual"
 }
 asuser() { psql -h 127.0.0.1 -p $PGPORT -U "$1" -d postgres -X -q -A -t -c "$2" 2>&1; }
 
-echo "# Mode B security regression (§4.6 leaf-only substitution)"
+echo "# Mode B security regression (leaf-only substitution)"
 
 # ---- fixtures -------------------------------------------------------------
 $ADMIN >/dev/null 2>&1 <<'SQL'
@@ -100,7 +100,7 @@ chk "MASK: that superuser read went through the Custom Scan" \
 
 # ---- 3. parameterized / generic plans never take the const-only cache path -
 # The hook only fires for pk = Const at plan time; a parameter ($1) must fall
-# back to the normal plan (§4.3b: no baking one caller's row into a generic plan)
+# back to the normal plan (no baking one caller's row into a generic plan)
 gplan=$($ADMIN <<'SQL' 2>&1 | grep -m1 -E 'Custom Scan|Index Scan|Seq Scan'
 SET plan_cache_mode = force_generic_plan;
 PREPARE q(bigint) AS SELECT * FROM public.rc_mask WHERE id=$1;

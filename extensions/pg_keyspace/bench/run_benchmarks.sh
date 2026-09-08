@@ -3,8 +3,8 @@
 #
 # Compares pg_keyspace (RESP served by a Postgres background worker over a PG
 # shared-memory segment) against Redis/Valkey, on the same host, same client,
-# same parameters. Also measures the in-backend SQL read path (§6) and the
-# per-durability-tier RESP SET cost (§3.4).
+# same parameters. Also measures the in-backend SQL read path and the
+# per-durability-tier RESP SET cost.
 #
 # Assumes: redis on $REDIS_PORT, pg_keyspace RESP on $PGKS_PORT, Postgres on
 # $PGPORT with the extension created.
@@ -53,7 +53,7 @@ echo | tee -a "$OUT/summary.txt"
 
 # ---------------------------------------------------------------------------
 # 1. Closed-loop latency (1 connection, no pipeline) — the client-observed
-#    single-request latency the §11 table targets.
+#    single-request latency the table targets.
 # ---------------------------------------------------------------------------
 echo "## Closed-loop latency (-c 1 -P 1), 200k requests, ${DATASIZE}B values" | tee -a "$OUT/summary.txt"
 printf "%-10s %-10s | %12s %8s %8s %8s\n" "op" "server" "rps" "avg(ms)" "p50" "p99" | tee -a "$OUT/summary.txt"
@@ -67,7 +67,7 @@ done
 echo | tee -a "$OUT/summary.txt"
 
 # ---------------------------------------------------------------------------
-# 2. Pipelined throughput (-c 50 -P 16) — the §11 throughput row.
+# 2. Pipelined throughput (-c 50 -P 16) — the throughput row.
 # ---------------------------------------------------------------------------
 echo "## Pipelined throughput (-c 50 -P 16), 1M requests, ${DATASIZE}B values" | tee -a "$OUT/summary.txt"
 printf "%-10s %-10s | %12s %8s %8s\n" "op" "server" "rps" "p50(ms)" "p99" | tee -a "$OUT/summary.txt"
@@ -81,10 +81,10 @@ done
 echo | tee -a "$OUT/summary.txt"
 
 # ---------------------------------------------------------------------------
-# 3. In-backend SQL read path (§6): pure shared-memory op latency inside the
+# 3. In-backend SQL read path: pure shared-memory op latency inside the
 #    calling Postgres backend, no client round-trip.
 # ---------------------------------------------------------------------------
-echo "## In-backend shared-memory op latency (§6), 5M iters, in-process" | tee -a "$OUT/summary.txt"
+echo "## In-backend shared-memory op latency, 5M iters, in-process" | tee -a "$OUT/summary.txt"
 ITERS=5000000
 gns=$($PSQL -c "SELECT supacache.bench_get('benchk', repeat('x',$DATASIZE)::bytea, $ITERS);")
 sns=$($PSQL -c "SELECT supacache.bench_set('benchk', repeat('x',$DATASIZE)::bytea, $ITERS);")

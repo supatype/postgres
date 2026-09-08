@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# §4.3c / §6 — the cost of reading a MASKED table, and how supacache.get
-# (the §6 SQL surface) accelerates it. Run against the PG17 base with
+# the cost of reading a MASKED table, and how supacache.get
+# (the SQL surface) accelerates it. Run against the PG17 base with
 # supatype_mask + pg_keyspace loaded. Measures a full scan of a 100k-row table
 # that references 3 masked columns (so supatype_mask wraps each in
 # CASE WHEN <predicate>(row) THEN col ELSE NULL END -> 3 predicate calls/row),
@@ -17,7 +17,7 @@ CREATE TABLE public.bench_masked (LIKE public.bench_plain INCLUDING ALL);
 INSERT INTO public.bench_masked SELECT * FROM public.bench_plain;
 CREATE TABLE public.bench_perms(role text primary key, allowed bool);
 INSERT INTO public.bench_perms VALUES ('bench_user', true) ON CONFLICT (role) DO UPDATE SET allowed=true;
--- trivial (inlinable), realistic table-lookup, and §6 shmem predicates
+-- trivial (inlinable), realistic table-lookup, and shmem predicates
 CREATE OR REPLACE FUNCTION public.can_read_true (r public.bench_masked) RETURNS bool LANGUAGE sql STABLE AS $$ SELECT true $$;
 CREATE OR REPLACE FUNCTION public.can_read_join (r public.bench_masked) RETURNS bool LANGUAGE sql STABLE AS
   $$ SELECT coalesce((SELECT allowed FROM public.bench_perms WHERE role = current_user), false) $$;
@@ -48,5 +48,5 @@ echo "# masked-read cost (100k rows, 3 masked columns, min of 5 runs)"
 run "plain, no mask" "SELECT count(length(c1)+length(c2)+length(c3)) FROM public.bench_plain"
 swap can_read_true;  run "masked, predicate = trivial (inlined)"     "$Q"
 swap can_read_join;  run "masked, predicate = table lookup per row"  "$Q"
-swap can_read_shmem; run "masked, predicate = supacache.get (§6)"    "$Q"
+swap can_read_shmem; run "masked, predicate = supacache.get"    "$Q"
 swap can_read_norow; run "masked, predicate = row-indep. InitPlan"   "$Q"

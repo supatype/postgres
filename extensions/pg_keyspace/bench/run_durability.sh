@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-durability-tier RESP SET benchmark (§3.4), all in-PG. For each tier we
+# Per-durability-tier RESP SET benchmark, all in-PG. For each tier we
 # reconfigure pg_keyspace.durability, restart Postgres (the GUC is Postmaster
 # context), and measure:
 #   * closed-loop SET latency (-c 1 -P 1): what one client waits for a write;
@@ -25,7 +25,7 @@ restart_with() {
 }
 
 {
-echo "# Durability tiers — RESP SET (§3.4), commit_window=500us"
+echo "# Durability tiers — RESP SET, commit_window=500us"
 echo "host: $(nproc) cpus; WAL on container fs"
 printf "%-12s | %14s %10s | %16s\n" "tier" "closed p50(ms)" "avg(ms)" "concurrent rps(c50)"
 for tier in ephemeral relaxed durable replicated; do

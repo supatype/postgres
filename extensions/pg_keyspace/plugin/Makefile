@@ -1,4 +1,4 @@
-# Keys-only logical decoding output plugin for the Mode B row cache (§3.5).
+# Keys-only logical decoding output plugin for the Mode B row cache.
 MODULES = supacache_keys
 
 PG_CONFIG ?= pg_config

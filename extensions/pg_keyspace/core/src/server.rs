@@ -1,7 +1,7 @@
 //! One slot worker: an epoll event loop over non-blocking sockets, parsing RESP
-//! and dispatching against its own shared-memory partition (§3.1). No
+//! and dispatching against its own shared-memory partition. No
 //! transaction is ever opened on this path; a command is a shmem read/write
-//! plus, for logged tiers, a handoff to the commit batcher (§3.4). This is the
+//! plus, for logged tiers, a handoff to the commit batcher. This is the
 //! hot path the latency benchmarks measure.
 
 use crate::aggr;
@@ -22,7 +22,7 @@ const EPOLL_MAX: usize = 1024;
 const READ_CHUNK: usize = 64 * 1024;
 
 /// A staged write: (key, value, expires_at_micros, kind). `kind` is the value's
-/// type tag (§5) so aggregates persist and recover as the right type.
+/// type tag so aggregates persist and recover as the right type.
 pub type PendingWrite = (Vec<u8>, Vec<u8>, i64, u8);
 
 /// Sentinel `expires_at` marking a delete (tombstone) carried through the ring,
@@ -73,7 +73,7 @@ fn shard_push(
 
 // ---- security: RESP AUTH -> role, keyspace ACL, forced tenant scoping ----
 
-/// A RESP credential (§4.5): maps an AUTH username to a Postgres role + tenant.
+/// A RESP credential: maps an AUTH username to a Postgres role + tenant.
 ///
 /// `secret` is either a hashed verifier `sha256$<salt_hex>$<hash_hex>` (produced
 /// by `supacache.set_credential`, the recommended path — the plaintext is never
@@ -136,7 +136,7 @@ impl Cred {
     }
 }
 
-/// One keyspace ACL rule: a role may read/write keys under `prefix` (§4.5).
+/// One keyspace ACL rule: a role may read/write keys under `prefix`.
 #[derive(Clone)]
 pub struct AclRule {
     pub prefix: Vec<u8>,
@@ -146,11 +146,11 @@ pub struct AclRule {
 
 /// The full auth configuration, loaded from SQL by the extension and handed to
 /// the worker. When present, RESP AUTH is required for keyed commands; when
-/// absent, the worker runs in local/no-auth mode (matches §10 local dev).
+/// absent, the worker runs in local/no-auth mode (matches local dev).
 pub struct AuthConfig {
     pub creds: HashMap<String, Cred>,
     pub acl: HashMap<String, Vec<AclRule>>,
-    pub exempt: HashSet<String>, // roles that bypass ACL + scoping (§4.5)
+    pub exempt: HashSet<String>, // roles that bypass ACL + scoping
 }
 
 /// A live config swap applied by `run_with` (SIGHUP hot-reload). Each field is
@@ -196,7 +196,7 @@ struct Conn {
     // When set, this connection is TLS: ciphertext on the socket, plaintext in
     // rbuf/wbuf. `wpos` then counts wbuf bytes already fed to the TLS writer.
     tls: Option<Box<rustls::ServerConnection>>,
-    // pub/sub (§5): channels and glob patterns this connection is subscribed
+    // pub/sub: channels and glob patterns this connection is subscribed
     // to. Non-empty => the connection is in RESP2 subscribe mode.
     subs: HashSet<Vec<u8>>,
     psubs: HashSet<Vec<u8>>,
@@ -221,11 +221,11 @@ pub struct Worker {
     // TLS: when set, every accepted connection is wrapped in a TLS session so
     // the RESP wire is encrypted (the AUTH password is otherwise sent in clear).
     tls_config: Option<Arc<rustls::ServerConfig>>,
-    // pub/sub (§5): reverse indexes channel/pattern -> subscriber fds, so a
+    // pub/sub: reverse indexes channel/pattern -> subscriber fds, so a
     // PUBLISH fans out without scanning every connection. Local to this worker.
     channels: HashMap<Vec<u8>, HashSet<RawFd>>,
     patterns: HashMap<Vec<u8>, HashSet<RawFd>>,
-    // cross-worker pub/sub (§5): when workers share a process (the scale-out
+    // cross-worker pub/sub: when workers share a process (the scale-out
     // daemon), a shared Bus routes a PUBLISH to subscribers on *other* workers.
     // `None` for the single-worker in-PG extension (local delivery only).
     bus: Option<Arc<pubsub::Bus>>,
@@ -609,7 +609,7 @@ impl Worker {
             return;
         }
 
-        // ---- pub/sub (§5): handled before keyed-command scoping. Channels
+        // ---- pub/sub: handled before keyed-command scoping. Channels
         // are tenant-scoped for non-exempt authed roles (same `{tenant}:` prefix
         // as keys); the scoping is transparent — every reply/message frame echoes
         // the client's own unscoped name. ----
@@ -670,7 +670,7 @@ impl Worker {
         let tier = self.tier;
         let persist_on = !self.producers.is_empty();
         let sync_ack = self.sync_ack;
-        // A write to enqueue for persistence (§3.3), applied after the match so
+        // A write to enqueue for persistence, applied after the match so
         // it does not tangle with the `out` borrow.
         let mut stage: Option<PendingWrite> = None;
         // (ring, seq) records enqueued this command; a durable write's reply is
@@ -826,7 +826,7 @@ impl Worker {
                     None => resp::error(out, "ERR value is not an integer or out of range"),
                 }
             }
-            // ---- §5: TYPE + hashes ------------------------------------
+            // ---- TYPE + hashes ------------------------------------
             b"TYPE" => {
                 if nargs < 2 {
                     resp::error(out, "ERR wrong number of arguments for 'type'");
@@ -1020,7 +1020,7 @@ impl Worker {
                 store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
                 resp::integer(out, next);
             }
-            // ---- §5: lists --------------------------------------------
+            // ---- lists --------------------------------------------
             b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" => {
                 if nargs < 3 {
                     resp::error(out, "ERR wrong number of arguments");
@@ -1191,7 +1191,7 @@ impl Worker {
                 save_list(&store, &args[1], &l, exp);
                 resp::simple(out, "OK");
             }
-            // ---- §5: sorted sets --------------------------------------
+            // ---- sorted sets --------------------------------------
             b"ZADD" => {
                 // ZADD key [NX|XX] [CH] score member [score member ...]
                 if nargs < 4 {
@@ -1452,7 +1452,7 @@ impl Worker {
             _ => resp::error(out, "ERR unknown command"),
         }
 
-        // durable aggregates (§5/§3.3): a mutation of a hash/list/zset persists
+        // durable aggregates: a mutation of a hash/list/zset persists
         // its whole (kind-tagged) blob from the final store state — or a tombstone
         // if the key was emptied/deleted — so it recovers as the right type.
         if persist_on && stage.is_none() && is_aggregate_write(&cmd) && nargs >= 2 {
@@ -1478,7 +1478,7 @@ impl Worker {
     }
 
     /// RESP `AUTH [user] pass` — resolve the credential and set the connection's
-    /// role/tenant/exempt state (§4.5). Computed in two phases so the borrow of
+    /// role/tenant/exempt state. Computed in two phases so the borrow of
     /// `self.auth` is released before the connection is mutated.
     fn handle_auth(&mut self, fd: RawFd, args: &[Vec<u8>]) {
         enum R {
@@ -1759,7 +1759,7 @@ impl Worker {
 
     /// The tenant scope prefix (`{tenant}:`) for this connection, or `None` when
     /// no scoping applies (no auth configured, or an exempt/service role). Pub/sub
-    /// channels are scoped by the same prefix as keys (§4.4/§4.5), so one tenant's
+    /// channels are scoped by the same prefix as keys, so one tenant's
     /// SUBSCRIBE/PUBLISH cannot reach another's — the isolation keys already have.
     fn conn_prefix(&self, fd: RawFd) -> Option<Vec<u8>> {
         if self.auth.is_none() {
@@ -1789,7 +1789,7 @@ impl Worker {
     }
 
     /// Enforce the keyspace ACL and rewrite each key to `{tenant}:{key}` for a
-    /// non-exempt authenticated role (§4.4/§4.5). Exempt roles (service_role,
+    /// non-exempt authenticated role. Exempt roles (service_role,
     /// per `supatype_mask.exempt_roles`) bypass both. Returns the denial kind on
     /// the first key the role may not touch.
     fn apply_auth(
@@ -2307,7 +2307,7 @@ fn is_aggregate_write(cmd: &[u8]) -> bool {
     )
 }
 
-/// Hand a write to the commit batcher for logged tiers (§3.4). Ephemeral writes
+/// Hand a write to the commit batcher for logged tiers. Ephemeral writes
 /// stay shmem-authoritative and never touch disk.
 #[inline]
 fn durable_log(batcher: &Option<Arc<Batcher>>, tier: Tier, key: &[u8], val: &[u8]) {
@@ -2354,7 +2354,7 @@ impl Write for FdIo {
     }
 }
 
-/// Build a rustls server config from PEM cert + key files (§4.5 TLS). Accepts a
+/// Build a rustls server config from PEM cert + key files (TLS). Accepts a
 /// PKCS#8, RSA, or SEC1/EC private key. Used by the extension when both
 /// `pg_keyspace.tls_cert_file` and `pg_keyspace.tls_key_file` are set.
 pub fn load_tls_config(cert_path: &str, key_path: &str) -> io::Result<Arc<rustls::ServerConfig>> {

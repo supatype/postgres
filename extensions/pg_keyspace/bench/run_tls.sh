@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hardening — native TLS on the RESP wire (§4.5). The AUTH password and all
+# hardening — native TLS on the RESP wire. The AUTH password and all
 # values are otherwise sent in clear; with pg_keyspace.tls_cert_file +
 # tls_key_file set, every RESP connection is wrapped in a rustls TLS session.
 #
@@ -15,7 +15,7 @@ pass=0; fail=0
 chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-52s\n" "$1"; pass=$((pass+1));
         else printf "  FAIL  %-52s exp=[%s] got=[%s]\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 
-echo "# TLS on the RESP wire (§4.5)"
+echo "# TLS on the RESP wire"
 
 # 1. plaintext is refused on the TLS port (handshake fails -> connection closed)
 chk "plaintext client is rejected on the TLS port" \

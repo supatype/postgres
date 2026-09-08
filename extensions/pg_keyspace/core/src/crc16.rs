@@ -1,7 +1,7 @@
 //! CRC16 (CCITT, XMODEM) — the exact function Redis/Valkey Cluster uses to map
 //! a key to one of 16384 hash slots. Reproduced here so that a stock
 //! cluster-aware client (ioredis, go-redis, lettuce) routes a key to the same
-//! slot pg_keyspace assigns it to. Validates §3.1: "Each [worker] owns a disjoint
+//! slot pg_keyspace assigns it to. Validates: "Each [worker] owns a disjoint
 //! slot range of the 16384-slot CRC16 keyspace."
 
 pub const NUM_SLOTS: u16 = 16384;

@@ -1,10 +1,10 @@
-//! pg_keyspace core — the shared-memory RESP hot path (§12).
+//! pg_keyspace core — the shared-memory RESP hot path.
 //!
 //! This crate is the *performance-critical hot path* of pg_keyspace, shared
-//! verbatim with the pgrx extension: an epoll event loop (§3.1) serving RESP
-//! (§5) against an open-addressed hash table in a POSIX shared-memory segment
-//! (§3.2) with a size-classed slab allocator and CLOCK eviction, plus a commit
-//! batcher for the four durability tiers (§3.4) and CRC16 slot routing (§3.1).
+//! verbatim with the pgrx extension: an epoll event loop serving RESP
+//! against an open-addressed hash table in a POSIX shared-memory segment
+//! with a size-classed slab allocator and CLOCK eviction, plus a commit
+//! batcher for the four durability tiers and CRC16 slot routing.
 //!
 //! It deliberately does NOT embed Postgres: the read hot path never opens a
 //! transaction and is pure shmem access, so a standalone process attaching the

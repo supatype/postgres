@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# slice 3 (§3.5) — the keys-only logical-decoding invalidation worker.
+# slice 3 — the keys-only logical-decoding invalidation worker.
 #
 # The Mode B row cache holds RAW pre-policy tuples, so it must be dropped the
 # instant the underlying row changes. A logical replication slot whose output
 # plugin (supacache_keys) emits ONLY `<I|U|D> <relid> <pk>` drives that: the
 # worker learns *which* keys changed and drops them, and no column value ever
-# leaves the plugin (§4.7 "decoding worker stores WAL values" — impossible here).
+# leaves the plugin ("decoding worker stores WAL values" — impossible here).
 #
 # Requires: wal_level=logical, pg_keyspace.rowcache_decode=on, the supacache_keys
 # plugin installed, and the invalidation worker running.
@@ -18,7 +18,7 @@ chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-50s\n" "$1"; pass=$((pass+1))
         else printf "  FAIL  %-50s exp=[%s] got=[%s]\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 plan() { $A -c "EXPLAIN (COSTS OFF) $1" 2>/dev/null | head -1; }
 
-echo "# slice 3 — keys-only invalidation (§3.5)"
+echo "# slice 3 — keys-only invalidation"
 
 $A >/dev/null 2>&1 <<'SQL'
 DROP TABLE IF EXISTS public.inval CASCADE;

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Mode B transparent row-cache LATENCY. What does substituting the cached
 # row at the leaf save versus the normal index-scan + heap-fetch path, for a
-# single-row pk lookup — the PostgREST hot path (§7.1)? And how does it behave
-# on a MASKED table, where the mask CASE runs above the scan either way (§4.3c)?
+# single-row pk lookup — the PostgREST hot path? And how does it behave
+# on a MASKED table, where the mask CASE runs above the scan either way?
 #
 # We compare two IDENTICAL tables: one registered+cached, one not. EXPLAIN
 # ANALYZE separates planner-hook overhead (Planning Time) from executor cost

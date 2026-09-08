@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §4.5 — TLS cert rotation: swapping the cert/key files in place and sending
+# TLS cert rotation: swapping the cert/key files in place and sending
 # SIGHUP (pg_reload_conf) makes new connections use the new cert with no restart,
 # and a broken cert on reload keeps the current cert (never drops TLS mid-flight).
 set -u
@@ -14,7 +14,7 @@ chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-46s\n" "$1"; pass=$((pass+1))
 fp() { echo | timeout 4 openssl s_client -connect 127.0.0.1:$RESP 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null; }
 reload() { $P -c "SELECT pg_reload_conf();" >/dev/null 2>&1; sleep 1; }
 
-echo "# TLS cert rotation (§4.5)"
+echo "# TLS cert rotation"
 before="$(fp)"
 [ -z "$before" ] && { echo "  SKIP  TLS not enabled on :$RESP"; exit 0; }
 

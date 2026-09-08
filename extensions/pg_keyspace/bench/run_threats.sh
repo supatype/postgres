@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# security tests (§4.7) against the real base: PG17 + supatype_mask + pg_guard
+# security tests against the real base: PG17 + supatype_mask + pg_guard
 # + pg_keyspace. Assumes the cluster is up on $PGPORT with RESP on $RESP_PORT and
 # credentials seeded (see the "seed" section). The load-order and seclabel
 # refusal cases require a restart with a changed config and are documented at the
@@ -54,9 +54,9 @@ echo "== $pass passed, $fail failed =="
 echo
 cat <<'DOC'
 Restart-based cases (change config, then `pg_ctl restart`):
-  §4.1 load order:  set shared_preload_libraries='supatype_mask, pg_keyspace'
+  load order:  set shared_preload_libraries='supatype_mask, pg_keyspace'
                     -> worker logs "REFUSING ... must load AFTER pg_keyspace"; RESP down.
-  §4.5 seclabel:    SECURITY LABEL FOR supatype ON COLUMN supacache.kv.val IS 'MASK ...'
-                    -> worker logs "REFUSING ... supatype security label ... (§4.5)"; RESP down.
+  seclabel:    SECURITY LABEL FOR supatype ON COLUMN supacache.kv.val IS 'MASK ...'
+                    -> worker logs "REFUSING ... supatype security label ..."; RESP down.
                     Remove the label (IS NULL) and restart -> RESP recovers.
 DOC

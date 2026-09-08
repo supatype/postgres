@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared-nothing scale-out (§3.1). Each slot worker owns a disjoint partition in
+# Shared-nothing scale-out. Each slot worker owns a disjoint partition in
 # its own segment and its own port, so there is no cross-worker contention. We
 # drive N workers with N parallel redis-benchmark clients and sum throughput.
 #

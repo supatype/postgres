@@ -109,7 +109,7 @@ print their own pass/fail and numbers).
 | `GET` closed-loop p50 | **39 µs** | 39 µs |
 | `SET` pipelined (`-c50 -P16`) | **556 k/s** | 537 k/s |
 | `GET` pipelined (`-c50 -P16`) | 500 k/s | 628 k/s |
-| In-backend SQL read (§6, in-process) | **8.9 ns** | — (n/a) |
+| In-backend SQL read (in-process) | **8.9 ns** | — (n/a) |
 | SQL surface via libpq (`SELECT supacache.get`) | 0.048 ms, 21 k tps | — |
 
 ### Horizontal scale-out (`bench/run_scaleout.sh`, aggregate rps)
@@ -208,7 +208,7 @@ To *optionally* add Supatype column masking, load `supatype_mask` after
 `pg_keyspace` and leave `require_mask` on:
 
 ```ini
-shared_preload_libraries = 'pg_keyspace, supatype_mask'  # pg_keyspace BEFORE mask (§4.1)
+shared_preload_libraries = 'pg_keyspace, supatype_mask'  # pg_keyspace BEFORE mask
 ```
 
 ```sql
@@ -309,7 +309,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | GUC | default | meaning |
 |---|---|---|
 | `pg_keyspace.port` | 6380 | RESP listen port (worker *w* uses `port + w`); examples here set 6381 |
-| `pg_keyspace.workers` | 1 | shared-nothing RESP slot workers (§3.1); >1 forces ephemeral |
+| `pg_keyspace.workers` | 1 | shared-nothing RESP slot workers; >1 forces ephemeral |
 | `pg_keyspace.keys` | 1000000 | keyspace capacity per worker (sizes the segment) |
 | `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
 | `pg_keyspace.durability` | `ephemeral` | `ephemeral` \| `relaxed` \| `durable` \| `replicated` |
@@ -317,7 +317,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.persist_workers` | 1 | persist workers/rings draining in parallel |
 | `pg_keyspace.ring_mb` | 64 | per-worker RESP→persist ring size (burst absorption) |
 | `pg_keyspace.ttl_bucket_secs` | 10 | TTL time-bucket width (range-partitioned `supacache.kv_ttl`) |
-| `pg_keyspace.require_mask` | `off` | `off` (default) runs standalone; `on` fails closed unless `supatype_mask` is loaded + outermost (§4.1) — set by the Supatype platform |
+| `pg_keyspace.require_mask` | `off` | `off` (default) runs standalone; `on` fails closed unless `supatype_mask` is loaded + outermost — set by the Supatype platform |
 | `pg_keyspace.tls_cert_file` / `tls_key_file` | *(empty)* | PEM cert + key → serve RESP over TLS |
 | `pg_keyspace.rowcache_mb` | 64 | Mode B row-cache segment size (never RESP-addressable) |
 | `pg_keyspace.rowcache_decode` | `off` | keys-only Mode B invalidation worker (needs `wal_level=logical`) |
@@ -331,13 +331,13 @@ All are `Postmaster` context (set in `postgresql.conf`).
 extensions/pg_keyspace/
 ├── core/                     shared core (Rust, libc only) + tools
 │   └── src/
-│       ├── store.rs          open-addressed hash, size-classed slab, CLOCK eviction (§3.2)
-│       ├── server.rs         epoll RESP2 event loop + command dispatch (§3.1/§5)
+│       ├── store.rs          open-addressed hash, size-classed slab, CLOCK eviction
+│       ├── server.rs         epoll RESP2 event loop + command dispatch
 │       ├── resp.rs           RESP2 codec
 │       ├── aggr.rs           hashes/lists/sorted sets, incl. indexed large-collection encodings
 │       ├── pubsub.rs         cross-worker pub/sub bus
-│       ├── batcher.rs        commit batching + the four durability tiers (§3.4)
-│       ├── repl.rs           real synchronous replication to a standby (§3.4)
+│       ├── batcher.rs        commit batching + the four durability tiers
+│       ├── repl.rs           real synchronous replication to a standby
 │       ├── ring.rs           SPSC shmem ring: RESP worker → persistence worker
 │       ├── crc16.rs          cluster slot hashing
 │       └── bin/
@@ -347,7 +347,7 @@ extensions/pg_keyspace/
 ├── extension/                the pgrx extension (compiles core/src verbatim via #[path])
 │   └── src/lib.rs            _PG_init, shmem hooks, N RESP workers, persist/expiry/invalidation
 │                             workers, Mode B CustomScan, supacache.* SQL surface
-├── plugin/                   supacache_keys: keys-only logical-decoding output plugin (§3.5)
+├── plugin/                   supacache_keys: keys-only logical-decoding output plugin
 └── bench/                    reproducible benchmark + conformance harnesses (run_*.sh)
 ```
 

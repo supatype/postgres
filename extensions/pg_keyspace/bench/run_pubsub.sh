@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §5 — pub/sub: SUBSCRIBE/PSUBSCRIBE/PUBLISH/UNSUBSCRIBE, pattern globbing,
+# pub/sub: SUBSCRIBE/PSUBSCRIBE/PUBLISH/UNSUBSCRIBE, pattern globbing,
 # receiver counts, and the RESP2 subscribe-mode gate. Local single-worker
 # fan-out (cross-worker pub/sub is a documented follow-up). Plaintext or TLS.
 set -u
@@ -13,7 +13,7 @@ pass=0; fail=0
 chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-46s\n" "$1"; pass=$((pass+1));
         else printf "  FAIL  %-46s exp=[%s] got=[%s]\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 
-echo "# pub/sub (§5)"
+echo "# pub/sub"
 
 # background subscribers
 sub_ch=$(mktemp); sub_pat=$(mktemp)

@@ -1,4 +1,4 @@
-//! Isolated commit-batcher benchmark (§3.4). The in-PG RESP path serializes
+//! Isolated commit-batcher benchmark. The in-PG RESP path serializes
 //! durable writes because one slot worker blocks on each commit's fsync; this
 //! binary measures the batcher itself under `threads` concurrent committers,
 //! which models N slot workers (or deferred acks within one) all staging into

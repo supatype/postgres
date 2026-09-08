@@ -1,5 +1,5 @@
 //! pgks-replica — a standalone synchronous-replication standby for the
-//! `replicated` durability tier (§3.4). It accepts one primary connection per
+//! `replicated` durability tier. It accepts one primary connection per
 //! slot worker, appends+fsyncs each streamed WAL batch to its own WAL, and acks
 //! the batch — the same `repl::serve` loop the in-process (loopback) standby
 //! runs, so a real cross-process/cross-host standby is the identical code path.

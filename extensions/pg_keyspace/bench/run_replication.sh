@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §3.4 — REAL synchronous replication (replicated tier). A standalone
+# REAL synchronous replication (replicated tier). A standalone
 # pgks-replica standby process receives streamed WAL batches over a socket,
 # appends+fsyncs them to its own WAL, and acks; the primary's replicated SET
 # returns only once the standby has acked. This proves the write is durable on a
@@ -30,7 +30,7 @@ trap 'kill $DPID $RPID 2>/dev/null' EXIT
 for _ in $(seq 1 30); do redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
 redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG || { echo "  FAIL  primary did not start"; cat /tmp/pgks_repl_pri.log; exit 1; }
 
-echo "# real synchronous replication (§3.4) — primary :$PORT, standby :$RPORT"
+echo "# real synchronous replication — primary :$PORT, standby :$RPORT"
 
 RWAL="$DIR/rep/pgks_replica_w0.wal"
 PWAL="$(ls "$DIR"/pri/*.wal 2>/dev/null | head -1)"

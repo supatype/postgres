@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §5 — CROSS-worker pub/sub. The scale-out daemon runs N shared-nothing slot
+# CROSS-worker pub/sub. The scale-out daemon runs N shared-nothing slot
 # workers as threads of one process; pub/sub channels are not sharded, so a
 # PUBLISH on one worker must reach subscribers on ANY worker. This is delivered
 # by an in-process Bus: a routing table (channel/pattern -> which workers hold
@@ -26,7 +26,7 @@ for _ in $(seq 1 20); do
 done
 redis-cli -p "$W0" PING 2>/dev/null | grep -q PONG || { echo "  FAIL  daemon did not start"; cat /tmp/pgks_xworker.log; exit 1; }
 
-echo "# cross-worker pub/sub (§5) — worker0=:$W0 worker1=:$W1"
+echo "# cross-worker pub/sub — worker0=:$W0 worker1=:$W1"
 
 # --- direct channel, A publishes -> B receives -----------------------------
 subA=$(mktemp); subB=$(mktemp)

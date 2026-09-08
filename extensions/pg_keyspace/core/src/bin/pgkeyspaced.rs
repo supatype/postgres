@@ -1,6 +1,6 @@
 //! pgkeyspaced — the standalone daemon. Spawns N slot workers, each a
 //! shared-nothing epoll loop on its own port backed by its own shared-memory
-//! segment (§3.1: "no locks, no atomics, no cache line ping-pong on the hot
+//! segment ("no locks, no atomics, no cache line ping-pong on the hot
 //! path"). N=1 is the single-worker configuration the latency benchmarks
 //! measure; N>1 demonstrates scale-out.
 //!
@@ -124,7 +124,7 @@ fn main() {
     );
 
     // Cross-worker pub/sub: workers are threads of this process, so they share
-    // one Bus. A PUBLISH on any worker reaches subscribers on all workers (§5).
+    // one Bus. A PUBLISH on any worker reaches subscribers on all workers.
     let bus = Arc::new(Bus::new(a.workers as usize));
 
     let mut handles = Vec::new();

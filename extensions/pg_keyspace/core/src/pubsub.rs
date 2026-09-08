@@ -1,6 +1,6 @@
-//! Cross-worker pub/sub bus (§5).
+//! Cross-worker pub/sub bus.
 //!
-//! The slot workers are shared-nothing on the *key* path (§3.1), but pub/sub
+//! The slot workers are shared-nothing on the *key* path, but pub/sub
 //! channels are not sharded — a PUBLISH on one worker must reach subscribers on
 //! any worker. When workers are threads of one process (the scale-out daemon)
 //! they share this `Bus`: a routing table (channel/pattern -> which workers hold

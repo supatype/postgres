@@ -1,11 +1,11 @@
 /*
  * supacache_keys — a KEYS-ONLY logical decoding output plugin for the Mode B
- * row cache (pg_keyspace §3.5).
+ * row cache (pg_keyspace).
  *
  * The invalidation worker must learn *which* cached rows changed, and nothing
  * else. WAL carries full column values; a decoding plugin that emitted them
  * would put unmasked, pre-policy data into a second channel — exactly the
- * "decoding worker stores WAL values" hazard §4.7 calls out. This plugin is the
+ * "decoding worker stores WAL values" hazard calls out. This plugin is the
  * structural answer: for each INSERT/UPDATE/DELETE it reads ONLY the replica
  * identity key column and emits one line
  *
