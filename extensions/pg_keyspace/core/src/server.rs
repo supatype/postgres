@@ -677,7 +677,7 @@ impl Worker {
         let scan_prefix = self.conn_prefix(fd);
         // A write to enqueue for persistence, applied after the match so
         // it does not tangle with the `out` borrow.
-        let mut stage: Option<PendingWrite> = None;
+        let mut stages: Vec<PendingWrite> = Vec::new();
         // (ring, seq) records enqueued this command; a durable write's reply is
         // held until all of them commit.
         let mut acks: Vec<(usize, u64)> = Vec::new();
@@ -748,7 +748,7 @@ impl Worker {
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
                     let exp = if ttl_micros > 0 { now_micros() + ttl_micros } else { 0 };
-                    stage = Some((args[1].clone(), args[2].clone(), exp, b's'));
+                    stages.push((args[1].clone(), args[2].clone(), exp, b's'));
                 }
             }
             b"SETNX" => {
@@ -759,7 +759,7 @@ impl Worker {
                     store.set(&args[1], &args[2], 0);
                     durable_log(&batcher, tier, &args[1], &args[2]);
                     if persist_on {
-                        stage = Some((args[1].clone(), args[2].clone(), 0, b's'));
+                        stages.push((args[1].clone(), args[2].clone(), 0, b's'));
                     }
                     1
                 };
@@ -777,7 +777,7 @@ impl Worker {
                 store.set(&args[1], &args[2], 0);
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
-                    stage = Some((args[1].clone(), args[2].clone(), 0, b's'));
+                    stages.push((args[1].clone(), args[2].clone(), 0, b's'));
                 }
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                 match old {
@@ -967,10 +967,277 @@ impl Worker {
                         let s = itoa(v);
                         durable_log(&batcher, tier, &args[1], &s);
                         if persist_on {
-                            stage = Some((args[1].clone(), s, 0, b's'));
+                            stages.push((args[1].clone(), s, 0, b's'));
                         }
                     }
                     None => resp::error(out, "ERR value is not an integer or out of range"),
+                }
+            }
+            b"MGET" => {
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'mget'");
+                    return;
+                }
+                resp::array_header(out, nargs - 1);
+                for k in &args[1..] {
+                    match store.get_typed(k) {
+                        // miss OR non-string -> nil; MGET never errors on WRONGTYPE
+                        Some((crate::store::KIND_STR, _, v)) => resp::bulk(out, v),
+                        _ => resp::nil(out),
+                    }
+                }
+            }
+            b"MSET" => {
+                if nargs < 3 || (nargs - 1) % 2 != 0 {
+                    resp::error(out, "ERR wrong number of arguments for 'mset'");
+                    return;
+                }
+                let mut i = 1;
+                while i + 1 < nargs {
+                    store.set(&args[i], &args[i + 1], 0);
+                    durable_log(&batcher, tier, &args[i], &args[i + 1]);
+                    if persist_on {
+                        stages.push((args[i].clone(), args[i + 1].clone(), 0, b's'));
+                    }
+                    i += 2;
+                }
+                resp::simple(out, "OK");
+            }
+            b"MSETNX" => {
+                if nargs < 3 || (nargs - 1) % 2 != 0 {
+                    resp::error(out, "ERR wrong number of arguments for 'msetnx'");
+                    return;
+                }
+                // All-or-nothing: set only if NONE of the keys already exist.
+                let mut any = false;
+                let mut i = 1;
+                while i + 1 < nargs {
+                    if matches!(store.get(&args[i]), Lookup::Hit(_)) {
+                        any = true;
+                        break;
+                    }
+                    i += 2;
+                }
+                if any {
+                    resp::integer(out, 0);
+                } else {
+                    let mut i = 1;
+                    while i + 1 < nargs {
+                        store.set(&args[i], &args[i + 1], 0);
+                        durable_log(&batcher, tier, &args[i], &args[i + 1]);
+                        if persist_on {
+                            stages.push((args[i].clone(), args[i + 1].clone(), 0, b's'));
+                        }
+                        i += 2;
+                    }
+                    resp::integer(out, 1);
+                }
+            }
+            b"SETEX" | b"PSETEX" => {
+                // SETEX key seconds value / PSETEX key millis value
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'setex'");
+                    return;
+                }
+                let n: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()) {
+                    Some(v) => v,
+                    None => {
+                        resp::error(out, "ERR value is not an integer or out of range");
+                        return;
+                    }
+                };
+                if n <= 0 {
+                    resp::error(out, "ERR invalid expire time in 'setex' command");
+                    return;
+                }
+                let ttl = if cmd == b"PSETEX" { n * 1_000 } else { n * 1_000_000 };
+                store.set(&args[1], &args[3], ttl);
+                resp::simple(out, "OK");
+                durable_log(&batcher, tier, &args[1], &args[3]);
+                if persist_on {
+                    stages.push((args[1].clone(), args[3].clone(), now_micros() + ttl, b's'));
+                }
+            }
+            b"GETDEL" => {
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                match store.get(&args[1]) {
+                    Lookup::Hit(v) => {
+                        let val = v.to_vec();
+                        store.del(&args[1]);
+                        resp::bulk(out, &val);
+                        if persist_on {
+                            stages.push((args[1].clone(), Vec::new(), DELETE_TOMBSTONE, b's'));
+                        }
+                    }
+                    Lookup::Miss => resp::nil(out),
+                }
+            }
+            b"GETEX" => {
+                // GETEX key [EX s | PX ms | EXAT ts | PXAT ms | PERSIST]
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                let (val, cur_exp) = match store.get_typed(&args[1]) {
+                    Some((_, exp, v)) => (v.to_vec(), exp),
+                    None => {
+                        resp::nil(out);
+                        return;
+                    }
+                };
+                let mut new_exp: Option<i64> = None; // Some(0)=persist, Some(e)=set
+                if nargs >= 2 {
+                    let opt = args.get(2).map(|a| a.to_ascii_uppercase());
+                    let n = || -> i64 {
+                        args.get(3)
+                            .and_then(|a| std::str::from_utf8(a).ok())
+                            .and_then(|t| t.parse().ok())
+                            .unwrap_or(0)
+                    };
+                    match opt.as_deref() {
+                        Some(b"EX") => new_exp = Some(now_micros() + n() * 1_000_000),
+                        Some(b"PX") => new_exp = Some(now_micros() + n() * 1_000),
+                        Some(b"EXAT") => new_exp = Some(n() * 1_000_000),
+                        Some(b"PXAT") => new_exp = Some(n() * 1_000),
+                        Some(b"PERSIST") => new_exp = Some(0),
+                        _ => {}
+                    }
+                }
+                if let Some(e) = new_exp {
+                    store.set_expiry(&args[1], e);
+                    let _ = cur_exp;
+                }
+                resp::bulk(out, &val);
+            }
+            b"APPEND" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'append'");
+                    return;
+                }
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                let (mut buf, exp) = match store.get_typed(&args[1]) {
+                    Some((_, e, v)) => (v.to_vec(), e),
+                    None => (Vec::new(), 0),
+                };
+                buf.extend_from_slice(&args[2]);
+                let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
+                store.set(&args[1], &buf, ttl);
+                resp::integer(out, buf.len() as i64);
+                durable_log(&batcher, tier, &args[1], &buf);
+                if persist_on {
+                    stages.push((args[1].clone(), buf, if exp > 0 { exp } else { 0 }, b's'));
+                }
+            }
+            b"STRLEN" => {
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                let len = match store.get(&args[1]) {
+                    Lookup::Hit(v) => v.len() as i64,
+                    Lookup::Miss => 0,
+                };
+                resp::integer(out, len);
+            }
+            b"GETRANGE" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'getrange'");
+                    return;
+                }
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                let v = match store.get(&args[1]) {
+                    Lookup::Hit(v) => v.to_vec(),
+                    Lookup::Miss => Vec::new(),
+                };
+                let (s, e) = (
+                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse::<i64>().ok()),
+                    std::str::from_utf8(&args[3]).ok().and_then(|t| t.parse::<i64>().ok()),
+                );
+                match (s, e) {
+                    (Some(s), Some(e)) => resp::bulk(out, substr(&v, s, e)),
+                    _ => resp::error(out, "ERR value is not an integer or out of range"),
+                }
+            }
+            b"SETRANGE" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'setrange'");
+                    return;
+                }
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                let off: usize = match std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()) {
+                    Some(v) => v,
+                    None => {
+                        resp::error(out, "ERR value is not an integer or out of range");
+                        return;
+                    }
+                };
+                let (mut buf, exp) = match store.get_typed(&args[1]) {
+                    Some((_, e, v)) => (v.to_vec(), e),
+                    None => (Vec::new(), 0),
+                };
+                if args[3].is_empty() {
+                    // no-op write: just report current length
+                    resp::integer(out, buf.len() as i64);
+                    return;
+                }
+                let end = off + args[3].len();
+                if buf.len() < end {
+                    buf.resize(end, 0); // zero-pad the gap, as Redis does
+                }
+                buf[off..end].copy_from_slice(&args[3]);
+                let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
+                store.set(&args[1], &buf, ttl);
+                resp::integer(out, buf.len() as i64);
+                durable_log(&batcher, tier, &args[1], &buf);
+                if persist_on {
+                    stages.push((args[1].clone(), buf, if exp > 0 { exp } else { 0 }, b's'));
+                }
+            }
+            b"INCRBYFLOAT" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'incrbyfloat'");
+                    return;
+                }
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                let (cur, exp) = match store.get_typed(&args[1]) {
+                    Some((_, e, v)) => {
+                        match std::str::from_utf8(v).ok().and_then(|t| t.trim().parse::<f64>().ok()) {
+                            Some(f) => (f, e),
+                            None => {
+                                resp::error(out, "ERR value is not a valid float");
+                                return;
+                            }
+                        }
+                    }
+                    None => (0.0, 0),
+                };
+                let by = match std::str::from_utf8(&args[2]).ok().and_then(|t| t.trim().parse::<f64>().ok()) {
+                    Some(f) => f,
+                    None => {
+                        resp::error(out, "ERR value is not a valid float");
+                        return;
+                    }
+                };
+                let nv = cur + by;
+                if !nv.is_finite() {
+                    resp::error(out, "ERR increment would produce NaN or Infinity");
+                    return;
+                }
+                let s = aggr::fmt_score(nv).into_bytes();
+                let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
+                store.set(&args[1], &s, ttl);
+                resp::bulk(out, &s);
+                durable_log(&batcher, tier, &args[1], &s);
+                if persist_on {
+                    stages.push((args[1].clone(), s, if exp > 0 { exp } else { 0 }, b's'));
                 }
             }
             // ---- TYPE + hashes ------------------------------------
@@ -1605,16 +1872,14 @@ impl Worker {
         // durable aggregates: a mutation of a hash/list/zset persists
         // its whole (kind-tagged) blob from the final store state — or a tombstone
         // if the key was emptied/deleted — so it recovers as the right type.
-        if persist_on && stage.is_none() && is_aggregate_write(&cmd) && nargs >= 2 {
-            stage = match store.get_typed(&args[1]) {
-                Some((kind, exp, blob)) => {
-                    Some((args[1].clone(), blob.to_vec(), exp, kind as u8))
-                }
-                None => Some((args[1].clone(), Vec::new(), DELETE_TOMBSTONE, b's')),
-            };
+        if persist_on && stages.is_empty() && is_aggregate_write(&cmd) && nargs >= 2 {
+            stages.push(match store.get_typed(&args[1]) {
+                Some((kind, exp, blob)) => (args[1].clone(), blob.to_vec(), exp, kind as u8),
+                None => (args[1].clone(), Vec::new(), DELETE_TOMBSTONE, b's'),
+            });
         }
 
-        if let Some((k, v, e, kind)) = stage {
+        for (k, v, e, kind) in stages {
             // sharded so a given key always lands on the same ring/persist worker
             // — no cross-worker key conflicts on ON CONFLICT.
             if let Some(sa) = shard_push(&self.producers, &k, &v, e, kind) {
@@ -2273,6 +2538,27 @@ fn remaining_ttl(exp: i64) -> i64 {
 /// Guard a string command: returns true if `key` is absent or holds a string;
 /// otherwise writes `WRONGTYPE` and returns false. (A cached aggregate must not
 /// be readable as a raw blob through `GET`/`INCR`/etc.)
+/// Redis GETRANGE slice: inclusive `[start, end]`, negative indices count from
+/// the end; out-of-range or start>end yields an empty slice.
+fn substr(v: &[u8], start: i64, end: i64) -> &[u8] {
+    let len = v.len() as i64;
+    if len == 0 {
+        return &[];
+    }
+    let mut s = if start < 0 { len + start } else { start };
+    let mut e = if end < 0 { len + end } else { end };
+    if s < 0 {
+        s = 0;
+    }
+    if e >= len {
+        e = len - 1;
+    }
+    if s > e || s >= len {
+        return &[];
+    }
+    &v[s as usize..=e as usize]
+}
+
 fn check_string(store: &Store, key: &[u8], out: &mut Vec<u8>) -> bool {
     match store.get_typed(key) {
         Some((k, _, _)) if k != crate::store::KIND_STR => {
@@ -2389,7 +2675,8 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
     match cmd {
         b"GET" | b"SET" | b"SETNX" | b"GETSET" | b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY"
         | b"TTL" | b"PTTL" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"PERSIST"
-        | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL"
+        | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL" | b"SETEX" | b"PSETEX" | b"GETEX"
+        | b"GETRANGE" | b"SETRANGE" | b"INCRBYFLOAT"
         // hashes + lists: the key is always the first argument
         | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
         | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY"
@@ -2405,6 +2692,8 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
             }
         }
         b"DEL" | b"UNLINK" | b"EXISTS" | b"MGET" => (1..nargs).collect(),
+        // MSET/MSETNX interleave key value key value … — scope every key slot.
+        b"MSET" | b"MSETNX" => (1..nargs).step_by(2).collect(),
         _ => vec![],
     }
 }
@@ -2428,6 +2717,13 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"PERSIST"
             | b"APPEND"
             | b"GETDEL"
+            | b"MSET"
+            | b"MSETNX"
+            | b"SETEX"
+            | b"PSETEX"
+            | b"GETEX"
+            | b"SETRANGE"
+            | b"INCRBYFLOAT"
             // hash mutations
             | b"HSET"
             | b"HMSET"
