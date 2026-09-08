@@ -271,16 +271,24 @@ jobs:
           SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
           mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
 
-          # Point pgrx at the staged PG (no managed dev PG is compiled), then package.
-          cargo pgrx init --pg17 "${PG_CONFIG}"
+          # `cargo pgrx package` builds against the given pg_config directly. It
+          # does NOT need `cargo pgrx init` — init runs initdb, which fails against
+          # a staged (DESTDIR) Postgres whose binaries resolve their libpq at an
+          # absolute install prefix that isn't installed yet (the macOS
+          # "Library not loaded: .../libpq.5.dylib" failure).
           ( cd extensions/pg_keyspace/extension && cargo pgrx package --pg-config "${PG_CONFIG}" )
 
-          # pgrx packages into <target>/pg_keyspace-pg17 + the pg_config prefix.
-          PKG="extensions/pg_keyspace/extension/target/release/pg_keyspace-pg17${{ env.INSTALL_PREFIX }}"
-          find "${PKG}/lib" \( -name "pg_keyspace.so" -o -name "pg_keyspace.dylib" \) \
+          # pgrx lays the package tree under target/release/pg_keyspace-pg17 at the
+          # paths pg_config REPORTS. PostgreSQL's pg_config is relocatable, so for a
+          # staged build those are the pg-install/... paths, not ${INSTALL_PREFIX} —
+          # derive them from pg_config rather than assuming the prefix.
+          PKGROOT="extensions/pg_keyspace/extension/target/release/pg_keyspace-pg17"
+          LIBSRC="${PKGROOT}$(${PG_CONFIG} --pkglibdir)"
+          SHARESRC="${PKGROOT}$(${PG_CONFIG} --sharedir)/extension"
+          find "${LIBSRC}" \( -name "pg_keyspace.so" -o -name "pg_keyspace.dylib" \) \
             -exec cp {} "${LIB_DIR}/" \;
-          cp "${PKG}/share/postgresql/extension/pg_keyspace.control" "${SHARE_DIR}/"
-          cp "${PKG}"/share/postgresql/extension/pg_keyspace--*.sql "${SHARE_DIR}/"
+          cp "${SHARESRC}/pg_keyspace.control" "${SHARE_DIR}/"
+          cp "${SHARESRC}"/pg_keyspace--*.sql "${SHARE_DIR}/"
 
           # keys-only logical-decode plugin (Mode B row cache), beside the .so.
           make -C extensions/pg_keyspace/plugin clean PG_CONFIG="${PG_CONFIG}" || true
