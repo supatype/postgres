@@ -164,11 +164,26 @@ predicate — collapsing a 96× overhead to ~1.5× over the unmasked baseline.
 
 ---
 
+## Getting it
+
+Three ways, easiest first:
+
+1. **The `supatype/postgres` image** — pg_keyspace is compiled from source into
+   the image (amd64 and arm64) and shipped ready to `CREATE EXTENSION`. It is
+   bundled but not auto-loaded; enable it by adding `pg_keyspace` to
+   `shared_preload_libraries` and restarting (see below).
+2. **Prebuilt packages** — every `v*` release attaches
+   `pg_keyspace-v<ver>-pg17-<arch>-linux-gnu.deb` and a matching `.tar.gz` for a
+   stock PGDG PostgreSQL 17. `dpkg -i pg_keyspace-*.deb` (or untar over the PG
+   prefix), then continue at the config step below.
+3. **Build from source** — the developer path, shown next.
+
 ## Install & use
 
-Requires only PostgreSQL (built/tested against 17.6) and `cargo-pgrx` 0.12.9.
-`supatype_mask` is **optional** — load it to add column masking; skip it to run
-standalone (`pg_keyspace.require_mask = off`). `pg_guard` is not required at all.
+Building from source requires only PostgreSQL (built/tested against 17.6) and
+`cargo-pgrx` 0.12.9. `supatype_mask` is **optional** — load it to add column
+masking; skip it to run standalone (`pg_keyspace.require_mask = off`). `pg_guard`
+is not required at all.
 
 ```bash
 # 1. core unit tests (no Postgres needed)

@@ -248,6 +248,49 @@ jobs:
           echo "pgjwt bundled."
 
       # ------------------------------------------------------------------ #
+      # pg_keyspace — Postgres-native RESP keyspace + PostgREST row cache
+      # (Rust/pgrx). Built from in-repo source against the staged PG so the
+      # native archive ships the same extension as the supatype/postgres image.
+      # Bundled BEFORE the macOS signing step so its library gets signed.
+      # Windows is skipped in build-windows: pgrx has no supported Windows target.
+      # ------------------------------------------------------------------ #
+      - name: Install clang for pgrx bindgen (Linux)
+        if: matrix.platform == 'linux'
+        run: sudo apt-get install -y --no-install-recommends clang libclang-dev llvm-dev
+
+      - name: Install cargo-pgrx
+        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
+        run: cargo install cargo-pgrx --version 0.12.9 --locked
+
+      - name: Build and bundle pg_keyspace
+        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
+        run: |
+          set -euo pipefail
+          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
+          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
+          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
+          mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
+
+          # Point pgrx at the staged PG (no managed dev PG is compiled), then package.
+          cargo pgrx init --pg17 "${PG_CONFIG}"
+          ( cd extensions/pg_keyspace/extension && cargo pgrx package --pg-config "${PG_CONFIG}" )
+
+          # pgrx packages into <target>/pg_keyspace-pg17 + the pg_config prefix.
+          PKG="extensions/pg_keyspace/extension/target/release/pg_keyspace-pg17${{ env.INSTALL_PREFIX }}"
+          find "${PKG}/lib" \( -name "pg_keyspace.so" -o -name "pg_keyspace.dylib" \) \
+            -exec cp {} "${LIB_DIR}/" \;
+          cp "${PKG}/share/postgresql/extension/pg_keyspace.control" "${SHARE_DIR}/"
+          cp "${PKG}"/share/postgresql/extension/pg_keyspace--*.sql "${SHARE_DIR}/"
+
+          # keys-only logical-decode plugin (Mode B row cache), beside the .so.
+          make -C extensions/pg_keyspace/plugin clean PG_CONFIG="${PG_CONFIG}" || true
+          make -C extensions/pg_keyspace/plugin PG_CONFIG="${PG_CONFIG}"
+          find extensions/pg_keyspace/plugin \
+            \( -name "supacache_keys.so" -o -name "supacache_keys.dylib" \) \
+            -exec cp {} "${LIB_DIR}/" \;
+          echo "pg_keyspace bundled into lib + share/postgresql/extension."
+
+      # ------------------------------------------------------------------ #
       # macOS — Developer ID + notarization (Phase 10.6 B7; same secrets as server-release)
       # ------------------------------------------------------------------ #
       - name: Sign staged Postgres tree (macOS)
@@ -494,6 +537,110 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------- #
+  # pg_keyspace — standalone installable packages (.deb + portable .tar.gz),
+  # the way pgrx extensions are normally distributed (cf. pg_graphql). These
+  # target a stock PGDG PostgreSQL 17 (prefix /usr/lib/postgresql/17) so anyone
+  # can `dpkg -i` or untar them onto their own Postgres — separate from the
+  # full-Postgres native archives above. Attached to the same release below.
+  # -------------------------------------------------------------------- #
+  pg-keyspace-package:
+    name: Package pg_keyspace (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-22.04
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add the PostgreSQL apt repository
+        run: |
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+      - name: Install PostgreSQL 17 + build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-17 postgresql-server-dev-17 \
+            clang libclang-dev llvm-dev build-essential
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version 0.12.9 --locked
+
+      - name: Initialise pgrx against the packaged PG17
+        run: cargo pgrx init --pg17 /usr/lib/postgresql/17/bin/pg_config
+
+      - name: Package the extension (.so + .control + .sql)
+        working-directory: extensions/pg_keyspace/extension
+        run: cargo pgrx package --pg-config /usr/lib/postgresql/17/bin/pg_config
+
+      - name: Build the keys-only decode plugin
+        working-directory: extensions/pg_keyspace/plugin
+        run: make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Assemble .deb and tarball
+        id: pkg
+        working-directory: extensions/pg_keyspace
+        run: |
+          set -eu
+          VER="${{ steps.v.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          PKGLIBDIR="$(/usr/lib/postgresql/17/bin/pg_config --pkglibdir)"
+
+          ROOT="$(mktemp -d)"
+          # pgrx package tree is already rooted at usr/...
+          cp -a extension/target/release/pg_keyspace-pg17/usr "$ROOT/"
+          # add the decode plugin next to the extension .so
+          install -Dm755 plugin/supacache_keys.so "$ROOT${PKGLIBDIR}/supacache_keys.so"
+
+          NAME="pg_keyspace-v${VER}-pg17-${ARCH}-linux-gnu"
+          tar czf "${GITHUB_WORKSPACE}/${NAME}.tar.gz" -C "$ROOT" usr
+
+          mkdir -p "$ROOT/DEBIAN"
+          cat > "$ROOT/DEBIAN/control" <<EOF
+          Package: pg-keyspace
+          Version: ${VER}
+          Architecture: ${ARCH}
+          Maintainer: Supatype <nic@titanacademy.io>
+          Depends: postgresql-17
+          Section: database
+          Priority: optional
+          Homepage: https://github.com/${{ github.repository }}
+          Description: Postgres-native RESP (Redis-compatible) keyspace + PostgREST row cache
+           A background-worker RESP2 server over a shared-memory keyspace, plus a
+           transparent row cache. Runs standalone; optional supatype_mask integration.
+          EOF
+          dpkg-deb --build --root-owner-group "$ROOT" "${GITHUB_WORKSPACE}/${NAME}.deb"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-keyspace-pkg-${{ matrix.arch }}
+          path: |
+            ${{ steps.pkg.outputs.name }}.deb
+            ${{ steps.pkg.outputs.name }}.tar.gz
+          retention-days: 7
+
+  # -------------------------------------------------------------------- #
   # Upload archives to CDN from one Linux runner.  This avoids parallel
   # multipart uploads from every build runner against Hetzner Object Storage
   # while keeping multipart enabled for large Postgres archives.
@@ -591,7 +738,7 @@ jobs:
   # -------------------------------------------------------------------- #
   release:
     name: Sign, Update CDN & Release
-    needs: [publish-cdn]
+    needs: [publish-cdn, pg-keyspace-package]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -614,6 +761,15 @@ jobs:
           pattern: supatype-pg-17-*
           merge-multiple: true
 
+      - name: Download pg_keyspace packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pg-keyspace-pkg-*
+          merge-multiple: true
+
+      # Only the full-Postgres native archives go into the signed/minisigned
+      # manifest the CLI verifies; the standalone pg_keyspace packages are
+      # attached to the Release below but kept out of this manifest.
       - name: Generate combined checksums.sha256
         run: |
           sha256sum supatype-pg-17-*.tar.gz supatype-pg-17-*.zip > checksums.sha256
@@ -733,3 +889,5 @@ jobs:
             supatype-pg-17-*.zip.sha256
             checksums.sha256
             checksums.sha256.minisig
+            pg_keyspace-v*-pg17-*-linux-gnu.deb
+            pg_keyspace-v*-pg17-*-linux-gnu.tar.gz
