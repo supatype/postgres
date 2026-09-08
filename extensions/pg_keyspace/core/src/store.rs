@@ -711,6 +711,79 @@ impl Store {
         }
     }
 
+    /// Set (or clear, when `exp_micros == 0`) the absolute expiry of an existing
+    /// key in place, without rewriting its value. Returns whether the key was
+    /// present. A non-zero `exp_micros` already in the past deletes the key (as
+    /// Redis EXPIRE/EXPIREAT with a past time do) and still returns `true`.
+    pub fn set_expiry(&self, key: &[u8], exp_micros: i64) -> bool {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            let b = match found {
+                Some(b) => b,
+                None => return false,
+            };
+            let idx = *self.buckets_ptr(p).add(b) - 1;
+            let e = self.entries_ptr(p).add(idx as usize);
+            let cur = (*e).expires_at;
+            if cur != 0 && cur <= now_micros() {
+                // key is already expired (not yet lazily reaped): treat as absent
+                self.remove_at(p, b, idx);
+                return false;
+            }
+            if exp_micros != 0 && exp_micros <= now_micros() {
+                self.remove_at(p, b, idx);
+                return true;
+            }
+            (*e).expires_at = exp_micros;
+            true
+        }
+    }
+
+    /// Iterate live keys for SCAN. `cursor` is an opaque position (0 starts a new
+    /// iteration); `limit` bounds how many keys one call returns. Returns the
+    /// keys found and the next cursor (0 once iteration is complete). Keys are
+    /// copied out (they outlive the borrow). Like Redis SCAN, coverage is only
+    /// guaranteed for keys present for the whole iteration; heavy concurrent
+    /// churn may miss or repeat a key.
+    pub fn scan(&self, cursor: u64, limit: usize) -> (u64, Vec<Vec<u8>>) {
+        let stride = self.entries as u64;
+        let total = self.num_partitions as u64 * stride;
+        let budget = limit.max(1);
+        let now = now_micros();
+        let mut pos = cursor;
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        unsafe {
+            while pos < total && keys.len() < budget {
+                let p = (pos / stride) as u32;
+                let idx = (pos % stride) as u32;
+                pos += 1;
+                let meta = self.meta(p);
+                if idx >= (*meta).entry_bump {
+                    // nothing allocated past entry_bump — skip this partition's tail
+                    pos = (p as u64 + 1) * stride;
+                    continue;
+                }
+                let e = self.entries_ptr(p).add(idx as usize);
+                if (*e).flags & FLAG_OCCUPIED == 0 {
+                    continue;
+                }
+                let exp = (*e).expires_at;
+                if exp != 0 && exp <= now {
+                    continue;
+                }
+                let k = std::slice::from_raw_parts(
+                    self.data_ptr(p).add((*e).key_off as usize),
+                    (*e).key_len as usize,
+                );
+                keys.push(k.to_vec());
+            }
+        }
+        let next = if pos >= total { 0 } else { pos };
+        (next, keys)
+    }
+
     /// INCR by `by`. Values are stored as decimal text (Redis semantics).
     /// Returns the new value, or None on overflow / non-integer.
     pub fn incr(&self, key: &[u8], by: i64) -> Option<i64> {
@@ -897,6 +970,61 @@ mod tests {
         s.set(b"k", b"v", 1); // 1 micro
         std::thread::sleep(std::time::Duration::from_millis(2));
         assert!(matches!(s.get(b"k"), Lookup::Miss));
+    }
+
+    #[test]
+    fn set_expiry_update_persist_and_past() {
+        let s = store("t_setexp");
+        assert!(s.set(b"k", b"v", 0));
+        // absent key
+        assert!(!s.set_expiry(b"missing", now_micros() + 1_000_000));
+        // set a future expiry in place (value unchanged)
+        assert!(s.set_expiry(b"k", now_micros() + 60_000_000));
+        assert!(matches!(s.get_typed(b"k"), Some((_, exp, v)) if exp > now_micros() && v == b"v"));
+        // clear the expiry (PERSIST)
+        assert!(s.set_expiry(b"k", 0));
+        assert!(matches!(s.get_typed(b"k"), Some((_, 0, _))));
+        // a past expiry deletes the key but still reports it existed
+        assert!(s.set_expiry(b"k", 1));
+        assert!(matches!(s.get(b"k"), Lookup::Miss));
+    }
+
+    #[test]
+    fn scan_visits_every_live_key_and_skips_expired() {
+        let s = store("t_scan");
+        for i in 0..500 {
+            s.set(format!("key:{i}").as_bytes(), b"v", 0);
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        loop {
+            let (next, batch) = s.scan(cursor, 32);
+            for k in batch {
+                seen.insert(k);
+            }
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(seen.len(), 500);
+
+        // an expired key is never returned by SCAN
+        s.set(b"soon", b"v", 1); // ~immediate expiry
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut cursor = 0u64;
+        let mut found_soon = false;
+        loop {
+            let (next, batch) = s.scan(cursor, 64);
+            if batch.iter().any(|k| k.as_slice() == b"soon") {
+                found_soon = true;
+            }
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        assert!(!found_soon);
     }
 
     #[test]

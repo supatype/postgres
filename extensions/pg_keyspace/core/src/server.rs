@@ -670,6 +670,11 @@ impl Worker {
         let tier = self.tier;
         let persist_on = !self.producers.is_empty();
         let sync_ack = self.sync_ack;
+        // Tenant scope for SCAN/KEYS (None for unauthed/exempt): keys are stored
+        // as `{tenant}:{key}`, so a scoped connection only sees — and only reports
+        // the unscoped form of — keys under its own prefix. Computed before the
+        // `out` borrow below, which takes `self` mutably.
+        let scan_prefix = self.conn_prefix(fd);
         // A write to enqueue for persistence, applied after the match so
         // it does not tangle with the `out` borrow.
         let mut stage: Option<PendingWrite> = None;
@@ -690,7 +695,11 @@ impl Worker {
                 resp::simple(out, "OK");
                 self.conns.get_mut(&fd).unwrap().closing = true;
             }
-            b"HELLO" => resp::error(out, "NOPROTO unsupported, use RESP2"),
+            // No HELLO arm: RESP2-only. HELLO falls through to the catch-all,
+            // which replies `ERR unknown command 'HELLO'`. A RESP3 client such as
+            // valkey-go matches that (its `noHello` probe) and transparently falls
+            // back to RESP2, instead of the old `NOPROTO` reply which it did not
+            // recognise and closed the connection on.
             b"CLIENT" | b"CONFIG" | b"SELECT" | b"RESET" => resp::simple(out, "OK"),
             b"COMMAND" => resp::array_header(out, 0),
             b"DBSIZE" => {
@@ -801,6 +810,144 @@ impl Worker {
                     }
                 }
                 resp::integer(out, count);
+            }
+            b"TTL" | b"PTTL" => {
+                if nargs != 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'ttl'");
+                    return;
+                }
+                match store.get_typed(&args[1]) {
+                    None => resp::integer(out, -2), // no such key
+                    Some((_, 0, _)) => resp::integer(out, -1), // key exists, no TTL
+                    Some((_, exp, _)) => {
+                        let ms = (exp - now_micros()).max(0) / 1000;
+                        if cmd == b"PTTL" {
+                            resp::integer(out, ms);
+                        } else {
+                            resp::integer(out, (ms + 500) / 1000); // round to seconds
+                        }
+                    }
+                }
+            }
+            b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'expire'");
+                    return;
+                }
+                let n: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()) {
+                    Some(v) => v,
+                    None => {
+                        resp::error(out, "ERR value is not an integer or out of range");
+                        return;
+                    }
+                };
+                let exp = match cmd.as_slice() {
+                    b"EXPIRE" => now_micros() + n.saturating_mul(1_000_000),
+                    b"PEXPIRE" => now_micros() + n.saturating_mul(1_000),
+                    b"EXPIREAT" => n.saturating_mul(1_000_000),
+                    _ => n.saturating_mul(1_000), // PEXPIREAT (unix millis)
+                };
+                // Applies in shared memory. NOTE: not written through to the
+                // durable backing tables — on the persistent tiers a crash reverts
+                // the key to the TTL its last SET persisted. Fine for the cache
+                // (ephemeral) use; see the durable-TTL follow-up.
+                resp::integer(out, if store.set_expiry(&args[1], exp) { 1 } else { 0 });
+            }
+            b"PERSIST" => {
+                if nargs != 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'persist'");
+                    return;
+                }
+                // 1 only if the key exists AND had a TTL to remove.
+                let had_ttl = matches!(store.get_typed(&args[1]), Some((_, exp, _)) if exp != 0);
+                if had_ttl {
+                    store.set_expiry(&args[1], 0);
+                }
+                resp::integer(out, if had_ttl { 1 } else { 0 });
+            }
+            b"SCAN" => {
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'scan'");
+                    return;
+                }
+                let cursor: u64 =
+                    std::str::from_utf8(&args[1]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                let mut pattern: Option<&[u8]> = None;
+                let mut count: usize = 10;
+                let mut i = 2;
+                while i + 1 < nargs {
+                    match args[i].to_ascii_uppercase().as_slice() {
+                        b"MATCH" => pattern = Some(&args[i + 1]),
+                        b"COUNT" => {
+                            if let Some(n) =
+                                std::str::from_utf8(&args[i + 1]).ok().and_then(|t| t.parse::<usize>().ok())
+                            {
+                                count = n.max(1);
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 2;
+                }
+                let (next, raw) = store.scan(cursor, count);
+                let mut facing: Vec<&[u8]> = Vec::new();
+                for k in &raw {
+                    let f: &[u8] = match &scan_prefix {
+                        Some(pfx) => {
+                            if !k.starts_with(pfx.as_slice()) {
+                                continue;
+                            }
+                            &k[pfx.len()..]
+                        }
+                        None => k.as_slice(),
+                    };
+                    if let Some(pat) = pattern {
+                        if !glob_match(pat, f) {
+                            continue;
+                        }
+                    }
+                    facing.push(f);
+                }
+                resp::array_header(out, 2);
+                resp::bulk(out, next.to_string().as_bytes());
+                resp::array_header(out, facing.len());
+                for f in facing {
+                    resp::bulk(out, f);
+                }
+            }
+            b"KEYS" => {
+                if nargs != 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'keys'");
+                    return;
+                }
+                let pattern = &args[1];
+                let mut facing: Vec<Vec<u8>> = Vec::new();
+                let mut cursor = 0u64;
+                loop {
+                    let (next, raw) = store.scan(cursor, 256);
+                    for k in raw {
+                        let f: &[u8] = match &scan_prefix {
+                            Some(pfx) => {
+                                if !k.starts_with(pfx.as_slice()) {
+                                    continue;
+                                }
+                                &k[pfx.len()..]
+                            }
+                            None => k.as_slice(),
+                        };
+                        if glob_match(pattern, f) {
+                            facing.push(f.to_vec());
+                        }
+                    }
+                    if next == 0 {
+                        break;
+                    }
+                    cursor = next;
+                }
+                resp::array_header(out, facing.len());
+                for f in &facing {
+                    resp::bulk(out, f);
+                }
             }
             b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY" => {
                 if !check_string(&store, &args[1], out) {
@@ -1449,7 +1596,10 @@ impl Worker {
                 };
                 resp::integer(out, raw.map(|b| aggr::zset_count(b, &min, &max)).unwrap_or(0) as i64);
             }
-            _ => resp::error(out, "ERR unknown command"),
+            other => resp::error(
+                out,
+                &format!("ERR unknown command '{}'", String::from_utf8_lossy(other)),
+            ),
         }
 
         // durable aggregates: a mutation of a hash/list/zset persists
@@ -2238,7 +2388,8 @@ fn save_zset(store: &Store, key: &[u8], z: &aggr::ZSet, exp: i64) {
 fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
     match cmd {
         b"GET" | b"SET" | b"SETNX" | b"GETSET" | b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY"
-        | b"TTL" | b"EXPIRE" | b"PERSIST" | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL"
+        | b"TTL" | b"PTTL" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"PERSIST"
+        | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL"
         // hashes + lists: the key is always the first argument
         | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
         | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY"
@@ -2271,6 +2422,9 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"DEL"
             | b"UNLINK"
             | b"EXPIRE"
+            | b"PEXPIRE"
+            | b"EXPIREAT"
+            | b"PEXPIREAT"
             | b"PERSIST"
             | b"APPEND"
             | b"GETDEL"

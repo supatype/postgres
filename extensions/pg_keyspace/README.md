@@ -227,8 +227,15 @@ SELECT * FROM supacache.stats();
 ```
 
 Redis data types work as expected (`HSET/HGET`, `LPUSH/LRANGE`, `ZADD/ZRANGE`,
-`SUBSCRIBE/PUBLISH`, `EXPIRE`, …), verified for Redis parity at 10 k-element
-scale.
+`SUBSCRIBE/PUBLISH`, …), verified for Redis parity at 10 k-element scale.
+Key lifetime and iteration are covered too: `SET … EX/PX`, `TTL`/`PTTL`,
+`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`, `PERSIST`, and `SCAN`/`KEYS`.
+
+**RESP2, client-side caching off.** pg_keyspace speaks RESP2; it does not
+implement `HELLO`/RESP3, so a RESP3 client that probes with `HELLO` falls back
+to RESP2 automatically (e.g. `valkey-go` — set `DisableCache: true`, since
+RESP3 client-side caching is unavailable). Sets (`SADD`/`SCARD`/…) are not yet
+implemented.
 
 ### Durability & crash recovery
 
