@@ -1,7 +1,8 @@
-//! pgkeyspaced — the POC daemon. Spawns N slot workers, each a shared-nothing
-//! epoll loop on its own port backed by its own shared-memory segment (§3.1:
-//! "no locks, no atomics, no cache line ping-pong on the hot path"). N=1 is the
-//! P0 configuration the kill criterion measures; N>1 demonstrates scale-out.
+//! pgkeyspaced — the standalone daemon. Spawns N slot workers, each a
+//! shared-nothing epoll loop on its own port backed by its own shared-memory
+//! segment (§3.1: "no locks, no atomics, no cache line ping-pong on the hot
+//! path"). N=1 is the single-worker configuration the latency benchmarks
+//! measure; N>1 demonstrates scale-out.
 //!
 //! Usage:
 //!   pgkeyspaced [--workers N] [--port 6380] [--host 127.0.0.1]

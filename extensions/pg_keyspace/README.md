@@ -8,8 +8,7 @@ row cache for PostgREST. Stock clients — `redis-cli`, `ioredis`, `redis-py`,
 `redis-benchmark` — talk to it unmodified on `:6381`, while the *same bytes* are
 readable and writable from SQL. One system, one thing to run, one security model.
 
-It validated its kill criterion up front — *"if a cache hit is not under 80 µs,
-stop"* — coming in at **~34 µs, tying Valkey** — and has grown into a working
+A cache read lands in **~34 µs — tying Valkey** — and it is a complete
 extension: a full command surface, four durability tiers with real crash
 recovery and synchronous replication, native large-collection structures, a
 transparent PostgREST row cache, horizontal multi-worker scale-out, and an
@@ -129,7 +128,7 @@ the others). — `bench/run_p0_scaleout_inpg.sh`
 
 Past a threshold, collections switch to an indexed in-value structure. Point
 reads go from O(n) to O(1)/O(log n) — dramatic at scale, byte-for-byte
-Redis-compatible (`bench/run_p3_big{hash,list,zset}.sh`, `poc/examples/bench_*`):
+Redis-compatible (`bench/run_p3_big{hash,list,zset}.sh`, `core/examples/bench_*`):
 
 | Op | Elements | Flat (inline) | Indexed | Speedup |
 |---|---:|---:|---:|---:|
@@ -187,7 +186,7 @@ is not required at all.
 
 ```bash
 # 1. core unit tests (no Postgres needed)
-cd extensions/pg_keyspace/poc && cargo test
+cd extensions/pg_keyspace/core && cargo test
 
 # 2. build + install the extension
 cd ../extension
@@ -330,7 +329,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 
 ```
 extensions/pg_keyspace/
-├── poc/                      shared core (Rust, libc only) + tools
+├── core/                     shared core (Rust, libc only) + tools
 │   └── src/
 │       ├── store.rs          open-addressed hash, size-classed slab, CLOCK eviction (§3.2)
 │       ├── server.rs         epoll RESP2 event loop + command dispatch (§3.1/§5)
@@ -345,19 +344,19 @@ extensions/pg_keyspace/
 │           ├── pgkeyspaced.rs      standalone daemon (scale-out demo)
 │           ├── pgks-replica.rs     standalone replication standby
 │           └── durability_bench.rs commit-batcher microbenchmark
-├── extension/                the pgrx extension (compiles poc/src verbatim via #[path])
+├── extension/                the pgrx extension (compiles core/src verbatim via #[path])
 │   └── src/lib.rs            _PG_init, shmem hooks, N RESP workers, persist/expiry/invalidation
 │                             workers, Mode B CustomScan, supacache.* SQL surface
 ├── plugin/                   supacache_keys: keys-only logical-decoding output plugin (§3.5)
 └── bench/                    reproducible benchmark + conformance harnesses (run_*.sh)
 ```
 
-The extension shares the `poc/src/*.rs` modules **verbatim** (via `#[path]`), so
+The extension shares the `core/src/*.rs` modules **verbatim** (via `#[path]`), so
 the code measured standalone is the same code that runs inside Postgres.
 
 ### Tests & benches
 
-`cargo test` in `poc/` runs the self-contained unit tests (data structures, slab
+`cargo test` in `core/` runs the self-contained unit tests (data structures, slab
 allocator, auth, replication). The `bench/` scripts are integration + conformance
 harnesses grouped by phase — Redis parity for every type (`run_p3_*`), security
 (`run_p2_*`, `run_p6_security.sh`), Mode B coherence for int/uuid/text/TOAST PKs

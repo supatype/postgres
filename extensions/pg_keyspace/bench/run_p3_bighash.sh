@@ -6,7 +6,7 @@
 # indexed blob is still one atomically-managed keyspace value. Parity is checked
 # against a real redis-server on :6379.
 set -u
-DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/poc/target/release/pgkeyspaced}
+DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/core/target/release/pgkeyspaced}
 PORT=${PORT:-6392}
 REDIS=${REDIS:-6379}
 N=${N:-10000}

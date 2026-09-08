@@ -10,7 +10,7 @@
 //!     segment directly in the calling backend — the in-process ~1-2µs path.
 //!
 //! The performance-critical modules are shared verbatim with the standalone
-//! `poc` crate (via `#[path]`), so the code measured here is the same code the
+//! `core` crate (via `#[path]`), so the code measured here is the same code the
 //! standalone benchmarks measure.
 
 use core::ffi::c_void;
@@ -25,26 +25,26 @@ use std::time::Duration;
 
 pgrx::pg_module_magic!();
 
-// ---- shared core (identical to the standalone poc) -----------------------
-#[path = "../../poc/src/crc16.rs"]
+// ---- shared core (identical to the standalone core crate) ----------------
+#[path = "../../core/src/crc16.rs"]
 mod crc16;
-#[path = "../../poc/src/shmem.rs"]
+#[path = "../../core/src/shmem.rs"]
 mod shmem;
-#[path = "../../poc/src/store.rs"]
+#[path = "../../core/src/store.rs"]
 mod store;
-#[path = "../../poc/src/resp.rs"]
+#[path = "../../core/src/resp.rs"]
 mod resp;
-#[path = "../../poc/src/batcher.rs"]
+#[path = "../../core/src/batcher.rs"]
 mod batcher;
-#[path = "../../poc/src/ring.rs"]
+#[path = "../../core/src/ring.rs"]
 mod ring;
-#[path = "../../poc/src/pubsub.rs"]
+#[path = "../../core/src/pubsub.rs"]
 mod pubsub;
-#[path = "../../poc/src/repl.rs"]
+#[path = "../../core/src/repl.rs"]
 mod repl;
-#[path = "../../poc/src/aggr.rs"]
+#[path = "../../core/src/aggr.rs"]
 mod aggr;
-#[path = "../../poc/src/server.rs"]
+#[path = "../../core/src/server.rs"]
 mod server;
 
 use batcher::Tier;

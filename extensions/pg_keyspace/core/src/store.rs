@@ -169,7 +169,7 @@ impl Config {
 
 #[allow(dead_code)]
 enum Backing {
-    /// POSIX shared memory owned by this handle (poc daemon, tests).
+    /// POSIX shared memory owned by this handle (core daemon, tests).
     Posix(Shmem),
     /// A raw region owned by someone else — e.g. a Postgres shared-memory
     /// segment from `ShmemInitStruct`, mapped at the same address in every
@@ -193,8 +193,8 @@ pub struct Store {
 }
 
 // A partition is written by exactly one worker; SQL-surface readers in other
-// backends observe a consistent-enough view for a POC (the plan notes a seqlock
-// is the production answer). The raw base is stable across backends.
+// backends observe a consistent-enough view (the plan notes a seqlock is the
+// stronger guarantee). The raw base is stable across backends.
 unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 

@@ -35,13 +35,13 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            extensions/pg_keyspace/poc/target
+            extensions/pg_keyspace/core/target
             extensions/pg_keyspace/extension/target
           key: pgks-cargo-${{ runner.os }}-pg${{ matrix.pg }}-${{ hashFiles('extensions/pg_keyspace/**/Cargo.lock') }}
 
       # ---- core unit tests: pure Rust, no Postgres needed --------------------
-      - name: Unit tests (poc core)
-        working-directory: extensions/pg_keyspace/poc
+      - name: Unit tests (core)
+        working-directory: extensions/pg_keyspace/core
         run: cargo test --locked
 
       # ---- extension build: needs PG17 headers + libclang (pgrx bindgen) -----
@@ -86,8 +86,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            extensions/pg_keyspace/poc/target
-          key: pgks-poc-${{ runner.os }}-${{ hashFiles('extensions/pg_keyspace/poc/Cargo.lock') }}
+            extensions/pg_keyspace/core/target
+          key: pgks-core-${{ runner.os }}-${{ hashFiles('extensions/pg_keyspace/core/Cargo.lock') }}
 
       - name: Install redis (server + tools)
         run: |
@@ -95,7 +95,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends redis-server redis-tools
 
       - name: Build daemon + standby binaries
-        working-directory: extensions/pg_keyspace/poc
+        working-directory: extensions/pg_keyspace/core
         run: cargo build --locked --release --bins
 
       - name: Start redis (reference for parity checks)
@@ -107,8 +107,8 @@ jobs:
       - name: Run conformance + integration benches
         working-directory: extensions/pg_keyspace
         env:
-          DAEMON: ${{ github.workspace }}/extensions/pg_keyspace/poc/target/release/pgkeyspaced
-          REPLICA: ${{ github.workspace }}/extensions/pg_keyspace/poc/target/release/pgks-replica
+          DAEMON: ${{ github.workspace }}/extensions/pg_keyspace/core/target/release/pgkeyspaced
+          REPLICA: ${{ github.workspace }}/extensions/pg_keyspace/core/target/release/pgks-replica
         run: |
           set -u
           fail=0

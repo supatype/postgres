@@ -7,7 +7,7 @@
 # epoll loop. This test proves a SUBSCRIBE on worker B receives a PUBLISH issued
 # on worker A (and the reverse), across direct channels and glob patterns.
 set -u
-DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/poc/target/release/pgkeyspaced}
+DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/core/target/release/pgkeyspaced}
 BASE=${BASE:-6390}          # worker 0 = BASE, worker 1 = BASE+1
 W0=$BASE; W1=$((BASE+1))
 pass=0; fail=0

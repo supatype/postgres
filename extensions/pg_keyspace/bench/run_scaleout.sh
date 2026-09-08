@@ -7,7 +7,7 @@
 # compete with the N workers for CPU; scaling is therefore sub-linear here and
 # would be cleaner with the load generator on a separate host.
 set -u
-BIN=/home/user/postgres/extensions/pg_keyspace/poc/target/release/pgkeyspaced
+BIN=/home/user/postgres/extensions/pg_keyspace/core/target/release/pgkeyspaced
 OUT=/home/user/postgres/extensions/pg_keyspace/results
 BASE=6390
 REQS=500000

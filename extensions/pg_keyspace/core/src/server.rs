@@ -2,7 +2,7 @@
 //! and dispatching against its own shared-memory partition (§3.1). No
 //! transaction is ever opened on this path; a command is a shmem read/write
 //! plus, for logged tiers, a handoff to the commit batcher (§3.4). This is the
-//! path the P0 kill criterion measures.
+//! hot path the latency benchmarks measure.
 
 use crate::aggr;
 use crate::batcher::{Batcher, Tier};

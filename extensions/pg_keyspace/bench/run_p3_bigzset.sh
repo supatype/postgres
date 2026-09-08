@@ -5,7 +5,7 @@
 # Proves a 10k-member zset (with score ties, to exercise (score,member) order) is
 # byte-for-byte Redis-compatible over the read surface.
 set -u
-DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/poc/target/release/pgkeyspaced}
+DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/core/target/release/pgkeyspaced}
 PORT=${PORT:-6398}
 REDIS=${REDIS:-6379}
 N=${N:-10000}

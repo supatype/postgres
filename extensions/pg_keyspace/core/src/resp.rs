@@ -1,5 +1,5 @@
 //! Minimal RESP2 codec — enough for `ioredis`/`go-redis`/`redis-benchmark` to
-//! drive the POC unmodified (§5). Parses the array-of-bulk-strings request form
+//! drive pg_keyspace unmodified (§5). Parses the array-of-bulk-strings request form
 //! (what all real clients send) plus inline commands (for `redis-cli`/telnet),
 //! and provides the reply encoders.
 

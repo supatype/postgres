@@ -6,8 +6,8 @@
 # SECOND node — not a sleep. Also contrasts replicated vs durable latency (the
 # real socket round-trip + second fsync).
 set -u
-DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/poc/target/release/pgkeyspaced}
-REPLICA=${REPLICA:-/home/user/postgres/extensions/pg_keyspace/poc/target/release/pgks-replica}
+DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/core/target/release/pgkeyspaced}
+REPLICA=${REPLICA:-/home/user/postgres/extensions/pg_keyspace/core/target/release/pgks-replica}
 PORT=${PORT:-6500}
 RPORT=${RPORT:-7500}
 DIR=${DIR:-/tmp/pgks_repl_$$}

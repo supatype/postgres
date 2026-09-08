@@ -5,7 +5,7 @@
 # byte-for-byte Redis-compatible over the read surface (parity vs a real
 # redis-server on :6379) and stays a single key.
 set -u
-DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/poc/target/release/pgkeyspaced}
+DAEMON=${DAEMON:-/home/user/postgres/extensions/pg_keyspace/core/target/release/pgkeyspaced}
 PORT=${PORT:-6396}
 REDIS=${REDIS:-6379}
 N=${N:-10000}
