@@ -1240,6 +1240,277 @@ impl Worker {
                     stages.push((args[1].clone(), s, if exp > 0 { exp } else { 0 }, b's'));
                 }
             }
+            // ---- key-space management -----------------------------
+            b"RENAME" | b"RENAMENX" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'rename'");
+                    return;
+                }
+                let src = args[1].clone();
+                let dst = args[2].clone();
+                let (kind, exp, blob) = match store.get_typed(&src) {
+                    Some((k, e, v)) => (k, e, v.to_vec()),
+                    None => {
+                        resp::error(out, "ERR no such key");
+                        return;
+                    }
+                };
+                let dst_exists = matches!(store.get_typed(&dst), Some(_));
+                if cmd == b"RENAMENX" && (dst_exists || src == dst) {
+                    // NX: refuse if the destination is already taken.
+                    resp::integer(out, 0);
+                    return;
+                }
+                if src == dst {
+                    // RENAME onto itself is a no-op that still validates existence.
+                    resp::simple(out, "OK");
+                    return;
+                }
+                store.set_typed(&dst, &blob, remaining_ttl(exp), kind);
+                store.del(&src);
+                if persist_on {
+                    stages.push((dst, blob, if exp > 0 { exp } else { 0 }, kind as u8));
+                    stages.push((src, Vec::new(), DELETE_TOMBSTONE, b's'));
+                }
+                if cmd == b"RENAMENX" {
+                    resp::integer(out, 1);
+                } else {
+                    resp::simple(out, "OK");
+                }
+            }
+            b"COPY" => {
+                // COPY source destination [REPLACE] [DB n]
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'copy'");
+                    return;
+                }
+                let replace = args[3..]
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(b"REPLACE"));
+                let (kind, exp, blob) = match store.get_typed(&args[1]) {
+                    Some((k, e, v)) => (k, e, v.to_vec()),
+                    None => {
+                        resp::integer(out, 0);
+                        return;
+                    }
+                };
+                if !replace && matches!(store.get_typed(&args[2]), Some(_)) {
+                    resp::integer(out, 0);
+                    return;
+                }
+                store.set_typed(&args[2], &blob, remaining_ttl(exp), kind);
+                if persist_on {
+                    stages.push((args[2].clone(), blob, if exp > 0 { exp } else { 0 }, kind as u8));
+                }
+                resp::integer(out, 1);
+            }
+            b"TOUCH" => {
+                // Count the keys that exist (a get refreshes the CLOCK ref bit).
+                let mut count = 0i64;
+                for a in &args[1..] {
+                    if matches!(store.get(a), Lookup::Hit(_)) {
+                        count += 1;
+                    }
+                }
+                resp::integer(out, count);
+            }
+            b"RANDOMKEY" => {
+                // Pick a live key, returned in its client-facing (unscoped) form.
+                // Start the scan at a time-seeded position so repeated calls do not
+                // always return the same key, wrapping to the head once if needed.
+                let stride = store.num_partitions() as u64;
+                let total = stride.max(1);
+                let mut start = (now_micros() as u64).wrapping_mul(0x9E3779B97F4A7C15) % total;
+                let mut chosen: Option<Vec<u8>> = None;
+                for _ in 0..2 {
+                    let mut cursor = start;
+                    loop {
+                        let (next, raw) = store.scan(cursor, 128);
+                        for k in &raw {
+                            let f: &[u8] = match &scan_prefix {
+                                Some(pfx) => {
+                                    if !k.starts_with(pfx.as_slice()) {
+                                        continue;
+                                    }
+                                    &k[pfx.len()..]
+                                }
+                                None => k.as_slice(),
+                            };
+                            chosen = Some(f.to_vec());
+                            break;
+                        }
+                        if chosen.is_some() || next == 0 {
+                            break;
+                        }
+                        cursor = next;
+                    }
+                    if chosen.is_some() {
+                        break;
+                    }
+                    start = 0; // second pass from the head to cover the wrap
+                }
+                match chosen {
+                    Some(k) => resp::bulk(out, &k),
+                    None => resp::nil(out),
+                }
+            }
+            b"EXPIRETIME" | b"PEXPIRETIME" => {
+                if nargs != 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'expiretime'");
+                    return;
+                }
+                match store.get_typed(&args[1]) {
+                    None => resp::integer(out, -2),          // no such key
+                    Some((_, 0, _)) => resp::integer(out, -1), // exists, no expiry
+                    Some((_, exp, _)) => {
+                        if cmd == b"PEXPIRETIME" {
+                            resp::integer(out, exp / 1_000);
+                        } else {
+                            resp::integer(out, exp / 1_000_000);
+                        }
+                    }
+                }
+            }
+            b"OBJECT" => {
+                // OBJECT ENCODING|REFCOUNT|IDLETIME|FREQ key  (+ HELP)
+                let sub = args.get(1).map(|a| a.to_ascii_uppercase());
+                match sub.as_deref() {
+                    Some(b"HELP") => {
+                        resp::array_header(out, 1);
+                        resp::bulk(out, b"OBJECT ENCODING|REFCOUNT|IDLETIME|FREQ <key>");
+                    }
+                    Some(b"ENCODING") | Some(b"REFCOUNT") | Some(b"IDLETIME") | Some(b"FREQ")
+                        if nargs >= 3 =>
+                    {
+                        match store.get_typed(&args[2]) {
+                            None => resp::error(out, "ERR no such key"),
+                            Some((kind, _, v)) => match sub.as_deref() {
+                                Some(b"ENCODING") => {
+                                    let enc: &[u8] = match kind {
+                                        KIND_HASH => b"hashtable",
+                                        k if k == crate::store::KIND_LIST => b"quicklist",
+                                        k if k == crate::store::KIND_ZSET => b"skiplist",
+                                        // integer strings report "int" as Redis does
+                                        _ if std::str::from_utf8(v)
+                                            .ok()
+                                            .and_then(|t| t.parse::<i64>().ok())
+                                            .is_some() =>
+                                        {
+                                            b"int"
+                                        }
+                                        _ => b"embstr",
+                                    };
+                                    resp::bulk(out, enc);
+                                }
+                                Some(b"REFCOUNT") => resp::integer(out, 1),
+                                _ => resp::integer(out, 0), // IDLETIME / FREQ
+                            },
+                        }
+                    }
+                    _ => resp::error(
+                        out,
+                        "ERR Unknown OBJECT subcommand or wrong number of arguments",
+                    ),
+                }
+            }
+            // ---- server / admin -----------------------------------
+            b"ECHO" => {
+                if nargs != 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'echo'");
+                    return;
+                }
+                resp::bulk(out, &args[1]);
+            }
+            b"TIME" => {
+                let us = now_micros();
+                resp::array_header(out, 2);
+                resp::bulk(out, (us / 1_000_000).to_string().as_bytes());
+                resp::bulk(out, (us % 1_000_000).to_string().as_bytes());
+            }
+            b"INFO" => {
+                let mut keys = 0u64;
+                let mut used = 0u64;
+                for p in 0..store.num_partitions() {
+                    let st = store.stats(p);
+                    keys += st.entries;
+                    used += st.data_used;
+                }
+                let body = format!(
+                    "# Server\r\nredis_version:7.4.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\n\
+                     # Clients\r\nblocked_clients:0\r\n\
+                     # Memory\r\nused_memory:{used}\r\nmaxmemory:0\r\n\
+                     # Persistence\r\nloading:0\r\n\
+                     # Replication\r\nrole:master\r\nconnected_slaves:0\r\n\
+                     # Keyspace\r\ndb0:keys={keys},expires=0,avg_ttl=0\r\n"
+                );
+                resp::bulk(out, body.as_bytes());
+            }
+            b"MEMORY" => {
+                match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
+                    Some(b"USAGE") if nargs >= 3 => match store.get_typed(&args[2]) {
+                        None => resp::nil(out),
+                        // rough estimate: value + key bytes + fixed entry overhead
+                        Some((_, _, v)) => {
+                            resp::integer(out, (v.len() + args[2].len() + 64) as i64)
+                        }
+                    },
+                    Some(b"DOCTOR") => resp::bulk(out, b"Sam, I detected a few issues in this Redis instance memory implants:\n\n * No issues detected.\n"),
+                    _ => resp::error(
+                        out,
+                        "ERR Unknown MEMORY subcommand or wrong number of arguments",
+                    ),
+                }
+            }
+            b"DEBUG" => {
+                // Enough of DEBUG for tooling/tests; nothing mutates state.
+                match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
+                    Some(b"OBJECT") if nargs >= 3 => match store.get_typed(&args[2]) {
+                        None => resp::error(out, "ERR no such key"),
+                        Some((_, _, v)) => resp::simple(
+                            out,
+                            &format!(
+                                "Value at:0x0 refcount:1 encoding:raw serializedlength:{} lru:0 lru_seconds_idle:0",
+                                v.len()
+                            ),
+                        ),
+                    },
+                    // DEBUG SLEEP would block the single-threaded loop, so it is a
+                    // no-op OK rather than an actual stall.
+                    _ => resp::simple(out, "OK"),
+                }
+            }
+            b"FLUSHALL" | b"FLUSHDB" => {
+                // Collect first, then delete, so we don't mutate mid-scan. A scoped
+                // (tenant) connection only clears its own prefix; an unscoped/exempt
+                // connection clears everything.
+                let mut victims: Vec<Vec<u8>> = Vec::new();
+                let mut cursor = 0u64;
+                loop {
+                    let (next, raw) = store.scan(cursor, 512);
+                    for k in raw {
+                        match &scan_prefix {
+                            Some(pfx) if !k.starts_with(pfx.as_slice()) => continue,
+                            _ => victims.push(k),
+                        }
+                    }
+                    if next == 0 {
+                        break;
+                    }
+                    cursor = next;
+                }
+                for k in &victims {
+                    store.del(k);
+                    if persist_on {
+                        if let Some(sa) =
+                            shard_push(&self.producers, k, b"", DELETE_TOMBSTONE, b's')
+                        {
+                            acks.push(sa);
+                        }
+                    }
+                }
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                resp::simple(out, "OK");
+            }
             // ---- TYPE + hashes ------------------------------------
             b"TYPE" => {
                 if nargs < 2 {
@@ -2676,7 +2947,7 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
         b"GET" | b"SET" | b"SETNX" | b"GETSET" | b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY"
         | b"TTL" | b"PTTL" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"PERSIST"
         | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL" | b"SETEX" | b"PSETEX" | b"GETEX"
-        | b"GETRANGE" | b"SETRANGE" | b"INCRBYFLOAT"
+        | b"GETRANGE" | b"SETRANGE" | b"INCRBYFLOAT" | b"EXPIRETIME" | b"PEXPIRETIME"
         // hashes + lists: the key is always the first argument
         | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
         | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY"
@@ -2691,9 +2962,25 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
                 vec![]
             }
         }
-        b"DEL" | b"UNLINK" | b"EXISTS" | b"MGET" => (1..nargs).collect(),
+        b"DEL" | b"UNLINK" | b"EXISTS" | b"MGET" | b"TOUCH" => (1..nargs).collect(),
         // MSET/MSETNX interleave key value key value … — scope every key slot.
         b"MSET" | b"MSETNX" => (1..nargs).step_by(2).collect(),
+        // RENAME/COPY take a source and destination key.
+        b"RENAME" | b"RENAMENX" | b"COPY" => {
+            if nargs > 2 {
+                vec![1, 2]
+            } else {
+                vec![]
+            }
+        }
+        // OBJECT <SUBCOMMAND> key — the key is the third argument.
+        b"OBJECT" => {
+            if nargs > 2 {
+                vec![2]
+            } else {
+                vec![]
+            }
+        }
         _ => vec![],
     }
 }
@@ -2724,6 +3011,11 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"GETEX"
             | b"SETRANGE"
             | b"INCRBYFLOAT"
+            | b"RENAME"
+            | b"RENAMENX"
+            | b"COPY"
+            | b"FLUSHALL"
+            | b"FLUSHDB"
             // hash mutations
             | b"HSET"
             | b"HMSET"
