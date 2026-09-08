@@ -251,19 +251,22 @@ jobs:
       # pg_keyspace — Postgres-native RESP keyspace + PostgREST row cache
       # (Rust/pgrx). Built from in-repo source against the staged PG so the
       # native archive ships the same extension as the supatype/postgres image.
-      # Bundled BEFORE the macOS signing step so its library gets signed.
-      # Windows is skipped in build-windows: pgrx has no supported Windows target.
+      #
+      # LINUX ONLY. pg_keyspace's core is an epoll/eventfd event loop, which are
+      # Linux-only syscalls — it does not compile on macOS (kqueue) and pgrx has
+      # no supported Windows target. The macOS and Windows native archives ship
+      # the other extensions but not pg_keyspace.
       # ------------------------------------------------------------------ #
       - name: Install clang for pgrx bindgen (Linux)
         if: matrix.platform == 'linux'
         run: sudo apt-get install -y --no-install-recommends clang libclang-dev llvm-dev
 
       - name: Install cargo-pgrx
-        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
+        if: matrix.platform == 'linux'
         run: cargo install cargo-pgrx --version 0.12.9 --locked
 
       - name: Build and bundle pg_keyspace
-        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
+        if: matrix.platform == 'linux'
         run: |
           set -euo pipefail
           PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
