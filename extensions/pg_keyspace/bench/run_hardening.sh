@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P2 hardening — RESP AUTH secrets are hashed at rest (salted SHA-256, constant-
+# hardening — RESP AUTH secrets are hashed at rest (salted SHA-256, constant-
 # time verify) and credentials hot-reload on SIGHUP with no worker restart.
 set -u
 PGPORT=${PGPORT:-5434}
@@ -11,7 +11,7 @@ chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-52s\n" "$1"; pass=$((pass+1))
         else printf "  FAIL  %-52s exp=[%s] got=[%s]\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 reload() { $P -c "SELECT pg_reload_conf();" >/dev/null 2>&1; sleep 1; }
 
-echo "# P2 hardening — hashed AUTH secrets + hot reload"
+echo "# hardening — hashed AUTH secrets + hot reload"
 
 # clean slate: remove any creds, reload -> no-auth mode
 $P -c "TRUNCATE supacache.resp_credential;" >/dev/null 2>&1; reload

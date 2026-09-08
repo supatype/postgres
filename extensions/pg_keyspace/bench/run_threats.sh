@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P2 security tests (§4.7) against the real base: PG17 + supatype_mask + pg_guard
+# security tests (§4.7) against the real base: PG17 + supatype_mask + pg_guard
 # + pg_keyspace. Assumes the cluster is up on $PGPORT with RESP on $RESP_PORT and
 # credentials seeded (see the "seed" section). The load-order and seclabel
 # refusal cases require a restart with a changed config and are documented at the
@@ -25,7 +25,7 @@ INSERT INTO supacache.acl(role_name,prefix,can_read,can_write) VALUES
   ('tenant_a','session:',true,true),('tenant_b','session:',true,true),('tenant_a','ro:',true,false)
 ON CONFLICT(role_name,prefix) DO UPDATE SET can_read=EXCLUDED.can_read,can_write=EXCLUDED.can_write;
 SELECT pg_reload_conf();" >/dev/null
-# Hot reload (P2 hardening): the worker picks up credential/ACL changes on SIGHUP,
+# Hot reload (hardening): the worker picks up credential/ACL changes on SIGHUP,
 # so pg_reload_conf() applies them with no restart. (secret shown here is stored
 # plaintext to exercise the legacy verify path; supacache.set_credential hashes.)
 sleep 1

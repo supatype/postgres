@@ -30,7 +30,7 @@ const FLAG_OCCUPIED: u32 = 1;
 const FLAG_REF: u32 = 2; // CLOCK reference bit
 
 pub const KIND_STR: u32 = b's' as u32;
-/// P3 aggregate kinds (§5): value blob is a serialized hash/list/sorted-set.
+/// aggregate kinds (§5): value blob is a serialized hash/list/sorted-set.
 pub const KIND_HASH: u32 = b'h' as u32;
 pub const KIND_LIST: u32 = b'l' as u32;
 pub const KIND_ZSET: u32 = b'z' as u32;
@@ -518,7 +518,7 @@ impl Store {
         self.set_typed(key, val, ttl_micros, KIND_STR)
     }
 
-    /// SET a typed value (P3 aggregates, §5): same as `set` but tags the entry's
+    /// SET a typed value (aggregates, §5): same as `set` but tags the entry's
     /// `kind` so `get_typed` can enforce Redis `WRONGTYPE` semantics.
     pub fn set_typed(&self, key: &[u8], val: &[u8], ttl_micros: i64, kind: u32) -> bool {
         let hash = fnv1a(key);

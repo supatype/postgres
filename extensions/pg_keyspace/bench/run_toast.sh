@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P6 slice 3 — Mode B row cache for rows with out-of-line (TOASTed) values.
+# slice 3 — Mode B row cache for rows with out-of-line (TOASTed) values.
 #
 # The cache stores raw heap-tuple bytes. If a column is TOASTed the raw tuple
 # holds a POINTER into the table's toast relation, not the value — caching that
@@ -20,7 +20,7 @@ chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-54s\n" "$1"; pass=$((pass+1))
 plan() { $A -c "EXPLAIN (COSTS OFF) $1" 2>/dev/null | head -1; }
 refill="$($A -c 'SHOW pg_keyspace.rowcache_refill' | tr -d '[:space:]')"
 
-echo "# P6 — Mode B row cache for TOASTed rows; refill=$refill"
+echo "# Mode B row cache for TOASTed rows; refill=$refill"
 
 # A 20 KB value in an EXTERNAL-storage column is forced out of line (no
 # compression, and the tuple exceeds the page's toast threshold).

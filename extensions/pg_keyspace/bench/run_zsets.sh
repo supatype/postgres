@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P3 §5 — sorted-set type: command coverage, WRONGTYPE semantics, redis parity,
+# §5 — sorted-set type: command coverage, WRONGTYPE semantics, redis parity,
 # and a throughput sample. Works whether the RESP port is plaintext or TLS.
 # Scores here are integers/exactly-representable, so formatting matches redis.
 set -u
@@ -13,7 +13,7 @@ pass=0; fail=0
 chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-46s\n" "$1"; pass=$((pass+1));
         else printf "  FAIL  %-46s exp=[%s] got=[%s]\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 
-echo "# P3 sorted sets (§5)"
+echo "# sorted sets (§5)"
 $K DEL z str >/dev/null 2>&1
 
 chk "ZADD 4 members"               "4"          "$($K ZADD z 1 a 2 b 3 c 2 d)"

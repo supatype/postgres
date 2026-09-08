@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P3 §5 — list type: command coverage, WRONGTYPE semantics, redis parity, and a
+# §5 — list type: command coverage, WRONGTYPE semantics, redis parity, and a
 # throughput sample. Works whether the RESP port is plaintext or TLS.
 set -u
 RESP=${RESP:-6381}
@@ -12,7 +12,7 @@ pass=0; fail=0
 chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-46s\n" "$1"; pass=$((pass+1));
         else printf "  FAIL  %-46s exp=[%s] got=[%s]\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 
-echo "# P3 lists (§5)"
+echo "# lists (§5)"
 $K DEL l str >/dev/null 2>&1
 
 chk "RPUSH a b c -> 3"            "3"        "$($K RPUSH l a b c)"

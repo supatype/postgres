@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P6 slice 3 — Mode B row cache for NON-integer and text primary keys.
+# slice 3 — Mode B row cache for NON-integer and text primary keys.
 #
 # The cache used to key rows by (relid, int8 pk) — only single-column integer
 # PKs were cacheable, which excludes the uuid/text keys most PostgREST tables
@@ -21,7 +21,7 @@ chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-54s\n" "$1"; pass=$((pass+1))
 plan() { $A -c "EXPLAIN (COSTS OFF) $1" 2>/dev/null | head -1; }
 refill="$($A -c 'SHOW pg_keyspace.rowcache_refill' | tr -d '[:space:]')"
 
-echo "# P6 — Mode B row cache for non-integer PKs (uuid, text); refill=$refill"
+echo "# Mode B row cache for non-integer PKs (uuid, text); refill=$refill"
 
 # ---------------------------------------------------------------- uuid PK -----
 U1='11111111-1111-1111-1111-111111111111'

@@ -75,7 +75,7 @@ static GUC_VAL_BYTES: GucSetting<i32> = GucSetting::<i32>::new(512);
 static GUC_DURABILITY: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"ephemeral"));
 static GUC_COMMIT_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
-// P1 persistence: which database holds supacache.kv, and how often the worker
+// persistence: which database holds supacache.kv, and how often the worker
 // flushes staged writes to it in one batched transaction.
 static GUC_DATABASE: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"postgres"));
@@ -106,7 +106,7 @@ static GUC_TLS_CERT: GucSetting<Option<&'static CStr>> =
 static GUC_TLS_KEY: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(None);
 
-/// Mode B (P6 §3.5): enable the keys-only logical-decoding invalidation worker,
+/// Mode B (§3.5): enable the keys-only logical-decoding invalidation worker,
 /// which consumes a replication slot (output plugin `supacache_keys`) and drops
 /// changed rows from the row cache so it stays coherent with committed writes.
 /// Off by default — it needs `wal_level = logical` and holds a replication slot.
@@ -729,7 +729,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         None => log!("pg_keyspace worker: no RESP credentials configured — local/no-auth mode"),
     }
 
-    // P1 storage & durability: recover shmem from the tables at startup; the
+    // storage & durability: recover shmem from the tables at startup; the
     // steady-state persistence is offloaded to the persistence worker via the
     // ring, so the RESP hot path never touches SPI.
     if persisted {
@@ -966,7 +966,7 @@ fn pg_ensure_schema() {
                  FOR VALUES WITH (MODULUS 8, REMAINDER {i})"
             ));
         }
-        // P2: RESP credential -> role/tenant map (§4.5) and keyspace ACL.
+        // RESP credential -> role/tenant map (§4.5) and keyspace ACL.
         let _ = Spi::run(
             "CREATE TABLE IF NOT EXISTS supacache.resp_credential (\
              username text PRIMARY KEY, secret text NOT NULL, \
@@ -2330,7 +2330,7 @@ mod supacache {
     /// out-of-line (TOASTed) value? Reads the stored tuple's info-mask. Returns
     /// None if the row isn't cached. After `rowcache_put` this is always `false`
     /// even when the live row has external values — proof the cache flattened
-    /// them inline (see `bench/run_p6_toast.sh`).
+    /// them inline (see `bench/run_toast.sh`).
     #[pg_extern]
     fn rowcache_cached_has_external(tbl: &str, pk: AnyElement) -> Option<bool> {
         let relid = Spi::get_one_with_args::<pg_sys::Oid>(

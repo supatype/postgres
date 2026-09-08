@@ -121,18 +121,18 @@ jobs:
           }
 
           # Self-contained: each starts its own daemon (and standby) and cleans up.
-          runbench run_p1_replication.sh
-          runbench run_p3_bighash.sh
-          runbench run_p3_biglist.sh
-          runbench run_p3_bigzset.sh
-          runbench run_p3_pubsub_xworker.sh
+          runbench run_replication.sh
+          runbench run_bighash.sh
+          runbench run_biglist.sh
+          runbench run_bigzset.sh
+          runbench run_pubsub_xworker.sh
 
           # Type conformance + WRONGTYPE + redis parity, against one daemon.
           "$DAEMON" --workers 1 --port 6400 --keys-per-worker 200000 --shmem-mb 128 \
             >/tmp/pgks_ci_daemon.log 2>&1 &
           dpid=$!
           for _ in $(seq 1 30); do redis-cli -p 6400 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
-          for s in run_p3_hashes.sh run_p3_lists.sh run_p3_zsets.sh run_p3_pubsub.sh; do
+          for s in run_hashes.sh run_lists.sh run_zsets.sh run_pubsub.sh; do
             runbench "$s" RESP=6400
           done
           kill $dpid 2>/dev/null || true

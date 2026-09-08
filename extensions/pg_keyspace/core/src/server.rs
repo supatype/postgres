@@ -71,7 +71,7 @@ fn shard_push(
     }
 }
 
-// ---- P2 security: RESP AUTH -> role, keyspace ACL, forced tenant scoping ----
+// ---- security: RESP AUTH -> role, keyspace ACL, forced tenant scoping ----
 
 /// A RESP credential (§4.5): maps an AUTH username to a Postgres role + tenant.
 ///
@@ -196,7 +196,7 @@ struct Conn {
     // When set, this connection is TLS: ciphertext on the socket, plaintext in
     // rbuf/wbuf. `wpos` then counts wbuf bytes already fed to the TLS writer.
     tls: Option<Box<rustls::ServerConnection>>,
-    // P3 pub/sub (§5): channels and glob patterns this connection is subscribed
+    // pub/sub (§5): channels and glob patterns this connection is subscribed
     // to. Non-empty => the connection is in RESP2 subscribe mode.
     subs: HashSet<Vec<u8>>,
     psubs: HashSet<Vec<u8>>,
@@ -210,22 +210,22 @@ pub struct Worker {
     epfd: RawFd,
     conns: HashMap<RawFd, Conn>,
     args: Vec<(usize, usize)>,
-    // P1: when non-empty, every write is enqueued into one of these shared-memory
+    // when non-empty, every write is enqueued into one of these shared-memory
     // rings (sharded by key slot) and a dedicated persistence worker drains each
     // — the RESP path never touches SPI. Multiple rings scale durable writes.
     producers: Vec<ring::Producer>,
-    // P2: when set, RESP AUTH is required and keys are ACL-checked + tenant-scoped.
+    // when set, RESP AUTH is required and keys are ACL-checked + tenant-scoped.
     auth: Option<AuthConfig>,
     // durable tier: hold each write's RESP reply until its ring record commits.
     sync_ack: bool,
-    // P2 TLS: when set, every accepted connection is wrapped in a TLS session so
+    // TLS: when set, every accepted connection is wrapped in a TLS session so
     // the RESP wire is encrypted (the AUTH password is otherwise sent in clear).
     tls_config: Option<Arc<rustls::ServerConfig>>,
-    // P3 pub/sub (§5): reverse indexes channel/pattern -> subscriber fds, so a
+    // pub/sub (§5): reverse indexes channel/pattern -> subscriber fds, so a
     // PUBLISH fans out without scanning every connection. Local to this worker.
     channels: HashMap<Vec<u8>, HashSet<RawFd>>,
     patterns: HashMap<Vec<u8>, HashSet<RawFd>>,
-    // P3 cross-worker pub/sub (§5): when workers share a process (the scale-out
+    // cross-worker pub/sub (§5): when workers share a process (the scale-out
     // daemon), a shared Bus routes a PUBLISH to subscribers on *other* workers.
     // `None` for the single-worker in-PG extension (local delivery only).
     bus: Option<Arc<pubsub::Bus>>,
@@ -287,13 +287,13 @@ impl Worker {
         self.tls_config = Some(cfg);
     }
 
-    /// Enable P1 persistence: writes are sharded by key slot across these rings,
+    /// Enable persistence: writes are sharded by key slot across these rings,
     /// each drained by its own persistence worker.
     pub fn set_ring_producers(&mut self, producers: Vec<ring::Producer>) {
         self.producers = producers;
     }
 
-    /// Enable P2 access control: RESP AUTH required, keyspace ACL + tenant scope.
+    /// Enable access control: RESP AUTH required, keyspace ACL + tenant scope.
     pub fn set_auth_config(&mut self, auth: AuthConfig) {
         self.auth = Some(auth);
     }
@@ -603,13 +603,13 @@ impl Worker {
         let mut cmd = args[0].clone();
         cmd.make_ascii_uppercase();
 
-        // ---- P2: AUTH command ----
+        // ---- AUTH command ----
         if cmd == b"AUTH" {
             self.handle_auth(fd, args);
             return;
         }
 
-        // ---- P3 pub/sub (§5): handled before keyed-command scoping. Channels
+        // ---- pub/sub (§5): handled before keyed-command scoping. Channels
         // are tenant-scoped for non-exempt authed roles (same `{tenant}:` prefix
         // as keys); the scoping is transparent — every reply/message frame echoes
         // the client's own unscoped name. ----
@@ -642,7 +642,7 @@ impl Worker {
             return;
         }
 
-        // ---- P2: auth gate + forced tenant scoping for keyed commands ----
+        // ---- auth gate + forced tenant scoping for keyed commands ----
         // `eff` holds the args actually used below; key positions are rewritten
         // to `{tenant}:{key}` for non-exempt authenticated roles.
         let mut eff: Vec<Vec<u8>> = Vec::new();
@@ -826,7 +826,7 @@ impl Worker {
                     None => resp::error(out, "ERR value is not an integer or out of range"),
                 }
             }
-            // ---- P3 §5: TYPE + hashes ------------------------------------
+            // ---- §5: TYPE + hashes ------------------------------------
             b"TYPE" => {
                 if nargs < 2 {
                     resp::error(out, "ERR wrong number of arguments for 'type'");
@@ -1020,7 +1020,7 @@ impl Worker {
                 store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
                 resp::integer(out, next);
             }
-            // ---- P3 §5: lists --------------------------------------------
+            // ---- §5: lists --------------------------------------------
             b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" => {
                 if nargs < 3 {
                     resp::error(out, "ERR wrong number of arguments");
@@ -1191,7 +1191,7 @@ impl Worker {
                 save_list(&store, &args[1], &l, exp);
                 resp::simple(out, "OK");
             }
-            // ---- P3 §5: sorted sets --------------------------------------
+            // ---- §5: sorted sets --------------------------------------
             b"ZADD" => {
                 // ZADD key [NX|XX] [CH] score member [score member ...]
                 if nargs < 4 {
@@ -1452,7 +1452,7 @@ impl Worker {
             _ => resp::error(out, "ERR unknown command"),
         }
 
-        // P3 durable aggregates (§5/§3.3): a mutation of a hash/list/zset persists
+        // durable aggregates (§5/§3.3): a mutation of a hash/list/zset persists
         // its whole (kind-tagged) blob from the final store state — or a tombstone
         // if the key was emptied/deleted — so it recovers as the right type.
         if persist_on && stage.is_none() && is_aggregate_write(&cmd) && nargs >= 2 {
@@ -1968,7 +1968,7 @@ impl Worker {
     }
 
     fn close(&mut self, fd: RawFd) {
-        // P3: drop this fd from every channel/pattern it was subscribed to.
+        // drop this fd from every channel/pattern it was subscribed to.
         // Take the subscription sets out so we can mutate the reverse indexes and
         // the Bus without holding a borrow on self.conns.
         let (subs, psubs) = match self.conns.get_mut(&fd) {
@@ -2239,7 +2239,7 @@ fn key_indices(cmd: &[u8], nargs: usize) -> Vec<usize> {
     match cmd {
         b"GET" | b"SET" | b"SETNX" | b"GETSET" | b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY"
         | b"TTL" | b"EXPIRE" | b"PERSIST" | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL"
-        // P3 hashes + lists: the key is always the first argument
+        // hashes + lists: the key is always the first argument
         | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
         | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY"
         | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"LPOP" | b"RPOP" | b"LLEN"
@@ -2274,13 +2274,13 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"PERSIST"
             | b"APPEND"
             | b"GETDEL"
-            // P3 hash mutations
+            // hash mutations
             | b"HSET"
             | b"HMSET"
             | b"HSETNX"
             | b"HDEL"
             | b"HINCRBY"
-            // P3 list mutations
+            // list mutations
             | b"LPUSH"
             | b"RPUSH"
             | b"LPUSHX"
@@ -2289,7 +2289,7 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"RPOP"
             | b"LSET"
             | b"LTRIM"
-            // P3 zset mutations
+            // zset mutations
             | b"ZADD"
             | b"ZREM"
             | b"ZINCRBY"
@@ -2297,7 +2297,7 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
 }
 
 /// Aggregate (hash/list/zset) mutations — their whole blob is persisted from the
-/// final store state after dispatch (P3 durable aggregates).
+/// final store state after dispatch (durable aggregates).
 fn is_aggregate_write(cmd: &[u8]) -> bool {
     matches!(
         cmd,

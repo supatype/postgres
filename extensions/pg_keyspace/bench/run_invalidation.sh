@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P6 slice 3 (§3.5) — the keys-only logical-decoding invalidation worker.
+# slice 3 (§3.5) — the keys-only logical-decoding invalidation worker.
 #
 # The Mode B row cache holds RAW pre-policy tuples, so it must be dropped the
 # instant the underlying row changes. A logical replication slot whose output
@@ -18,7 +18,7 @@ chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-50s\n" "$1"; pass=$((pass+1))
         else printf "  FAIL  %-50s exp=[%s] got=[%s]\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 plan() { $A -c "EXPLAIN (COSTS OFF) $1" 2>/dev/null | head -1; }
 
-echo "# P6 slice 3 — keys-only invalidation (§3.5)"
+echo "# slice 3 — keys-only invalidation (§3.5)"
 
 $A >/dev/null 2>&1 <<'SQL'
 DROP TABLE IF EXISTS public.inval CASCADE;

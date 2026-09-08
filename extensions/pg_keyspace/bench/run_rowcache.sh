@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P6 — Mode B transparent row-cache LATENCY. What does substituting the cached
+# Mode B transparent row-cache LATENCY. What does substituting the cached
 # row at the leaf save versus the normal index-scan + heap-fetch path, for a
 # single-row pk lookup — the PostgREST hot path (§7.1)? And how does it behave
 # on a MASKED table, where the mask CASE runs above the scan either way (§4.3c)?
@@ -74,7 +74,7 @@ timeit() { # $1 label  $2 query
 node() { psql -h 127.0.0.1 -p $PGPORT -U rc_bench -d postgres -X -q -A -t -c "EXPLAIN (COSTS OFF) $1" 2>/dev/null | head -1; }
 
 Q='SELECT * FROM public.%s WHERE id = 100000'
-echo "# P6 Mode B row-cache latency (single-row pk=100000, min of $N, role rc_bench)"
+echo "# Mode B row-cache latency (single-row pk=100000, min of $N, role rc_bench)"
 echo "# plain twins:"
 echo "    cold plan: $(node "$(printf "$Q" rc_cold)")   |   hot plan: $(node "$(printf "$Q" rc_hot)")"
 timeit "cold: index scan + heap fetch"        "$(printf "$Q" rc_cold)"

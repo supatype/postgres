@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P6 / §4.3c / §6 — the cost of reading a MASKED table, and how supacache.get
+# §4.3c / §6 — the cost of reading a MASKED table, and how supacache.get
 # (the §6 SQL surface) accelerates it. Run against the PG17 base with
 # supatype_mask + pg_keyspace loaded. Measures a full scan of a 100k-row table
 # that references 3 masked columns (so supatype_mask wraps each in
@@ -44,7 +44,7 @@ run() { local best=999999; for i in 1 2 3 4 5; do
   printf "  %-46s %10s ms\n" "$1" "$best"; }
 
 Q="SELECT count(length(c1)+length(c2)+length(c3)) FROM public.bench_masked"
-echo "# P6 masked-read cost (100k rows, 3 masked columns, min of 5 runs)"
+echo "# masked-read cost (100k rows, 3 masked columns, min of 5 runs)"
 run "plain, no mask" "SELECT count(length(c1)+length(c2)+length(c3)) FROM public.bench_plain"
 swap can_read_true;  run "masked, predicate = trivial (inlined)"     "$Q"
 swap can_read_join;  run "masked, predicate = table lookup per row"  "$Q"

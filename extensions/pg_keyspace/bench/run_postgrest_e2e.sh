@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P6 slice 3 — REAL PostgREST end-to-end over the Mode B row cache.
+# slice 3 — REAL PostgREST end-to-end over the Mode B row cache.
 #
 # This runs the actual PostgREST binary (v12.2.3) in front of the cluster: real
 # HTTP requests with signed JWTs -> PostgREST opens a txn, SET ROLE from the
@@ -46,7 +46,7 @@ print((h + b'.' + p + b'.' + sig).decode())
 PY
 }
 
-echo "# P6 — REAL PostgREST e2e over masked + RLS + row-cached table ($($BIN --version))"
+echo "# REAL PostgREST e2e over masked + RLS + row-cached table ($($BIN --version))"
 
 # --- schema: roles, table, claims-based RLS + mask, row cache -----------------
 $ADMIN >/dev/null 2>&1 <<'SQL'

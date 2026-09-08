@@ -1,4 +1,4 @@
-//! P3 aggregate value types (§5): hashes, lists, sorted sets.
+//! aggregate value types (§5): hashes, lists, sorted sets.
 //!
 //! Each aggregate is stored in the keyspace as a single self-describing blob in
 //! the slab (the entry's `kind` tags which type it is), decoded on read and

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P3 §5 — native large-list structure. Past a threshold a list is stored with an
+# §5 — native large-list structure. Past a threshold a list is stored with an
 # explicit offset table so LINDEX/LRANGE/LLEN are O(1)/O(k) instead of walking
 # every length-prefix from the head. This proves a 10k-element list is
 # byte-for-byte Redis-compatible over the read surface (parity vs a real
@@ -22,7 +22,7 @@ trap 'kill $DPID 2>/dev/null' EXIT
 for _ in $(seq 1 20); do redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
 redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG || { echo "  FAIL  daemon did not start"; exit 1; }
 
-echo "# P3 native large-list (§5) — $N elements, parity vs redis :$REDIS"
+echo "# native large-list (§5) — $N elements, parity vs redis :$REDIS"
 redis-cli -p "$REDIS" DEL bl >/dev/null; redis-cli -p "$PORT" DEL bl >/dev/null
 build() { awk -v n="$N" 'BEGIN{for(i=0;i<n;i++) printf "RPUSH bl e%d\n", i}'; }
 build | redis-cli -p "$REDIS" >/dev/null

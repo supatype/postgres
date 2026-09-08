@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P3 §5 — native large-sorted-set structure. Past a threshold a zset is stored
+# §5 — native large-sorted-set structure. Past a threshold a zset is stored
 # as a member->score bucket table (O(1) ZSCORE) plus a pre-sorted offset array
 # (O(log n) ZRANK/ZRANGEBYSCORE, O(k) ZRANGE) instead of re-sorting on every op.
 # Proves a 10k-member zset (with score ties, to exercise (score,member) order) is
@@ -22,7 +22,7 @@ trap 'kill $DPID 2>/dev/null' EXIT
 for _ in $(seq 1 20); do redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
 redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG || { echo "  FAIL  daemon did not start"; exit 1; }
 
-echo "# P3 native large-zset (§5) — $N members with ties, parity vs redis :$REDIS"
+echo "# native large-zset (§5) — $N members with ties, parity vs redis :$REDIS"
 redis-cli -p "$REDIS" DEL bz >/dev/null; redis-cli -p "$PORT" DEL bz >/dev/null
 # score = i % 50 -> heavy ties, so (score, member) tie-breaking is exercised
 build() { awk -v n="$N" 'BEGIN{for(i=0;i<n;i++) printf "ZADD bz %d m%06d\n", i%50, i}'; }

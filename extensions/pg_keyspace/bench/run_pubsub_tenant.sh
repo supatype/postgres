@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P3/P2 — tenant-scoped pub/sub. Channels are namespaced by the authenticated
+# tenant-scoped pub/sub. Channels are namespaced by the authenticated
 # connection's tenant (the same `{tenant}:` prefix that isolates keys), so one
 # tenant's SUBSCRIBE/PUBLISH cannot reach another's — transparently: every frame
 # echoes the client's own unscoped channel name. Exempt (service_role)
@@ -30,7 +30,7 @@ if [ -n "$TLS" ] && ! timeout 3 redis-cli $TLS -p "$RESP" PING 2>/dev/null | gre
 fi
 A() { redis-cli $TLS -p "$RESP" --user "$1" -a "$2" --no-auth-warning "${@:3}" 2>/dev/null; }
 
-echo "# P3/P2 tenant-scoped pub/sub (RESP :$RESP, tls=${TLS:-off})"
+echo "# tenant-scoped pub/sub (RESP :$RESP, tls=${TLS:-off})"
 
 # alice (tenant_a) subscribes to "news"; capture her stream for 5s
 sub=$(mktemp)

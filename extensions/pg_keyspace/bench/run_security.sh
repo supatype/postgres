@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P6 / §4.6 / §4.7 — Mode B row-cache SECURITY regression suite.
+# §4.6 / §4.7 — Mode B row-cache SECURITY regression suite.
 #
 # The transparent row cache substitutes a CustomScan at the LEAF for a
 # `pk = Const` lookup on a registered, currently-cached relation, serving the
@@ -19,7 +19,7 @@ chk() { # chk "label" "expected" "actual"
 }
 asuser() { psql -h 127.0.0.1 -p $PGPORT -U "$1" -d postgres -X -q -A -t -c "$2" 2>&1; }
 
-echo "# P6 Mode B security regression (§4.6 leaf-only substitution)"
+echo "# Mode B security regression (§4.6 leaf-only substitution)"
 
 # ---- fixtures -------------------------------------------------------------
 $ADMIN >/dev/null 2>&1 <<'SQL'

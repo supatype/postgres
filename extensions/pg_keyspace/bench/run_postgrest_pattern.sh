@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P6 slice 3 — the PostgREST access pattern, end to end.
+# slice 3 — the PostgREST access pattern, end to end.
 #
 # PostgREST could not be installed in this sandbox (its GitHub release download
 # returns 403 through the egress proxy). But PostgREST is a thin REST->SQL layer:
@@ -30,7 +30,7 @@ COMMIT;
 SQL
 }
 
-echo "# P6 — PostgREST access pattern over a masked + RLS + cached table"
+echo "# PostgREST access pattern over a masked + RLS + cached table"
 
 $ADMIN >/dev/null 2>&1 <<'SQL'
 DROP TABLE IF EXISTS public.pr CASCADE;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P3 §5/§3.3 — durable aggregates: hashes/lists/sorted-sets persist to
+# §5/§3.3 — durable aggregates: hashes/lists/sorted-sets persist to
 # supacache.kv with their type tag and recover, with the right type, after a
 # crash. Requires a durable tier (pg_keyspace.durability != ephemeral) and the
 # ability to restart the cluster. Set PGDATA + PGCTL + PG_USER for the restart.
@@ -16,7 +16,7 @@ pass=0; fail=0
 chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-46s\n" "$1"; pass=$((pass+1));
         else printf "  FAIL  %-46s exp=[%s] got=[%s]\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 
-echo "# P3 durable aggregates (§5/§3.3)"
+echo "# durable aggregates (§5/§3.3)"
 if [ "$($P -c "SHOW pg_keyspace.durability")" = "ephemeral" ]; then
   echo "  SKIP  cluster is ephemeral; set pg_keyspace.durability=relaxed"; exit 0
 fi

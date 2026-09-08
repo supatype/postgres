@@ -128,7 +128,7 @@ the others). — `bench/run_scaleout_inpg.sh`
 
 Past a threshold, collections switch to an indexed in-value structure. Point
 reads go from O(n) to O(1)/O(log n) — dramatic at scale, byte-for-byte
-Redis-compatible (`bench/run_p3_big{hash,list,zset}.sh`, `core/examples/bench_*`):
+Redis-compatible (`bench/run_big{hash,list,zset}.sh`, `core/examples/bench_*`):
 
 | Op | Elements | Flat (inline) | Indexed | Speedup |
 |---|---:|---:|---:|---:|
@@ -155,7 +155,7 @@ Redis-compatible (`bench/run_p3_big{hash,list,zset}.sh`, `core/examples/bench_*`
 - **TTL expiry** is an O(1) partition `DROP` (3.2 ms) vs an O(n) `DELETE`
   (141 ms for 100 k rows) — no vacuum churn.
 
-### Mode B row cache (masked-read cost, `bench/run_p6_maskcost.sh`)
+### Mode B row cache (masked-read cost, `bench/run_maskcost.sh`)
 
 A row-independent mask predicate plans as an `InitPlan` (evaluated **once** per
 scan): **18.6 ms** for 100 k masked rows vs **1,127 ms** for a naive per-row
@@ -358,11 +358,14 @@ the code measured standalone is the same code that runs inside Postgres.
 
 `cargo test` in `core/` runs the self-contained unit tests (data structures, slab
 allocator, auth, replication). The `bench/` scripts are integration + conformance
-harnesses grouped by phase — Redis parity for every type (`run_p3_*`), security
-(`run_p2_*`, `run_p6_security.sh`), Mode B coherence for int/uuid/text/TOAST PKs
-(`run_p6_*`), tenant-scoped pub/sub, real synchronous replication
-(`run_p1_replication.sh`), a real PostgREST v12.2.3 end-to-end
-(`run_p6_postgrest_e2e.sh`), and scale-out. Each prints its own `# result: N
+harnesses, each named for what it checks: Redis parity for every type
+(`run_hashes.sh`, `run_lists.sh`, `run_zsets.sh`, `run_pubsub.sh`), security
+(`run_hardening.sh`, `run_tls.sh`, `run_threats.sh`, `run_security.sh`), Mode B
+row-cache coherence for int/uuid/text/TOAST PKs (`run_rowcache.sh`,
+`run_nonint_pk.sh`, `run_toast.sh`, `run_invalidation.sh`), tenant-scoped pub/sub
+(`run_pubsub_tenant.sh`), real synchronous replication (`run_replication.sh`), a
+real PostgREST v12.2.3 end-to-end (`run_postgrest_e2e.sh`), and scale-out
+(`run_scaleout.sh`, `run_scaleout_inpg.sh`). Each prints its own `# result: N
 passed, M failed`.
 
 ---

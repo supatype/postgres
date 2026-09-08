@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P3 §5 — native large-collection structure (indexed hashes). Past a threshold a
+# §5 — native large-collection structure (indexed hashes). Past a threshold a
 # hash is stored in an in-value bucket table so point reads are O(1) average
 # instead of scanning every field. This test proves the promoted (10k-field)
 # hash behaves EXACTLY like Redis for the read/write surface, and that the
@@ -23,7 +23,7 @@ trap 'kill $DPID 2>/dev/null' EXIT
 for _ in $(seq 1 20); do redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
 redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG || { echo "  FAIL  daemon did not start"; cat /tmp/pgks_bighash.log; exit 1; }
 
-echo "# P3 native large-collection hash (§5) — $N fields, parity vs redis :$REDIS"
+echo "# native large-collection hash (§5) — $N fields, parity vs redis :$REDIS"
 
 # Build the same big hash on both servers, one pipelined connection each.
 redis-cli -p "$REDIS" DEL bh >/dev/null
