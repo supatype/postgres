@@ -31,8 +31,10 @@ typedef struct RelMask {
 /// keeps this to a single traversal and makes outer references correct -- a masked
 /// column named from inside a correlated subquery is the case a per-level pass misses.
 typedef struct MaskCtx {
-  List *levels;
-  bool  in_aggref;
+  List  *levels;
+  Query *curquery; // the Query being masked now; carries hasSubLinks when a
+                   // row-independent predicate is emitted as a `(SELECT pred())`
+  bool   in_aggref;
 } MaskCtx;
 
 static Node *mask_mutator(Node *node, void *context);
@@ -105,6 +107,44 @@ supatype_mask_build_deny(Oid type, int32 typmod, Oid collation, const char *mess
                                DEFAULT_COLLATION_OID, COERCE_EXPLICIT_CALL);
 }
 
+/// A row-INDEPENDENT predicate `pred()` emitted as an uncorrelated
+/// `(SELECT pred())`. Because the sub-select references no column of the outer
+/// row, the planner turns it into an InitPlan -- evaluated ONCE per scan and its
+/// boolean cached in a Param -- instead of a call per row. It is still evaluated
+/// at run time (never folded into the plan; `STABLE` and IMMUTABLE-rejected), so
+/// a plan cached for one role re-runs the InitPlan for the next caller's session:
+/// no cross-caller leak, same guarantee as the whole-row form.
+static Node *
+build_norow_predicate(Oid funcid) {
+  FuncExpr    *call;
+  TargetEntry *te;
+  Query       *sub;
+  SubLink     *sublink;
+
+  call = makeFuncExpr(funcid, BOOLOID, NIL, InvalidOid, InvalidOid,
+                      COERCE_EXPLICIT_CALL);
+  te   = makeTargetEntry((Expr *) call, 1, "supatype_mask_read", false);
+
+  sub                    = makeNode(Query);
+  sub->commandType       = CMD_SELECT;
+  sub->canSetTag         = false;
+  sub->targetList        = list_make1(te);
+  sub->rtable            = NIL;
+  sub->jointree          = makeNode(FromExpr);
+  sub->jointree->fromlist = NIL;
+  sub->jointree->quals    = NULL;
+
+  sublink              = makeNode(SubLink);
+  sublink->subLinkType = EXPR_SUBLINK;
+  sublink->subLinkId   = 0;
+  sublink->testexpr    = NULL;
+  sublink->operName    = NIL;
+  sublink->subselect   = (Node *) sub;
+  sublink->location    = -1;
+
+  return (Node *) sublink;
+}
+
 /// `can_read_<table>__<column>(<table>)` over a whole-row reference.
 ///
 /// A bare `FuncExpr` rather than `(SELECT ...)`: the argument is a `Var`, so the
@@ -112,10 +152,21 @@ supatype_mask_build_deny(Oid type, int32 typmod, Oid collation, const char *mess
 /// and a `STABLE` function with a non-constant argument is evaluated per execution.
 /// That is what keeps a plan cached for one role from answering for another, which is
 /// the whole risk in this design.
+///
+/// When `norow` is set the label named a zero-argument predicate: its answer does
+/// not depend on the row, so emit the once-per-scan InitPlan form instead and flag
+/// the containing query as carrying a SubLink so the planner processes it.
 static Node *
-build_predicate_call(RelMask *rm, Oid funcid, Index levelsup,
-                     const Bitmapset *nullingrels) {
-  Var *rowvar = makeWholeRowVar(rm->rte, rm->varno, levelsup, false);
+build_predicate_call(MaskCtx *ctx, RelMask *rm, Oid funcid, bool norow,
+                     Index levelsup, const Bitmapset *nullingrels) {
+  Var *rowvar;
+
+  if (norow) {
+    ctx->curquery->hasSubLinks = true;
+    return build_norow_predicate(funcid);
+  }
+
+  rowvar = makeWholeRowVar(rm->rte, rm->varno, levelsup, false);
 
   if (rowvar == NULL)
     ereport(ERROR,
@@ -146,7 +197,7 @@ column_label(RelMask *rm, AttrNumber attnum) {
 /// worse than an error. Denying per row rather than refusing the aggregate outright
 /// means a caller entitled to every row still gets a correct total.
 static Node *
-build_read_mask(RelMask *rm, Var *var, MaskedColumn *col, bool in_aggref) {
+build_read_mask(MaskCtx *ctx, RelMask *rm, Var *var, MaskedColumn *col) {
   Node     *fallback;
   CaseExpr *caseexpr;
   CaseWhen *when;
@@ -155,7 +206,7 @@ build_read_mask(RelMask *rm, Var *var, MaskedColumn *col, bool in_aggref) {
   // it in a predicate that always answers true would cost a call per row for nothing.
   if (!col->force_mask && !OidIsValid(col->read_fn)) return (Node *) var;
 
-  if (in_aggref)
+  if (ctx->in_aggref)
     fallback = supatype_mask_build_deny(
         var->vartype, var->vartypmod, var->varcollid,
         psprintf("column %s is masked for this role and cannot be aggregated",
@@ -167,8 +218,8 @@ build_read_mask(RelMask *rm, Var *var, MaskedColumn *col, bool in_aggref) {
   if (col->force_mask || !OidIsValid(col->read_fn)) return fallback;
 
   when         = makeNode(CaseWhen);
-  when->expr   = (Expr *) build_predicate_call(rm, col->read_fn, var->varlevelsup,
-                                               var->varnullingrels);
+  when->expr   = (Expr *) build_predicate_call(ctx, rm, col->read_fn, col->read_norow,
+                                               var->varlevelsup, var->varnullingrels);
   when->result = (Expr *) copyObject(var);
 
   caseexpr             = makeNode(CaseExpr);
@@ -188,10 +239,21 @@ build_read_mask(RelMask *rm, Var *var, MaskedColumn *col, bool in_aggref) {
 /// is unrepresentable there; mirroring that here keeps a caller from round-tripping a
 /// value they were never shown and destroying it.
 static Node *
-build_write_test(RelMask *rm, MaskedColumn *col, Index levelsup, bool for_insert) {
-  Oid funcid = OidIsValid(col->write_fn) ? col->write_fn : col->read_fn;
+build_write_test(MaskCtx *ctx, RelMask *rm, MaskedColumn *col, Index levelsup,
+                 bool for_insert) {
+  bool valid_write = OidIsValid(col->write_fn);
+  Oid  funcid      = valid_write ? col->write_fn : col->read_fn;
+  bool norow       = valid_write ? col->write_norow : col->read_norow;
 
-  if (!for_insert) return build_predicate_call(rm, funcid, levelsup, NULL);
+  if (!for_insert)
+    return build_predicate_call(ctx, rm, funcid, norow, levelsup, NULL);
+
+  // A row-independent rule (`Role<"admin">`) is the same once-per-statement
+  // InitPlan whether or not there is an old row, so an INSERT uses it directly.
+  if (norow) {
+    ctx->curquery->hasSubLinks = true;
+    return build_norow_predicate(funcid);
+  }
 
   // An INSERT has no old row, so the predicate is evaluated against `NULL::t`. An
   // identity-only rule (`Role<"admin">`) answers correctly; a row-dependent one
@@ -220,7 +282,7 @@ build_write_test(RelMask *rm, MaskedColumn *col, Index levelsup, bool for_insert
 ///        ELSE deny(...)                       -- saw it and tried to change it
 ///   END
 static Node *
-build_update_coercion(RelMask *rm, MaskedColumn *col, Node *submitted) {
+build_update_coercion(MaskCtx *ctx, RelMask *rm, MaskedColumn *col, Node *submitted) {
   Var      *oldvalue;
   CaseExpr *caseexpr;
   CaseWhen *accept;
@@ -235,7 +297,7 @@ build_update_coercion(RelMask *rm, MaskedColumn *col, Node *submitted) {
   if (col->force_mask) return (Node *) oldvalue;
 
   accept         = makeNode(CaseWhen);
-  accept->expr   = (Expr *) build_write_test(rm, col, 0, false);
+  accept->expr   = (Expr *) build_write_test(ctx, rm, col, 0, false);
   accept->result = (Expr *) submitted;
 
   caseexpr             = makeNode(CaseExpr);
@@ -254,7 +316,9 @@ build_update_coercion(RelMask *rm, MaskedColumn *col, Node *submitted) {
   if (OidIsValid(col->read_fn)) {
     preserve       = makeNode(CaseWhen);
     preserve->expr = (Expr *) makeBoolExpr(
-        NOT_EXPR, list_make1(build_predicate_call(rm, col->read_fn, 0, NULL)), -1);
+        NOT_EXPR,
+        list_make1(build_predicate_call(ctx, rm, col->read_fn, col->read_norow, 0, NULL)),
+        -1);
     preserve->result = (Expr *) oldvalue;
 
     caseexpr->args = list_make2(accept, preserve);
@@ -277,7 +341,7 @@ build_update_coercion(RelMask *rm, MaskedColumn *col, Node *submitted) {
 /// must not error, so an unauthorised value coerces to what the column would have got
 /// had the caller not mentioned it.
 static Node *
-build_insert_coercion(RelMask *rm, MaskedColumn *col, Node *submitted) {
+build_insert_coercion(MaskCtx *ctx, RelMask *rm, MaskedColumn *col, Node *submitted) {
   Relation  rel;
   Node     *fallback;
   CaseExpr *caseexpr;
@@ -293,7 +357,7 @@ build_insert_coercion(RelMask *rm, MaskedColumn *col, Node *submitted) {
   if (col->force_mask) return fallback;
 
   accept         = makeNode(CaseWhen);
-  accept->expr   = (Expr *) build_write_test(rm, col, 0, true);
+  accept->expr   = (Expr *) build_write_test(ctx, rm, col, 0, true);
   accept->result = (Expr *) submitted;
 
   caseexpr             = makeNode(CaseExpr);
@@ -337,8 +401,8 @@ mask_assignments(Query *query, List *tlist, MaskCtx *ctx, bool as_update) {
     if (col == NULL) continue;
 
     te->expr = (Expr *) (as_update
-                             ? build_update_coercion(target, col, (Node *) te->expr)
-                             : build_insert_coercion(target, col, (Node *) te->expr));
+                             ? build_update_coercion(ctx, target, col, (Node *) te->expr)
+                             : build_insert_coercion(ctx, target, col, (Node *) te->expr));
   }
 
   return tlist;
@@ -428,9 +492,13 @@ mask_query_fields(Query *query, MaskCtx *ctx) {
 
 static Query *
 mask_query(Query *query, MaskCtx *ctx) {
-  ctx->levels = lcons(build_level(query), ctx->levels);
+  Query *saved = ctx->curquery;
+
+  ctx->curquery = query;
+  ctx->levels   = lcons(build_level(query), ctx->levels);
   mask_query_fields(query, ctx);
-  ctx->levels = list_delete_first(ctx->levels);
+  ctx->levels   = list_delete_first(ctx->levels);
+  ctx->curquery = saved;
 
   return query;
 }
@@ -473,7 +541,7 @@ mask_mutator(Node *node, void *context) {
     col = supatype_mask_column(rm->entry, var->varattno);
     if (col == NULL) return node;
 
-    return build_read_mask(rm, var, col, ctx->in_aggref);
+    return build_read_mask(ctx, rm, var, col);
   }
 
   if (IsA(node, Aggref)) {
@@ -497,6 +565,7 @@ supatype_mask_rewrite(Query *query) {
   MaskCtx ctx;
 
   ctx.levels    = NIL;
+  ctx.curquery  = NULL;
   ctx.in_aggref = false;
 
   return mask_query(query, &ctx);

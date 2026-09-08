@@ -79,6 +79,15 @@ typedef struct MaskedColumn {
   Oid        read_fn;  // InvalidOid when the label restricts writes only
   Oid        write_fn; // InvalidOid when the label restricts reads only
   bool       force_mask;
+  // A predicate declared with NO arguments is row-INDEPENDENT: its answer is a
+  // function of session state only (role, JWT claims), not of the row. Such a
+  // predicate is emitted as an uncorrelated `(SELECT pred())`, which the planner
+  // hoists to an InitPlan evaluated ONCE per scan rather than once per row --
+  // collapsing the dominant cost of masking a full scan (see mask_rewrite.c).
+  // The whole-row overload `pred(t)` is preferred when both exist, so this is
+  // opt-in by the predicate's signature and fully backward compatible.
+  bool       read_norow;
+  bool       write_norow;
 } MaskedColumn;
 
 /// Every masked column of one relation. `ncols == 0` is a negative cache entry: the

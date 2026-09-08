@@ -1,0 +1,16 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Runtime artifacts
+*.wal
+*.so
+
+# pgrx
+.pgrx/
+
+# C build objects
+*.o
+
+# Redis runtime dump artifact (written by a redis-server during benches)
+dump.rdb

@@ -1,0 +1,6 @@
+comment = 'pg_keyspace: Postgres-native RESP keyspace + PostgREST row cache'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_keyspace'
+relocatable = false
+superuser = true
+trusted = false

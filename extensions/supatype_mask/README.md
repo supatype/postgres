@@ -52,6 +52,33 @@ CREATE FUNCTION can_read_posts__salary(posts posts) RETURNS boolean
   $$;
 ```
 
+### Row-independent predicates (once per scan, not once per row)
+
+The whole-row form above is called **once per row per masked column** — correct
+for a value-dependent rule (`author_id = auth.uid()`), but wasteful for the common
+case where the answer depends only on the session (a role- or claim-level rule that
+ignores the row). On a full scan of a masked table that is the dominant cost: a
+predicate doing a per-row lookup can make the scan ~100× the unmasked cost.
+
+Declare such a predicate with **no arguments** and supatype_mask emits it as an
+uncorrelated `(SELECT pred())`, which the planner hoists to an **InitPlan evaluated
+once per scan**:
+
+```sql
+CREATE FUNCTION can_read_posts__salary() RETURNS boolean
+  LANGUAGE sql STABLE AS $$ SELECT auth.jwt_role() = 'hr' $$;
+```
+
+Measured on a 100k-row table, 3 masked columns, with a per-`current_user` table
+lookup as the predicate body: **1117 ms per-row → 18 ms row-independent** (96× →
+1.7×, i.e. the cost of the `CASE` branches alone). The InitPlan is still evaluated
+at run time on every execution, and `IMMUTABLE` is still refused, so a plan cached
+for one caller re-runs it for the next caller's session — no cross-caller leak, the
+same guarantee as the per-row form.
+
+The whole-row overload wins when both `pred(t)` and `pred()` exist, so making a rule
+row-independent is opt-in by the predicate's signature and fully backward compatible.
+
 ## Install
 
 Bundled in the `supatype/postgres` image. Two halves, and both are needed:
