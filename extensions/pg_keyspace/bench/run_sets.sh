@@ -65,6 +65,12 @@ $K DEL a b >/dev/null; $K SADD a 1 >/dev/null; $K SADD b 2 >/dev/null
 chk "empty SINTERSTORE deletes dst" "0"     "$($K SINTERSTORE dst a b)"
 chk "dst gone after empty store"  "0"       "$($K EXISTS dst)"
 
+# SINTERCARD
+$K DEL a b >/dev/null; $K SADD a 1 2 3 4 >/dev/null; $K SADD b 3 4 5 6 >/dev/null
+chk "SINTERCARD full"             "2"       "$($K SINTERCARD 2 a b)"
+chk "SINTERCARD LIMIT 1"          "1"       "$($K SINTERCARD 2 a b LIMIT 1)"
+chk "SINTERCARD LIMIT 0 = no cap" "2"       "$($K SINTERCARD 2 a b LIMIT 0)"
+
 # TYPE + WRONGTYPE
 $K DEL s >/dev/null; $K SADD s a >/dev/null
 chk "TYPE reports set"            "set"     "$($K TYPE s)"
