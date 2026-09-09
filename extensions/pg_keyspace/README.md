@@ -340,13 +340,35 @@ to a worker that does not own it is answered with a Redis-Cluster `MOVED <slot>
 than served. This is a durability requirement, not a style preference: crash
 recovery restores each key into the segment whose slot range covers it, so a
 worker that accepted a key it does not own would lose that key on the next
-restart — after having acked the write as durable. A cluster-aware client
-(ioredis, go-redis, lettuce) follows the redirect automatically; set
-`pg_keyspace.cluster_announce_host` to an address your clients can reach
-(default `127.0.0.1`), since the workers bind `0.0.0.0`.
+restart — after having acked the write as durable.
 
-Ephemeral multi-worker deployments are unchanged: no slot enforcement, any key
-may live on any worker.
+In that mode the cluster is discoverable, so a stock cluster client configures
+itself: `INFO` reports `redis_mode:cluster` / `cluster_enabled:1`, and `CLUSTER
+SLOTS`, `CLUSTER SHARDS`, `CLUSTER NODES`, `CLUSTER MYID`, `CLUSTER INFO` and
+`CLUSTER KEYSLOT` publish the same map `supacache.slot_ranges()` returns. Node
+ids are derived from the endpoint, so a worker keeps its id across restarts and
+clients do not see the topology churn. Point the cluster constructor at any
+worker's port and it discovers the rest:
+
+```js
+new Redis.Cluster([{ host: 'db.internal', port: 6379 }])   // ioredis
+```
+```go
+redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"db.internal:6379"}})
+```
+
+Because those clients connect to the addresses the topology names,
+**`pg_keyspace.cluster_announce_host` is required** here — the workers bind
+`0.0.0.0` and cannot infer an address a client can reach, and a wrong one is a
+connection failure rather than a confusing error. A persisted multi-worker
+cluster refuses to start without it; use `127.0.0.1` for a local-only deployment.
+
+A *standalone* client (the default constructor in every driver — `new Redis()`,
+`redis.NewClient()`, `JedisPool`) does not follow `MOVED` and will surface it as
+an error. Multi-worker durability needs the cluster constructor.
+
+Ephemeral multi-worker deployments are unchanged: no slot enforcement, no cluster
+advertisement (`redis_mode:standalone`), any key may live on any worker.
 
 Two sizing notes: the keyspace segment and the persistence rings are both
 allocated **per worker**, so `workers = 4` with `ring_mb = 64` reserves 256 MB of
@@ -467,11 +489,15 @@ writes, `MOVED` on misrouting, and per-worker crash recovery
 
 Scoping for this version — the extension works; these are the edges to know:
 
-- **A persisted multi-worker cluster requires a slot-aware client.** Each worker
-  serves only its own slot range and answers `MOVED` for anything else (see
-  [Multi-worker scale-out](#multi-worker-scale-out)), so a client that pins every
-  key to one port will be redirected rather than served. Single-worker and
-  ephemeral multi-worker deployments are unaffected.
+- **A persisted multi-worker cluster requires the client's *cluster* constructor**
+  (`Redis.Cluster`, `NewClusterClient`, `JedisCluster`, …), not the standalone
+  default, since each worker serves only its own slot range and redirects the
+  rest. The topology is discoverable over `CLUSTER SLOTS`/`SHARDS`/`NODES`, so no
+  client-side slot table is needed — see
+  [Multi-worker scale-out](#multi-worker-scale-out). Single-worker and ephemeral
+  multi-worker deployments are unaffected. Online resharding (live slot
+  migration, `ASKING`/`MIGRATE`) is not supported; changing `pg_keyspace.workers`
+  is a restart.
 - **Pub/sub is cross-worker within one process** (the scale-out daemon), not yet
   cross-*process* for N in-PG background workers.
 - **Mode B caches single-column primary keys** (composite keys are refused); the

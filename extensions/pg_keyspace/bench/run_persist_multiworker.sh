@@ -77,6 +77,75 @@ for w in $(seq 0 $((N-1))); do
 done
 chk "$((N-1)) non-owning worker(s) redirect rather than serve" "$((N-1))" "$redirects"
 
+# --- cluster topology discovery ---------------------------------------------
+# Library cluster clients (ioredis, go-redis, Jedis, redis-py, lettuce) bootstrap
+# by fetching the slot map before routing anything, so MOVED alone leaves them
+# unable to connect at all. These are what make them work.
+chk "INFO advertises cluster mode" "redis_mode:cluster" \
+    "$(R "$BASE" INFO | tr -d '\r' | grep '^redis_mode:')"
+chk "INFO advertises cluster_enabled:1" "cluster_enabled:1" \
+    "$(R "$BASE" INFO | tr -d '\r' | grep '^cluster_enabled:')"
+chk "CLUSTER INFO reports all slots assigned" "cluster_slots_assigned:16384" \
+    "$(R "$BASE" CLUSTER INFO | tr -d '\r' | grep '^cluster_slots_assigned:')"
+chk "CLUSTER SLOTS returns one node per worker" "$N" \
+    "$(R "$BASE" CLUSTER SLOTS | tr -d '[:space:]' | grep -oE '[0-9a-f]{40}' | wc -l | tr -d ' ')"
+# Flattened CLUSTER SLOTS emits lo, hi, port per entry, so read integers in
+# threes and compare each (lo, hi) against the SQL map. CLUSTER SLOTS is
+# inclusive on hi; slot_ranges() is half-open.
+chk "CLUSTER SLOTS ranges match the SQL slot map" "0" \
+    "$(R "$BASE" CLUSTER SLOTS | tr -d '\r' | grep -E '^[0-9]+$' \
+       | awk 'NR%3==1{lo=$1} NR%3==2{print lo, $1}' | while read -r lo hi; do
+         [ "$($P -c "SELECT count(*) FROM supacache.slot_ranges() WHERE slot_lo = $lo AND slot_hi = $((hi+1));" | tr -d '[:space:]')" = "1" ] || echo x
+       done | wc -l | tr -d ' ')"
+chk "CLUSTER NODES lists every worker" "$N" "$(R "$BASE" CLUSTER NODES | grep -c connected)"
+chk "CLUSTER NODES marks exactly one node myself" "1" \
+    "$(R "$BASE" CLUSTER NODES | grep -c myself)"
+chk "CLUSTER MYID is a 40-char node id" "40" "$(R "$BASE" CLUSTER MYID | tr -d '[:space:]' | wc -c | tr -d ' ')"
+chk "node ids are distinct across workers" "$N" \
+    "$(for w in $(seq 0 $((N-1))); do R $((BASE+w)) CLUSTER MYID; done | sort -u | wc -l | tr -d ' ')"
+chk "every worker reports the same topology" "1" \
+    "$(for w in $(seq 0 $((N-1))); do R $((BASE+w)) CLUSTER SLOTS; done | sort -u | md5sum >/dev/null; \
+       for w in $(seq 0 $((N-1))); do R $((BASE+w)) CLUSTER SLOTS | md5sum; done | sort -u | wc -l | tr -d ' ')"
+chk "CLUSTER KEYSLOT matches the SQL slot map" \
+    "$($P -c "SELECT slot_lo FROM supacache.slot_ranges() WHERE worker = supacache.key_worker('mw:1');" | tr -d '[:space:]')" \
+    "$(R "$BASE" CLUSTER SLOTS >/dev/null; $P -c "SELECT slot_lo FROM supacache.slot_ranges() r WHERE $(R "$BASE" CLUSTER KEYSLOT 'mw:1') >= r.slot_lo AND $(R "$BASE" CLUSTER KEYSLOT 'mw:1') < r.slot_hi;" | tr -d '[:space:]')"
+
+# A cluster-mode client must transparently follow the redirect end to end.
+if redis-cli $T -c -p "$BASE" PING >/dev/null 2>&1; then
+  R2() { timeout 5 redis-cli $T -c -p "$1" "${@:2}" 2>/dev/null; }
+  R2 "$BASE" SET "mw:clusterprobe" hello >/dev/null
+  chk "cluster-mode client round-trips a redirected key" "hello" "$(R2 "$BASE" GET "mw:clusterprobe")"
+  R2 "$BASE" DEL "mw:clusterprobe" >/dev/null
+fi
+
+# A real library cluster client is the check that matters: it bootstraps from
+# CLUSTER SLOTS and needs COMMAND to locate each command's key before it will
+# route anything. Skipped when redis-py is not installed.
+if python3 -c "import redis" >/dev/null 2>&1; then
+  pyout=$(python3 - "$BASE" <<'PYEOF'
+import sys
+from redis.cluster import RedisCluster, ClusterNode
+port = int(sys.argv[1])
+rc = RedisCluster(startup_nodes=[ClusterNode("127.0.0.1", port)],
+                  decode_responses=True, require_full_coverage=True)
+keys = [f"mwpy:{i}" for i in range(60)]
+for k in keys:
+    rc.set(k, f"v-{k}")
+ok = sum(1 for k in keys if rc.get(k) == f"v-{k}")
+ports = {rc.get_node_from_key(k).port for k in keys}
+for k in keys:
+    rc.delete(k)
+print(f"{len(rc.get_nodes())} {ok} {len(ports)}")
+PYEOF
+  )
+  read -r pynodes pyok pyports <<<"${pyout:-0 0 0}"
+  chk "redis-py cluster client discovers every worker" "$N" "${pynodes:-0}"
+  chk "redis-py round-trips 60 keys via its own routing" "60" "${pyok:-0}"
+  chk "redis-py spread those keys across all workers" "$N" "${pyports:-0}"
+else
+  echo "note: redis-py not installed — skipping the library-client check"
+fi
+
 # --- misrouting is refused, not silently accepted ---------------------------
 # A key sent to a worker that does not own it must come back as MOVED, naming
 # the owning worker's port. Accepting it would ack a durable write that the next
