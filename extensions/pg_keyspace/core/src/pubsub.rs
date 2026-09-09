@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Which workers hold subscribers for a key, and how many each has.
@@ -22,14 +23,26 @@ struct Routing {
     patterns: HashMap<Vec<u8>, HashMap<usize, usize>>,
 }
 
+/// One item in a worker's cross-worker inbox: either a pub/sub message to
+/// deliver to local subscribers, or a client-side-caching invalidation to apply
+/// to local trackers (`None` key = the whole keyspace changed, i.e. FLUSH).
+pub enum BusMsg {
+    Publish(Vec<u8>, Vec<u8>), // (channel, message)
+    Invalidate(Option<Vec<u8>>), // scoped key, or None for flush-all
+}
+
 struct Slot {
-    inbox: Mutex<VecDeque<(Vec<u8>, Vec<u8>)>>, // (channel, message)
-    wake_fd: RawFd,                              // eventfd for this worker
+    inbox: Mutex<VecDeque<BusMsg>>,
+    wake_fd: RawFd, // eventfd for this worker
 }
 
 pub struct Bus {
     routing: Mutex<Routing>,
     slots: Vec<Slot>,
+    // Number of connections across all workers with CLIENT TRACKING on. The
+    // write path consults this to skip broadcasting invalidations entirely when
+    // nobody is tracking, so tracking costs the hot path nothing when unused.
+    trackers: AtomicUsize,
 }
 
 impl Bus {
@@ -46,7 +59,33 @@ impl Bus {
         Bus {
             routing: Mutex::new(Routing::default()),
             slots,
+            trackers: AtomicUsize::new(0),
         }
+    }
+
+    /// Record that a connection turned CLIENT TRACKING on / off. `tracking_active`
+    /// then tells the write path whether any worker has a tracker at all.
+    pub fn tracker_add(&self) {
+        self.trackers.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn tracker_remove(&self) {
+        // saturating: never wrap below zero if counts ever get out of step.
+        let mut cur = self.trackers.load(Ordering::Relaxed);
+        while cur > 0 {
+            match self.trackers.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
+    }
+    /// Whether any connection anywhere has tracking on.
+    pub fn tracking_active(&self) -> bool {
+        self.trackers.load(Ordering::Relaxed) > 0
     }
 
     /// The eventfd a worker registers in its epoll set to learn of deliveries.
@@ -125,24 +164,46 @@ impl Bus {
             remote += count;
             {
                 let mut ib = self.slots[wid].inbox.lock().unwrap();
-                ib.push_back((channel.to_vec(), msg.to_vec()));
+                ib.push_back(BusMsg::Publish(channel.to_vec(), msg.to_vec()));
             }
-            // wake the target worker's epoll (write 1 to its eventfd)
-            let one: u64 = 1;
-            unsafe {
-                libc::write(
-                    self.slots[wid].wake_fd,
-                    &one as *const u64 as *const libc::c_void,
-                    8,
-                );
-            }
+            self.wake(wid);
         }
         remote
     }
 
+    /// Broadcast a client-side-caching invalidation to every *other* worker so
+    /// each can notify its own trackers of the changed key (`None` = the whole
+    /// keyspace, for FLUSH). Unlike `publish` this fans out to all workers rather
+    /// than routing by subscription, because the tracking tables live per-worker.
+    /// Callers gate this on `tracking_active` so it never runs when nobody tracks.
+    pub fn invalidate(&self, from: usize, key: Option<&[u8]>) {
+        for wid in 0..self.slots.len() {
+            if wid == from {
+                continue; // the caller already invalidated its own trackers
+            }
+            {
+                let mut ib = self.slots[wid].inbox.lock().unwrap();
+                ib.push_back(BusMsg::Invalidate(key.map(|k| k.to_vec())));
+            }
+            self.wake(wid);
+        }
+    }
+
+    /// Wake a worker's epoll loop (write 1 to its eventfd).
+    fn wake(&self, wid: usize) {
+        let one: u64 = 1;
+        unsafe {
+            libc::write(
+                self.slots[wid].wake_fd,
+                &one as *const u64 as *const libc::c_void,
+                8,
+            );
+        }
+    }
+
     /// Drain this worker's inbox (called after its wake fd fires). Also consumes
     /// the eventfd counter so it does not re-fire spuriously.
-    pub fn drain(&self, wid: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub fn drain(&self, wid: usize) -> Vec<BusMsg> {
         let mut buf = [0u8; 8];
         unsafe {
             libc::read(

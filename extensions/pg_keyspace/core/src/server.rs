@@ -391,12 +391,25 @@ impl Worker {
                 if fd == self.listen_fd {
                     self.accept_all();
                 } else if self.bus.as_ref().map_or(false, |b| fd == b.wake_fd(self.worker_id)) {
-                    // A remote worker published to a channel/pattern we hold a
-                    // subscriber for: drain the inbox and deliver locally (never
-                    // re-broadcast — deliver_local is local-only).
+                    // A remote worker published to a channel we subscribe to, or
+                    // invalidated a key we may be tracking: drain the inbox and
+                    // apply each locally (never re-broadcast — these are local-only
+                    // so a cross-worker message can't ping-pong).
                     let msgs = self.bus.as_ref().unwrap().drain(self.worker_id);
-                    for (channel, msg) in msgs {
-                        self.deliver_local(&channel, &msg);
+                    for m in msgs {
+                        match m {
+                            pubsub::BusMsg::Publish(channel, msg) => {
+                                self.deliver_local(&channel, &msg);
+                            }
+                            // -1 is not a live fd, so nothing local is skipped: the
+                            // writer that made the change is on another worker.
+                            pubsub::BusMsg::Invalidate(Some(key)) => {
+                                self.invalidate_key(&key, -1);
+                            }
+                            pubsub::BusMsg::Invalidate(None) => {
+                                self.invalidate_all(-1);
+                            }
+                        }
                     }
                 } else {
                     let flags = ev.events;
@@ -3313,11 +3326,13 @@ impl Worker {
         // them fires an invalidation. FLUSH invalidates the whole keyspace.
         if matches!(cmd.as_slice(), b"FLUSHALL" | b"FLUSHDB") {
             self.invalidate_all(fd);
+            self.broadcast_invalidation(None);
         } else if !key_idxs.is_empty() {
             if is_write_cmd(&cmd) {
                 for &i in &key_idxs {
                     if let Some(k) = args.get(i) {
                         self.invalidate_key(k, fd);
+                        self.broadcast_invalidation(Some(k));
                     }
                 }
             } else if self.should_record_reads(fd) {
@@ -3615,9 +3630,15 @@ impl Worker {
             Some(b"OFF") => {
                 self.bcast_subs.remove(&fd);
                 self.untrack_fd(fd);
+                let was_on = self.conns.get(&fd).map(|c| c.track.on).unwrap_or(false);
                 let c = self.conns.get_mut(&fd).unwrap();
                 c.track = Tracking::default();
                 resp::simple(&mut c.wbuf, "OK");
+                if was_on {
+                    if let Some(bus) = &self.bus {
+                        bus.tracker_remove();
+                    }
+                }
             }
             Some(b"ON") => {
                 let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
@@ -3700,9 +3721,18 @@ impl Worker {
                 } else {
                     self.bcast_subs.remove(&fd);
                 }
+                let was_on = self.conns.get(&fd).map(|c| c.track.on).unwrap_or(false);
                 let c = self.conns.get_mut(&fd).unwrap();
                 c.track = t;
                 resp::simple(&mut c.wbuf, "OK");
+                // Count this connection toward the cross-worker tracking gate the
+                // first time it turns tracking on (re-negotiating an already-on
+                // connection does not double-count).
+                if !was_on {
+                    if let Some(bus) = &self.bus {
+                        bus.tracker_add();
+                    }
+                }
             }
             _ => {
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
@@ -3748,6 +3778,23 @@ impl Worker {
                 let prefix = self.conn_prefix(reader);
                 let facing = strip_scope(key, &prefix).to_vec();
                 self.deliver_invalidation(reader, Some(&facing));
+            }
+        }
+    }
+
+    /// Fan a client-side-caching invalidation out to the other workers over the
+    /// Bus so each notifies its own trackers (`None` = whole keyspace, for FLUSH).
+    /// A no-op without a Bus (the single-worker in-PG extension) and skipped
+    /// entirely when no connection anywhere is tracking, so a write pays only one
+    /// relaxed atomic load when client-side caching is unused. Cross-worker
+    /// invalidation is conservative: workers own independent keyspace segments, so
+    /// a same-named key on another worker may be told to drop a still-valid cache
+    /// entry (it re-fetches — never serves stale data). It is exactly right once a
+    /// worker set shares one store.
+    fn broadcast_invalidation(&self, key: Option<&[u8]>) {
+        if let Some(bus) = &self.bus {
+            if bus.tracking_active() {
+                bus.invalidate(self.worker_id, key);
             }
         }
     }
@@ -4311,6 +4358,11 @@ impl Worker {
             self.untrack_fd(fd);
         }
         self.bcast_subs.remove(&fd);
+        if self.conns.get(&fd).map(|c| c.track.on).unwrap_or(false) {
+            if let Some(bus) = &self.bus {
+                bus.tracker_remove();
+            }
+        }
         let _ = epoll_del(self.epfd, fd);
         unsafe { libc::close(fd) };
         self.conns.remove(&fd);

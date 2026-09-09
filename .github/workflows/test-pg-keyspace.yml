@@ -126,6 +126,7 @@ jobs:
           runbench run_biglist.sh
           runbench run_bigzset.sh
           runbench run_pubsub_xworker.sh
+          runbench run_tracking_xworker.sh
 
           # Type conformance + WRONGTYPE + redis parity, against one daemon.
           "$DAEMON" --workers 1 --port 6400 --keys-per-worker 200000 --shmem-mb 128 \
