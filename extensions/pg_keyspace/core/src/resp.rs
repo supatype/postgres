@@ -148,6 +148,12 @@ pub fn nil(out: &mut Vec<u8>) {
     out.extend_from_slice(b"$-1\r\n");
 }
 
+/// A null array (`*-1`), distinct from an empty array — used by EXEC when a
+/// WATCHed key changed, so the transaction is aborted.
+pub fn nil_array(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"*-1\r\n");
+}
+
 pub fn array_header(out: &mut Vec<u8>, n: usize) {
     out.push(b'*');
     write_int(out, n as i64);
