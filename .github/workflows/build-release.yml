@@ -42,9 +42,13 @@ jobs:
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             VERSION="${{ github.ref_name }}"
             VERSION="${VERSION#v}"   # strip leading 'v'
-            echo "tags=${IMAGE}:${VERSION}-${{ matrix.arch }},${IMAGE}:17-latest-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+            # A release tag owns the versioned image; the rolling 17-latest/latest
+            # pointers are re-pointed to it in the merge job.
+            echo "tags=${IMAGE}:${VERSION}-${{ matrix.arch }}" >> $GITHUB_OUTPUT
           else
-            echo "tags=${IMAGE}:17-latest-${{ matrix.arch }},${IMAGE}:develop-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+            # A branch build (develop) publishes only its own branch tag — never
+            # 17-latest/latest, so those track releases, not the dev branch.
+            echo "tags=${IMAGE}:develop-${{ matrix.arch }}" >> $GITHUB_OUTPUT
           fi
 
       - name: Set up Docker Buildx
@@ -79,20 +83,27 @@ jobs:
         run: |
           IMAGE="supatype/postgres"
 
-          # Rolling PG17 pointer (currently only major we ship)
-          docker buildx imagetools create -t ${IMAGE}:17-latest \
-            ${IMAGE}:17-latest-amd64 \
-            ${IMAGE}:17-latest-arm64
-
-          # Flat alias: same digest as 17-latest (no extra branch-only vs tag-only divergence)
-          docker buildx imagetools create -t ${IMAGE}:latest \
-            ${IMAGE}:17-latest-amd64 \
-            ${IMAGE}:17-latest-arm64
-
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             VERSION="${{ github.ref_name }}"
             VERSION="${VERSION#v}"
+
+            # The immutable versioned image.
             docker buildx imagetools create -t ${IMAGE}:${VERSION} \
               ${IMAGE}:${VERSION}-amd64 \
               ${IMAGE}:${VERSION}-arm64
+
+            # Rolling PG17 pointer + flat alias, re-pointed to THIS release.
+            # Only tag builds move these, so latest/17-latest always name a
+            # published release rather than the develop head.
+            docker buildx imagetools create -t ${IMAGE}:17-latest \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker buildx imagetools create -t ${IMAGE}:latest \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+          else
+            # Branch build (develop): stitch only the branch's own multi-arch tag.
+            docker buildx imagetools create -t ${IMAGE}:develop \
+              ${IMAGE}:develop-amd64 \
+              ${IMAGE}:develop-arm64
           fi

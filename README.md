@@ -16,10 +16,10 @@ docker pull supatype/postgres:17-latest
 
 | Tag | Description |
 |---|---|
-| `17-latest` | Latest build from `main` |
-| `x.y.z` | Pinned release |
-| `latest` | Alias for the most recent release tag |
-| `develop` | Latest build from `develop` branch |
+| `17-latest` | Most recent PG17 **release** — moves only when a `vX.Y.Z` tag is published, not on `develop` pushes |
+| `x.y.z` | Pinned, immutable release |
+| `latest` | Alias for the most recent release (same digest as `17-latest`) |
+| `develop` | Latest build from the `develop` branch |
 
 Multi-arch: `linux/amd64` and `linux/arm64`.
 
