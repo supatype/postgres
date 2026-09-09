@@ -110,10 +110,13 @@ static GUC_TLS_KEY: GucSetting<Option<&'static CStr>> =
 /// which consumes a replication slot (output plugin `supacache_keys`) and drops
 /// changed rows from the row cache so it stays coherent with committed writes.
 /// Off by default — it needs `wal_level = logical` and holds a replication slot.
-/// Host advertised in `MOVED` redirects (the workers bind 0.0.0.0, so they
-/// cannot infer a reachable address for a remote client).
+/// Host advertised in `MOVED` redirects and the `CLUSTER` topology (the workers
+/// bind 0.0.0.0, so they cannot infer an address a remote client can reach).
+/// Deliberately unset by default: a persisted multi-worker cluster refuses to
+/// start without it rather than publishing an address that may only resolve on
+/// the server host.
 static GUC_ANNOUNCE_HOST: GucSetting<Option<&'static CStr>> =
-    GucSetting::<Option<&'static CStr>>::new(Some(c"127.0.0.1"));
+    GucSetting::<Option<&'static CStr>>::new(None);
 static GUC_ROWCACHE_DECODE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static GUC_ROWCACHE_SLOT: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"supacache_rowcache"));
@@ -418,9 +421,11 @@ pub extern "C" fn _PG_init() {
     );
     GucRegistry::define_string_guc(
         "pg_keyspace.cluster_announce_host",
-        "Host advertised in MOVED redirects for multi-worker persisted clusters",
-        "Slot workers bind 0.0.0.0; a redirect must name an address the client can \
-         reach. Set this to the hostname or IP clients use.",
+        "Host advertised in MOVED redirects and CLUSTER topology replies",
+        "Slot workers bind 0.0.0.0, so a redirect or slot map must name an address \
+         the client can reach. Required when a persisted tier runs with workers > 1; \
+         set it to the hostname or IP your clients connect to (e.g. 127.0.0.1 for \
+         a purely local deployment).",
         &GUC_ANNOUNCE_HOST,
         GucContext::Postmaster,
         GucFlags::empty(),
@@ -769,6 +774,29 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         None => log!("pg_keyspace worker: no RESP credentials configured — local/no-auth mode"),
     }
 
+    // A persisted multi-worker cluster publishes a slot map and redirects
+    // clients by address, so it must know an address clients can reach. Guessing
+    // (127.0.0.1) would hand remote clients a topology pointing at themselves —
+    // a confusing connection failure rather than a clear misconfiguration. Fail
+    // closed, as with a bad TLS cert.
+    let announce_host = GUC_ANNOUNCE_HOST
+        .get()
+        .and_then(|c| c.to_str().ok().map(str::to_string))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if persisted && worker_count() > 1 && announce_host.is_none() {
+        log!(
+            "pg_keyspace worker {w}: REFUSING to start — a persisted tier with \
+             pg_keyspace.workers > 1 redirects clients by address, so \
+             pg_keyspace.cluster_announce_host must be set to a host your clients \
+             can reach (use '127.0.0.1' for a local-only deployment)"
+        );
+        while !BackgroundWorker::sigterm_received() {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        return;
+    }
+
     // storage & durability: recover shmem from the tables at startup; the
     // steady-state persistence is offloaded to the persistence worker via the
     // ring, so the RESP hot path never touches SPI.
@@ -812,11 +840,9 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             // A cluster-aware client follows the MOVED and lands on the right
             // port; a single-port client gets a loud error instead of silent loss.
             if nworkers > 1 {
-                let host = GUC_ANNOUNCE_HOST
-                    .get()
-                    .and_then(|c| c.to_str().ok().map(str::to_string))
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                // Checked above: a persisted multi-worker cluster does not reach
+                // here without an announce host.
+                let host = announce_host.clone().unwrap_or_default();
                 let base = GUC_PORT.get() as u16;
                 let endpoints: Vec<String> =
                     (0..nworkers).map(|i| format!("{host}:{}", base + i as u16)).collect();
@@ -824,7 +850,9 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
                 let (lo, hi) = crc16::slot_range(w, nworkers);
                 log!(
                     "pg_keyspace worker {w}: serving slots {lo}..{hi}; keys outside it \
-                     answer MOVED (announce host '{host}')"
+                     answer MOVED, topology published via CLUSTER SLOTS/SHARDS/NODES \
+                     (announced as {host}:{})",
+                    base + w as u16
                 );
             }
         }

@@ -39,12 +39,136 @@ pub type PendingWrite = (Vec<u8>, Vec<u8>, i64, u8);
 pub const DELETE_TOMBSTONE: i64 = -1;
 
 /// This worker's place in the slot->worker map, plus the address of every peer,
-/// so a key it does not own can be answered with `MOVED <slot> <host>:<port>`.
+/// so a key it does not own can be answered with `MOVED <slot> <host>:<port>`,
+/// and the whole map can be published through `CLUSTER SLOTS`/`SHARDS`/`NODES`.
 struct Routing {
     index: usize,
     nworkers: usize,
     /// `host:port` of each slot worker, indexed by worker number.
     endpoints: Vec<String>,
+    /// A stable 40-hex-char node id per worker. Cluster clients key their cached
+    /// topology on these, so they are derived from the endpoint rather than
+    /// randomised — a worker keeps its id across restarts.
+    node_ids: Vec<String>,
+}
+
+impl Routing {
+    fn host_port(&self, w: usize) -> (&str, u16) {
+        let ep = self.endpoints.get(w).map(String::as_str).unwrap_or("");
+        match ep.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse().unwrap_or(0)),
+            None => (ep, 0),
+        }
+    }
+
+    fn node_id(&self, w: usize) -> &str {
+        self.node_ids.get(w).map(String::as_str).unwrap_or("")
+    }
+}
+
+/// A deterministic 40-hex-char cluster node id for `endpoint`.
+fn node_id_for(endpoint: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(endpoint.as_bytes());
+    digest.iter().take(20).map(|b| format!("{b:02x}")).collect()
+}
+
+
+// ---- COMMAND introspection -----------------------------------------------
+// Cluster clients that do not ship a static command table (redis-py, most
+// notably) call `COMMAND` at connect and extract each command's key positions
+// from the reply. Without it they can route nothing — the slot map alone is not
+// enough. Positions here must agree with `key_indices`, which is what the server
+// actually treats as keys.
+
+/// `(first_key, last_key, step)` for one command shape.
+struct CmdSpec {
+    name: &'static str,
+    write: bool,
+    first: i64,
+    last: i64,
+    step: i64,
+    /// Keys are located by a `numkeys` argument, so a client must ask
+    /// `COMMAND GETKEYS` rather than read fixed positions.
+    movable: bool,
+}
+
+/// Key at argument 1 — the overwhelming majority of commands.
+const CMD_KEY1_READ: &[&str] = &[
+    "GET", "TTL", "PTTL", "TYPE", "STRLEN", "GETRANGE", "EXPIRETIME", "PEXPIRETIME",
+    "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS", "HSTRLEN", "HRANDFIELD",
+    "LLEN", "LINDEX", "LRANGE", "LPOS",
+    "ZSCORE", "ZMSCORE", "ZCARD", "ZRANK", "ZREVRANK", "ZRANGE", "ZREVRANGE",
+    "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZCOUNT", "ZRANDMEMBER", "ZRANGEBYLEX",
+    "ZREVRANGEBYLEX", "ZLEXCOUNT",
+    "SCARD", "SISMEMBER", "SMISMEMBER", "SMEMBERS", "SRANDMEMBER",
+    "HSCAN", "SSCAN", "ZSCAN",
+];
+const CMD_KEY1_WRITE: &[&str] = &[
+    "SET", "SETNX", "GETSET", "INCR", "DECR", "INCRBY", "DECRBY", "EXPIRE", "PEXPIRE",
+    "EXPIREAT", "PEXPIREAT", "PERSIST", "APPEND", "GETDEL", "SETEX", "PSETEX", "GETEX",
+    "SETRANGE", "INCRBYFLOAT",
+    "HSET", "HMSET", "HSETNX", "HDEL", "HINCRBY", "HINCRBYFLOAT",
+    "LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LSET", "LTRIM", "LINSERT", "LREM",
+    "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX",
+    "SADD", "SREM", "SPOP",
+];
+/// Every argument is a key.
+const CMD_ALLKEYS_READ: &[&str] = &["EXISTS", "MGET", "TOUCH", "SUNION", "SINTER", "SDIFF", "WATCH"];
+const CMD_ALLKEYS_WRITE: &[&str] =
+    &["DEL", "UNLINK", "SUNIONSTORE", "SINTERSTORE", "SDIFFSTORE"];
+/// Source and destination key.
+const CMD_TWOKEY_WRITE: &[&str] =
+    &["RENAME", "RENAMENX", "COPY", "LMOVE", "RPOPLPUSH", "SMOVE", "ZRANGESTORE"];
+/// `numkeys`-style: key count is an argument, so positions are not fixed.
+const CMD_MOVABLE_READ: &[&str] = &["ZUNION", "ZINTER", "ZDIFF", "SINTERCARD"];
+const CMD_MOVABLE_WRITE: &[&str] = &["ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZMPOP"];
+/// Commands that take no keys; a cluster client may send these to any worker.
+const CMD_KEYLESS: &[&str] = &[
+    "PING", "ECHO", "INFO", "DBSIZE", "FLUSHALL", "FLUSHDB", "SCAN", "KEYS", "COMMAND",
+    "CLUSTER", "HELLO", "AUTH", "CLIENT", "CONFIG", "SELECT", "RESET", "MEMORY", "DEBUG",
+    "TIME", "MULTI", "EXEC", "DISCARD", "UNWATCH", "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE",
+    "PUNSUBSCRIBE", "PUBLISH", "PUBSUB", "QUIT",
+];
+
+fn command_specs() -> Vec<CmdSpec> {
+    let mut v = Vec::with_capacity(160);
+    let mut add = |names: &[&'static str], write: bool, first: i64, last: i64, step: i64, movable: bool| {
+        for name in names {
+            v.push(CmdSpec { name, write, first, last, step, movable });
+        }
+    };
+    add(CMD_KEY1_READ, false, 1, 1, 1, false);
+    add(CMD_KEY1_WRITE, true, 1, 1, 1, false);
+    add(CMD_ALLKEYS_READ, false, 1, -1, 1, false);
+    add(CMD_ALLKEYS_WRITE, true, 1, -1, 1, false);
+    add(&["MSET", "MSETNX"], true, 1, -1, 2, false);
+    add(CMD_TWOKEY_WRITE, true, 1, 2, 1, false);
+    add(CMD_MOVABLE_READ, false, 0, 0, 0, true);
+    add(CMD_MOVABLE_WRITE, true, 0, 0, 0, true);
+    add(&["OBJECT"], false, 2, 2, 1, false);
+    add(CMD_KEYLESS, false, 0, 0, 0, false);
+    v
+}
+
+/// One `COMMAND` reply entry: `[name, arity, flags, first, last, step]`.
+fn write_command_entry(out: &mut Vec<u8>, c: &CmdSpec) {
+    resp::array_header(out, 6);
+    resp::bulk(out, c.name.to_ascii_lowercase().as_bytes());
+    // Variadic minimum: every listed command takes at least its own name, and
+    // keyed ones at least one key. Clients use this only as a lower bound.
+    resp::integer(out, if c.first > 0 { -2 } else { -1 });
+    let mut flags: Vec<&str> = vec![if c.write { "write" } else { "readonly" }];
+    if c.movable {
+        flags.push("movablekeys");
+    }
+    resp::array_header(out, flags.len());
+    for f in flags {
+        resp::simple(out, f);
+    }
+    resp::integer(out, c.first);
+    resp::integer(out, c.last);
+    resp::integer(out, c.step);
 }
 
 /// Enqueue one record into the ring sharded by key slot (same shard function as
@@ -388,7 +512,8 @@ impl Worker {
     /// restart — after having acked the write as durable.
     pub fn set_slot_routing(&mut self, index: usize, nworkers: usize, endpoints: Vec<String>) {
         self.routing = if nworkers > 1 {
-            Some(Routing { index, nworkers, endpoints })
+            let node_ids = endpoints.iter().map(|e| node_id_for(e)).collect();
+            Some(Routing { index, nworkers, endpoints, node_ids })
         } else {
             None
         };
@@ -886,7 +1011,55 @@ impl Worker {
             }
             // HELLO and CLIENT are handled before this match.
             b"CONFIG" | b"SELECT" | b"RESET" => resp::simple(out, "OK"),
-            b"COMMAND" => resp::array_header(out, 0),
+            b"COMMAND" => {
+                let specs = command_specs();
+                match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
+                    None => {
+                        resp::array_header(out, specs.len());
+                        for c in &specs {
+                            write_command_entry(out, c);
+                        }
+                    }
+                    Some(b"COUNT") => resp::integer(out, specs.len() as i64),
+                    Some(b"INFO") => {
+                        let names: Vec<Vec<u8>> =
+                            args[2..].iter().map(|a| a.to_ascii_uppercase()).collect();
+                        let wanted: Vec<&Vec<u8>> = names.iter().collect();
+                        if wanted.is_empty() {
+                            resp::array_header(out, specs.len());
+                            for c in &specs {
+                                write_command_entry(out, c);
+                            }
+                        } else {
+                            resp::array_header(out, wanted.len());
+                            for want in wanted {
+                                match specs.iter().find(|c| c.name.as_bytes() == want.as_slice()) {
+                                    Some(c) => write_command_entry(out, c),
+                                    None => resp::nil_array(out),
+                                }
+                            }
+                        }
+                    }
+                    // The `numkeys` commands are flagged movablekeys, so clients
+                    // ask here instead of reading fixed positions. Answered from
+                    // key_indices, the same function routing uses.
+                    Some(b"GETKEYS") if nargs >= 3 => {
+                        let sub: Vec<Vec<u8>> = args[2..].to_vec();
+                        let name = sub[0].to_ascii_uppercase();
+                        let idxs = key_indices(&name, &sub);
+                        if idxs.is_empty() {
+                            resp::error(out, "ERR The command has no key arguments");
+                        } else {
+                            resp::array_header(out, idxs.len());
+                            for i in idxs {
+                                resp::bulk(out, &sub[i]);
+                            }
+                        }
+                    }
+                    Some(b"DOCS") => resp::map_header(out, 0, resp3),
+                    _ => resp::array_header(out, 0),
+                }
+            }
             b"DBSIZE" => {
                 let mut total = 0i64;
                 for p in 0..store.num_partitions() {
@@ -1633,15 +1806,141 @@ impl Worker {
                     keys += st.entries;
                     used += st.data_used;
                 }
+                // Clients decide whether to speak cluster from `redis_mode` /
+                // `cluster_enabled`, so these must track slot routing exactly.
+                let clustered = self.routing.is_some();
+                let mode = if clustered { "cluster" } else { "standalone" };
+                let cluster_enabled = u8::from(clustered);
                 let body = format!(
-                    "# Server\r\nredis_version:7.4.0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\n\
+                    "# Server\r\nredis_version:7.4.0\r\nredis_mode:{mode}\r\nos:Linux\r\narch_bits:64\r\n\
                      # Clients\r\nblocked_clients:0\r\n\
                      # Memory\r\nused_memory:{used}\r\nmaxmemory:0\r\n\
                      # Persistence\r\nloading:0\r\n\
                      # Replication\r\nrole:master\r\nconnected_slaves:0\r\n\
+                     # Cluster\r\ncluster_enabled:{cluster_enabled}\r\n\
                      # Keyspace\r\ndb0:keys={keys},expires=0,avg_ttl=0\r\n"
                 );
                 resp::bulk(out, body.as_bytes());
+            }
+            // ---- cluster topology discovery ----
+            // Cluster clients bootstrap by asking for the slot map before they
+            // will route anything, so MOVED alone is not enough to make them
+            // work: without these they fail at connect. Only served when slot
+            // routing is on (persisted, workers > 1) — advertising a slot map a
+            // single-worker or ephemeral deployment does not enforce would be a
+            // lie the client then routes by.
+            b"CLUSTER" => {
+                let sub = args.get(1).map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+                let r = match &self.routing {
+                    Some(r) => r,
+                    None => {
+                        // Redis's own wording when built without cluster support.
+                        match sub.as_slice() {
+                            b"KEYSLOT" if nargs >= 3 => {
+                                resp::integer(out, crc16::key_slot(&args[2]) as i64)
+                            }
+                            b"INFO" => resp::bulk(
+                                out,
+                                b"cluster_enabled:0\r\ncluster_state:ok\r\ncluster_slots_assigned:0\r\n",
+                            ),
+                            _ => resp::error(out, "ERR This instance has cluster support disabled"),
+                        }
+                        return;
+                    }
+                };
+                let n = r.nworkers;
+                match sub.as_slice() {
+                    // [[start, end, [ip, port, id, metadata]], …] — one range per
+                    // worker, no replicas (a worker's standby is Postgres's own).
+                    b"SLOTS" => {
+                        resp::array_header(out, n);
+                        for w in 0..n {
+                            let (lo, hi) = crc16::slot_range(w, n);
+                            let (ip, port) = r.host_port(w);
+                            resp::array_header(out, 3);
+                            resp::integer(out, lo as i64);
+                            resp::integer(out, hi as i64 - 1); // CLUSTER SLOTS is inclusive
+                            resp::array_header(out, 4);
+                            resp::bulk(out, ip.as_bytes());
+                            resp::integer(out, port as i64);
+                            resp::bulk(out, r.node_id(w).as_bytes());
+                            resp::array_header(out, 0);
+                        }
+                    }
+                    b"SHARDS" => {
+                        resp::array_header(out, n);
+                        for w in 0..n {
+                            let (lo, hi) = crc16::slot_range(w, n);
+                            let (ip, port) = r.host_port(w);
+                            resp::map_header(out, 2, resp3);
+                            resp::bulk(out, b"slots");
+                            resp::array_header(out, 2);
+                            resp::integer(out, lo as i64);
+                            resp::integer(out, hi as i64 - 1);
+                            resp::bulk(out, b"nodes");
+                            resp::array_header(out, 1);
+                            resp::map_header(out, 7, resp3);
+                            resp::bulk(out, b"id");
+                            resp::bulk(out, r.node_id(w).as_bytes());
+                            resp::bulk(out, b"port");
+                            resp::integer(out, port as i64);
+                            resp::bulk(out, b"ip");
+                            resp::bulk(out, ip.as_bytes());
+                            resp::bulk(out, b"endpoint");
+                            resp::bulk(out, ip.as_bytes());
+                            resp::bulk(out, b"role");
+                            resp::bulk(out, b"master");
+                            resp::bulk(out, b"replication-offset");
+                            resp::integer(out, 0);
+                            resp::bulk(out, b"health");
+                            resp::bulk(out, b"online");
+                        }
+                    }
+                    // nodes.conf line format — lettuce and Jedis parse this one.
+                    b"NODES" => {
+                        let mut body = String::new();
+                        for w in 0..n {
+                            let (lo, hi) = crc16::slot_range(w, n);
+                            let (ip, port) = r.host_port(w);
+                            let flags = if w == r.index { "myself,master" } else { "master" };
+                            body.push_str(&format!(
+                                "{} {}:{}@{} {} - 0 0 {} connected {}-{}\n",
+                                r.node_id(w),
+                                ip,
+                                port,
+                                port as u32 + 10_000, // conventional cluster bus port
+                                flags,
+                                w,
+                                lo,
+                                hi - 1,
+                            ));
+                        }
+                        resp::bulk(out, body.as_bytes());
+                    }
+                    b"MYID" => resp::bulk(out, r.node_id(r.index).as_bytes()),
+                    b"INFO" => {
+                        let body = format!(
+                            "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:{}\r\n\
+                             cluster_slots_ok:{}\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
+                             cluster_known_nodes:{n}\r\ncluster_size:{n}\r\ncluster_current_epoch:{n}\r\n\
+                             cluster_my_epoch:{}\r\n",
+                            crc16::NUM_SLOTS,
+                            crc16::NUM_SLOTS,
+                            r.index,
+                        );
+                        resp::bulk(out, body.as_bytes());
+                    }
+                    b"KEYSLOT" if nargs >= 3 => {
+                        resp::integer(out, crc16::key_slot(&args[2]) as i64)
+                    }
+                    b"COUNTKEYSINSLOT" => resp::integer(out, 0),
+                    // Topology is fixed by pg_keyspace.workers, so there is no
+                    // resharding surface to expose.
+                    _ => resp::error(
+                        out,
+                        "ERR Unknown CLUSTER subcommand or wrong number of arguments",
+                    ),
+                }
             }
             b"MEMORY" => {
                 match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
