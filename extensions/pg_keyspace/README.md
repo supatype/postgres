@@ -100,10 +100,13 @@ throughput, the full command/type surface, or mature cluster operations today.
 
 A stock client (`redis-cli`, `ioredis`, `redis-py`, `valkey-go`) drives
 `pg_keyspace` unmodified, in **RESP2 or RESP3**: `HELLO 3` negotiates RESP3
-(typed map/set/double/null replies and push-framed pub/sub), and `CLIENT
-TRACKING` enables server-assisted client-side caching (`invalidate` pushes),
-so `valkey-go`/`rueidis` can run with client-side caching on. Coverage below;
-anything not listed replies `ERR unknown command`.
+(typed map/set/double/null replies, `WITHSCORES`/`WITHVALUES` member–value
+pairs, and push-framed pub/sub), and `CLIENT TRACKING` enables server-assisted
+client-side caching (`invalidate` pushes) in every mode — default, `BCAST`
+(with `PREFIX`), `OPTIN`/`OPTOUT` (with `CLIENT CACHING`), and `REDIRECT` — so
+`valkey-go`/`rueidis` can run with client-side caching on rather than
+`DisableCache`. Coverage below; anything not listed replies
+`ERR unknown command`.
 
 **Supported**
 
@@ -121,10 +124,15 @@ anything not listed replies `ERR unknown command`.
 
 **Not yet supported** — scripting (`EVAL`/`FUNCTION`), streams (`XADD`…),
 blocking ops (`BLPOP`/`BRPOP`/`BZPOPMIN`…), HyperLogLog / bitmaps / geo, and
-cluster commands. `CLIENT TRACKING` runs in default (per-read) mode over RESP3;
-BCAST/OPTIN/REDIRECT modes and cross-worker invalidation on the in-PG shared
-store are follow-ups (correct today on the daemon, where each worker owns an
-independent store).
+cluster commands. `CLIENT TRACKING` supports every mode (default, `BCAST` with
+`PREFIX`, `OPTIN`/`OPTOUT` with `CLIENT CACHING`, `REDIRECT`). Invalidations are
+delivered as RESP3 pushes, or — for a RESP2 `REDIRECT` target — as
+`__redis__:invalidate` pub/sub messages. `NOLOOP` is accepted and is always in
+effect: the connection that issued a write is never sent an invalidation for its
+own change. When tracking is active, invalidations also cross workers over the
+pub/sub Bus; since each worker owns an independent keyspace segment this is
+conservative (a same-named key on another worker may be told to re-fetch — it
+never serves stale data), and becomes exact once a worker set shares one store.
 
 **Known divergences:** queuing a malformed command inside `MULTI` does not
 pre-flag `EXECABORT` (it errors as that command's element in the `EXEC` array;
@@ -273,13 +281,16 @@ lifetime and iteration are covered too: `SET … EX/PX`, `TTL`/`PTTL`,
 `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`, `PERSIST`, and `SCAN`/`KEYS`.
 
 **RESP2 and RESP3.** A client using RESP2 works unchanged. `HELLO 3` switches a
-connection to RESP3 — typed replies (map/set/double/null) and push-framed
-pub/sub — and `CLIENT TRACKING ON` turns on server-assisted client-side
-caching: keys the connection reads are tracked, and an `invalidate` push is
-sent when one changes (a null push on `FLUSHALL`/`FLUSHDB`). So `valkey-go`
-/`rueidis` can run with client-side caching enabled rather than
-`DisableCache`. Tracking is default (per-read) mode; see the caveats under
-[command coverage](#command-coverage).
+connection to RESP3 — typed replies (map/set/double/null), `WITHSCORES`
+/`WITHVALUES` member–value pairs, and push-framed pub/sub — and `CLIENT
+TRACKING ON` turns on server-assisted client-side caching: keys the connection
+reads are tracked, and an `invalidate` push is sent when one changes (a null
+push on `FLUSHALL`/`FLUSHDB`). All tracking modes are supported — default,
+`BCAST` (`PREFIX`), `OPTIN`/`OPTOUT` (`CLIENT CACHING`), and `REDIRECT` (which
+lets a RESP2 client receive invalidations as `__redis__:invalidate` pub/sub
+messages) — and invalidations cross workers over the Bus. So `valkey-go`
+/`rueidis` can run with client-side caching enabled rather than `DisableCache`.
+See the notes under [command coverage](#command-coverage).
 
 ### Durability & crash recovery
 
@@ -414,10 +425,11 @@ harnesses, each named for what it checks: Redis parity for every type
 (`run_hardening.sh`, `run_tls.sh`, `run_threats.sh`, `run_security.sh`), Mode B
 row-cache coherence for int/uuid/text/TOAST PKs (`run_rowcache.sh`,
 `run_nonint_pk.sh`, `run_toast.sh`, `run_invalidation.sh`), tenant-scoped pub/sub
-(`run_pubsub_tenant.sh`), real synchronous replication (`run_replication.sh`), a
-real PostgREST v12.2.3 end-to-end (`run_postgrest_e2e.sh`), and scale-out
-(`run_scaleout.sh`, `run_scaleout_inpg.sh`). Each prints its own `# result: N
-passed, M failed`.
+(`run_pubsub_tenant.sh`), RESP3 typed replies and every `CLIENT TRACKING` mode
+(`run_resp3.sh`) including cross-worker invalidation (`run_tracking_xworker.sh`),
+real synchronous replication (`run_replication.sh`), a real PostgREST v12.2.3
+end-to-end (`run_postgrest_e2e.sh`), and scale-out (`run_scaleout.sh`,
+`run_scaleout_inpg.sh`). Each prints its own `# result: N passed, M failed`.
 
 ---
 
