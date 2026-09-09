@@ -38,6 +38,15 @@ pub type PendingWrite = (Vec<u8>, Vec<u8>, i64, u8);
 /// upserting it — otherwise a deleted key would resurrect on crash recovery.
 pub const DELETE_TOMBSTONE: i64 = -1;
 
+/// This worker's place in the slot->worker map, plus the address of every peer,
+/// so a key it does not own can be answered with `MOVED <slot> <host>:<port>`.
+struct Routing {
+    index: usize,
+    nworkers: usize,
+    /// `host:port` of each slot worker, indexed by worker number.
+    endpoints: Vec<String>,
+}
+
 /// Enqueue one record into the ring sharded by key slot (same shard function as
 /// the write path, so a key's writes and deletes always reach the same worker).
 ///
@@ -268,6 +277,12 @@ pub struct Worker {
     auth: Option<AuthConfig>,
     // durable tier: hold each write's RESP reply until its ring record commits.
     sync_ack: bool,
+    // Cluster routing. When set, this worker serves only the keys whose CRC16
+    // slot it owns and answers anything else with a Redis-Cluster `MOVED`
+    // redirect. Enabled for persisted multi-worker deployments, where a write
+    // taken by the wrong worker would be recovered into the owning worker's
+    // segment after a restart and so silently vanish from the one that took it.
+    routing: Option<Routing>,
     // TLS: when set, every accepted connection is wrapped in a TLS session so
     // the RESP wire is encrypted (the AUTH password is otherwise sent in clear).
     tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -322,6 +337,7 @@ impl Worker {
             producers: Vec::new(),
             auth: None,
             sync_ack: false,
+            routing: None,
             tls_config: None,
             channels: HashMap::new(),
             patterns: HashMap::new(),
@@ -360,6 +376,22 @@ impl Worker {
     /// each drained by its own persistence worker.
     pub fn set_ring_producers(&mut self, producers: Vec<ring::Producer>) {
         self.producers = producers;
+    }
+
+    /// Serve only this worker's slot range, redirecting every other key with a
+    /// Redis-Cluster `MOVED`.
+    ///
+    /// `endpoints[w]` is the `host:port` a client should retry against for a key
+    /// worker `w` owns. Persisted multi-worker deployments must enable this:
+    /// recovery restores each key into the segment its slot range covers, so a
+    /// worker that accepted a key it does not own would lose that key on the next
+    /// restart — after having acked the write as durable.
+    pub fn set_slot_routing(&mut self, index: usize, nworkers: usize, endpoints: Vec<String>) {
+        self.routing = if nworkers > 1 {
+            Some(Routing { index, nworkers, endpoints })
+        } else {
+            None
+        };
     }
 
     /// Enable access control: RESP AUTH required, keyspace ACL + tenant scope.
@@ -792,6 +824,35 @@ impl Worker {
         }
         // From here on, use the (possibly scoped) args.
         let args: &[Vec<u8>] = if eff.is_empty() { args } else { &eff };
+
+        // ---- cluster routing: refuse keys this worker does not own ----
+        // Checked on the tenant-scoped key, which is what gets stored, sharded
+        // into a ring and persisted, so the slot here is the slot recovery will
+        // route by. A multi-key command touching another worker's key is a
+        // genuine CROSSSLOT: the workers are shared-nothing, so no single worker
+        // can serve it.
+        if let Some(r) = &self.routing {
+            let mut owners = key_idxs.iter().filter_map(|&i| {
+                args.get(i).map(|k| (crc16::key_owner(k, r.nworkers), i))
+            });
+            if let Some((first, idx)) = owners.next() {
+                // All keys on one worker: serve it here, or redirect the client
+                // there. Keys split across workers cannot be served by anyone.
+                let split = owners.any(|(o, _)| o != first);
+                if split {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(out, "CROSSSLOT Keys in request don't hash to the same slot");
+                    return;
+                }
+                if first != r.index {
+                    let slot = crc16::key_slot(&args[idx]);
+                    let ep = r.endpoints.get(first).cloned().unwrap_or_default();
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(out, &format!("MOVED {slot} {ep}"));
+                    return;
+                }
+            }
+        }
 
         let store = self.store.clone();
         let batcher = self.batcher.clone();

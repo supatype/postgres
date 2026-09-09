@@ -22,9 +22,8 @@ Postgres-native RESP keyspace + RLS-aware row cache. The Supatype platform can
 [Security](#resp-auth-tenant-scoping--tls)); that integration is opt-in, not a
 prerequisite.
 
-> **Status:** built and benchmarked against PostgreSQL 17.6. A working extension;
-> some capabilities (persistence, the row cache) are single-worker in this
-> version — see [Current limitations](#current-limitations).
+> **Status:** built and benchmarked against PostgreSQL 17.6. A working extension
+> — see [Current limitations](#current-limitations) for the edges to know.
 
 ---
 
@@ -323,8 +322,37 @@ own streaming replication for the standby.
 ```ini
 pg_keyspace.workers = 4     # N shared-nothing workers on port, port+1, … port+N-1
 ```
-Clients shard keys across the ports (Redis-Cluster style). Persistence/row-cache
-stay single-worker in this slice, so `workers > 1` runs the ephemeral tier.
+Clients shard keys across the ports (Redis-Cluster style). Each worker owns a
+disjoint, contiguous range of the 16384-slot CRC16 keyspace, its own shared-memory
+segment, and its own persistence rings, so **scale-out composes with every
+durability tier** — `workers > 1` no longer forces the ephemeral tier.
+
+The slot map is the routing table, and it is queryable:
+
+```sql
+SELECT * FROM supacache.slot_ranges();   -- worker | port | slot_lo | slot_hi
+SELECT supacache.key_worker('user:42');  -- which worker owns this key
+```
+
+**Routing is enforced when a persisted tier runs with `workers > 1`.** A key sent
+to a worker that does not own it is answered with a Redis-Cluster `MOVED <slot>
+<host>:<port>` (or `CROSSSLOT` for a multi-key command spanning workers) rather
+than served. This is a durability requirement, not a style preference: crash
+recovery restores each key into the segment whose slot range covers it, so a
+worker that accepted a key it does not own would lose that key on the next
+restart — after having acked the write as durable. A cluster-aware client
+(ioredis, go-redis, lettuce) follows the redirect automatically; set
+`pg_keyspace.cluster_announce_host` to an address your clients can reach
+(default `127.0.0.1`), since the workers bind `0.0.0.0`.
+
+Ephemeral multi-worker deployments are unchanged: no slot enforcement, any key
+may live on any worker.
+
+Two sizing notes: the keyspace segment and the persistence rings are both
+allocated **per worker**, so `workers = 4` with `ring_mb = 64` reserves 256 MB of
+rings (`pg_keyspace.persist_workers` multiplies this further, as it is a count of
+rings *per worker*). Persistence worker *processes* do not scale with `workers` —
+persistence worker `s` drains shard `s` of every slot worker's ring set.
 
 ### Mode B — transparent PostgREST row cache
 
@@ -429,7 +457,9 @@ row-cache coherence for int/uuid/text/TOAST PKs (`run_rowcache.sh`,
 (`run_resp3.sh`) including cross-worker invalidation (`run_tracking_xworker.sh`),
 real synchronous replication (`run_replication.sh`), a real PostgREST v12.2.3
 end-to-end (`run_postgrest_e2e.sh`), and scale-out (`run_scaleout.sh`,
-`run_scaleout_inpg.sh`). Each prints its own `# result: N passed, M failed`.
+`run_scaleout_inpg.sh`) including durability and scale-out together — slot-routed
+writes, `MOVED` on misrouting, and per-worker crash recovery
+(`run_persist_multiworker.sh`). Each prints its own `# result: N passed, M failed`.
 
 ---
 
@@ -437,8 +467,11 @@ end-to-end (`run_postgrest_e2e.sh`), and scale-out (`run_scaleout.sh`,
 
 Scoping for this version — the extension works; these are the edges to know:
 
-- **Persistence and the Mode B row cache are single-worker.** `pg_keyspace.workers
-  > 1` runs the ephemeral (Mode A) tier only.
+- **A persisted multi-worker cluster requires a slot-aware client.** Each worker
+  serves only its own slot range and answers `MOVED` for anything else (see
+  [Multi-worker scale-out](#multi-worker-scale-out)), so a client that pins every
+  key to one port will be redirected rather than served. Single-worker and
+  ephemeral multi-worker deployments are unaffected.
 - **Pub/sub is cross-worker within one process** (the scale-out daemon), not yet
   cross-*process* for N in-PG background workers.
 - **Mode B caches single-column primary keys** (composite keys are refused); the
