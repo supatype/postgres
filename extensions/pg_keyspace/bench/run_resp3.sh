@@ -66,6 +66,48 @@ if [ "$R2" = "redis-cli -p $RESP" ]; then
   fi
   chk "tracking client gets an invalidation" "1" "$(printf '%s' "$inv" | grep -ci invalidate)"
   chk "invalidation names the tracked key"   "1" "$(printf '%s' "$inv" | grep -c 'tk')"
+
+  # WITHSCORES pair shape (RESP3): ZRANGE … WITHSCORES is an array of
+  # [member, double] pairs. Read the raw bytes to confirm the , double type and
+  # the nested framing, which redis-cli's rendering would otherwise hide.
+  $R2 DEL zz >/dev/null; $R2 ZADD zz 1 a 2 b >/dev/null
+  raw=""
+  if exec 3<>"/dev/tcp/127.0.0.1/$RESP" 2>/dev/null; then
+    printf 'HELLO 3\r\nZRANGE zz 0 -1 WITHSCORES\r\n' >&3
+    sleep 0.3
+    raw=$(timeout 1 cat <&3 2>/dev/null || true)
+    exec 3<&- 2>/dev/null || true
+  fi
+  chk "ZRANGE WITHSCORES emits RESP3 doubles" "2" "$(printf '%s' "$raw" | grep -c '^,')"
+  # one top-level *2 (two pairs) + two per-pair *2 = three; HELLO's map is %7.
+  chk "ZRANGE WITHSCORES nests member+score"  "3" "$(printf '%s' "$raw" | grep -c '^\*2')"
+
+  # BCAST: prefix-driven invalidation with no prior read of the key.
+  $R2 DEL bc:1 >/dev/null
+  inv=""
+  if exec 3<>"/dev/tcp/127.0.0.1/$RESP" 2>/dev/null; then
+    printf 'HELLO 3\r\nCLIENT TRACKING ON BCAST PREFIX bc:\r\n' >&3
+    sleep 0.3
+    $R2 SET bc:1 v >/dev/null   # matches the bc: prefix; never read on conn 3
+    inv=$(timeout 1 cat <&3 2>/dev/null || true)
+    exec 3<&- 2>/dev/null || true
+  fi
+  chk "BCAST invalidation on prefix write" "1" "$(printf '%s' "$inv" | grep -ci invalidate)"
+  chk "BCAST invalidation names the key"   "1" "$(printf '%s' "$inv" | grep -c 'bc:1')"
+
+  # OPTIN: only reads that follow CLIENT CACHING YES are tracked.
+  $R2 DEL oi:1 oi:2 >/dev/null; $R2 SET oi:1 a >/dev/null; $R2 SET oi:2 b >/dev/null
+  out=""
+  if exec 3<>"/dev/tcp/127.0.0.1/$RESP" 2>/dev/null; then
+    printf 'HELLO 3\r\nCLIENT TRACKING ON OPTIN\r\nGET oi:1\r\nCLIENT CACHING YES\r\nGET oi:2\r\n' >&3
+    sleep 0.3
+    $R2 SET oi:1 a2 >/dev/null   # not opted in -> no invalidation
+    $R2 SET oi:2 b2 >/dev/null   # opted in    -> invalidation for oi:2
+    out=$(timeout 1 cat <&3 2>/dev/null || true)
+    exec 3<&- 2>/dev/null || true
+  fi
+  chk "OPTIN skips the un-opted read"  "0" "$(printf '%s' "$out" | grep -c 'oi:1')"
+  chk "OPTIN tracks the opted-in read" "1" "$(printf '%s' "$out" | grep -c 'oi:2')"
 else
   echo "  SKIP  tracking invalidation (TLS port; raw socket unavailable)"
 fi
