@@ -27,6 +27,9 @@ libc = "0.2"
 sha2 = "0.11"
 rustls = "0.21"
 rustls-pemfile = "1"
+# server.rs / pubsub.rs are shared from core via #[path], so this crate compiles
+# them too and needs the same readiness layer (epoll on Linux, kqueue on macOS).
+mio = { version = "1.0", features = ["os-poll", "os-ext"] }
 
 [dev-dependencies]
 pgrx-tests = "=0.12.9"

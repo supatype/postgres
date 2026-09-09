@@ -4,8 +4,9 @@
 //! channels are not sharded — a PUBLISH on one worker must reach subscribers on
 //! any worker. When workers are threads of one process (the scale-out daemon)
 //! they share this `Bus`: a routing table (channel/pattern -> which workers hold
-//! subscribers, and how many) plus a per-worker inbox and an `eventfd` to wake
-//! that worker's epoll loop so delivery is prompt, not poll-latency bound.
+//! subscribers, and how many) plus a per-worker inbox and a wake fd (an
+//! `eventfd` on Linux, a self-pipe on macOS) to wake that worker's poller so
+//! delivery is prompt, not poll-latency bound.
 //!
 //! The in-PG extension runs a single RESP worker, so it uses no bus (local
 //! delivery only); a future multi-*process* deployment would back the same
@@ -33,7 +34,39 @@ pub enum BusMsg {
 
 struct Slot {
     inbox: Mutex<VecDeque<BusMsg>>,
-    wake_fd: RawFd, // eventfd for this worker
+    // Wake fd registered in the worker's poller. On Linux this is a single
+    // eventfd (read == write). On macOS it is a self-pipe: `wake_fd` is the read
+    // end (what the worker polls and drains), `wake_w` the write end.
+    wake_fd: RawFd,
+    wake_w: RawFd,
+}
+
+/// Create a wake handle: (read/poll fd, write fd). One eventfd on Linux; a
+/// non-blocking, close-on-exec self-pipe on macOS.
+fn make_wake() -> (RawFd, RawFd) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let fd = libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
+        (fd, fd)
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let mut fds = [0 as RawFd; 2];
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return (-1, -1);
+        }
+        for &fd in &fds {
+            let fl = libc::fcntl(fd, libc::F_GETFL, 0);
+            if fl >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+            let fdfl = libc::fcntl(fd, libc::F_GETFD, 0);
+            if fdfl >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, fdfl | libc::FD_CLOEXEC);
+            }
+        }
+        (fds[0], fds[1]) // (read, write)
+    }
 }
 
 pub struct Bus {
@@ -46,14 +79,15 @@ pub struct Bus {
 }
 
 impl Bus {
-    /// Create a bus for `nworkers`, each with its own eventfd wake handle.
+    /// Create a bus for `nworkers`, each with its own wake handle.
     pub fn new(nworkers: usize) -> Bus {
         let mut slots = Vec::with_capacity(nworkers);
         for _ in 0..nworkers {
-            let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            let (wake_fd, wake_w) = make_wake();
             slots.push(Slot {
                 inbox: Mutex::new(VecDeque::new()),
-                wake_fd: fd,
+                wake_fd,
+                wake_w,
             });
         }
         Bus {
@@ -88,7 +122,8 @@ impl Bus {
         self.trackers.load(Ordering::Relaxed) > 0
     }
 
-    /// The eventfd a worker registers in its epoll set to learn of deliveries.
+    /// The fd a worker registers with its poller to learn of deliveries (the
+    /// eventfd on Linux, the pipe's read end on macOS).
     pub fn wake_fd(&self, wid: usize) -> RawFd {
         self.slots[wid].wake_fd
     }
@@ -189,28 +224,37 @@ impl Bus {
         }
     }
 
-    /// Wake a worker's epoll loop (write 1 to its eventfd).
+    /// Wake a worker's poller. Writes an 8-byte value to the wake fd: on Linux
+    /// that bumps the eventfd counter; on macOS it queues 8 bytes in the pipe.
+    /// Either way the worker's poll fires and `drain` empties it.
     fn wake(&self, wid: usize) {
         let one: u64 = 1;
         unsafe {
             libc::write(
-                self.slots[wid].wake_fd,
+                self.slots[wid].wake_w,
                 &one as *const u64 as *const libc::c_void,
                 8,
             );
         }
     }
 
-    /// Drain this worker's inbox (called after its wake fd fires). Also consumes
-    /// the eventfd counter so it does not re-fire spuriously.
+    /// Drain this worker's inbox (called after its wake fd fires). Also fully
+    /// drains the wake fd itself so it does not re-fire spuriously — read until
+    /// EAGAIN, which empties both an eventfd counter and a pipe with queued bytes
+    /// (mio is edge-triggered, so a partial drain would miss later wakes).
     pub fn drain(&self, wid: usize) -> Vec<BusMsg> {
-        let mut buf = [0u8; 8];
-        unsafe {
-            libc::read(
-                self.slots[wid].wake_fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                8,
-            );
+        let mut buf = [0u8; 64];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    self.slots[wid].wake_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                break; // EAGAIN (drained) or error
+            }
         }
         let mut ib = self.slots[wid].inbox.lock().unwrap();
         ib.drain(..).collect()
@@ -220,7 +264,14 @@ impl Bus {
 impl Drop for Bus {
     fn drop(&mut self) {
         for s in &self.slots {
-            unsafe { libc::close(s.wake_fd) };
+            unsafe {
+                libc::close(s.wake_fd);
+                // On Linux read==write (one eventfd); only close the write end
+                // separately when it is a distinct fd (the macOS self-pipe).
+                if s.wake_w != s.wake_fd {
+                    libc::close(s.wake_w);
+                }
+            }
         }
     }
 }

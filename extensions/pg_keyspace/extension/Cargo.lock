@@ -895,6 +895,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
 dependencies = [
  "libc",
+ "log",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]
@@ -1031,6 +1032,7 @@ name = "pg_keyspace"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "mio",
  "pgrx",
  "pgrx-tests",
  "rustls",
