@@ -949,6 +949,213 @@ pub fn rank_bounds(n: usize, start: i64, stop: i64) -> (usize, usize) {
     (s as usize, (e + 1) as usize)
 }
 
+// ---- Set ------------------------------------------------------------------
+
+/// A set with more than this many members uses the indexed encoding (an in-value
+/// bucket table), so SISMEMBER is O(1) average instead of a linear scan.
+pub const SET_INDEX_THRESHOLD: usize = 128;
+/// ...or if any member is longer than this (a big member also makes the linear
+/// scan expensive). Mirrors the hash value threshold.
+pub const SET_INDEX_VALUE_MAX: usize = 64;
+
+const S_INLINE: u8 = 0;
+const S_INDEXED: u8 = 1;
+
+/// A Redis set: unique members, insertion order preserved for the inline
+/// encoding (SMEMBERS order is unspecified in Redis, so callers must not rely on
+/// it). Lookups are linear inline, O(1) average once promoted to indexed.
+#[derive(Default)]
+pub struct Set {
+    pub members: Vec<Vec<u8>>,
+}
+
+impl Set {
+    pub fn new() -> Set {
+        Set { members: Vec::new() }
+    }
+
+    /// Decode a stored blob (either encoding). A malformed tail is ignored.
+    pub fn decode(buf: &[u8]) -> Set {
+        match buf.first() {
+            None => Set::new(),
+            Some(&S_INDEXED) => {
+                let mut s = Set::new();
+                let nbuckets = match rd_u32(buf, 1) {
+                    Some(n) => n as usize,
+                    None => return s,
+                };
+                let region_base = 9 + 4 * nbuckets;
+                if let Some(region) = buf.get(region_base..) {
+                    let mut off = 0usize;
+                    while off < region.len() {
+                        match sread_entry(region, off) {
+                            Some((m, _next, end)) => {
+                                s.members.push(m.to_vec());
+                                off = end;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                s
+            }
+            _ => {
+                let mut p = &buf[1..];
+                let mut s = Set::new();
+                while let Some(m) = take_bytes(&mut p) {
+                    s.members.push(m.to_vec());
+                }
+                s
+            }
+        }
+    }
+
+    /// Encode, choosing inline or indexed by size (first byte is the tag).
+    pub fn encode(&self) -> Vec<u8> {
+        let big = self.members.len() > SET_INDEX_THRESHOLD
+            || self.members.iter().any(|m| m.len() > SET_INDEX_VALUE_MAX);
+        self.force_encode(big)
+    }
+
+    /// Encode with an explicit layout choice (tests/benches compare the two).
+    /// Indexed layout mirrors the hash: `[S_INDEXED][nbuckets u32][count u32]
+    /// [heads: nbuckets×u32][entries]`, each entry `mlen u32, member, next u32`.
+    pub fn force_encode(&self, indexed: bool) -> Vec<u8> {
+        if !indexed {
+            let mut out = Vec::with_capacity(1 + self.members.len() * 8);
+            out.push(S_INLINE);
+            for m in &self.members {
+                put_bytes(&mut out, m);
+            }
+            return out;
+        }
+        let nbuckets = self.members.len().next_power_of_two().max(8);
+        let mask = (nbuckets - 1) as u64;
+        let mut heads = vec![0u32; nbuckets];
+        let mut region: Vec<u8> = Vec::new();
+        for m in &self.members {
+            let off = region.len() as u32;
+            let b = (fieldhash(m) & mask) as usize;
+            put_bytes(&mut region, m);
+            region.extend_from_slice(&heads[b].to_le_bytes()); // next = old head
+            heads[b] = off + 1;
+        }
+        let mut out = Vec::with_capacity(9 + 4 * nbuckets + region.len());
+        out.push(S_INDEXED);
+        out.extend_from_slice(&(nbuckets as u32).to_le_bytes());
+        out.extend_from_slice(&(self.members.len() as u32).to_le_bytes());
+        for h in &heads {
+            out.extend_from_slice(&h.to_le_bytes());
+        }
+        out.extend_from_slice(&region);
+        out
+    }
+
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    pub fn contains(&self, member: &[u8]) -> bool {
+        self.members.iter().any(|m| m == member)
+    }
+
+    /// Insert. Returns true if the member was newly added.
+    pub fn add(&mut self, member: &[u8]) -> bool {
+        if self.contains(member) {
+            false
+        } else {
+            self.members.push(member.to_vec());
+            true
+        }
+    }
+
+    /// Remove. Returns true if the member was present.
+    pub fn remove(&mut self, member: &[u8]) -> bool {
+        if let Some(i) = self.members.iter().position(|m| m == member) {
+            self.members.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Parse the entry at `region[off..]` of an indexed set: `(member, next, end)`.
+fn sread_entry(region: &[u8], off: usize) -> Option<(&[u8], u32, usize)> {
+    let mut p = off;
+    let ml = rd_u32(region, p)? as usize;
+    p += 4;
+    let m = region.get(p..p + ml)?;
+    p += ml;
+    let next = rd_u32(region, p)?;
+    p += 4;
+    Some((m, next, p))
+}
+
+/// O(1)-average membership test straight off the stored blob (indexed walks one
+/// bucket chain; inline falls back to a linear scan, which small sets want).
+pub fn set_contains(buf: &[u8], member: &[u8]) -> bool {
+    match buf.first() {
+        None => false,
+        Some(&S_INDEXED) => {
+            let nbuckets = match rd_u32(buf, 1) {
+                Some(n) => n as usize,
+                None => return false,
+            };
+            let region_base = 9 + 4 * nbuckets;
+            let region = match buf.get(region_base..) {
+                Some(r) => r,
+                None => return false,
+            };
+            let mask = (nbuckets - 1) as u64;
+            let b = (fieldhash(member) & mask) as usize;
+            let mut head = rd_u32(buf, 9 + 4 * b).unwrap_or(0);
+            while head != 0 {
+                let off = (head - 1) as usize;
+                match sread_entry(region, off) {
+                    Some((m, next, _)) => {
+                        if m == member {
+                            return true;
+                        }
+                        head = next;
+                    }
+                    None => break,
+                }
+            }
+            false
+        }
+        _ => {
+            let mut p = &buf[1..];
+            while let Some(m) = take_bytes(&mut p) {
+                if m == member {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// O(1) member count off the raw set blob (indexed: header; inline: walk).
+pub fn set_card(buf: &[u8]) -> usize {
+    match buf.first() {
+        None => 0,
+        Some(&S_INDEXED) => rd_u32(buf, 5).unwrap_or(0) as usize,
+        _ => {
+            let mut p = &buf[1..];
+            let mut n = 0;
+            while take_bytes(&mut p).is_some() {
+                n += 1;
+            }
+            n
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1253,5 +1460,53 @@ mod tests {
         assert_eq!(hash_probe(&blob2, &7u32.to_le_bytes()), Some(&b"new"[..]));
         assert_eq!(hash_probe(&blob2, &9u32.to_le_bytes()), None);
         assert_eq!(hash_count(&blob2), 199);
+    }
+
+    #[test]
+    fn set_add_remove_and_roundtrip() {
+        let mut s = Set::new();
+        assert!(s.add(b"a"));
+        assert!(s.add(b"b"));
+        assert!(!s.add(b"a")); // duplicate -> not added
+        assert_eq!(s.len(), 2);
+        assert!(s.contains(b"a"));
+        assert!(!s.contains(b"z"));
+        assert!(s.remove(b"a"));
+        assert!(!s.remove(b"a"));
+
+        let blob = s.encode();
+        assert_eq!(blob[0], S_INLINE, "a tiny set stays inline");
+        assert_eq!(set_card(&blob), 1);
+        assert!(set_contains(&blob, b"b"));
+        assert!(!set_contains(&blob, b"a"));
+        let s2 = Set::decode(&blob);
+        assert_eq!(s2.len(), 1);
+        assert!(s2.contains(b"b"));
+    }
+
+    #[test]
+    fn set_indexed_matches_inline_at_scale() {
+        let mut s = Set::new();
+        for i in 0..1000u32 {
+            s.add(format!("m{i:04}").as_bytes());
+        }
+        let blob = s.encode();
+        assert_eq!(blob[0], S_INDEXED, "1000 members must use the indexed layout");
+        assert_eq!(set_card(&blob), 1000);
+        for i in 0..1000u32 {
+            assert!(set_contains(&blob, format!("m{i:04}").as_bytes()), "member {i}");
+        }
+        assert!(!set_contains(&blob, b"nope"));
+        // decode preserves every member
+        assert_eq!(Set::decode(&blob).len(), 1000);
+    }
+
+    #[test]
+    fn set_promotes_on_big_member() {
+        let mut s = Set::new();
+        s.add(&vec![b'x'; SET_INDEX_VALUE_MAX + 1]);
+        let blob = s.encode();
+        assert_eq!(blob[0], S_INDEXED);
+        assert!(set_contains(&blob, &vec![b'x'; SET_INDEX_VALUE_MAX + 1]));
     }
 }
