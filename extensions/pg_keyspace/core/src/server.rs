@@ -627,6 +627,10 @@ impl Worker {
         let nargs = args.len();
         let mut cmd = args[0].clone();
         cmd.make_ascii_uppercase();
+        // RESP3 wire form for this connection (typed nulls/maps/sets/doubles and
+        // push frames). Read once up front so every reply site — including the
+        // auth-gate nil below — can use the right encoding.
+        let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
 
         // ---- AUTH command ----
         if cmd == b"AUTH" {
@@ -717,7 +721,7 @@ impl Worker {
                         out,
                         "NOPERM this user has no permissions to access one of the keys used as arguments",
                     ),
-                    Deny::Nil => resp::nil(out),
+                    Deny::Nil => resp::null(out, resp3),
                 }
                 return;
             }
@@ -735,9 +739,6 @@ impl Worker {
         // the unscoped form of — keys under its own prefix. Computed before the
         // `out` borrow below, which takes `self` mutably.
         let scan_prefix = self.conn_prefix(fd);
-        // RESP3 wire form for this connection (typed nulls/maps/sets/doubles);
-        // read before the `out` borrow below.
-        let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
         // A write to enqueue for persistence, applied after the match so
         // it does not tangle with the `out` borrow.
         let mut stages: Vec<PendingWrite> = Vec::new();
@@ -778,7 +779,7 @@ impl Worker {
                 }
                 match store.get(&args[1]) {
                     Lookup::Hit(v) => resp::bulk(out, v),
-                    Lookup::Miss => resp::nil(out),
+                    Lookup::Miss => resp::null(out, resp3),
                 }
             }
             b"SET" => {
@@ -841,7 +842,7 @@ impl Worker {
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                 match old {
                     Some(v) => resp::bulk(out, &v),
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"DEL" | b"UNLINK" => {
@@ -1042,7 +1043,7 @@ impl Worker {
                     match store.get_typed(k) {
                         // miss OR non-string -> nil; MGET never errors on WRONGTYPE
                         Some((crate::store::KIND_STR, _, v)) => resp::bulk(out, v),
-                        _ => resp::nil(out),
+                        _ => resp::null(out, resp3),
                     }
                 }
             }
@@ -1130,7 +1131,7 @@ impl Worker {
                             stages.push((args[1].clone(), Vec::new(), DELETE_TOMBSTONE, b's'));
                         }
                     }
-                    Lookup::Miss => resp::nil(out),
+                    Lookup::Miss => resp::null(out, resp3),
                 }
             }
             b"GETEX" => {
@@ -1141,7 +1142,7 @@ impl Worker {
                 let (val, cur_exp) = match store.get_typed(&args[1]) {
                     Some((_, exp, v)) => (v.to_vec(), exp),
                     None => {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                         return;
                     }
                 };
@@ -1410,7 +1411,7 @@ impl Worker {
                 }
                 match chosen {
                     Some(k) => resp::bulk(out, &k),
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"EXPIRETIME" | b"PEXPIRETIME" => {
@@ -1508,7 +1509,7 @@ impl Worker {
             b"MEMORY" => {
                 match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
                     Some(b"USAGE") if nargs >= 3 => match store.get_typed(&args[2]) {
-                        None => resp::nil(out),
+                        None => resp::null(out, resp3),
                         // rough estimate: value + key bytes + fixed entry overhead
                         Some((_, _, v)) => {
                             resp::integer(out, (v.len() + args[2].len() + 64) as i64)
@@ -1640,7 +1641,7 @@ impl Worker {
                 };
                 match raw.and_then(|b| aggr::hash_probe(b, &args[2])) {
                     Some(v) => resp::bulk(out, v),
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"HMGET" => {
@@ -1656,7 +1657,7 @@ impl Worker {
                 for f in &args[2..] {
                     match raw.and_then(|b| aggr::hash_probe(b, f)) {
                         Some(v) => resp::bulk(out, v),
-                        None => resp::nil(out),
+                        None => resp::null(out, resp3),
                     }
                 }
             }
@@ -1820,12 +1821,12 @@ impl Worker {
                         let popped = if left { l.lpop() } else { l.rpop() };
                         match popped {
                             Some(v) => resp::bulk(out, &v),
-                            None => resp::nil(out),
+                            None => resp::null(out, resp3),
                         }
                     }
                     Some(c) => {
                         if l.is_empty() {
-                            resp::nil(out);
+                            resp::null(out, resp3);
                             return;
                         }
                         let mut taken = Vec::new();
@@ -1871,7 +1872,7 @@ impl Worker {
                 });
                 match hit {
                     Some(v) => resp::bulk(out, v),
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"LRANGE" => {
@@ -2007,7 +2008,7 @@ impl Worker {
                 };
                 match raw.and_then(|b| aggr::zset_score(b, &args[2])) {
                     Some(s) => resp::double(out, &aggr::fmt_score(s), resp3),
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"ZMSCORE" => {
@@ -2023,7 +2024,7 @@ impl Worker {
                 for m in &args[2..] {
                     match raw.and_then(|b| aggr::zset_score(b, m)) {
                         Some(s) => resp::double(out, &aggr::fmt_score(s), resp3),
-                        None => resp::nil(out),
+                        None => resp::null(out, resp3),
                     }
                 }
             }
@@ -2091,7 +2092,7 @@ impl Worker {
                         let r = if cmd == b"ZREVRANK" { card - 1 - r } else { r };
                         resp::integer(out, r as i64);
                     }
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"ZRANGE" | b"ZREVRANGE" => {
@@ -2244,7 +2245,7 @@ impl Worker {
                 };
                 if nargs < 3 {
                     if h.is_empty() {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                     } else {
                         let i = (rng_next(&mut rand_seed()) as usize) % h.len();
                         resp::bulk(out, &h.entries[i].0);
@@ -2404,7 +2405,7 @@ impl Worker {
                 match count {
                     None => match hits.first() {
                         Some(&p) => resp::integer(out, p),
-                        None => resp::nil(out),
+                        None => resp::null(out, resp3),
                     },
                     Some(_) => {
                         resp::array_header(out, hits.len());
@@ -2454,7 +2455,7 @@ impl Worker {
                     let val = if from_left { l.lpop() } else { l.rpop() };
                     match val {
                         None => {
-                            resp::nil(out);
+                            resp::null(out, resp3);
                             return;
                         }
                         Some(v) => {
@@ -2480,7 +2481,7 @@ impl Worker {
                     let val = if from_left { src.lpop() } else { src.rpop() };
                     match val {
                         None => {
-                            resp::nil(out);
+                            resp::null(out, resp3);
                             return;
                         }
                         Some(v) => {
@@ -2551,7 +2552,7 @@ impl Worker {
                 };
                 if nargs < 3 {
                     if z.is_empty() {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                     } else {
                         let i = (rng_next(&mut rand_seed()) as usize) % z.len();
                         resp::bulk(out, &z.members[i].0);
@@ -2675,7 +2676,7 @@ impl Worker {
                 };
                 if nargs < 3 {
                     if s.is_empty() {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                         return;
                     }
                     let i = (rng_next(&mut rand_seed()) as usize) % s.len();
@@ -2719,7 +2720,7 @@ impl Worker {
                 };
                 if nargs < 3 {
                     if s.is_empty() {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                     } else {
                         let i = (rng_next(&mut rand_seed()) as usize) % s.len();
                         resp::bulk(out, &s.members[i]);
@@ -3032,7 +3033,7 @@ impl Worker {
                     }
                     return;
                 }
-                resp::nil(out); // all input sets empty
+                resp::null(out, resp3); // all input sets empty
             }
             b"ZLEXCOUNT" => {
                 if nargs != 4 {
