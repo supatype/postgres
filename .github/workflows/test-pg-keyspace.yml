@@ -161,8 +161,15 @@ jobs:
             extensions/pg_keyspace/core/target
           key: pgks-macos-${{ hashFiles('extensions/pg_keyspace/core/Cargo.lock') }}
 
-      - name: Install redis (server + tools)
-        run: brew install redis
+      - name: Install redis + GNU coreutils
+        # The bench harnesses are shared with the Linux jobs and assume a GNU
+        # userland — `timeout` (absent on macOS) and `paste`/`sort` reading
+        # stdin. coreutils provides them; put its gnubin dir (unprefixed GNU
+        # tools) first on PATH so the scripts run unchanged. This only affects
+        # the test harness — the daemon under test is native macOS (kqueue).
+        run: |
+          brew install redis coreutils
+          echo "$(brew --prefix)/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
 
       # ---- core unit tests: pure Rust, exercises the macOS build -------------
       - name: Unit tests (core)
