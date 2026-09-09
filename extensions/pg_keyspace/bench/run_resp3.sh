@@ -16,7 +16,9 @@ chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-48s\n" "$1"; pass=$((pass+1))
 echo "# RESP3"
 # The -3 client PINGing at all proves the HELLO 3 handshake map parsed cleanly.
 chk "RESP3 client connects (HELLO 3 ok)" "PONG" "$($R3 PING)"
-chk "HELLO 3 reports proto 3" "3" "$($R3 HELLO 3 | grep -A1 -iE '^proto$' | tail -1)"
+# redis-cli renders a RESP3 map as one "key value" line (so proto + its value
+# share a line) but a RESP2 array as one token per line (value on the next).
+chk "HELLO 3 reports proto 3" "3" "$($R3 HELLO 3 | grep -i proto | tr -dc '0-9')"
 chk "HELLO 2 reports proto 2" "2" "$($R2 HELLO 2 | grep -A1 -iE '^proto$' | tail -1)"
 chk "HELLO with a bad version errors" "1" "$($R2 HELLO 4 2>&1 | grep -ci 'NOPROTO')"
 
@@ -24,7 +26,9 @@ $R3 DEL h s z >/dev/null 2>&1
 
 # map (%): HGETALL — values must round-trip through the RESP3 map decode
 $R3 HSET h f1 v1 f2 v2 >/dev/null
-chk "HGETALL map round-trips (RESP3)"  "f1,f2,v1,v2" "$($R3 HGETALL h | tr -d '"' | sort | paste -sd,)"
+# redis-cli prints a RESP3 map as "f1 v1" per line; split on space+newline so
+# the same check works whether the reply is a map (pairs) or a flat array.
+chk "HGETALL map round-trips (RESP3)"  "f1,f2,v1,v2" "$($R3 HGETALL h | tr -d '"' | tr ' ' '\n' | grep . | sort | paste -sd,)"
 chk "HGETALL flat array (RESP2)"       "f1,f2,v1,v2" "$($R2 HGETALL h | sort | paste -sd,)"
 
 # set (~): SMEMBERS / SINTER
