@@ -18,6 +18,10 @@ libc = "0.2"
 sha2 = "0.11"
 rustls = "0.21"
 rustls-pemfile = "1"
+# Cross-platform readiness: epoll on Linux, kqueue on macOS. `os-poll` gives
+# Poll/Events/Registry/Interest/Token; `os-ext` gives unix::SourceFd so we can
+# register our own raw fds (we manage the sockets/shm ourselves via libc).
+mio = { version = "1.0", features = ["os-poll", "os-ext"] }
 
 [profile.release]
 opt-level = 3

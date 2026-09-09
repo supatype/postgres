@@ -141,3 +141,67 @@ jobs:
           echo "===================================="
           [ "$fail" -eq 0 ] && echo "all benches passed" || echo "some benches FAILED"
           exit $fail
+
+  # Job 3: macOS. Proves the readiness loop builds and runs on kqueue (mio's
+  # macOS backend) and the cross-worker wake self-pipe works, so the darwin
+  # native archive can bundle pg_keyspace. No Postgres — just the core crate,
+  # the daemon, and the RESP/cross-worker conformance harnesses.
+  macos:
+    name: macOS build + kqueue event loop
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            extensions/pg_keyspace/core/target
+          key: pgks-macos-${{ hashFiles('extensions/pg_keyspace/core/Cargo.lock') }}
+
+      - name: Install redis (server + tools)
+        run: brew install redis
+
+      # ---- core unit tests: pure Rust, exercises the macOS build -------------
+      - name: Unit tests (core)
+        working-directory: extensions/pg_keyspace/core
+        run: cargo test --locked
+
+      - name: Build daemon (release)
+        working-directory: extensions/pg_keyspace/core
+        run: cargo build --locked --release --bin pgkeyspaced
+
+      - name: RESP + cross-worker conformance (kqueue)
+        working-directory: extensions/pg_keyspace
+        env:
+          DAEMON: ${{ github.workspace }}/extensions/pg_keyspace/core/target/release/pgkeyspaced
+        run: |
+          set -u
+          fail=0
+          runbench() {           # runbench <script> [env assignments...]
+            local script="$1"; shift
+            echo "::group::$script"
+            if env "$@" bash "bench/$script"; then echo "OK  $script";
+            else echo "FAIL $script"; fail=1; fi
+            echo "::endgroup::"
+          }
+
+          # Cross-worker paths drive the Bus wake fd through kqueue (self-pipe).
+          runbench run_pubsub_xworker.sh
+          runbench run_tracking_xworker.sh
+
+          # Protocol + a representative slice of the type surface, one daemon.
+          "$DAEMON" --workers 1 --port 6400 --keys-per-worker 200000 --shmem-mb 128 \
+            >/tmp/pgks_ci_daemon.log 2>&1 &
+          dpid=$!
+          for _ in $(seq 1 30); do redis-cli -p 6400 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
+          for s in run_resp3.sh run_hashes.sh run_lists.sh run_zsets.sh run_sets.sh run_ttl_scan.sh run_pubsub.sh run_txn.sh; do
+            runbench "$s" RESP=6400
+          done
+          kill $dpid 2>/dev/null || true
+
+          echo "===================================="
+          [ "$fail" -eq 0 ] && echo "all benches passed" || echo "some benches FAILED"
+          exit $fail

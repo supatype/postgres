@@ -391,10 +391,10 @@ All are `Postmaster` context (set in `postgresql.conf`).
 
 ```
 extensions/pg_keyspace/
-├── core/                     shared core (Rust, libc only) + tools
+├── core/                     shared core (Rust: libc + mio) + tools
 │   └── src/
 │       ├── store.rs          open-addressed hash, size-classed slab, CLOCK eviction
-│       ├── server.rs         epoll RESP2/RESP3 event loop + command dispatch
+│       ├── server.rs         RESP2/RESP3 event loop (mio: epoll/kqueue) + dispatch
 │       ├── resp.rs           RESP2/RESP3 codec
 │       ├── aggr.rs           hashes/lists/sorted sets, incl. indexed large-collection encodings
 │       ├── pubsub.rs         cross-worker pub/sub bus

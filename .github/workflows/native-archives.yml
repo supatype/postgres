@@ -252,21 +252,23 @@ jobs:
       # (Rust/pgrx). Built from in-repo source against the staged PG so the
       # native archive ships the same extension as the supatype/postgres image.
       #
-      # LINUX ONLY. pg_keyspace's core is an epoll/eventfd event loop, which are
-      # Linux-only syscalls — it does not compile on macOS (kqueue) and pgrx has
-      # no supported Windows target. The macOS and Windows native archives ship
+      # LINUX + macOS. pg_keyspace's event loop is readiness-driven via mio
+      # (epoll on Linux, kqueue on macOS), so it builds on both. Windows is still
+      # excluded — pgrx has no supported Windows target — so that archive ships
       # the other extensions but not pg_keyspace.
       # ------------------------------------------------------------------ #
       - name: Install clang for pgrx bindgen (Linux)
         if: matrix.platform == 'linux'
         run: sudo apt-get install -y --no-install-recommends clang libclang-dev llvm-dev
+        # macOS runners already ship clang/libclang with the Xcode command-line
+        # tools, so no extra install step is needed there.
 
       - name: Install cargo-pgrx
-        if: matrix.platform == 'linux'
+        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
         run: cargo install cargo-pgrx --version 0.12.9 --locked
 
       - name: Build and bundle pg_keyspace
-        if: matrix.platform == 'linux'
+        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
         run: |
           set -euo pipefail
           PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"

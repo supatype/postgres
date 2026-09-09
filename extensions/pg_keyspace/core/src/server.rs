@@ -1,8 +1,14 @@
-//! One slot worker: an epoll event loop over non-blocking sockets, parsing RESP
-//! and dispatching against its own shared-memory partition. No
+//! One slot worker: a readiness-driven event loop over non-blocking sockets,
+//! parsing RESP and dispatching against its own shared-memory partition. No
 //! transaction is ever opened on this path; a command is a shmem read/write
 //! plus, for logged tiers, a handoff to the commit batcher. This is the
 //! hot path the latency benchmarks measure.
+//!
+//! Readiness comes from `mio` (epoll on Linux, kqueue on macOS); we still own
+//! the sockets and shared memory ourselves via libc and only register the raw
+//! fds with mio through `SourceFd`. mio is edge-triggered, which is safe here
+//! because every fd is drained to `EAGAIN` on each wake (reads, writes, accept,
+//! and the cross-worker wake fd).
 
 use crate::aggr;
 use crate::batcher::{Batcher, Tier};
@@ -11,6 +17,8 @@ use crate::pubsub;
 use crate::resp::{self, Parse};
 use crate::ring;
 use crate::store::{now_micros, Lookup, Store, KIND_HASH, KIND_LIST, KIND_SET, KIND_ZSET};
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll, Registry, Token};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::{Read, Write};
@@ -18,7 +26,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const EPOLL_MAX: usize = 1024;
+const POLL_MAX: usize = 1024;
 const READ_CHUNK: usize = 64 * 1024;
 
 /// A staged write: (key, value, expires_at_micros, kind). `kind` is the value's
@@ -245,7 +253,11 @@ pub struct Worker {
     batcher: Option<Arc<Batcher>>,
     tier: Tier,
     listen_fd: RawFd,
-    epfd: RawFd,
+    // Readiness poller (epoll/kqueue). `registry` is a clone of `poll`'s registry
+    // so fds can be (re)registered without borrowing `poll` while it is being
+    // polled. Each fd registers under `Token(fd)`, so an event's token is the fd.
+    poll: Poll,
+    registry: Registry,
     conns: HashMap<RawFd, Conn>,
     args: Vec<(usize, usize)>,
     // when non-empty, every write is enqueued into one of these shared-memory
@@ -291,17 +303,20 @@ impl Worker {
         port: u16,
     ) -> io::Result<Worker> {
         let listen_fd = listen(addr, port)?;
-        let epfd = unsafe { libc::epoll_create1(0) };
-        if epfd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        epoll_add(epfd, listen_fd, libc::EPOLLIN as u32)?;
+        let poll = Poll::new()?;
+        let registry = poll.registry().try_clone()?;
+        registry.register(
+            &mut SourceFd(&listen_fd),
+            Token(listen_fd as usize),
+            Interest::READABLE,
+        )?;
         Ok(Worker {
             store,
             batcher,
             tier,
             listen_fd,
-            epfd,
+            poll,
+            registry,
             conns: HashMap::new(),
             args: Vec::with_capacity(8),
             producers: Vec::new(),
@@ -317,13 +332,15 @@ impl Worker {
         })
     }
 
-    /// Join a cross-worker pub/sub Bus as worker `worker_id`. The Bus's wake
-    /// eventfd is added to this worker's epoll set so remote deliveries arrive
+    /// Join a cross-worker pub/sub Bus as worker `worker_id`. The Bus's wake fd
+    /// is registered with this worker's poller so remote deliveries wake it
     /// promptly. Only used by the multi-worker daemon; the in-PG extension runs
     /// a single worker and never calls this.
     pub fn set_bus(&mut self, bus: Arc<pubsub::Bus>, worker_id: usize) {
         let wfd = bus.wake_fd(worker_id);
-        let _ = epoll_add(self.epfd, wfd, libc::EPOLLIN as u32);
+        let _ = self
+            .registry
+            .register(&mut SourceFd(&wfd), Token(wfd as usize), Interest::READABLE);
         self.bus = Some(bus);
         self.worker_id = worker_id;
     }
@@ -355,14 +372,19 @@ impl Worker {
     }
 
     /// Run the event loop, calling `tick()` once per iteration (and whenever a
-    /// signal interrupts the wait). `timeout_ms` bounds each `epoll_wait` so the
+    /// signal interrupts the wait). `timeout_ms` bounds each poll so the
     /// tick runs even when idle (a Postgres background worker uses this to notice
     /// SIGTERM/SIGHUP). `Tick::Stop` ends the loop; `Tick::Reload(cfg)` swaps the
     /// auth config live — the hot-reload hook the extension drives on SIGHUP, so
     /// credential changes need no restart (`None` = switch to no-auth).
     pub fn run_with<F: FnMut() -> Tick>(&mut self, mut tick: F, timeout_ms: i32) -> io::Result<()> {
-        let mut events: Vec<libc::epoll_event> =
-            vec![unsafe { std::mem::zeroed() }; EPOLL_MAX];
+        let mut events = Events::with_capacity(POLL_MAX);
+        // `timeout_ms < 0` means block indefinitely (matches the old epoll_wait -1).
+        let timeout = if timeout_ms < 0 {
+            None
+        } else {
+            Some(Duration::from_millis(timeout_ms as u64))
+        };
         loop {
             match tick() {
                 Tick::Stop => return Ok(()),
@@ -376,18 +398,16 @@ impl Worker {
                 }
                 Tick::Continue => {}
             }
-            let n = unsafe {
-                libc::epoll_wait(self.epfd, events.as_mut_ptr(), EPOLL_MAX as i32, timeout_ms)
-            };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() == Some(libc::EINTR) {
+            if let Err(e) = self.poll.poll(&mut events, timeout) {
+                // A signal (e.g. SIGTERM/SIGHUP in the bgworker) interrupts the
+                // wait; loop so `tick` observes it, exactly as with epoll_wait+EINTR.
+                if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 return Err(e);
             }
-            for ev in events.iter().take(n as usize) {
-                let fd = ev.u64 as RawFd;
+            for ev in events.iter() {
+                let fd = ev.token().0 as RawFd;
                 if fd == self.listen_fd {
                     self.accept_all();
                 } else if self.bus.as_ref().map_or(false, |b| fd == b.wake_fd(self.worker_id)) {
@@ -412,13 +432,10 @@ impl Worker {
                         }
                     }
                 } else {
-                    let flags = ev.events;
-                    if flags & (libc::EPOLLIN as u32) != 0 {
+                    if ev.is_readable() {
                         self.on_readable(fd);
                     }
-                    if self.conns.contains_key(&fd)
-                        && flags & (libc::EPOLLOUT as u32) != 0
-                    {
+                    if self.conns.contains_key(&fd) && ev.is_writable() {
                         self.flush(fd);
                     }
                 }
@@ -460,14 +477,16 @@ impl Worker {
 
     fn accept_all(&mut self) {
         loop {
-            let cfd = unsafe {
-                libc::accept4(self.listen_fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK)
-            };
+            let cfd = accept_nonblocking(self.listen_fd);
             if cfd < 0 {
                 break; // EAGAIN
             }
             set_nodelay(cfd);
-            if epoll_add(self.epfd, cfd, libc::EPOLLIN as u32).is_err() {
+            if self
+                .registry
+                .register(&mut SourceFd(&cfd), Token(cfd as usize), Interest::READABLE)
+                .is_err()
+            {
                 unsafe { libc::close(cfd) };
                 continue;
             }
@@ -475,7 +494,7 @@ impl Worker {
                 Some(cfg) => match rustls::ServerConnection::new(cfg.clone()) {
                     Ok(s) => Some(Box::new(s)),
                     Err(_) => {
-                        let _ = epoll_del(self.epfd, cfd);
+                        let _ = self.registry.deregister(&mut SourceFd(&cfd));
                         unsafe { libc::close(cfd) };
                         continue;
                     }
@@ -4217,11 +4236,7 @@ impl Worker {
                 match e.raw_os_error() {
                     Some(libc::EAGAIN) => {
                         if !c.want_write {
-                            let _ = epoll_mod(
-                                self.epfd,
-                                fd,
-                                (libc::EPOLLIN | libc::EPOLLOUT) as u32,
-                            );
+                            set_interest(&self.registry, fd, true);
                             c.want_write = true;
                         }
                         return;
@@ -4238,7 +4253,7 @@ impl Worker {
         c.wbuf.clear();
         c.wpos = 0;
         if c.want_write {
-            let _ = epoll_mod(self.epfd, fd, libc::EPOLLIN as u32);
+            set_interest(&self.registry, fd, false);
             c.want_write = false;
         }
         if c.closing {
@@ -4304,7 +4319,7 @@ impl Worker {
         match act {
             Act::WantWrite => {
                 if self.conns.get(&fd).map(|c| !c.want_write).unwrap_or(false) {
-                    let _ = epoll_mod(self.epfd, fd, (libc::EPOLLIN | libc::EPOLLOUT) as u32);
+                    set_interest(&self.registry, fd, true);
                     if let Some(c) = self.conns.get_mut(&fd) {
                         c.want_write = true;
                     }
@@ -4317,7 +4332,7 @@ impl Worker {
                     .map(|c| (c.want_write, c.closing))
                     .unwrap_or((false, false));
                 if ww {
-                    let _ = epoll_mod(self.epfd, fd, libc::EPOLLIN as u32);
+                    set_interest(&self.registry, fd, false);
                     if let Some(c) = self.conns.get_mut(&fd) {
                         c.want_write = false;
                     }
@@ -4375,7 +4390,8 @@ impl Worker {
                 bus.tracker_remove();
             }
         }
-        let _ = epoll_del(self.epfd, fd);
+        // Deregister before closing: the fd must still be valid for deregister.
+        let _ = self.registry.deregister(&mut SourceFd(&fd));
         unsafe { libc::close(fd) };
         self.conns.remove(&fd);
     }
@@ -5171,14 +5187,17 @@ pub fn load_tls_config(cert_path: &str, key_path: &str) -> io::Result<Arc<rustls
     Ok(Arc::new(config))
 }
 
-// ---- socket / epoll helpers ---------------------------------------------
+// ---- socket / poller helpers --------------------------------------------
 
 fn listen(addr: &str, port: u16) -> io::Result<RawFd> {
     unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
+        // SOCK_NONBLOCK on socket() is a Linux extension; create the socket and
+        // set O_NONBLOCK portably instead (macOS has no SOCK_NONBLOCK).
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        set_nonblocking(fd);
         let one: libc::c_int = 1;
         libc::setsockopt(
             fd,
@@ -5195,7 +5214,10 @@ fn listen(addr: &str, port: u16) -> io::Result<RawFd> {
             std::mem::size_of::<libc::c_int>() as u32,
         );
         let mut sa: libc::sockaddr_in = std::mem::zeroed();
-        sa.sin_family = libc::AF_INET as u16;
+        // sin_family is u16 on Linux, u8 on the BSDs/macOS — `as _` picks the
+        // right width from the field type. (macOS's extra sin_len stays 0, which
+        // bind accepts.)
+        sa.sin_family = libc::AF_INET as _;
         sa.sin_port = port.to_be();
         sa.sin_addr.s_addr = inet_addr(addr);
         if libc::bind(
@@ -5214,6 +5236,39 @@ fn listen(addr: &str, port: u16) -> io::Result<RawFd> {
             return Err(e);
         }
         Ok(fd)
+    }
+}
+
+/// Accept one connection, returning a non-blocking client fd (or <0 on EAGAIN /
+/// error). Linux does this in one syscall (`accept4` + `SOCK_NONBLOCK`); macOS
+/// has no `accept4`, so accept then set O_NONBLOCK.
+fn accept_nonblocking(listen_fd: RawFd) -> RawFd {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::accept4(
+            listen_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_NONBLOCK,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let fd = libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut());
+        if fd >= 0 {
+            set_nonblocking(fd);
+        }
+        fd
+    }
+}
+
+/// Set O_NONBLOCK on `fd` (portable; used where SOCK_NONBLOCK isn't available).
+fn set_nonblocking(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 }
 
@@ -5239,33 +5294,16 @@ fn set_nodelay(fd: RawFd) {
     }
 }
 
-fn epoll_ctl(epfd: RawFd, op: libc::c_int, fd: RawFd, events: u32) -> io::Result<()> {
-    let mut ev = libc::epoll_event {
-        events,
-        u64: fd as u64,
+/// (Re)set a connection's readiness interest: always readable, plus writable
+/// while its write buffer is backed up (`want_write`). Takes the registry by ref
+/// so callers can invoke it while holding a `&mut` borrow of `conns`.
+fn set_interest(registry: &Registry, fd: RawFd, want_write: bool) {
+    let interest = if want_write {
+        Interest::READABLE | Interest::WRITABLE
+    } else {
+        Interest::READABLE
     };
-    let r = unsafe { libc::epoll_ctl(epfd, op, fd, &mut ev) };
-    if r < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn epoll_add(epfd: RawFd, fd: RawFd, events: u32) -> io::Result<()> {
-    epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, events)
-}
-fn epoll_mod(epfd: RawFd, fd: RawFd, events: u32) -> io::Result<()> {
-    epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, events)
-}
-fn epoll_del(epfd: RawFd, fd: RawFd) -> io::Result<()> {
-    let mut ev = libc::epoll_event { events: 0, u64: 0 };
-    let r = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) };
-    if r < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    let _ = registry.reregister(&mut SourceFd(&fd), Token(fd as usize), interest);
 }
 
 #[cfg(test)]
