@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# TTL / EXPIRE family + SCAN / KEYS command coverage, and the HELLO handshake
-# that lets a RESP3 client (e.g. valkey-go) transparently fall back to RESP2.
+# TTL / EXPIRE family + SCAN / KEYS command coverage. (RESP3 / HELLO
+# negotiation lives in run_resp3.sh.)
 # Assumes a daemon is already listening on $RESP (started by the harness);
 # works whether that port is plaintext or TLS.
 set -u
@@ -57,10 +57,8 @@ done
 chk "SCAN MATCH finds all 3 keys"        "3"  "$(printf '%s\n' $found | grep -c '^scan:test:')"
 chk "KEYS pattern finds all 3 keys"      "3"  "$($K KEYS 'scan:test:*' | grep -c '^scan:test:')"
 
-# ---- HELLO handshake ----
-# A RESP3 client sends HELLO first; the reply must read as an unknown command
-# so valkey-go's `noHello` probe matches and it falls back to RESP2.
-chk "HELLO -> unknown command (RESP2 fallback)" "1" "$($K HELLO 3 2>&1 | grep -ci 'unknown command')"
+# (HELLO / RESP3 negotiation is covered by run_resp3.sh — HELLO is now a real
+# command that negotiates RESP2/RESP3, not an unknown-command fallback.)
 
 echo
 echo "# result: $pass passed, $fail failed"

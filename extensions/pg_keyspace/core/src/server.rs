@@ -179,6 +179,30 @@ enum Deny {
     Nil,
 }
 
+/// Per-connection CLIENT TRACKING state (server-assisted client-side caching).
+/// `on` is the master switch; the rest select the flavour negotiated by
+/// `CLIENT TRACKING ON [REDIRECT id] [PREFIX p ...] [BCAST] [OPTIN|OPTOUT]`.
+#[derive(Default)]
+struct Tracking {
+    /// Tracking enabled on this connection.
+    on: bool,
+    /// Broadcasting mode: invalidations are driven by `prefixes` at write time
+    /// rather than by recording each read. With no prefixes, the whole keyspace.
+    bcast: bool,
+    /// Scoped key prefixes to broadcast on (BCAST). Empty => match every key.
+    prefixes: Vec<Vec<u8>>,
+    /// OPTIN: cache only reads that follow `CLIENT CACHING YES`.
+    optin: bool,
+    /// OPTOUT: cache every read except those following `CLIENT CACHING NO`.
+    optout: bool,
+    /// One-shot `CLIENT CACHING` flag consumed by the next command: `Some(true)`
+    /// opts the next read in, `Some(false)` opts it out.
+    caching: Option<bool>,
+    /// REDIRECT target client id (== fd); 0 delivers to this connection itself.
+    /// A RESP2 connection may only track when it redirects to another client.
+    redirect: RawFd,
+}
+
 struct Conn {
     rbuf: Vec<u8>,
     wbuf: Vec<u8>,
@@ -206,6 +230,14 @@ struct Conn {
     in_multi: bool,
     queued: Vec<Vec<Vec<u8>>>,
     watch: Vec<(Vec<u8>, Option<u64>)>,
+    // RESP3 (set by `HELLO 3`): reply nulls/maps/sets/doubles use the RESP3 wire
+    // forms and pub/sub + invalidations are delivered as push (`>`) frames.
+    resp3: bool,
+    // Server-assisted client-side caching (CLIENT TRACKING). Keys this
+    // connection reads are recorded in the worker's `tracked` table (default /
+    // OPTIN / OPTOUT modes) or matched by prefix at write time (BCAST); an
+    // `invalidate` push is then sent to this connection or its REDIRECT target.
+    track: Tracking,
 }
 
 pub struct Worker {
@@ -236,6 +268,18 @@ pub struct Worker {
     // `None` for the single-worker in-PG extension (local delivery only).
     bus: Option<Arc<pubsub::Bus>>,
     worker_id: usize,
+    // Server-assisted client-side caching: scoped key -> the fds that read it
+    // while CLIENT TRACKING was on. A write to a key sends each of those fds an
+    // `invalidate` push and drops the entry (the client re-reads to re-track).
+    // Local to this worker — correct because each worker owns an independent
+    // keyspace segment (daemon and in-PG extension alike): a key is only ever
+    // read and written on the one worker that owns it, so no invalidation ever
+    // needs to cross workers.
+    tracked: HashMap<Vec<u8>, HashSet<RawFd>>,
+    // Connections in BCAST tracking mode. A write checks each against its
+    // prefixes instead of the per-read `tracked` table. Kept as a set so the
+    // write path pays nothing when no connection is broadcasting.
+    bcast_subs: HashSet<RawFd>,
 }
 
 impl Worker {
@@ -268,6 +312,8 @@ impl Worker {
             patterns: HashMap::new(),
             bus: None,
             worker_id: 0,
+            tracked: HashMap::new(),
+            bcast_subs: HashSet::new(),
         })
     }
 
@@ -345,12 +391,25 @@ impl Worker {
                 if fd == self.listen_fd {
                     self.accept_all();
                 } else if self.bus.as_ref().map_or(false, |b| fd == b.wake_fd(self.worker_id)) {
-                    // A remote worker published to a channel/pattern we hold a
-                    // subscriber for: drain the inbox and deliver locally (never
-                    // re-broadcast — deliver_local is local-only).
+                    // A remote worker published to a channel we subscribe to, or
+                    // invalidated a key we may be tracking: drain the inbox and
+                    // apply each locally (never re-broadcast — these are local-only
+                    // so a cross-worker message can't ping-pong).
                     let msgs = self.bus.as_ref().unwrap().drain(self.worker_id);
-                    for (channel, msg) in msgs {
-                        self.deliver_local(&channel, &msg);
+                    for m in msgs {
+                        match m {
+                            pubsub::BusMsg::Publish(channel, msg) => {
+                                self.deliver_local(&channel, &msg);
+                            }
+                            // -1 is not a live fd, so nothing local is skipped: the
+                            // writer that made the change is on another worker.
+                            pubsub::BusMsg::Invalidate(Some(key)) => {
+                                self.invalidate_key(&key, -1);
+                            }
+                            pubsub::BusMsg::Invalidate(None) => {
+                                self.invalidate_all(-1);
+                            }
+                        }
                     }
                 } else {
                     let flags = ev.events;
@@ -442,6 +501,8 @@ impl Worker {
                     in_multi: false,
                     queued: Vec::new(),
                     watch: Vec::new(),
+                    resp3: false,
+                    track: Tracking::default(),
                 },
             );
         }
@@ -611,10 +672,26 @@ impl Worker {
         let nargs = args.len();
         let mut cmd = args[0].clone();
         cmd.make_ascii_uppercase();
+        // RESP3 wire form for this connection (typed nulls/maps/sets/doubles and
+        // push frames). Read once up front so every reply site — including the
+        // auth-gate nil below — can use the right encoding.
+        let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
 
         // ---- AUTH command ----
         if cmd == b"AUTH" {
             self.handle_auth(fd, args);
+            return;
+        }
+
+        // ---- HELLO: RESP2/RESP3 negotiation ----
+        if cmd == b"HELLO" {
+            self.handle_hello(fd, args);
+            return;
+        }
+
+        // ---- CLIENT (incl. TRACKING for client-side caching) ----
+        if cmd == b"CLIENT" {
+            self.handle_client(fd, args);
             return;
         }
 
@@ -689,7 +766,7 @@ impl Worker {
                         out,
                         "NOPERM this user has no permissions to access one of the keys used as arguments",
                     ),
-                    Deny::Nil => resp::nil(out),
+                    Deny::Nil => resp::null(out, resp3),
                 }
                 return;
             }
@@ -727,12 +804,8 @@ impl Worker {
                 resp::simple(out, "OK");
                 self.conns.get_mut(&fd).unwrap().closing = true;
             }
-            // No HELLO arm: RESP2-only. HELLO falls through to the catch-all,
-            // which replies `ERR unknown command 'HELLO'`. A RESP3 client such as
-            // valkey-go matches that (its `noHello` probe) and transparently falls
-            // back to RESP2, instead of the old `NOPROTO` reply which it did not
-            // recognise and closed the connection on.
-            b"CLIENT" | b"CONFIG" | b"SELECT" | b"RESET" => resp::simple(out, "OK"),
+            // HELLO and CLIENT are handled before this match.
+            b"CONFIG" | b"SELECT" | b"RESET" => resp::simple(out, "OK"),
             b"COMMAND" => resp::array_header(out, 0),
             b"DBSIZE" => {
                 let mut total = 0i64;
@@ -751,7 +824,7 @@ impl Worker {
                 }
                 match store.get(&args[1]) {
                     Lookup::Hit(v) => resp::bulk(out, v),
-                    Lookup::Miss => resp::nil(out),
+                    Lookup::Miss => resp::null(out, resp3),
                 }
             }
             b"SET" => {
@@ -814,7 +887,7 @@ impl Worker {
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                 match old {
                     Some(v) => resp::bulk(out, &v),
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"DEL" | b"UNLINK" => {
@@ -1022,7 +1095,7 @@ impl Worker {
                     match store.get_typed(k) {
                         // miss OR non-string -> nil; MGET never errors on WRONGTYPE
                         Some((crate::store::KIND_STR, _, v)) => resp::bulk(out, v),
-                        _ => resp::nil(out),
+                        _ => resp::null(out, resp3),
                     }
                 }
             }
@@ -1110,7 +1183,7 @@ impl Worker {
                             stages.push((args[1].clone(), Vec::new(), DELETE_TOMBSTONE, b's'));
                         }
                     }
-                    Lookup::Miss => resp::nil(out),
+                    Lookup::Miss => resp::null(out, resp3),
                 }
             }
             b"GETEX" => {
@@ -1121,7 +1194,7 @@ impl Worker {
                 let (val, cur_exp) = match store.get_typed(&args[1]) {
                     Some((_, exp, v)) => (v.to_vec(), exp),
                     None => {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                         return;
                     }
                 };
@@ -1395,7 +1468,7 @@ impl Worker {
                 }
                 match chosen {
                     Some(k) => resp::bulk(out, &k),
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"EXPIRETIME" | b"PEXPIRETIME" => {
@@ -1493,7 +1566,7 @@ impl Worker {
             b"MEMORY" => {
                 match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
                     Some(b"USAGE") if nargs >= 3 => match store.get_typed(&args[2]) {
-                        None => resp::nil(out),
+                        None => resp::null(out, resp3),
                         // rough estimate: value + key bytes + fixed entry overhead
                         Some((_, _, v)) => {
                             resp::integer(out, (v.len() + args[2].len() + 64) as i64)
@@ -1625,7 +1698,7 @@ impl Worker {
                 };
                 match raw.and_then(|b| aggr::hash_probe(b, &args[2])) {
                     Some(v) => resp::bulk(out, v),
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"HMGET" => {
@@ -1641,7 +1714,7 @@ impl Worker {
                 for f in &args[2..] {
                     match raw.and_then(|b| aggr::hash_probe(b, f)) {
                         Some(v) => resp::bulk(out, v),
-                        None => resp::nil(out),
+                        None => resp::null(out, resp3),
                     }
                 }
             }
@@ -1672,7 +1745,7 @@ impl Worker {
                     Some(x) => x,
                     None => return,
                 };
-                resp::array_header(out, h.len() * 2);
+                resp::map_header(out, h.len(), resp3); // RESP3 map, RESP2 flat array
                 for (f, v) in &h.entries {
                     resp::bulk(out, f);
                     resp::bulk(out, v);
@@ -1805,12 +1878,12 @@ impl Worker {
                         let popped = if left { l.lpop() } else { l.rpop() };
                         match popped {
                             Some(v) => resp::bulk(out, &v),
-                            None => resp::nil(out),
+                            None => resp::null(out, resp3),
                         }
                     }
                     Some(c) => {
                         if l.is_empty() {
-                            resp::nil(out);
+                            resp::null(out, resp3);
                             return;
                         }
                         let mut taken = Vec::new();
@@ -1856,7 +1929,7 @@ impl Worker {
                 });
                 match hit {
                     Some(v) => resp::bulk(out, v),
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"LRANGE" => {
@@ -1991,8 +2064,8 @@ impl Worker {
                     None => return,
                 };
                 match raw.and_then(|b| aggr::zset_score(b, &args[2])) {
-                    Some(s) => resp::bulk(out, aggr::fmt_score(s).as_bytes()),
-                    None => resp::nil(out),
+                    Some(s) => resp::double(out, &aggr::fmt_score(s), resp3),
+                    None => resp::null(out, resp3),
                 }
             }
             b"ZMSCORE" => {
@@ -2007,8 +2080,8 @@ impl Worker {
                 resp::array_header(out, nargs - 2);
                 for m in &args[2..] {
                     match raw.and_then(|b| aggr::zset_score(b, m)) {
-                        Some(s) => resp::bulk(out, aggr::fmt_score(s).as_bytes()),
-                        None => resp::nil(out),
+                        Some(s) => resp::double(out, &aggr::fmt_score(s), resp3),
+                        None => resp::null(out, resp3),
                     }
                 }
             }
@@ -2056,7 +2129,7 @@ impl Worker {
                 let next = z.score(&args[3]).unwrap_or(0.0) + by;
                 z.add(&args[3], next);
                 save_zset(&store, &args[1], &z, exp);
-                resp::bulk(out, aggr::fmt_score(next).as_bytes());
+                resp::double(out, &aggr::fmt_score(next), resp3);
             }
             b"ZRANK" | b"ZREVRANK" => {
                 if nargs != 3 {
@@ -2076,7 +2149,7 @@ impl Worker {
                         let r = if cmd == b"ZREVRANK" { card - 1 - r } else { r };
                         resp::integer(out, r as i64);
                     }
-                    None => resp::nil(out),
+                    None => resp::null(out, resp3),
                 }
             }
             b"ZRANGE" | b"ZREVRANGE" => {
@@ -2108,11 +2181,12 @@ impl Worker {
                         }
                     }
                 };
-                resp::array_header(out, if withscores { items.len() * 2 } else { items.len() });
-                for (m, s) in &items {
-                    resp::bulk(out, m);
-                    if withscores {
-                        resp::bulk(out, aggr::fmt_score(*s).as_bytes());
+                if withscores {
+                    reply_scored(out, &items, resp3, resp3);
+                } else {
+                    resp::array_header(out, items.len());
+                    for (m, _) in &items {
+                        resp::bulk(out, m);
                     }
                 }
             }
@@ -2154,11 +2228,12 @@ impl Worker {
                     items.reverse();
                 }
                 let items: Vec<_> = items.into_iter().skip(offset).take(count.unwrap_or(usize::MAX)).collect();
-                resp::array_header(out, if withscores { items.len() * 2 } else { items.len() });
-                for (m, s) in &items {
-                    resp::bulk(out, m);
-                    if withscores {
-                        resp::bulk(out, aggr::fmt_score(*s).as_bytes());
+                if withscores {
+                    reply_scored(out, &items, resp3, resp3);
+                } else {
+                    resp::array_header(out, items.len());
+                    for (m, _) in &items {
+                        resp::bulk(out, m);
                     }
                 }
             }
@@ -2229,7 +2304,7 @@ impl Worker {
                 };
                 if nargs < 3 {
                     if h.is_empty() {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                     } else {
                         let i = (rng_next(&mut rand_seed()) as usize) % h.len();
                         resp::bulk(out, &h.entries[i].0);
@@ -2244,11 +2319,21 @@ impl Worker {
                     return;
                 }
                 let idx = pick_indices(h.len(), count, rand_seed());
-                resp::array_header(out, idx.len() * if withvals { 2 } else { 1 });
-                for i in idx {
-                    resp::bulk(out, &h.entries[i].0);
-                    if withvals {
+                if withvals && resp3 {
+                    // RESP3 pairs each field with its value as a two-element array.
+                    resp::array_header(out, idx.len());
+                    for i in idx {
+                        resp::array_header(out, 2);
+                        resp::bulk(out, &h.entries[i].0);
                         resp::bulk(out, &h.entries[i].1);
+                    }
+                } else {
+                    resp::array_header(out, idx.len() * if withvals { 2 } else { 1 });
+                    for i in idx {
+                        resp::bulk(out, &h.entries[i].0);
+                        if withvals {
+                            resp::bulk(out, &h.entries[i].1);
+                        }
                     }
                 }
             }
@@ -2389,7 +2474,7 @@ impl Worker {
                 match count {
                     None => match hits.first() {
                         Some(&p) => resp::integer(out, p),
-                        None => resp::nil(out),
+                        None => resp::null(out, resp3),
                     },
                     Some(_) => {
                         resp::array_header(out, hits.len());
@@ -2439,7 +2524,7 @@ impl Worker {
                     let val = if from_left { l.lpop() } else { l.rpop() };
                     match val {
                         None => {
-                            resp::nil(out);
+                            resp::null(out, resp3);
                             return;
                         }
                         Some(v) => {
@@ -2465,7 +2550,7 @@ impl Worker {
                     let val = if from_left { src.lpop() } else { src.rpop() };
                     match val {
                         None => {
-                            resp::nil(out);
+                            resp::null(out, resp3);
                             return;
                         }
                         Some(v) => {
@@ -2498,7 +2583,8 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'zpopmin'");
                     return;
                 }
-                let count: usize = if nargs >= 3 {
+                let count_given = nargs >= 3;
+                let count: usize = if count_given {
                     std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(1)
                 } else {
                     1
@@ -2518,11 +2604,8 @@ impl Worker {
                     z.remove(m);
                 }
                 save_zset(&store, &args[1], &z, exp);
-                resp::array_header(out, chosen.len() * 2);
-                for (m, s) in &chosen {
-                    resp::bulk(out, m);
-                    resp::bulk(out, aggr::fmt_score(*s).as_bytes());
-                }
+                // Valkey pairs the counted form under RESP3; the bare form stays flat.
+                reply_scored(out, &chosen, resp3 && count_given, resp3);
             }
             b"ZRANDMEMBER" => {
                 // ZRANDMEMBER key [count [WITHSCORES]]
@@ -2536,7 +2619,7 @@ impl Worker {
                 };
                 if nargs < 3 {
                     if z.is_empty() {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                     } else {
                         let i = (rng_next(&mut rand_seed()) as usize) % z.len();
                         resp::bulk(out, &z.members[i].0);
@@ -2551,11 +2634,14 @@ impl Worker {
                     return;
                 }
                 let idx = pick_indices(z.len(), count, rand_seed());
-                resp::array_header(out, idx.len() * if withscores { 2 } else { 1 });
-                for i in idx {
-                    resp::bulk(out, &z.members[i].0);
-                    if withscores {
-                        resp::bulk(out, aggr::fmt_score(z.members[i].1).as_bytes());
+                if withscores {
+                    let picked: Vec<(Vec<u8>, f64)> =
+                        idx.iter().map(|&i| z.members[i].clone()).collect();
+                    reply_scored(out, &picked, resp3, resp3);
+                } else {
+                    resp::array_header(out, idx.len());
+                    for i in idx {
+                        resp::bulk(out, &z.members[i].0);
                     }
                 }
             }
@@ -2643,7 +2729,7 @@ impl Worker {
                     Some(x) => x,
                     None => return,
                 };
-                resp::array_header(out, s.len());
+                resp::set_header(out, s.len(), resp3); // RESP3 set, RESP2 array
                 for m in &s.members {
                     resp::bulk(out, m);
                 }
@@ -2660,7 +2746,7 @@ impl Worker {
                 };
                 if nargs < 3 {
                     if s.is_empty() {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                         return;
                     }
                     let i = (rng_next(&mut rand_seed()) as usize) % s.len();
@@ -2704,7 +2790,7 @@ impl Worker {
                 };
                 if nargs < 3 {
                     if s.is_empty() {
-                        resp::nil(out);
+                        resp::null(out, resp3);
                     } else {
                         let i = (rng_next(&mut rand_seed()) as usize) % s.len();
                         resp::bulk(out, &s.members[i]);
@@ -2768,7 +2854,7 @@ impl Worker {
                     }
                 }
                 let result = set_combine(&cmd, &sets);
-                resp::array_header(out, result.len());
+                resp::set_header(out, result.len(), resp3); // RESP3 set, RESP2 array
                 for m in &result {
                     resp::bulk(out, m);
                 }
@@ -2943,13 +3029,12 @@ impl Worker {
                         store.set_typed(&args[1], &z.encode(), 0, KIND_ZSET);
                     }
                     resp::integer(out, result.len() as i64);
+                } else if withscores {
+                    reply_scored(out, &result, resp3, resp3);
                 } else {
-                    resp::array_header(out, if withscores { result.len() * 2 } else { result.len() });
-                    for (m, s) in &result {
+                    resp::array_header(out, result.len());
+                    for (m, _) in &result {
                         resp::bulk(out, m);
-                        if withscores {
-                            resp::bulk(out, aggr::fmt_score(*s).as_bytes());
-                        }
                     }
                 }
             }
@@ -3007,7 +3092,7 @@ impl Worker {
                     for (m, s) in &chosen {
                         resp::array_header(out, 2);
                         resp::bulk(out, m);
-                        resp::bulk(out, aggr::fmt_score(*s).as_bytes());
+                        resp::double(out, &aggr::fmt_score(*s), resp3);
                     }
                     if persist_on {
                         stages.push(match store.get_typed(k) {
@@ -3017,7 +3102,7 @@ impl Worker {
                     }
                     return;
                 }
-                resp::nil(out); // all input sets empty
+                resp::null(out, resp3); // all input sets empty
             }
             b"ZLEXCOUNT" => {
                 if nargs != 4 {
@@ -3246,6 +3331,37 @@ impl Worker {
         if sync_ack && !acks.is_empty() {
             self.conns.get_mut(&fd).unwrap().ack = acks;
         }
+
+        // ---- server-assisted client-side caching (CLIENT TRACKING) ----
+        // A write invalidates every tracker of the keys it touched; a read from a
+        // tracking connection records the keys it just read so a later write to
+        // them fires an invalidation. FLUSH invalidates the whole keyspace.
+        if matches!(cmd.as_slice(), b"FLUSHALL" | b"FLUSHDB") {
+            self.invalidate_all(fd);
+            self.broadcast_invalidation(None);
+        } else if !key_idxs.is_empty() {
+            if is_write_cmd(&cmd) {
+                for &i in &key_idxs {
+                    if let Some(k) = args.get(i) {
+                        self.invalidate_key(k, fd);
+                        self.broadcast_invalidation(Some(k));
+                    }
+                }
+            } else if self.should_record_reads(fd) {
+                // Default / OPTIN / OPTOUT register each read key; BCAST does not
+                // (its invalidations come from prefix matching at write time).
+                for &i in &key_idxs {
+                    if let Some(k) = args.get(i) {
+                        self.tracked.entry(k.to_vec()).or_default().insert(fd);
+                    }
+                }
+            }
+        }
+        // CLIENT CACHING is a one-shot flag for the command that follows it; this
+        // command has now consumed it (CLIENT itself never reaches here).
+        if let Some(c) = self.conns.get_mut(&fd) {
+            c.track.caching = None;
+        }
     }
 
     /// MULTI — open a transaction: subsequent commands queue until EXEC/DISCARD.
@@ -3371,6 +3487,404 @@ impl Worker {
                 resp::simple(&mut c.wbuf, "OK");
             }
         }
+    }
+
+    /// HELLO [protover [AUTH user pass] [SETNAME name]] — negotiate the protocol
+    /// and reply with the server handshake map. `HELLO 3` switches the connection
+    /// to RESP3 (typed replies + push-framed pub/sub); `HELLO 2` (or none) is
+    /// RESP2. An optional inline AUTH is applied before the reply.
+    fn handle_hello(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        let mut proto: i64 = if self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false) {
+            3
+        } else {
+            2
+        };
+        let mut i = 1;
+        if args.len() >= 2 {
+            match std::str::from_utf8(&args[1]).ok().and_then(|t| t.parse::<i64>().ok()) {
+                Some(p) if p == 2 || p == 3 => {
+                    proto = p;
+                    i = 2;
+                }
+                _ => {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(
+                        out,
+                        "NOPROTO unsupported protocol version",
+                    );
+                    return;
+                }
+            }
+        }
+        // Optional AUTH / SETNAME arguments after the version.
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"AUTH" if i + 2 < args.len() => {
+                    let user = String::from_utf8_lossy(&args[i + 1]).into_owned();
+                    // Resolve the credential without holding a `conns` borrow.
+                    enum A {
+                        NoCfg,
+                        Ok(String, String, bool),
+                        Wrong,
+                    }
+                    let outcome = match &self.auth {
+                        None => A::NoCfg,
+                        Some(cfg) => match cfg.creds.get(&user) {
+                            Some(c) if c.verify(args[i + 2].as_slice()) => {
+                                A::Ok(c.role.clone(), c.tenant.clone(), cfg.exempt.contains(&c.role))
+                            }
+                            _ => A::Wrong,
+                        },
+                    };
+                    match outcome {
+                        A::Wrong => {
+                            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                            resp::error(
+                                out,
+                                "WRONGPASS invalid username-password pair or user is disabled.",
+                            );
+                            return;
+                        }
+                        A::Ok(role, tenant, exempt) => {
+                            let c = self.conns.get_mut(&fd).unwrap();
+                            c.authed = true;
+                            c.role = role;
+                            c.tenant = tenant;
+                            c.exempt = exempt;
+                        }
+                        A::NoCfg => {} // no auth configured: HELLO AUTH is a no-op OK
+                    }
+                    i += 3;
+                }
+                b"SETNAME" if i + 1 < args.len() => i += 2, // client name: accepted, unused
+                _ => {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(out, "ERR syntax error in HELLO");
+                    return;
+                }
+            }
+        }
+        self.conns.get_mut(&fd).unwrap().resp3 = proto == 3;
+        let resp3 = proto == 3;
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::map_header(out, 7, resp3);
+        resp::bulk(out, b"server");
+        resp::bulk(out, b"redis");
+        resp::bulk(out, b"version");
+        resp::bulk(out, b"7.4.0");
+        resp::bulk(out, b"proto");
+        resp::integer(out, proto);
+        resp::bulk(out, b"id");
+        resp::integer(out, fd as i64);
+        resp::bulk(out, b"mode");
+        resp::bulk(out, b"standalone");
+        resp::bulk(out, b"role");
+        resp::bulk(out, b"master");
+        resp::bulk(out, b"modules");
+        resp::array_header(out, 0);
+    }
+
+    /// CLIENT subcommands. TRACKING ON/OFF drives server-assisted client-side
+    /// caching; the rest are the benign ones clients send at connect (ID, GETNAME,
+    /// SETNAME, SETINFO, NO-EVICT, …), answered OK.
+    fn handle_client(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
+            Some(b"ID") => {
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                resp::integer(out, fd as i64);
+            }
+            Some(b"GETNAME") => {
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                resp::bulk(out, b"");
+            }
+            Some(b"TRACKING") => self.handle_tracking(fd, args),
+            Some(b"CACHING") => {
+                // One-shot opt for the next command; only valid under OPTIN/OPTOUT.
+                let yes = match args.get(2).map(|a| a.to_ascii_uppercase()).as_deref() {
+                    Some(b"YES") => true,
+                    Some(b"NO") => false,
+                    _ => {
+                        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                        resp::error(out, "ERR syntax error");
+                        return;
+                    }
+                };
+                let c = self.conns.get_mut(&fd).unwrap();
+                if !c.track.on || (!c.track.optin && !c.track.optout) {
+                    resp::error(
+                        &mut c.wbuf,
+                        "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
+                    );
+                    return;
+                }
+                // YES is meaningful under OPTIN, NO under OPTOUT; store either as
+                // the one-shot flag the next read consults.
+                c.track.caching = Some(yes);
+                resp::simple(&mut c.wbuf, "OK");
+            }
+            _ => {
+                // SETNAME / SETINFO / NO-EVICT / NO-TOUCH / UNPAUSE / …
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                resp::simple(out, "OK");
+            }
+        }
+    }
+
+    /// `CLIENT TRACKING ON|OFF [REDIRECT id] [PREFIX p ...] [BCAST] [OPTIN] [OPTOUT]
+    /// [NOLOOP]`. ON without REDIRECT needs a RESP3 connection (the invalidations
+    /// arrive as push frames); with REDIRECT the pushes go to another client id, so
+    /// a RESP2 connection may track too. Rejects the combinations Valkey rejects
+    /// (OPTIN with OPTOUT; PREFIX without BCAST) so a client that mis-negotiates
+    /// hears about it rather than silently getting the wrong invalidations.
+    fn handle_tracking(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        let onoff = args.get(2).map(|a| a.to_ascii_uppercase());
+        match onoff.as_deref() {
+            Some(b"OFF") => {
+                self.bcast_subs.remove(&fd);
+                self.untrack_fd(fd);
+                let was_on = self.conns.get(&fd).map(|c| c.track.on).unwrap_or(false);
+                let c = self.conns.get_mut(&fd).unwrap();
+                c.track = Tracking::default();
+                resp::simple(&mut c.wbuf, "OK");
+                if was_on {
+                    if let Some(bus) = &self.bus {
+                        bus.tracker_remove();
+                    }
+                }
+            }
+            Some(b"ON") => {
+                let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
+                let mut t = Tracking { on: true, ..Tracking::default() };
+                let mut raw_prefixes: Vec<Vec<u8>> = Vec::new();
+                let mut i = 3;
+                while i < args.len() {
+                    match args[i].to_ascii_uppercase().as_slice() {
+                        b"REDIRECT" if i + 1 < args.len() => {
+                            let id: i64 = std::str::from_utf8(&args[i + 1])
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(-1);
+                            // 0 means "no redirect"; otherwise the id must be a live
+                            // client (our client id is its fd).
+                            if id != 0 && !self.conns.contains_key(&(id as RawFd)) {
+                                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                                resp::error(
+                                    out,
+                                    "ERR The client ID you want redirect to does not exist",
+                                );
+                                return;
+                            }
+                            t.redirect = id as RawFd;
+                            i += 2;
+                        }
+                        b"PREFIX" if i + 1 < args.len() => {
+                            raw_prefixes.push(args[i + 1].clone());
+                            i += 2;
+                        }
+                        b"BCAST" => {
+                            t.bcast = true;
+                            i += 1;
+                        }
+                        b"OPTIN" => {
+                            t.optin = true;
+                            i += 1;
+                        }
+                        b"OPTOUT" => {
+                            t.optout = true;
+                            i += 1;
+                        }
+                        b"NOLOOP" => {
+                            // Accepted: this server never echoes an invalidation to
+                            // the connection that issued the write (see invalidate_key),
+                            // so NOLOOP is already the effective behaviour.
+                            i += 1;
+                        }
+                        _ => {
+                            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                            resp::error(out, "ERR syntax error in CLIENT TRACKING");
+                            return;
+                        }
+                    }
+                }
+                // Validate the negotiated combination.
+                let err = if t.optin && t.optout {
+                    Some("ERR You can't specify both OPTIN mode and OPTOUT mode")
+                } else if !raw_prefixes.is_empty() && !t.bcast {
+                    Some("ERR PREFIX option requires BCAST mode to be enabled")
+                } else if (t.optin || t.optout) && t.bcast {
+                    Some("ERR OPTIN and OPTOUT are not compatible with BCAST")
+                } else if t.redirect == 0 && !resp3 {
+                    Some("ERR Client tracking requires RESP3; send HELLO 3 first or REDIRECT to a client")
+                } else {
+                    None
+                };
+                if let Some(msg) = err {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(out, msg);
+                    return;
+                }
+                // Scope the client-facing prefixes to this tenant so BCAST matches
+                // the scoped keys the write path sees.
+                t.prefixes = raw_prefixes.iter().map(|p| self.scope_name(fd, p)).collect();
+                // Re-negotiating from a previous mode: clear any stale registrations.
+                self.untrack_fd(fd);
+                if t.bcast {
+                    self.bcast_subs.insert(fd);
+                } else {
+                    self.bcast_subs.remove(&fd);
+                }
+                let was_on = self.conns.get(&fd).map(|c| c.track.on).unwrap_or(false);
+                let c = self.conns.get_mut(&fd).unwrap();
+                c.track = t;
+                resp::simple(&mut c.wbuf, "OK");
+                // Count this connection toward the cross-worker tracking gate the
+                // first time it turns tracking on (re-negotiating an already-on
+                // connection does not double-count).
+                if !was_on {
+                    if let Some(bus) = &self.bus {
+                        bus.tracker_add();
+                    }
+                }
+            }
+            _ => {
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                resp::error(out, "ERR syntax error in CLIENT TRACKING");
+            }
+        }
+    }
+
+    /// Send an `invalidate` push for `key` to every connection tracking it, then
+    /// drop the entry (Redis drops a key from the table once it invalidates; the
+    /// client re-reads to re-track). Each tracker sees the key in its own
+    /// tenant-facing (unscoped) form. Guarded by the live conn's `tracking`+`resp3`
+    /// so a reused fd can never receive a stray push into a non-tracking stream.
+    fn invalidate_key(&mut self, key: &[u8], except: RawFd) {
+        // Default / OPTIN / OPTOUT trackers that recorded a read of this key.
+        if let Some(fds) = self.tracked.remove(key) {
+            for reader in fds {
+                // Skip the writer itself (NOLOOP): it already knows it changed the
+                // key, and flushing its own fd mid-command would race the ack.
+                if reader == except {
+                    continue;
+                }
+                let prefix = self.conn_prefix(reader);
+                let facing = strip_scope(key, &prefix).to_vec();
+                self.deliver_invalidation(reader, Some(&facing));
+            }
+        }
+        // BCAST trackers: no per-read table — a write matches the key against each
+        // broadcasting connection's registered prefixes (empty => whole keyspace).
+        if !self.bcast_subs.is_empty() {
+            let readers: Vec<RawFd> = self
+                .bcast_subs
+                .iter()
+                .copied()
+                .filter(|&r| r != except)
+                .filter(|&r| {
+                    self.conns
+                        .get(&r)
+                        .map_or(false, |c| bcast_matches(&c.track.prefixes, key))
+                })
+                .collect();
+            for reader in readers {
+                let prefix = self.conn_prefix(reader);
+                let facing = strip_scope(key, &prefix).to_vec();
+                self.deliver_invalidation(reader, Some(&facing));
+            }
+        }
+    }
+
+    /// Fan a client-side-caching invalidation out to the other workers over the
+    /// Bus so each notifies its own trackers (`None` = whole keyspace, for FLUSH).
+    /// A no-op without a Bus (the single-worker in-PG extension) and skipped
+    /// entirely when no connection anywhere is tracking, so a write pays only one
+    /// relaxed atomic load when client-side caching is unused. Cross-worker
+    /// invalidation is conservative: workers own independent keyspace segments, so
+    /// a same-named key on another worker may be told to drop a still-valid cache
+    /// entry (it re-fetches — never serves stale data). It is exactly right once a
+    /// worker set shares one store.
+    fn broadcast_invalidation(&self, key: Option<&[u8]>) {
+        if let Some(bus) = &self.bus {
+            if bus.tracking_active() {
+                bus.invalidate(self.worker_id, key);
+            }
+        }
+    }
+
+    /// Deliver one invalidation to `reader`'s sink. The sink is the REDIRECT
+    /// target when set, else `reader` itself: a RESP3 sink receives a push
+    /// (`>2 invalidate …`), a RESP2 sink (only reachable via REDIRECT) the pub/sub
+    /// message form on `__redis__:invalidate`. `facing` is the tenant-facing key,
+    /// or `None` for the whole-keyspace (FLUSH) signal.
+    fn deliver_invalidation(&mut self, reader: RawFd, facing: Option<&[u8]>) {
+        let target = match self.conns.get(&reader) {
+            Some(c) if c.track.redirect != 0 => c.track.redirect,
+            Some(_) => reader,
+            None => return,
+        };
+        let resp3 = match self.conns.get(&target) {
+            Some(c) => c.resp3,
+            None => return, // redirect target already gone
+        };
+        let out = &mut self.conns.get_mut(&target).unwrap().wbuf;
+        if resp3 {
+            resp::push_header(out, 2, true);
+            resp::bulk(out, b"invalidate");
+        } else {
+            resp::array_header(out, 3);
+            resp::bulk(out, b"message");
+            resp::bulk(out, b"__redis__:invalidate");
+        }
+        match facing {
+            Some(k) => {
+                resp::array_header(out, 1);
+                resp::bulk(out, k);
+            }
+            None => resp::null(out, resp3),
+        }
+        self.flush(target);
+    }
+
+    /// Invalidate everything (FLUSHALL/FLUSHDB): send a null `invalidate` — Redis's
+    /// "the whole keyspace changed" signal — to every tracking connection (except
+    /// the caller) and clear the per-read table.
+    fn invalidate_all(&mut self, except: RawFd) {
+        self.tracked.clear();
+        let readers: Vec<RawFd> = self
+            .conns
+            .iter()
+            .filter(|(&f, c)| f != except && c.track.on)
+            .map(|(&f, _)| f)
+            .collect();
+        for reader in readers {
+            self.deliver_invalidation(reader, None);
+        }
+    }
+
+    /// Whether a read from `fd` should be recorded in the per-read `tracked`
+    /// table: tracking on, not BCAST, and — under OPTIN — the previous command was
+    /// `CLIENT CACHING YES`; under OPTOUT — it was not `CLIENT CACHING NO`.
+    fn should_record_reads(&self, fd: RawFd) -> bool {
+        match self.conns.get(&fd) {
+            Some(c) if c.track.on && !c.track.bcast => {
+                if c.track.optin {
+                    c.track.caching == Some(true)
+                } else if c.track.optout {
+                    c.track.caching != Some(false)
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove `fd` from every tracked-key set (on CLIENT TRACKING OFF or close).
+    fn untrack_fd(&mut self, fd: RawFd) {
+        self.tracked.retain(|_, fds| {
+            fds.remove(&fd);
+            !fds.is_empty()
+        });
     }
 
     /// True if the connection may run pub/sub commands (authed, or no auth
@@ -3577,15 +4091,17 @@ impl Worker {
             let fch = strip_scope(channel, &prefix);
             let fpat = pat.as_ref().map(|p| strip_scope(p, &prefix));
             if let Some(c) = self.conns.get_mut(sfd) {
+                // RESP3 delivers pub/sub out-of-band as a push (`>`) frame; RESP2
+                // uses a normal array. push_header emits the right one.
                 match fpat {
                     None => {
-                        resp::array_header(&mut c.wbuf, 3);
+                        resp::push_header(&mut c.wbuf, 3, c.resp3);
                         resp::bulk(&mut c.wbuf, b"message");
                         resp::bulk(&mut c.wbuf, fch);
                         resp::bulk(&mut c.wbuf, msg);
                     }
                     Some(p) => {
-                        resp::array_header(&mut c.wbuf, 4);
+                        resp::push_header(&mut c.wbuf, 4, c.resp3);
                         resp::bulk(&mut c.wbuf, b"pmessage");
                         resp::bulk(&mut c.wbuf, p);
                         resp::bulk(&mut c.wbuf, fch);
@@ -3847,6 +4363,18 @@ impl Worker {
                 }
             }
         }
+        // Drop this fd from the client-side-caching tracking table (and the BCAST
+        // set) so a future connection reusing the fd never inherits a stale
+        // invalidation target.
+        if !self.tracked.is_empty() {
+            self.untrack_fd(fd);
+        }
+        self.bcast_subs.remove(&fd);
+        if self.conns.get(&fd).map(|c| c.track.on).unwrap_or(false) {
+            if let Some(bus) = &self.bus {
+                bus.tracker_remove();
+            }
+        }
         let _ = epoll_del(self.epfd, fd);
         unsafe { libc::close(fd) };
         self.conns.remove(&fd);
@@ -3860,6 +4388,12 @@ fn itoa(n: i64) -> Vec<u8> {
 
 /// Strip a tenant scope prefix from a channel/pattern for a client-facing frame.
 /// `None` prefix (exempt / no-auth) or a non-matching name is returned as-is.
+/// Whether a BCAST tracker with these (scoped) prefixes should be told about a
+/// change to `key`. No prefixes means "the whole keyspace" (Valkey's default).
+fn bcast_matches(prefixes: &[Vec<u8>], key: &[u8]) -> bool {
+    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p))
+}
+
 fn strip_scope<'a>(name: &'a [u8], prefix: &Option<Vec<u8>>) -> &'a [u8] {
     match prefix {
         Some(p) if name.starts_with(p) => &name[p.len()..],
@@ -4017,6 +4551,30 @@ fn pick_indices(n: usize, count: i64, seed: u64) -> Vec<usize> {
         }
         idx.truncate(k);
         idx
+    }
+}
+
+/// Emit a member+score list. RESP2 is a flat array `[m, s, m, s, …]` with the
+/// scores as bulk strings; RESP3 uses double replies (`,`) for the scores and,
+/// when `nested` is set, wraps each element as a two-element `[member, double]`
+/// array (the shape real clients decode into member→score maps). Callers pass
+/// `nested = resp3 && withscores` for the ZRANGE/ZUNION family and
+/// `resp3 && count_given` for ZPOPMIN/ZPOPMAX (Valkey only pairs the counted
+/// form). The flat, non-scored case is left to the caller.
+fn reply_scored(out: &mut Vec<u8>, items: &[(Vec<u8>, f64)], nested: bool, resp3: bool) {
+    if nested {
+        resp::array_header(out, items.len());
+        for (m, s) in items {
+            resp::array_header(out, 2);
+            resp::bulk(out, m);
+            resp::double(out, &aggr::fmt_score(*s), resp3);
+        }
+    } else {
+        resp::array_header(out, items.len() * 2);
+        for (m, s) in items {
+            resp::bulk(out, m);
+            resp::double(out, &aggr::fmt_score(*s), resp3);
+        }
     }
 }
 
