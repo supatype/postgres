@@ -986,8 +986,15 @@ fn pg_ensure_schema() {
         let _ = Spi::run(
             "CREATE TABLE IF NOT EXISTS supacache.kv_ttl (\
              tenant text NOT NULL DEFAULT '', key bytea NOT NULL, slot int NOT NULL, \
-             val bytea, expires_at bigint NOT NULL, bucket bigint NOT NULL, \
+             kind \"char\" NOT NULL DEFAULT 's', val bytea, \
+             expires_at bigint NOT NULL, bucket bigint NOT NULL, \
              PRIMARY KEY (bucket, tenant, key)) PARTITION BY RANGE (bucket)",
+        );
+        // A `kind` column lets a TTL'd aggregate (a hash/list/set/zset that gained
+        // a TTL via EXPIRE, or a SET EX on any type) recover as the right type
+        // instead of a raw string. Older clusters created kv_ttl without it.
+        let _ = Spi::run(
+            "ALTER TABLE supacache.kv_ttl ADD COLUMN IF NOT EXISTS kind \"char\" NOT NULL DEFAULT 's'",
         );
     });
 }
@@ -1121,7 +1128,7 @@ fn pg_recover(store: &Store) -> i64 {
                 }
             }
             let tup = client.select(
-                "SELECT DISTINCT ON (key) key, val, expires_at FROM supacache.kv_ttl \
+                "SELECT DISTINCT ON (key) key, val, expires_at, kind::text FROM supacache.kv_ttl \
                  WHERE expires_at > $1 ORDER BY key, expires_at DESC",
                 None,
                 Some(vec![(
@@ -1133,8 +1140,12 @@ fn pg_recover(store: &Store) -> i64 {
                 let k: Option<Vec<u8>> = row.get(1)?;
                 let v: Option<Vec<u8>> = row.get(2)?;
                 let e: i64 = row.get::<i64>(3)?.unwrap_or(0);
+                let kind = row
+                    .get::<String>(4)?
+                    .and_then(|s| s.bytes().next())
+                    .unwrap_or(b's') as u32;
                 if let (Some(k), Some(v)) = (k, v) {
-                    store.set(&k, &v, (e - now).max(1));
+                    store.set_typed(&k, &v, (e - now).max(1), kind);
                     cnt += 1;
                 }
             }
@@ -1165,9 +1176,10 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
         Vec::<String>::new(),
     );
     // TTL upserts -> kv_ttl
-    let (mut tkeys, mut tslots, mut tvals, mut texps, mut tbuckets) = (
+    let (mut tkeys, mut tslots, mut tkinds, mut tvals, mut texps, mut tbuckets) = (
         Vec::<Vec<u8>>::new(),
         Vec::<i32>::new(),
+        Vec::<String>::new(),
         Vec::<Vec<u8>>::new(),
         Vec::<i64>::new(),
         Vec::<i64>::new(),
@@ -1178,11 +1190,12 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
         if e == server::DELETE_TOMBSTONE {
             del_keys.push(k);
         } else if e > 0 {
-            // TTL'd keys are strings (only SET EX creates them), so kv_ttl needs
-            // no kind column.
+            // A TTL'd key of any type (SET EX, or EXPIRE on a hash/list/set/zset)
+            // carries its kind so it recovers as the right type.
             let b = e / bucket_us;
             buckets_seen.insert(b);
             tslots.push(crc16::key_slot(&k) as i32);
+            tkinds.push((kind as char).to_string());
             tvals.push(v);
             texps.push(e);
             tbuckets.push(b);
@@ -1194,6 +1207,12 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
             keys.push(k);
         }
     }
+    // A key lives in exactly one table at a time, keyed on its *current* TTL
+    // state, so recovery (which reads kv then kv_ttl) never resurrects a stale
+    // row: a no-TTL write (SET, PERSIST) removes any prior kv_ttl row, and a
+    // TTL'd write (SET EX, EXPIRE) removes any prior kv row.
+    let clear_from_ttl = keys.clone();
+    let clear_from_kv = tkeys.clone();
 
     BackgroundWorker::transaction(move || {
         let _ = Spi::connect(|mut client| {
@@ -1229,19 +1248,42 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
                 let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), tkeys.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), tslots.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID), tkinds.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), tvals.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), texps.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), tbuckets.into_datum()),
                 ];
                 client.update(
-                    "INSERT INTO supacache.kv_ttl (tenant,key,slot,val,expires_at,bucket) \
-                     SELECT '', k, s, v, e, b \
-                     FROM unnest($1::bytea[], $2::int[], $3::bytea[], $4::bigint[], $5::bigint[]) \
-                          AS t(k, s, v, e, b) \
+                    "INSERT INTO supacache.kv_ttl (tenant,key,slot,kind,val,expires_at,bucket) \
+                     SELECT '', k, s, ki::\"char\", v, e, b \
+                     FROM unnest($1::bytea[], $2::int[], $3::text[], $4::bytea[], $5::bigint[], $6::bigint[]) \
+                          AS t(k, s, ki, v, e, b) \
                      ON CONFLICT (bucket,tenant,key) DO UPDATE SET \
-                     val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, slot=EXCLUDED.slot",
+                     kind=EXCLUDED.kind, val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, slot=EXCLUDED.slot",
                     None,
                     Some(args),
+                )?;
+            }
+            // Cross-table cleanup so each key sits in exactly one table for its
+            // current TTL state (see note above): drop the old opposite-table row.
+            if !clear_from_ttl.is_empty() {
+                client.update(
+                    "DELETE FROM supacache.kv_ttl WHERE tenant='' AND key = ANY($1::bytea[])",
+                    None,
+                    Some(vec![(
+                        PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID),
+                        clear_from_ttl.into_datum(),
+                    )]),
+                )?;
+            }
+            if !clear_from_kv.is_empty() {
+                client.update(
+                    "DELETE FROM supacache.kv WHERE tenant='' AND key = ANY($1::bytea[])",
+                    None,
+                    Some(vec![(
+                        PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID),
+                        clear_from_kv.into_datum(),
+                    )]),
                 )?;
             }
             if !del_keys.is_empty() {

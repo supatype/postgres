@@ -879,11 +879,14 @@ impl Worker {
                     b"EXPIREAT" => n.saturating_mul(1_000_000),
                     _ => n.saturating_mul(1_000), // PEXPIREAT (unix millis)
                 };
-                // Applies in shared memory. NOTE: not written through to the
-                // durable backing tables — on the persistent tiers a crash reverts
-                // the key to the TTL its last SET persisted. Fine for the cache
-                // (ephemeral) use; see the durable-TTL follow-up.
-                resp::integer(out, if store.set_expiry(&args[1], exp) { 1 } else { 0 });
+                let existed = store.set_expiry(&args[1], exp);
+                // Persist the new expiry (or a tombstone, if `exp` was in the past
+                // and deleted the key) so it survives crash recovery on the durable
+                // tiers rather than reverting to the last SET's TTL.
+                if existed && persist_on {
+                    stages.push(stage_current_state(&store, &args[1]));
+                }
+                resp::integer(out, if existed { 1 } else { 0 });
             }
             b"PERSIST" => {
                 if nargs != 2 {
@@ -894,6 +897,10 @@ impl Worker {
                 let had_ttl = matches!(store.get_typed(&args[1]), Some((_, exp, _)) if exp != 0);
                 if had_ttl {
                     store.set_expiry(&args[1], 0);
+                    // Persist the cleared expiry through to the durable tier.
+                    if persist_on {
+                        stages.push(stage_current_state(&store, &args[1]));
+                    }
                 }
                 resp::integer(out, if had_ttl { 1 } else { 0 });
             }
@@ -1139,6 +1146,11 @@ impl Worker {
                 if let Some(e) = new_exp {
                     store.set_expiry(&args[1], e);
                     let _ = cur_exp;
+                    // Persist the new expiry (GETEX EX/PX/EXAT/PXAT/PERSIST) so it
+                    // survives crash recovery on the durable tiers.
+                    if persist_on {
+                        stages.push(stage_current_state(&store, &args[1]));
+                    }
                 }
                 resp::bulk(out, &val);
             }
@@ -3953,6 +3965,18 @@ fn remaining_ttl(exp: i64) -> i64 {
         (exp - now_micros()).max(1)
     } else {
         0
+    }
+}
+
+/// A persistence record capturing a key's current stored state — its value,
+/// kind and absolute expiry — or a tombstone if the key is gone. Called after a
+/// TTL-only mutation (EXPIRE/PERSIST/GETEX) so the changed expiry is written
+/// through to the durable tier instead of reverting to the last SET's TTL on
+/// crash recovery; the enqueued record also carries the durable-tier ack.
+fn stage_current_state(store: &Store, key: &[u8]) -> PendingWrite {
+    match store.get_typed(key) {
+        Some((kind, exp, blob)) => (key.to_vec(), blob.to_vec(), exp, kind as u8),
+        None => (key.to_vec(), Vec::new(), DELETE_TOMBSTONE, b's'),
     }
 }
 

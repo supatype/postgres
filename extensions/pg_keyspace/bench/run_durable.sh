@@ -51,6 +51,23 @@ su "$PG_USER" -c "$PGCTL -D $PGDATA -w -t 30 -m immediate restart -l $PGDATA/ser
 sleep 2
 chk "hash mutation survives a 2nd crash" "f1,v1,f2,v2,f3,v3" "$($K HGETALL dh | paste -sd,)"
 
+# ---- durable TTL: EXPIRE / PERSIST changes, and a TTL'd aggregate's type,
+# must survive recovery (not revert to the TTL/type the last SET persisted) ----
+$K DEL de dp dhz >/dev/null 2>&1
+$K SET de v >/dev/null;         $K EXPIRE de 100000 >/dev/null    # TTL added after a SET
+$K SET dp v EX 1000 >/dev/null; $K PERSIST dp >/dev/null          # TTL removed after SET EX
+$K HSET dhz f1 v1 >/dev/null;   $K EXPIRE dhz 100000 >/dev/null   # a hash that gained a TTL
+sleep 2
+su "$PG_USER" -c "$PGCTL -D $PGDATA -w -t 30 -m immediate restart -l $PGDATA/server.log" >/dev/null 2>&1
+sleep 2
+t=$($K TTL de); { [ "$t" -gt 0 ] && { echo "  PASS  EXPIRE survived recovery (ttl=$t)"; pass=$((pass+1)); }; } \
+                || { echo "  FAIL  EXPIRE lost after recovery (ttl=$t)"; fail=$((fail+1)); }
+chk "PERSIST survived recovery (-1)"     "-1"    "$($K TTL dp)"
+chk "TTL'd hash recovered as a hash"     "hash"  "$($K TYPE dhz)"
+chk "TTL'd hash kept its value"          "v1"    "$($K HGET dhz f1)"
+t=$($K TTL dhz); { [ "$t" -gt 0 ] && { echo "  PASS  TTL'd hash kept its TTL (ttl=$t)"; pass=$((pass+1)); }; } \
+                 || { echo "  FAIL  TTL'd hash lost its TTL (ttl=$t)"; fail=$((fail+1)); }
+
 echo
 echo "# result: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
