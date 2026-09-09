@@ -38,67 +38,23 @@ pub type PendingWrite = (Vec<u8>, Vec<u8>, i64, u8);
 /// upserting it — otherwise a deleted key would resurrect on crash recovery.
 pub const DELETE_TOMBSTONE: i64 = -1;
 
+/// This worker's place in the slot->worker map, plus the address of every peer,
+/// so a key it does not own can be answered with `MOVED <slot> <host>:<port>`.
+struct Routing {
+    index: usize,
+    nworkers: usize,
+    /// `host:port` of each slot worker, indexed by worker number.
+    endpoints: Vec<String>,
+}
+
 /// Enqueue one record into the ring sharded by key slot (same shard function as
 /// the write path, so a key's writes and deletes always reach the same worker).
 ///
-/// Backpressure: if the ring is full, wait (bounded) for the persistence worker
-/// to drain rather than giving up immediately. Under sustained overload this
-/// throttles the RESP write path to the drain rate. Past the deadline the push
-/// fails and is counted (`ring_stats.dropped`); in a sync-ack tier the caller
-/// turns that into a client-visible error rather than a `+OK`, so a failure
-/// here is never silent data loss.
-///
-/// The wait is still inline on the event loop, so it stalls every connection on
-/// this worker for up to `PUSH_DEADLINE`. That is why the deadline is short and
-/// tunable; parking the connection and resuming it on drain, the way
-/// `resolve_acks` defers replies, is the proper fix and is not done here.
-pub const PUSH_DEADLINE: Duration = Duration::from_secs(2);
-
-/// Reply for a write the store could not hold. Redis uses this exact text when
-/// memory pressure prevents a write, and clients special-case it, so reusing it
-/// means an existing client library handles the condition it already knows.
-/// `resp::DEFAULT_MAX_BULK_LEN` as an i32, for the GUC definition.
-pub const DEFAULT_MAX_VALUE_BYTES: i32 = 512 * 1024 * 1024;
-
-pub const OOM_ERR: &str = "OOM command not allowed when used memory > 'maxmemory'.";
-
-/// Report a store write that did not happen, instead of replying success.
-///
-/// `Store::set`/`set_typed` return false when the value cannot be allocated:
-/// larger than the arena, or the arena is full of entries that cannot be
-/// evicted (a referenced value awaiting persistence, for instance). Every call
-/// site used to discard that, so the client was told `+OK` for a value the very
-/// next `GET` would not return.
-#[must_use]
-fn wrote(out: &mut Vec<u8>, ok: bool) -> bool {
-    if !ok {
-        resp::error(out, OOM_ERR);
-    }
-    ok
-}
-
-/// Values at or below this are copied into the ring; larger ones are staged by
-/// reference (see [`ring::KIND_REF`]).
-///
-/// 8 KiB is the store's largest slab class, so this is exactly the line between
-/// a value that fits a size class and one that takes the OVERSIZED path. Below
-/// it the copy is a few microseconds and buys complete independence from
-/// eviction, which is worth keeping for the overwhelming majority of traffic.
-/// Above it the copy is both expensive and the thing that made ring capacity a
-/// ceiling on value size, so those go by reference.
-pub const INLINE_MAX: usize = 8 * 1024;
-
-/// Which ring a key's records go to. A key always maps to the same shard, so
-/// its writes and deletes stay ordered and cannot conflict on `ON CONFLICT`.
-#[inline]
-fn shard_of(n: usize, key: &[u8]) -> usize {
-    if n <= 1 {
-        0
-    } else {
-        crc16::key_slot(key) as usize % n
-    }
-}
-
+/// No-loss backpressure: if the ring is full, wait (bounded) for the persistence
+/// worker to drain rather than dropping the write. Under sustained overload this
+/// throttles the RESP write path to the drain rate instead of silently losing
+/// durability. The bound only trips if persistence is wedged, in which case the
+/// record is dropped and counted (`ring_stats.dropped`) — a loud, rare event.
 fn shard_push(
     producers: &[ring::Producer],
     key: &[u8],
@@ -110,21 +66,23 @@ fn shard_push(
     if n == 0 {
         return None;
     }
-    let shard = shard_of(n, key);
+    let shard = if n == 1 {
+        0
+    } else {
+        crc16::key_slot(key) as usize % n
+    };
     let p = &producers[shard];
     if let Some(seq) = p.push(key, val, exp, kind) {
         return Some((shard, seq));
     }
-    let deadline = Instant::now() + PUSH_DEADLINE;
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         std::thread::sleep(Duration::from_micros(50));
         if let Some(seq) = p.push(key, val, exp, kind) {
             return Some((shard, seq));
         }
         if Instant::now() >= deadline {
-            // Persistence is wedged or the value cannot be encoded. Count it
-            // and let the caller decide: a sync-ack tier answers with an error.
-            p.note_drop();
+            p.note_drop(); // persistence wedged: drop + count, rather than hang forever
             return None;
         }
     }
@@ -276,12 +234,6 @@ struct Conn {
     // durable sync-ack: (ring, seq) the connection's reply is waiting on. While
     // non-empty the reply is held (not flushed) and no further commands are read.
     ack: Vec<(usize, u64)>,
-    // Backpressure park: the persistence ring had no room for this command's
-    // record, so the command was NOT applied and NOT consumed from `rbuf`. It
-    // is retried verbatim once the ring drains. Nothing is mutated and nothing
-    // is replied while this is set, which is what keeps the shared-memory
-    // store and `supacache.kv` from diverging under overload.
-    parked: bool,
     // When set, this connection is TLS: ciphertext on the socket, plaintext in
     // rbuf/wbuf. `wpos` then counts wbuf bytes already fed to the TLS writer.
     tls: Option<Box<rustls::ServerConnection>>,
@@ -325,12 +277,12 @@ pub struct Worker {
     auth: Option<AuthConfig>,
     // durable tier: hold each write's RESP reply until its ring record commits.
     sync_ack: bool,
-    // Largest bulk string accepted from a client, from
-    // `pg_keyspace.max_value_bytes`. The arena is the real bound on what
-    // can be stored; this bounds what will even be buffered, so a hostile
-    // client cannot make the server hold an arbitrary amount for a value
-    // that is going to be refused anyway.
-    max_value_bytes: usize,
+    // Cluster routing. When set, this worker serves only the keys whose CRC16
+    // slot it owns and answers anything else with a Redis-Cluster `MOVED`
+    // redirect. Enabled for persisted multi-worker deployments, where a write
+    // taken by the wrong worker would be recovered into the owning worker's
+    // segment after a restart and so silently vanish from the one that took it.
+    routing: Option<Routing>,
     // TLS: when set, every accepted connection is wrapped in a TLS session so
     // the RESP wire is encrypted (the AUTH password is otherwise sent in clear).
     tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -385,7 +337,7 @@ impl Worker {
             producers: Vec::new(),
             auth: None,
             sync_ack: false,
-            max_value_bytes: resp::DEFAULT_MAX_BULK_LEN,
+            routing: None,
             tls_config: None,
             channels: HashMap::new(),
             patterns: HashMap::new(),
@@ -414,11 +366,6 @@ impl Worker {
         self.sync_ack = on;
     }
 
-    /// Largest bulk string to accept from a client (`pg_keyspace.max_value_bytes`).
-    pub fn set_max_value_bytes(&mut self, n: usize) {
-        self.max_value_bytes = n.max(1);
-    }
-
     /// Enable TLS: every accepted connection is wrapped in a server-side TLS
     /// session, so the RESP wire (including the AUTH password) is encrypted.
     pub fn set_tls_config(&mut self, cfg: Arc<rustls::ServerConfig>) {
@@ -429,6 +376,22 @@ impl Worker {
     /// each drained by its own persistence worker.
     pub fn set_ring_producers(&mut self, producers: Vec<ring::Producer>) {
         self.producers = producers;
+    }
+
+    /// Serve only this worker's slot range, redirecting every other key with a
+    /// Redis-Cluster `MOVED`.
+    ///
+    /// `endpoints[w]` is the `host:port` a client should retry against for a key
+    /// worker `w` owns. Persisted multi-worker deployments must enable this:
+    /// recovery restores each key into the segment its slot range covers, so a
+    /// worker that accepted a key it does not own would lose that key on the next
+    /// restart — after having acked the write as durable.
+    pub fn set_slot_routing(&mut self, index: usize, nworkers: usize, endpoints: Vec<String>) {
+        self.routing = if nworkers > 1 {
+            Some(Routing { index, nworkers, endpoints })
+        } else {
+            None
+        };
     }
 
     /// Enable access control: RESP AUTH required, keyspace ACL + tenant scope.
@@ -509,93 +472,9 @@ impl Worker {
                     }
                 }
             }
-            // Publish how far persistence has committed so eviction knows which
-            // referenced values are safe to drop. The minimum across rings is
-            // used because sequence numbers are per-ring: conservative, and
-            // exact for the default single persist shard.
-            if !self.producers.is_empty() {
-                let w = self
-                    .producers
-                    .iter()
-                    .map(|p| p.committed())
-                    .min()
-                    .unwrap_or(0);
-                self.store.set_commit_watermark(w);
-            }
-            // Durable tier: release replies whose ring records have committed,
-            // then retry anything parked waiting for ring space to free up.
+            // Durable tier: release replies whose ring records have committed.
             if self.sync_ack {
                 self.resolve_acks();
-                self.resume_parked();
-            }
-        }
-    }
-
-    /// Whether every ring this command will write to can take its record(s).
-    ///
-    /// Sizes are upper bounds, deliberately. A string write persists the value
-    /// it was given, so that one is exact. An aggregate write (`HSET`, `LPUSH`,
-    /// `ZADD`, …) persists the *whole* post-mutation blob, whose size is not
-    /// known until after the mutation we are trying to avoid, so bound it by
-    /// the current blob plus every argument byte: the new blob cannot exceed
-    /// what is already stored plus what is being added. Over-estimating parks
-    /// slightly early, which is the safe direction.
-    fn rings_have_room(&self, cmd: &[u8], args: &[Vec<u8>], key_idxs: &[usize]) -> bool {
-        let n = self.producers.len();
-        if n == 0 {
-            return true;
-        }
-        let arg_bytes: usize = args.iter().map(|a| a.len()).sum();
-        let aggregate = is_aggregate_write(cmd);
-        for &ki in key_idxs {
-            let key = match args.get(ki) {
-                Some(k) => k,
-                None => continue,
-            };
-            let inline_bound = if aggregate {
-                // current blob (if any) + everything this command could add
-                let cur = self
-                    .store
-                    .get_typed(key)
-                    .map(|(_, _, blob)| blob.len())
-                    .unwrap_or(0);
-                cur + arg_bytes
-            } else {
-                arg_bytes
-            };
-            // A record never carries more than `INLINE_MAX` of value: past that
-            // the value is staged by reference and the record holds an 8-byte
-            // version instead. Sizing this check by the value itself made a
-            // write larger than `ring_mb` demand ring space it would never use,
-            // so `has_room` could never be satisfied and the connection parked
-            // forever with no error and no timeout.
-            let val_bound = inline_bound.min(INLINE_MAX);
-            if !self.producers[shard_of(n, key)].has_room(key.len(), val_bound) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Retry connections parked on a full persistence ring. Called once per
-    /// event-loop pass in a sync-ack tier: the poll has a bounded timeout, so
-    /// a parked connection is retried promptly without needing its own timer,
-    /// and the retry is just `process` re-reading the command still sitting in
-    /// `rbuf`.
-    fn resume_parked(&mut self) {
-        let parked: Vec<RawFd> = self
-            .conns
-            .iter()
-            .filter(|(_, c)| c.parked)
-            .map(|(fd, _)| *fd)
-            .collect();
-        for fd in parked {
-            if let Some(c) = self.conns.get_mut(&fd) {
-                c.parked = false; // re-evaluated by the pre-flight on retry
-            }
-            self.process(fd);
-            if self.conns.contains_key(&fd) {
-                self.flush(fd);
             }
         }
     }
@@ -667,7 +546,6 @@ impl Worker {
                     tenant: String::new(),
                     exempt: false,
                     ack: Vec::new(),
-                    parked: false,
                     tls,
                     subs: HashSet::new(),
                     psubs: HashSet::new(),
@@ -792,9 +670,6 @@ impl Worker {
             return;
         }
         let mut consumed_total = 0usize;
-        // Copied out before the borrows below: `self.args` is taken mutably
-        // inside the block, so `self.max_value_bytes` cannot also be read there.
-        let max_value_bytes = self.max_value_bytes;
         loop {
             // Parse one command and materialise its args as owned bytes, so the
             // immutable borrow of rbuf is dropped before we touch wbuf/store.
@@ -804,7 +679,7 @@ impl Worker {
                     None => return,
                 };
                 let buf = &c.rbuf[consumed_total..];
-                let parse = resp::parse(buf, &mut self.args, max_value_bytes);
+                let parse = resp::parse(buf, &mut self.args);
                 let cmd_args: Vec<Vec<u8>> = if let Parse::Complete { .. } = parse {
                     self.args.iter().map(|&(s, e)| buf[s..e].to_vec()).collect()
                 } else {
@@ -820,12 +695,6 @@ impl Worker {
                 }
                 Parse::Complete { consumed } => {
                     self.dispatch(fd, &cmd_args);
-                    // Parked on a full ring: the command was neither applied
-                    // nor answered, so it must stay in `rbuf` to be retried
-                    // verbatim. Consuming it here would lose the write.
-                    if self.conns.get(&fd).map(|c| c.parked).unwrap_or(false) {
-                        break;
-                    }
                     consumed_total += consumed;
                     let stop = self
                         .conns
@@ -956,6 +825,35 @@ impl Worker {
         // From here on, use the (possibly scoped) args.
         let args: &[Vec<u8>] = if eff.is_empty() { args } else { &eff };
 
+        // ---- cluster routing: refuse keys this worker does not own ----
+        // Checked on the tenant-scoped key, which is what gets stored, sharded
+        // into a ring and persisted, so the slot here is the slot recovery will
+        // route by. A multi-key command touching another worker's key is a
+        // genuine CROSSSLOT: the workers are shared-nothing, so no single worker
+        // can serve it.
+        if let Some(r) = &self.routing {
+            let mut owners = key_idxs.iter().filter_map(|&i| {
+                args.get(i).map(|k| (crc16::key_owner(k, r.nworkers), i))
+            });
+            if let Some((first, idx)) = owners.next() {
+                // All keys on one worker: serve it here, or redirect the client
+                // there. Keys split across workers cannot be served by anyone.
+                let split = owners.any(|(o, _)| o != first);
+                if split {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(out, "CROSSSLOT Keys in request don't hash to the same slot");
+                    return;
+                }
+                if first != r.index {
+                    let slot = crc16::key_slot(&args[idx]);
+                    let ep = r.endpoints.get(first).cloned().unwrap_or_default();
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(out, &format!("MOVED {slot} {ep}"));
+                    return;
+                }
+            }
+        }
+
         let store = self.store.clone();
         let batcher = self.batcher.clone();
         let tier = self.tier;
@@ -972,30 +870,6 @@ impl Worker {
         // (ring, seq) records enqueued this command; a durable write's reply is
         // held until all of them commit.
         let mut acks: Vec<(usize, u64)> = Vec::new();
-
-        // ---- backpressure pre-flight (sync-ack tiers only) ----------------
-        // Check the ring BEFORE touching the store. Applying the write first
-        // and discovering afterwards that it cannot be queued leaves the
-        // shared-memory store holding a value that will never be durable: the
-        // client is told the write failed, the very next GET returns it, and a
-        // restart loses it. Ordering the check first makes that impossible.
-        //
-        // The check is sound without a lock because there is one producer per
-        // ring (this event loop) and the consumer only frees space, so room
-        // seen here still exists at push time.
-        if sync_ack && persist_on && is_write_cmd(&cmd) {
-            if !self.rings_have_room(&cmd, args, &key_idxs) {
-                // Park: nothing mutated, nothing replied. `process` leaves the
-                // command in `rbuf` and retries it once the ring drains.
-                if let Some(c) = self.conns.get_mut(&fd) {
-                    c.parked = true;
-                }
-                return;
-            }
-        }
-
-        // Where this command's reply begins, so a late failure can rewind it.
-        let reply_start = self.conns.get(&fd).map_or(0, |c| c.wbuf.len());
         let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
 
         match cmd.as_slice() {
@@ -1054,9 +928,7 @@ impl Worker {
                     }
                     i += 2;
                 }
-                if !wrote(out, store.set(&args[1], &args[2], ttl_micros)) {
-                    return;
-                }
+                store.set(&args[1], &args[2], ttl_micros);
                 resp::simple(out, "OK");
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
@@ -1069,9 +941,7 @@ impl Worker {
                 let n = if exists {
                     0
                 } else {
-                    if !wrote(out, store.set(&args[1], &args[2], 0)) {
-                        return;
-                    }
+                    store.set(&args[1], &args[2], 0);
                     durable_log(&batcher, tier, &args[1], &args[2]);
                     if persist_on {
                         stages.push((args[1].clone(), args[2].clone(), 0, b's'));
@@ -1089,9 +959,7 @@ impl Worker {
                     Lookup::Hit(v) => Some(v.to_vec()),
                     Lookup::Miss => None,
                 };
-                if !wrote(out, store.set(&args[1], &args[2], 0)) {
-                    return;
-                }
+                store.set(&args[1], &args[2], 0);
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
                     stages.push((args[1].clone(), args[2].clone(), 0, b's'));
@@ -1318,9 +1186,7 @@ impl Worker {
                 }
                 let mut i = 1;
                 while i + 1 < nargs {
-                    if !wrote(out, store.set(&args[i], &args[i + 1], 0)) {
-                        return;
-                    }
+                    store.set(&args[i], &args[i + 1], 0);
                     durable_log(&batcher, tier, &args[i], &args[i + 1]);
                     if persist_on {
                         stages.push((args[i].clone(), args[i + 1].clone(), 0, b's'));
@@ -1349,9 +1215,7 @@ impl Worker {
                 } else {
                     let mut i = 1;
                     while i + 1 < nargs {
-                        if !wrote(out, store.set(&args[i], &args[i + 1], 0)) {
-                            return;
-                        }
+                        store.set(&args[i], &args[i + 1], 0);
                         durable_log(&batcher, tier, &args[i], &args[i + 1]);
                         if persist_on {
                             stages.push((args[i].clone(), args[i + 1].clone(), 0, b's'));
@@ -1379,9 +1243,7 @@ impl Worker {
                     return;
                 }
                 let ttl = if cmd == b"PSETEX" { n * 1_000 } else { n * 1_000_000 };
-                if !wrote(out, store.set(&args[1], &args[3], ttl)) {
-                    return;
-                }
+                store.set(&args[1], &args[3], ttl);
                 resp::simple(out, "OK");
                 durable_log(&batcher, tier, &args[1], &args[3]);
                 if persist_on {
@@ -1459,9 +1321,7 @@ impl Worker {
                 };
                 buf.extend_from_slice(&args[2]);
                 let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
-                if !wrote(out, store.set(&args[1], &buf, ttl)) {
-                    return;
-                }
+                store.set(&args[1], &buf, ttl);
                 resp::integer(out, buf.len() as i64);
                 durable_log(&batcher, tier, &args[1], &buf);
                 if persist_on {
@@ -1529,9 +1389,7 @@ impl Worker {
                 }
                 buf[off..end].copy_from_slice(&args[3]);
                 let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
-                if !wrote(out, store.set(&args[1], &buf, ttl)) {
-                    return;
-                }
+                store.set(&args[1], &buf, ttl);
                 resp::integer(out, buf.len() as i64);
                 durable_log(&batcher, tier, &args[1], &buf);
                 if persist_on {
@@ -1572,9 +1430,7 @@ impl Worker {
                 }
                 let s = aggr::fmt_score(nv).into_bytes();
                 let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
-                if !wrote(out, store.set(&args[1], &s, ttl)) {
-                    return;
-                }
+                store.set(&args[1], &s, ttl);
                 resp::bulk(out, &s);
                 durable_log(&batcher, tier, &args[1], &s);
                 if persist_on {
@@ -1607,9 +1463,7 @@ impl Worker {
                     resp::simple(out, "OK");
                     return;
                 }
-                if !wrote(out, store.set_typed(&dst, &blob, remaining_ttl(exp), kind)) {
-                    return;
-                }
+                store.set_typed(&dst, &blob, remaining_ttl(exp), kind);
                 store.del(&src);
                 if persist_on {
                     stages.push((dst, blob, if exp > 0 { exp } else { 0 }, kind as u8));
@@ -1641,9 +1495,7 @@ impl Worker {
                     resp::integer(out, 0);
                     return;
                 }
-                if !wrote(out, store.set_typed(&args[2], &blob, remaining_ttl(exp), kind)) {
-                    return;
-                }
+                store.set_typed(&args[2], &blob, remaining_ttl(exp), kind);
                 if persist_on {
                     stages.push((args[2].clone(), blob, if exp > 0 { exp } else { 0 }, kind as u8));
                 }
@@ -1891,9 +1743,7 @@ impl Worker {
                     }
                     i += 2;
                 }
-                if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
-                    return;
-                }
+                store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
                 if cmd == b"HMSET" {
                     resp::simple(out, "OK");
                 } else {
@@ -1913,9 +1763,7 @@ impl Worker {
                     resp::integer(out, 0);
                 } else {
                     h.set(&args[2], &args[3]);
-                    if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
-                        return;
-                    }
+                    store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
                     resp::integer(out, 1);
                 }
             }
@@ -1968,9 +1816,7 @@ impl Worker {
                 if h.is_empty() {
                     store.del(&args[1]); // Redis drops an emptied hash
                 } else {
-                    if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
-                        return;
-                    }
+                    store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
                 }
                 resp::integer(out, removed);
             }
@@ -2055,9 +1901,7 @@ impl Worker {
                 };
                 let next = cur + by;
                 h.set(&args[2], &itoa(next));
-                if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
-                    return;
-                }
+                store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
                 resp::integer(out, next);
             }
             // ---- lists --------------------------------------------
@@ -2084,9 +1928,7 @@ impl Worker {
                     }
                 }
                 let n = l.len() as i64;
-                if !save_list(&store, &args[1], &l, exp, out) {
-                    return;
-                }
+                save_list(&store, &args[1], &l, exp);
                 resp::integer(out, n);
             }
             b"LPOP" | b"RPOP" => {
@@ -2137,9 +1979,7 @@ impl Worker {
                         }
                     }
                 }
-                if !save_list(&store, &args[1], &l, exp, out) {
-                    return;
-                }
+                save_list(&store, &args[1], &l, exp);
             }
             b"LLEN" => {
                 let raw = match list_raw(&store, &args[1], out) {
@@ -2213,9 +2053,7 @@ impl Worker {
                 match l.real_index(i) {
                     Some(idx) => {
                         l.items[idx] = args[3].clone();
-                        if !save_list(&store, &args[1], &l, exp, out) {
-                            return;
-                        }
+                        save_list(&store, &args[1], &l, exp);
                         resp::simple(out, "OK");
                     }
                     None => resp::error(out, "ERR index out of range"),
@@ -2234,9 +2072,7 @@ impl Worker {
                 };
                 let (lo, hi) = l.range_bounds(start, stop);
                 l.items = l.items[lo..hi].to_vec();
-                if !save_list(&store, &args[1], &l, exp, out) {
-                    return;
-                }
+                save_list(&store, &args[1], &l, exp);
                 resp::simple(out, "OK");
             }
             // ---- sorted sets --------------------------------------
@@ -2295,9 +2131,7 @@ impl Worker {
                         changed += 1;
                     }
                 }
-                if !save_zset(&store, &args[1], &z, exp, out) {
-                    return;
-                }
+                save_zset(&store, &args[1], &z, exp);
                 resp::integer(out, if ch { changed } else { added });
             }
             b"ZSCORE" => {
@@ -2353,9 +2187,7 @@ impl Worker {
                         removed += 1;
                     }
                 }
-                if !save_zset(&store, &args[1], &z, exp, out) {
-                    return;
-                }
+                save_zset(&store, &args[1], &z, exp);
                 resp::integer(out, removed);
             }
             b"ZINCRBY" => {
@@ -2376,9 +2208,7 @@ impl Worker {
                 };
                 let next = z.score(&args[3]).unwrap_or(0.0) + by;
                 z.add(&args[3], next);
-                if !save_zset(&store, &args[1], &z, exp, out) {
-                    return;
-                }
+                save_zset(&store, &args[1], &z, exp);
                 resp::double(out, &aggr::fmt_score(next), resp3);
             }
             b"ZRANK" | b"ZREVRANK" => {
@@ -2539,9 +2369,7 @@ impl Worker {
                 }
                 let s = aggr::fmt_score(nv);
                 h.set(&args[2], s.as_bytes());
-                if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
-                    return;
-                }
+                store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
                 resp::bulk(out, s.as_bytes());
             }
             b"HRANDFIELD" => {
@@ -2617,9 +2445,7 @@ impl Worker {
                         let at = if before { idx } else { idx + 1 };
                         l.items.insert(at, args[4].clone());
                         let n = l.len() as i64;
-                        if !save_list(&store, &args[1], &l, exp, out) {
-                            return;
-                        }
+                        save_list(&store, &args[1], &l, exp);
                         resp::integer(out, n);
                     }
                     None => resp::integer(out, -1), // pivot not found
@@ -2667,9 +2493,7 @@ impl Worker {
                         }
                     }
                 }
-                if !save_list(&store, &args[1], &l, exp, out) {
-                    return;
-                }
+                save_list(&store, &args[1], &l, exp);
                 resp::integer(out, removed);
             }
             b"LPOS" => {
@@ -2789,9 +2613,7 @@ impl Worker {
                             } else {
                                 l.rpush(&v);
                             }
-                            if !save_list(&store, &args[1], &l, exp, out) {
-                                return;
-                            }
+                            save_list(&store, &args[1], &l, exp);
                             resp::bulk(out, &v);
                         }
                     }
@@ -2817,12 +2639,8 @@ impl Worker {
                             } else {
                                 dst.rpush(&v);
                             }
-                            if !save_list(&store, &args[1], &src, sexp, out) {
-                                return;
-                            }
-                            if !save_list(&store, &args[2], &dst, dexp, out) {
-                                return;
-                            }
+                            save_list(&store, &args[1], &src, sexp);
+                            save_list(&store, &args[2], &dst, dexp);
                             resp::bulk(out, &v);
                         }
                     }
@@ -2865,9 +2683,7 @@ impl Worker {
                 for (m, _) in &chosen {
                     z.remove(m);
                 }
-                if !save_zset(&store, &args[1], &z, exp, out) {
-                    return;
-                }
+                save_zset(&store, &args[1], &z, exp);
                 // Valkey pairs the counted form under RESP3; the bare form stays flat.
                 reply_scored(out, &chosen, resp3 && count_given, resp3);
             }
@@ -2925,9 +2741,7 @@ impl Worker {
                         added += 1;
                     }
                 }
-                if !save_set(&store, &args[1], &s, exp, out) {
-                    return;
-                }
+                save_set(&store, &args[1], &s, exp);
                 resp::integer(out, added);
             }
             b"SREM" => {
@@ -2945,9 +2759,7 @@ impl Worker {
                         removed += 1;
                     }
                 }
-                if !save_set(&store, &args[1], &s, exp, out) {
-                    return;
-                }
+                save_set(&store, &args[1], &s, exp);
                 resp::integer(out, removed);
             }
             b"SCARD" => {
@@ -3019,9 +2831,7 @@ impl Worker {
                     }
                     let i = (rng_next(&mut rand_seed()) as usize) % s.len();
                     let m = s.members.remove(i);
-                    if !save_set(&store, &args[1], &s, exp, out) {
-                        return;
-                    }
+                    save_set(&store, &args[1], &s, exp);
                     resp::bulk(out, &m);
                     return;
                 }
@@ -3042,9 +2852,7 @@ impl Worker {
                 for i in idx {
                     popped.push(s.members.remove(i));
                 }
-                if !save_set(&store, &args[1], &s, exp, out) {
-                    return;
-                }
+                save_set(&store, &args[1], &s, exp);
                 resp::array_header(out, popped.len());
                 for m in &popped {
                     resp::bulk(out, m);
@@ -3101,12 +2909,8 @@ impl Worker {
                     return;
                 }
                 dst.add(&args[3]);
-                if !save_set(&store, &args[1], &src, sexp, out) {
-                    return;
-                }
-                if !save_set(&store, &args[2], &dst, dexp, out) {
-                    return;
-                }
+                save_set(&store, &args[1], &src, sexp);
+                save_set(&store, &args[2], &dst, dexp);
                 resp::integer(out, 1);
                 if persist_on {
                     for k in [&args[1], &args[2]] {
@@ -3157,9 +2961,7 @@ impl Worker {
                 if ns.is_empty() {
                     store.del(&args[1]);
                 } else {
-                    if !wrote(out, store.set_typed(&args[1], &ns.encode(), 0, KIND_SET)) {
-                        return;
-                    }
+                    store.set_typed(&args[1], &ns.encode(), 0, KIND_SET);
                 }
                 resp::integer(out, ns.len() as i64);
             }
@@ -3304,9 +3106,7 @@ impl Worker {
                     if z.is_empty() {
                         store.del(&args[1]);
                     } else {
-                        if !wrote(out, store.set_typed(&args[1], &z.encode(), 0, KIND_ZSET)) {
-                            return;
-                        }
+                        store.set_typed(&args[1], &z.encode(), 0, KIND_ZSET);
                     }
                     resp::integer(out, result.len() as i64);
                 } else if withscores {
@@ -3365,9 +3165,7 @@ impl Worker {
                     for (m, _) in &chosen {
                         z.remove(m);
                     }
-                    if !save_zset(&store, k, &z, exp, out) {
-                        return;
-                    }
+                    save_zset(&store, k, &z, exp);
                     resp::array_header(out, 2);
                     resp::bulk(out, k);
                     resp::array_header(out, chosen.len());
@@ -3527,9 +3325,7 @@ impl Worker {
                 if nz.is_empty() {
                     store.del(&args[1]);
                 } else {
-                    if !wrote(out, store.set_typed(&args[1], &nz.encode(), 0, KIND_ZSET)) {
-                        return;
-                    }
+                    store.set_typed(&args[1], &nz.encode(), 0, KIND_ZSET);
                 }
                 resp::integer(out, n as i64);
                 if persist_on {
@@ -3604,71 +3400,15 @@ impl Worker {
             });
         }
 
-        let mut queue_failed = false;
         for (k, v, e, kind) in stages {
             // sharded so a given key always lands on the same ring/persist worker
             // — no cross-worker key conflicts on ON CONFLICT.
-            //
-            // Large values are staged by reference: the record carries the
-            // entry's version instead of the value, and the persistence worker
-            // reads the bytes straight out of the shared segment. That removes
-            // the second copy of the value and stops ring capacity from
-            // bounding how large a value may be. `stage_by_ref` also records
-            // the sequence on the entry so eviction cannot drop it before the
-            // worker has committed it.
-            let staged = match (v.len() > INLINE_MAX && e != DELETE_TOMBSTONE)
-                .then(|| store.version_of(&k))
-                .flatten()
-            {
-                Some(version) => {
-                    let r = shard_push(
-                        &self.producers,
-                        &k,
-                        &version.to_le_bytes(),
-                        e,
-                        kind | ring::KIND_REF,
-                    );
-                    // Marked after the push so the sequence is known. Safe to
-                    // do in this order: eviction runs on this same thread, so
-                    // nothing can drop the entry in between.
-                    if let Some((_, seq)) = r {
-                        store.set_staged_seq(&k, seq);
-                    }
-                    r
-                }
-                // Small value, a tombstone, or a key that vanished under us:
-                // copy it into the ring as before.
-                None => shard_push(&self.producers, &k, &v, e, kind),
-            };
-            match staged {
-                Some(sa) => acks.push(sa),
-                None => {
-                    queue_failed = true;
-                    break;
-                }
+            if let Some(sa) = shard_push(&self.producers, &k, &v, e, kind) {
+                acks.push(sa);
             }
         }
-        if queue_failed && sync_ack {
-            // A sync-ack tier promises that a successful reply means the write
-            // reached supacache.kv. The record could not even be queued, so the
-            // promise cannot be kept: replace the reply already written with an
-            // error instead of flushing a +OK for a write that is not durable.
-            //
-            // The shared-memory mutation has already been applied and is NOT
-            // rolled back: undoing it is not generally possible (INCR, LPUSH and
-            // the aggregate commands are not invertible from here). So the value
-            // may be readable until the next restart while never becoming
-            // durable. The error says exactly that, and it is the honest report
-            // of an ambiguous outcome rather than a false success.
-            let c = self.conns.get_mut(&fd).unwrap();
-            c.wbuf.truncate(reply_start);
-            resp::error(
-                &mut c.wbuf,
-                "ERR persistence backlog full: write applied in memory but NOT durable",
-            );
-            c.ack.clear();
-        } else if sync_ack && !acks.is_empty() {
-            // Durable tier: hold this command's reply until its record(s) commit.
+        // Durable tier: hold this command's reply until its record(s) commit.
+        if sync_ack && !acks.is_empty() {
             self.conns.get_mut(&fd).unwrap().ack = acks;
         }
 
@@ -5000,13 +4740,12 @@ fn load_list(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::List
 }
 
 /// Store a list back, or delete the key if it became empty (Redis semantics).
-#[must_use]
-fn save_list(store: &Store, key: &[u8], l: &aggr::List, exp: i64, out: &mut Vec<u8>) -> bool {
+fn save_list(store: &Store, key: &[u8], l: &aggr::List, exp: i64) {
     if l.is_empty() {
         store.del(key);
-        return true;
+    } else {
+        store.set_typed(key, &l.encode(), remaining_ttl(exp), KIND_LIST);
     }
-    wrote(out, store.set_typed(key, &l.encode(), remaining_ttl(exp), KIND_LIST))
 }
 
 /// Borrow the raw zset blob at `key` for sub-linear reads (ZSCORE/ZRANK/ZRANGE/
@@ -5038,13 +4777,12 @@ fn load_zset(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::ZSet
 }
 
 /// Store a sorted set back, or delete the key if it became empty.
-#[must_use]
-fn save_zset(store: &Store, key: &[u8], z: &aggr::ZSet, exp: i64, out: &mut Vec<u8>) -> bool {
+fn save_zset(store: &Store, key: &[u8], z: &aggr::ZSet, exp: i64) {
     if z.is_empty() {
         store.del(key);
-        return true;
+    } else {
+        store.set_typed(key, &z.encode(), remaining_ttl(exp), KIND_ZSET);
     }
-    wrote(out, store.set_typed(key, &z.encode(), remaining_ttl(exp), KIND_ZSET))
 }
 
 /// Borrow the raw set blob at `key` for O(1) SISMEMBER/SCARD off the stored
@@ -5074,13 +4812,12 @@ fn load_set(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::Set, 
 }
 
 /// Store a set back, or delete the key if it became empty (Redis semantics).
-#[must_use]
-fn save_set(store: &Store, key: &[u8], s: &aggr::Set, exp: i64, out: &mut Vec<u8>) -> bool {
+fn save_set(store: &Store, key: &[u8], s: &aggr::Set, exp: i64) {
     if s.is_empty() {
         store.del(key);
-        return true;
+    } else {
+        store.set_typed(key, &s.encode(), remaining_ttl(exp), KIND_SET);
     }
-    wrote(out, store.set_typed(key, &s.encode(), remaining_ttl(exp), KIND_SET))
 }
 
 /// Parse the trailing options of an H/S/ZSCAN (`[MATCH p] [COUNT n] [NOVALUES]`)
