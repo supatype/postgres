@@ -9,10 +9,11 @@ row cache for PostgREST. Stock clients — `redis-cli`, `ioredis`, `redis-py`,
 readable and writable from SQL. One system, one thing to run, one security model.
 
 A cache read lands in **~34 µs — tying Valkey** — and it is a complete
-extension: a full command surface, four durability tiers with real crash
-recovery and synchronous replication, native large-collection structures, a
-transparent PostgREST row cache, horizontal multi-worker scale-out, and an
-optional Postgres-native security layer.
+extension: a broad RESP command surface ([coverage](#command-coverage)) across
+strings, hashes, lists, sets, sorted sets, pub/sub and transactions; four
+durability tiers with real crash recovery and synchronous replication; native
+large-collection structures; a transparent PostgREST row cache; horizontal
+multi-worker scale-out; and an optional Postgres-native security layer.
 
 **pg_keyspace runs standalone.** It has **no dependency on any other extension** —
 not `supatype_mask`, not `pg_guard`. Load it on its own and it is a
@@ -83,7 +84,7 @@ ceiling for deep Postgres integration.
 | Column masking / RLS on cached rows | **Yes** — re-applied above the cache | N/A |
 | Durability | Tiered: ephemeral→relaxed→durable(fsync)→replicated; crash-recovers from PG tables | RDB / AOF snapshots & log |
 | Synchronous replication | **Yes** — ack held until standby fsync | Async by default (WAIT for quorum) |
-| Data types | strings, hashes, lists, sorted sets, pub/sub (+ TTL) | Full superset (streams, HLL, bitmaps, geo, …) |
+| Data types | strings, hashes, lists, sets, sorted sets, pub/sub (+ TTL), transactions | Superset (adds streams, HLL, bitmaps, geo, scripting) |
 | Raw write ceiling under no-persistence load | Lower (bounded by 1 event loop / worker) | **Higher** — purpose-built |
 | Maturity / ecosystem / ops tooling | New, focused feature set | **Mature**, huge ecosystem |
 
@@ -92,6 +93,41 @@ want SQL and RESP over the same data, a transparent row cache for PostgREST,
 per-key durability, and Postgres-native security — without operating a second
 stateful service. **Stay on Valkey when** you need maximum single-node write
 throughput, the full command/type surface, or mature cluster operations today.
+
+---
+
+## Command coverage
+
+A stock client (`redis-cli`, `ioredis`, `redis-py`, `valkey-go`) drives
+`pg_keyspace` unmodified. RESP3 clients transparently fall back to RESP2 (the
+`HELLO` handshake is answered as an unknown command, which the client's probe
+expects). Coverage below; anything not listed replies `ERR unknown command`.
+
+**Supported**
+
+| Group | Commands |
+|---|---|
+| Connection / server | `PING` `ECHO` `AUTH` `QUIT` `SELECT` `HELLO`→RESP2 `RESET` `CLIENT` `CONFIG` `COMMAND` `INFO` `TIME` `DBSIZE` `DEBUG` `MEMORY` |
+| Keys / generic | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` `TTL` `PTTL` `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `EXPIRETIME` `PEXPIRETIME` `PERSIST` `RENAME` `RENAMENX` `COPY` `TOUCH` `RANDOMKEY` `OBJECT` `FLUSHDB` `FLUSHALL` |
+| Strings | `GET` `SET` `SETNX` `SETEX` `PSETEX` `GETSET` `GETDEL` `GETEX` `APPEND` `STRLEN` `GETRANGE` `SETRANGE` `MGET` `MSET` `MSETNX` `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` |
+| Hashes | `HSET` `HMSET` `HSETNX` `HGET` `HMGET` `HDEL` `HGETALL` `HKEYS` `HVALS` `HLEN` `HEXISTS` `HSTRLEN` `HINCRBY` `HINCRBYFLOAT` `HRANDFIELD` `HSCAN` |
+| Lists | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP` `LLEN` `LINDEX` `LRANGE` `LSET` `LTRIM` `LINSERT` `LREM` `LPOS` `LMOVE` `RPOPLPUSH` |
+| Sets | `SADD` `SREM` `SCARD` `SISMEMBER` `SMISMEMBER` `SMEMBERS` `SPOP` `SRANDMEMBER` `SMOVE` `SSCAN` `SUNION` `SINTER` `SDIFF` `SUNIONSTORE` `SINTERSTORE` `SDIFFSTORE` `SINTERCARD` |
+| Sorted sets | `ZADD` `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZINCRBY` `ZRANK` `ZREVRANK` `ZCOUNT` `ZRANGE` `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` `ZLEXCOUNT` `ZRANGESTORE` `ZPOPMIN` `ZPOPMAX` `ZRANDMEMBER` `ZMPOP` `ZSCAN` `ZUNION` `ZINTER` `ZDIFF` `ZUNIONSTORE` `ZINTERSTORE` `ZDIFFSTORE` |
+| Pub/sub | `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` |
+| Transactions | `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` |
+
+**Not yet supported** — scripting (`EVAL`/`FUNCTION`), streams (`XADD`…),
+blocking ops (`BLPOP`/`BRPOP`/`BZPOPMIN`…), HyperLogLog / bitmaps / geo, RESP3
+client-side caching, and cluster commands. A RESP3 client must set
+`DisableCache` (client-side caching rides on RESP3, which is not offered).
+
+**Known divergences:** queuing a malformed command inside `MULTI` does not
+pre-flag `EXECABORT` (it errors as that command's element in the `EXEC` array;
+atomic apply and `WATCH`-abort are exact); `HSCAN`/`SSCAN`/`ZSCAN` return the
+whole collection in one call with cursor `0` (each aggregate is one blob), so
+`COUNT` is a hint; sorted-set scores print via Rust's shortest round-trip rather
+than `%.17g` (equal values, possibly different text).
 
 ---
 
@@ -226,9 +262,16 @@ SELECT convert_from(supacache.get('foo'), 'UTF8');   -- 'bar'  (same segment)
 SELECT * FROM supacache.stats();
 ```
 
-Redis data types work as expected (`HSET/HGET`, `LPUSH/LRANGE`, `ZADD/ZRANGE`,
-`SUBSCRIBE/PUBLISH`, `EXPIRE`, …), verified for Redis parity at 10 k-element
-scale.
+Redis data types work as expected (`HSET/HGET`, `LPUSH/LRANGE`, `SADD/SUNIONSTORE`,
+`ZADD/ZRANGE`, `SUBSCRIBE/PUBLISH`, `MULTI/EXEC`, …), verified for Redis parity
+at 10 k-element scale — see the full [command coverage](#command-coverage). Key
+lifetime and iteration are covered too: `SET … EX/PX`, `TTL`/`PTTL`,
+`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`, `PERSIST`, and `SCAN`/`KEYS`.
+
+**RESP2, client-side caching off.** pg_keyspace speaks RESP2; it does not
+implement `HELLO`/RESP3, so a RESP3 client that probes with `HELLO` falls back
+to RESP2 automatically (e.g. `valkey-go` — set `DisableCache: true`, since
+RESP3 client-side caching is unavailable).
 
 ### Durability & crash recovery
 
