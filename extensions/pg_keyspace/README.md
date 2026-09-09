@@ -2,8 +2,8 @@
 
 **A Redis/Valkey-compatible cache that lives *inside* PostgreSQL.**
 
-`pg_keyspace` is a Postgres extension that runs a RESP2 (Redis wire protocol)
-server in a background worker over a shared-memory keyspace, plus a transparent
+`pg_keyspace` is a Postgres extension that runs a RESP2/RESP3 (Redis wire
+protocol) server in a background worker over a shared-memory keyspace, plus a transparent
 row cache for PostgREST. Stock clients — `redis-cli`, `ioredis`, `redis-py`,
 `redis-benchmark` — talk to it unmodified on `:6381`, while the *same bytes* are
 readable and writable from SQL. One system, one thing to run, one security model.
@@ -99,15 +99,17 @@ throughput, the full command/type surface, or mature cluster operations today.
 ## Command coverage
 
 A stock client (`redis-cli`, `ioredis`, `redis-py`, `valkey-go`) drives
-`pg_keyspace` unmodified. RESP3 clients transparently fall back to RESP2 (the
-`HELLO` handshake is answered as an unknown command, which the client's probe
-expects). Coverage below; anything not listed replies `ERR unknown command`.
+`pg_keyspace` unmodified, in **RESP2 or RESP3**: `HELLO 3` negotiates RESP3
+(typed map/set/double/null replies and push-framed pub/sub), and `CLIENT
+TRACKING` enables server-assisted client-side caching (`invalidate` pushes),
+so `valkey-go`/`rueidis` can run with client-side caching on. Coverage below;
+anything not listed replies `ERR unknown command`.
 
 **Supported**
 
 | Group | Commands |
 |---|---|
-| Connection / server | `PING` `ECHO` `AUTH` `QUIT` `SELECT` `HELLO`→RESP2 `RESET` `CLIENT` `CONFIG` `COMMAND` `INFO` `TIME` `DBSIZE` `DEBUG` `MEMORY` |
+| Connection / server | `PING` `ECHO` `AUTH` `HELLO` (2/3) `QUIT` `SELECT` `RESET` `CLIENT` (incl. `TRACKING`) `CONFIG` `COMMAND` `INFO` `TIME` `DBSIZE` `DEBUG` `MEMORY` |
 | Keys / generic | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` `TTL` `PTTL` `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `EXPIRETIME` `PEXPIRETIME` `PERSIST` `RENAME` `RENAMENX` `COPY` `TOUCH` `RANDOMKEY` `OBJECT` `FLUSHDB` `FLUSHALL` |
 | Strings | `GET` `SET` `SETNX` `SETEX` `PSETEX` `GETSET` `GETDEL` `GETEX` `APPEND` `STRLEN` `GETRANGE` `SETRANGE` `MGET` `MSET` `MSETNX` `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` |
 | Hashes | `HSET` `HMSET` `HSETNX` `HGET` `HMGET` `HDEL` `HGETALL` `HKEYS` `HVALS` `HLEN` `HEXISTS` `HSTRLEN` `HINCRBY` `HINCRBYFLOAT` `HRANDFIELD` `HSCAN` |
@@ -118,9 +120,11 @@ expects). Coverage below; anything not listed replies `ERR unknown command`.
 | Transactions | `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` |
 
 **Not yet supported** — scripting (`EVAL`/`FUNCTION`), streams (`XADD`…),
-blocking ops (`BLPOP`/`BRPOP`/`BZPOPMIN`…), HyperLogLog / bitmaps / geo, RESP3
-client-side caching, and cluster commands. A RESP3 client must set
-`DisableCache` (client-side caching rides on RESP3, which is not offered).
+blocking ops (`BLPOP`/`BRPOP`/`BZPOPMIN`…), HyperLogLog / bitmaps / geo, and
+cluster commands. `CLIENT TRACKING` runs in default (per-read) mode over RESP3;
+BCAST/OPTIN/REDIRECT modes and cross-worker invalidation on the in-PG shared
+store are follow-ups (correct today on the daemon, where each worker owns an
+independent store).
 
 **Known divergences:** queuing a malformed command inside `MULTI` does not
 pre-flag `EXECABORT` (it errors as that command's element in the `EXEC` array;
@@ -268,10 +272,14 @@ at 10 k-element scale — see the full [command coverage](#command-coverage). Ke
 lifetime and iteration are covered too: `SET … EX/PX`, `TTL`/`PTTL`,
 `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`, `PERSIST`, and `SCAN`/`KEYS`.
 
-**RESP2, client-side caching off.** pg_keyspace speaks RESP2; it does not
-implement `HELLO`/RESP3, so a RESP3 client that probes with `HELLO` falls back
-to RESP2 automatically (e.g. `valkey-go` — set `DisableCache: true`, since
-RESP3 client-side caching is unavailable).
+**RESP2 and RESP3.** A client using RESP2 works unchanged. `HELLO 3` switches a
+connection to RESP3 — typed replies (map/set/double/null) and push-framed
+pub/sub — and `CLIENT TRACKING ON` turns on server-assisted client-side
+caching: keys the connection reads are tracked, and an `invalidate` push is
+sent when one changes (a null push on `FLUSHALL`/`FLUSHDB`). So `valkey-go`
+/`rueidis` can run with client-side caching enabled rather than
+`DisableCache`. Tracking is default (per-read) mode; see the caveats under
+[command coverage](#command-coverage).
 
 ### Durability & crash recovery
 
@@ -375,8 +383,8 @@ extensions/pg_keyspace/
 ├── core/                     shared core (Rust, libc only) + tools
 │   └── src/
 │       ├── store.rs          open-addressed hash, size-classed slab, CLOCK eviction
-│       ├── server.rs         epoll RESP2 event loop + command dispatch
-│       ├── resp.rs           RESP2 codec
+│       ├── server.rs         epoll RESP2/RESP3 event loop + command dispatch
+│       ├── resp.rs           RESP2/RESP3 codec
 │       ├── aggr.rs           hashes/lists/sorted sets, incl. indexed large-collection encodings
 │       ├── pubsub.rs         cross-worker pub/sub bus
 │       ├── batcher.rs        commit batching + the four durability tiers

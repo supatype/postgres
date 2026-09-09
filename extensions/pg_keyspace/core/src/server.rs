@@ -206,6 +206,13 @@ struct Conn {
     in_multi: bool,
     queued: Vec<Vec<Vec<u8>>>,
     watch: Vec<(Vec<u8>, Option<u64>)>,
+    // RESP3 (set by `HELLO 3`): reply nulls/maps/sets/doubles use the RESP3 wire
+    // forms and pub/sub + invalidations are delivered as push (`>`) frames.
+    resp3: bool,
+    // Server-assisted client-side caching (CLIENT TRACKING ON, default mode):
+    // keys this connection reads are recorded in the worker's `tracked` table and
+    // an `invalidate` push is sent here when one of them changes.
+    tracking: bool,
 }
 
 pub struct Worker {
@@ -236,6 +243,12 @@ pub struct Worker {
     // `None` for the single-worker in-PG extension (local delivery only).
     bus: Option<Arc<pubsub::Bus>>,
     worker_id: usize,
+    // Server-assisted client-side caching: scoped key -> the fds that read it
+    // while CLIENT TRACKING was on. A write to a key sends each of those fds an
+    // `invalidate` push and drops the entry (the client re-reads to re-track).
+    // Local to this worker — correct for the daemon (each worker owns an
+    // independent store); the in-PG shared-store multi-worker case is a follow-up.
+    tracked: HashMap<Vec<u8>, HashSet<RawFd>>,
 }
 
 impl Worker {
@@ -268,6 +281,7 @@ impl Worker {
             patterns: HashMap::new(),
             bus: None,
             worker_id: 0,
+            tracked: HashMap::new(),
         })
     }
 
@@ -442,6 +456,8 @@ impl Worker {
                     in_multi: false,
                     queued: Vec::new(),
                     watch: Vec::new(),
+                    resp3: false,
+                    tracking: false,
                 },
             );
         }
@@ -618,6 +634,18 @@ impl Worker {
             return;
         }
 
+        // ---- HELLO: RESP2/RESP3 negotiation ----
+        if cmd == b"HELLO" {
+            self.handle_hello(fd, args);
+            return;
+        }
+
+        // ---- CLIENT (incl. TRACKING for client-side caching) ----
+        if cmd == b"CLIENT" {
+            self.handle_client(fd, args);
+            return;
+        }
+
         // ---- pub/sub: handled before keyed-command scoping. Channels
         // are tenant-scoped for non-exempt authed roles (same `{tenant}:` prefix
         // as keys); the scoping is transparent — every reply/message frame echoes
@@ -707,6 +735,9 @@ impl Worker {
         // the unscoped form of — keys under its own prefix. Computed before the
         // `out` borrow below, which takes `self` mutably.
         let scan_prefix = self.conn_prefix(fd);
+        // RESP3 wire form for this connection (typed nulls/maps/sets/doubles);
+        // read before the `out` borrow below.
+        let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
         // A write to enqueue for persistence, applied after the match so
         // it does not tangle with the `out` borrow.
         let mut stages: Vec<PendingWrite> = Vec::new();
@@ -727,12 +758,8 @@ impl Worker {
                 resp::simple(out, "OK");
                 self.conns.get_mut(&fd).unwrap().closing = true;
             }
-            // No HELLO arm: RESP2-only. HELLO falls through to the catch-all,
-            // which replies `ERR unknown command 'HELLO'`. A RESP3 client such as
-            // valkey-go matches that (its `noHello` probe) and transparently falls
-            // back to RESP2, instead of the old `NOPROTO` reply which it did not
-            // recognise and closed the connection on.
-            b"CLIENT" | b"CONFIG" | b"SELECT" | b"RESET" => resp::simple(out, "OK"),
+            // HELLO and CLIENT are handled before this match.
+            b"CONFIG" | b"SELECT" | b"RESET" => resp::simple(out, "OK"),
             b"COMMAND" => resp::array_header(out, 0),
             b"DBSIZE" => {
                 let mut total = 0i64;
@@ -1660,7 +1687,7 @@ impl Worker {
                     Some(x) => x,
                     None => return,
                 };
-                resp::array_header(out, h.len() * 2);
+                resp::map_header(out, h.len(), resp3); // RESP3 map, RESP2 flat array
                 for (f, v) in &h.entries {
                     resp::bulk(out, f);
                     resp::bulk(out, v);
@@ -1979,7 +2006,7 @@ impl Worker {
                     None => return,
                 };
                 match raw.and_then(|b| aggr::zset_score(b, &args[2])) {
-                    Some(s) => resp::bulk(out, aggr::fmt_score(s).as_bytes()),
+                    Some(s) => resp::double(out, &aggr::fmt_score(s), resp3),
                     None => resp::nil(out),
                 }
             }
@@ -1995,7 +2022,7 @@ impl Worker {
                 resp::array_header(out, nargs - 2);
                 for m in &args[2..] {
                     match raw.and_then(|b| aggr::zset_score(b, m)) {
-                        Some(s) => resp::bulk(out, aggr::fmt_score(s).as_bytes()),
+                        Some(s) => resp::double(out, &aggr::fmt_score(s), resp3),
                         None => resp::nil(out),
                     }
                 }
@@ -2044,7 +2071,7 @@ impl Worker {
                 let next = z.score(&args[3]).unwrap_or(0.0) + by;
                 z.add(&args[3], next);
                 save_zset(&store, &args[1], &z, exp);
-                resp::bulk(out, aggr::fmt_score(next).as_bytes());
+                resp::double(out, &aggr::fmt_score(next), resp3);
             }
             b"ZRANK" | b"ZREVRANK" => {
                 if nargs != 3 {
@@ -2631,7 +2658,7 @@ impl Worker {
                     Some(x) => x,
                     None => return,
                 };
-                resp::array_header(out, s.len());
+                resp::set_header(out, s.len(), resp3); // RESP3 set, RESP2 array
                 for m in &s.members {
                     resp::bulk(out, m);
                 }
@@ -2756,7 +2783,7 @@ impl Worker {
                     }
                 }
                 let result = set_combine(&cmd, &sets);
-                resp::array_header(out, result.len());
+                resp::set_header(out, result.len(), resp3); // RESP3 set, RESP2 array
                 for m in &result {
                     resp::bulk(out, m);
                 }
@@ -3234,6 +3261,28 @@ impl Worker {
         if sync_ack && !acks.is_empty() {
             self.conns.get_mut(&fd).unwrap().ack = acks;
         }
+
+        // ---- server-assisted client-side caching (CLIENT TRACKING) ----
+        // A write invalidates every tracker of the keys it touched; a read from a
+        // tracking connection records the keys it just read so a later write to
+        // them fires an invalidation. FLUSH invalidates the whole keyspace.
+        if matches!(cmd.as_slice(), b"FLUSHALL" | b"FLUSHDB") {
+            self.invalidate_all(fd);
+        } else if !key_idxs.is_empty() {
+            if is_write_cmd(&cmd) {
+                for &i in &key_idxs {
+                    if let Some(k) = args.get(i) {
+                        self.invalidate_key(k, fd);
+                    }
+                }
+            } else if self.conns.get(&fd).map(|c| c.tracking).unwrap_or(false) {
+                for &i in &key_idxs {
+                    if let Some(k) = args.get(i) {
+                        self.tracked.entry(k.to_vec()).or_default().insert(fd);
+                    }
+                }
+            }
+        }
     }
 
     /// MULTI — open a transaction: subsequent commands queue until EXEC/DISCARD.
@@ -3359,6 +3408,219 @@ impl Worker {
                 resp::simple(&mut c.wbuf, "OK");
             }
         }
+    }
+
+    /// HELLO [protover [AUTH user pass] [SETNAME name]] — negotiate the protocol
+    /// and reply with the server handshake map. `HELLO 3` switches the connection
+    /// to RESP3 (typed replies + push-framed pub/sub); `HELLO 2` (or none) is
+    /// RESP2. An optional inline AUTH is applied before the reply.
+    fn handle_hello(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        let mut proto: i64 = if self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false) {
+            3
+        } else {
+            2
+        };
+        let mut i = 1;
+        if args.len() >= 2 {
+            match std::str::from_utf8(&args[1]).ok().and_then(|t| t.parse::<i64>().ok()) {
+                Some(p) if p == 2 || p == 3 => {
+                    proto = p;
+                    i = 2;
+                }
+                _ => {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(
+                        out,
+                        "NOPROTO unsupported protocol version",
+                    );
+                    return;
+                }
+            }
+        }
+        // Optional AUTH / SETNAME arguments after the version.
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"AUTH" if i + 2 < args.len() => {
+                    let user = String::from_utf8_lossy(&args[i + 1]).into_owned();
+                    // Resolve the credential without holding a `conns` borrow.
+                    enum A {
+                        NoCfg,
+                        Ok(String, String, bool),
+                        Wrong,
+                    }
+                    let outcome = match &self.auth {
+                        None => A::NoCfg,
+                        Some(cfg) => match cfg.creds.get(&user) {
+                            Some(c) if c.verify(args[i + 2].as_slice()) => {
+                                A::Ok(c.role.clone(), c.tenant.clone(), cfg.exempt.contains(&c.role))
+                            }
+                            _ => A::Wrong,
+                        },
+                    };
+                    match outcome {
+                        A::Wrong => {
+                            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                            resp::error(
+                                out,
+                                "WRONGPASS invalid username-password pair or user is disabled.",
+                            );
+                            return;
+                        }
+                        A::Ok(role, tenant, exempt) => {
+                            let c = self.conns.get_mut(&fd).unwrap();
+                            c.authed = true;
+                            c.role = role;
+                            c.tenant = tenant;
+                            c.exempt = exempt;
+                        }
+                        A::NoCfg => {} // no auth configured: HELLO AUTH is a no-op OK
+                    }
+                    i += 3;
+                }
+                b"SETNAME" if i + 1 < args.len() => i += 2, // client name: accepted, unused
+                _ => {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(out, "ERR syntax error in HELLO");
+                    return;
+                }
+            }
+        }
+        self.conns.get_mut(&fd).unwrap().resp3 = proto == 3;
+        let resp3 = proto == 3;
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::map_header(out, 7, resp3);
+        resp::bulk(out, b"server");
+        resp::bulk(out, b"redis");
+        resp::bulk(out, b"version");
+        resp::bulk(out, b"7.4.0");
+        resp::bulk(out, b"proto");
+        resp::integer(out, proto);
+        resp::bulk(out, b"id");
+        resp::integer(out, fd as i64);
+        resp::bulk(out, b"mode");
+        resp::bulk(out, b"standalone");
+        resp::bulk(out, b"role");
+        resp::bulk(out, b"master");
+        resp::bulk(out, b"modules");
+        resp::array_header(out, 0);
+    }
+
+    /// CLIENT subcommands. TRACKING ON/OFF drives server-assisted client-side
+    /// caching; the rest are the benign ones clients send at connect (ID, GETNAME,
+    /// SETNAME, SETINFO, NO-EVICT, …), answered OK.
+    fn handle_client(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
+            Some(b"ID") => {
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                resp::integer(out, fd as i64);
+            }
+            Some(b"GETNAME") => {
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                resp::bulk(out, b"");
+            }
+            Some(b"TRACKING") => {
+                let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
+                match args.get(2).map(|a| a.to_ascii_uppercase()).as_deref() {
+                    Some(b"ON") => {
+                        // Default-mode tracking needs a RESP3 connection to receive
+                        // the invalidation push frames (REDIRECT-to-pubsub isn't
+                        // supported), so require HELLO 3 first.
+                        if !resp3 {
+                            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                            resp::error(
+                                out,
+                                "ERR Client tracking requires RESP3; send HELLO 3 first",
+                            );
+                        } else {
+                            self.conns.get_mut(&fd).unwrap().tracking = true;
+                            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                            resp::simple(out, "OK");
+                        }
+                    }
+                    Some(b"OFF") => {
+                        self.conns.get_mut(&fd).unwrap().tracking = false;
+                        self.untrack_fd(fd);
+                        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                        resp::simple(out, "OK");
+                    }
+                    _ => {
+                        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                        resp::error(out, "ERR syntax error in CLIENT TRACKING");
+                    }
+                }
+            }
+            _ => {
+                // SETNAME / SETINFO / NO-EVICT / NO-TOUCH / UNPAUSE / …
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                resp::simple(out, "OK");
+            }
+        }
+    }
+
+    /// Send an `invalidate` push for `key` to every connection tracking it, then
+    /// drop the entry (Redis drops a key from the table once it invalidates; the
+    /// client re-reads to re-track). Each tracker sees the key in its own
+    /// tenant-facing (unscoped) form. Guarded by the live conn's `tracking`+`resp3`
+    /// so a reused fd can never receive a stray push into a non-tracking stream.
+    fn invalidate_key(&mut self, key: &[u8], except: RawFd) {
+        let fds = match self.tracked.remove(key) {
+            Some(f) => f,
+            None => return,
+        };
+        for fd in fds {
+            // Skip the writer itself (NOLOOP): it already knows it changed the key,
+            // and flushing its own fd mid-command would race the durable-tier ack.
+            if fd == except {
+                continue;
+            }
+            let prefix = self.conn_prefix(fd);
+            let facing = strip_scope(key, &prefix);
+            let deliver = match self.conns.get_mut(&fd) {
+                Some(c) if c.tracking && c.resp3 => {
+                    resp::push_header(&mut c.wbuf, 2, true);
+                    resp::bulk(&mut c.wbuf, b"invalidate");
+                    resp::array_header(&mut c.wbuf, 1);
+                    resp::bulk(&mut c.wbuf, &facing);
+                    true
+                }
+                _ => false,
+            };
+            if deliver {
+                self.flush(fd);
+            }
+        }
+    }
+
+    /// Invalidate everything (FLUSHALL/FLUSHDB): send a null `invalidate` push —
+    /// Redis's "the whole keyspace changed" signal — to every tracking connection
+    /// (except the caller) and clear the table.
+    fn invalidate_all(&mut self, except: RawFd) {
+        if self.tracked.is_empty() {
+            return;
+        }
+        self.tracked.clear();
+        let fds: Vec<RawFd> = self
+            .conns
+            .iter()
+            .filter(|(&f, c)| f != except && c.tracking && c.resp3)
+            .map(|(&f, _)| f)
+            .collect();
+        for fd in fds {
+            if let Some(c) = self.conns.get_mut(&fd) {
+                resp::push_header(&mut c.wbuf, 2, true);
+                resp::bulk(&mut c.wbuf, b"invalidate");
+                resp::null(&mut c.wbuf, true);
+            }
+            self.flush(fd);
+        }
+    }
+
+    /// Remove `fd` from every tracked-key set (on CLIENT TRACKING OFF or close).
+    fn untrack_fd(&mut self, fd: RawFd) {
+        self.tracked.retain(|_, fds| {
+            fds.remove(&fd);
+            !fds.is_empty()
+        });
     }
 
     /// True if the connection may run pub/sub commands (authed, or no auth
@@ -3565,15 +3827,17 @@ impl Worker {
             let fch = strip_scope(channel, &prefix);
             let fpat = pat.as_ref().map(|p| strip_scope(p, &prefix));
             if let Some(c) = self.conns.get_mut(sfd) {
+                // RESP3 delivers pub/sub out-of-band as a push (`>`) frame; RESP2
+                // uses a normal array. push_header emits the right one.
                 match fpat {
                     None => {
-                        resp::array_header(&mut c.wbuf, 3);
+                        resp::push_header(&mut c.wbuf, 3, c.resp3);
                         resp::bulk(&mut c.wbuf, b"message");
                         resp::bulk(&mut c.wbuf, fch);
                         resp::bulk(&mut c.wbuf, msg);
                     }
                     Some(p) => {
-                        resp::array_header(&mut c.wbuf, 4);
+                        resp::push_header(&mut c.wbuf, 4, c.resp3);
                         resp::bulk(&mut c.wbuf, b"pmessage");
                         resp::bulk(&mut c.wbuf, p);
                         resp::bulk(&mut c.wbuf, fch);
@@ -3834,6 +4098,11 @@ impl Worker {
                     self.patterns.remove(pat);
                 }
             }
+        }
+        // Drop this fd from the client-side-caching tracking table so a future
+        // connection reusing the fd never inherits a stale invalidation target.
+        if !self.tracked.is_empty() {
+            self.untrack_fd(fd);
         }
         let _ = epoll_del(self.epfd, fd);
         unsafe { libc::close(fd) };
