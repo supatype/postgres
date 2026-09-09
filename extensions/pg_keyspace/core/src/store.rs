@@ -34,6 +34,8 @@ pub const KIND_STR: u32 = b's' as u32;
 pub const KIND_HASH: u32 = b'h' as u32;
 pub const KIND_LIST: u32 = b'l' as u32;
 pub const KIND_ZSET: u32 = b'z' as u32;
+// 'S' (distinct from KIND_STR 's'): a serialized unordered set of members.
+pub const KIND_SET: u32 = b'S' as u32;
 
 #[repr(C)]
 struct SegHeader {
@@ -741,6 +743,26 @@ impl Store {
         }
     }
 
+    /// The version counter of the live entry at `key` (bumped on every write),
+    /// or None if the key is absent/expired. Used by WATCH to snapshot a key and
+    /// detect whether it changed before EXEC. Lazily expires like `get`.
+    pub fn version(&self, key: &[u8]) -> Option<u64> {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            let b = found?;
+            let idx = *self.buckets_ptr(p).add(b) - 1;
+            let e = self.entries_ptr(p).add(idx as usize);
+            let exp = (*e).expires_at;
+            if exp != 0 && exp <= now_micros() {
+                self.remove_at(p, b, idx);
+                return None;
+            }
+            Some((*e).version)
+        }
+    }
+
     /// Iterate live keys for SCAN. `cursor` is an opaque position (0 starts a new
     /// iteration); `limit` bounds how many keys one call returns. Returns the
     /// keys found and the next cursor (0 once iteration is complete). Keys are
@@ -987,6 +1009,19 @@ mod tests {
         // a past expiry deletes the key but still reports it existed
         assert!(s.set_expiry(b"k", 1));
         assert!(matches!(s.get(b"k"), Lookup::Miss));
+    }
+
+    #[test]
+    fn version_bumps_on_write_and_clears_on_delete() {
+        let s = store("t_version");
+        assert_eq!(s.version(b"k"), None); // absent
+        s.set(b"k", b"v1", 0);
+        let v1 = s.version(b"k").expect("present after set");
+        s.set(b"k", b"v2", 0);
+        let v2 = s.version(b"k").expect("present after overwrite");
+        assert!(v2 > v1, "version must advance on overwrite ({v1} -> {v2})");
+        s.del(b"k");
+        assert_eq!(s.version(b"k"), None); // gone
     }
 
     #[test]
