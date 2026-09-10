@@ -982,10 +982,20 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
             c.drain(max, |k, v, e, kind| batch.push((k.to_vec(), v.to_vec(), e, kind)));
         }
     };
-    // `mark_committed` republishes each ring's own drained count, and this is the
-    // only consumer of these rings, so marking a ring that contributed nothing to
-    // this batch rewrites the same value — safe, and it keeps the loop allocation
-    // free.
+    // Marking a ring that contributed nothing to this batch is harmless: this is
+    // the only consumer of these rings, so it rewrites the same value.
+    //
+    // The unsafe case is the other one, and it is not fixed here. `bulk_upsert`
+    // returns no result and discards its SPI error, so a batch that failed to
+    // commit is indistinguishable from one that succeeded, and the marking below
+    // releases its durable acks anyway (#30). Aggregating N rings into one batch
+    // widens that: a single failed upsert now falsely acks up to
+    // `workers * persist_workers` rings' worth of writes instead of one ring's.
+    //
+    // Gating on a Result here would not be enough on its own — `drain` has
+    // already advanced `head`, so the records are gone from the ring either way.
+    // The fix is #30's two-phase `peek`/`commit`, which keeps an uncommitted
+    // batch in the ring; this loop should be rebased onto it.
     let mark_all = || {
         for c in &consumers {
             c.mark_committed();
