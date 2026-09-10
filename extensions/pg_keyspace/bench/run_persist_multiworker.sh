@@ -157,6 +157,18 @@ chk "MOVED names the owning worker's port" "$((BASE+pw))"     "$(echo "$err" | g
 chk "misrouted read refused too" "MOVED"     "$(R $((BASE+wrong_w)) GET "mw:$probe" | grep -o MOVED | head -1)"
 chk "owning worker still serves the key" "val-$probe" "$(R $((BASE+pw)) GET "mw:$probe")"
 
+# --- keyspace-wide commands are per worker, by design -----------------------
+# SCAN/DBSIZE address one worker, as in real Redis Cluster. Asserted so the
+# property is visible rather than discovered by an admin listing that silently
+# under-reports: a caller wanting the whole keyspace must union every port.
+w0=$(R "$BASE" DBSIZE)
+allw=0
+for w in $(seq 0 $((N-1))); do allw=$((allw + $(R $((BASE+w)) DBSIZE))); done
+chk "DBSIZE on one worker is a strict subset of the cluster" "yes" \
+    "$([ "$w0" -lt "$allw" ] && echo yes || echo no)"
+chk "DBSIZE summed over all workers accounts for every key" "yes" \
+    "$([ "$allw" -ge "$KEYS" ] && echo yes || echo no)"
+
 # --- drain: every worker's ring reaches supacache.kv ------------------------
 for _ in $(seq 1 200); do
   b=$($P -c "SELECT backlog_bytes FROM supacache.ring_stats();" | tr -d '[:space:]')

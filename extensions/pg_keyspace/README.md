@@ -365,7 +365,17 @@ cluster refuses to start without it; use `127.0.0.1` for a local-only deployment
 
 A *standalone* client (the default constructor in every driver — `new Redis()`,
 `redis.NewClient()`, `JedisPool`) does not follow `MOVED` and will surface it as
-an error. Multi-worker durability needs the cluster constructor.
+an error. Multi-worker durability needs the cluster constructor. Clients that
+auto-detect (valkey-go/rueidis, StackExchange.Redis) pick cluster mode up from
+`INFO` and the slot map with no code change.
+
+**Keyspace-wide commands stay per worker.** `SCAN`, `KEYS`, `DBSIZE` and
+`FLUSHALL` address the worker they are sent to, not the cluster — the same
+property real Redis Cluster has, since each worker owns its own segment. Code
+that enumerates or counts the whole keyspace (an admin listing, a cache-size
+metric, a prefix flush) must iterate every port from `supacache.slot_ranges()`
+and union the results; against one port it silently sees only that worker's
+share. Keyed commands are unaffected: the client routes those by slot.
 
 Ephemeral multi-worker deployments are unchanged: no slot enforcement, no cluster
 advertisement (`redis_mode:standalone`), any key may live on any worker.
