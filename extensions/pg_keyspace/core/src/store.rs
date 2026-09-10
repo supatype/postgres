@@ -388,14 +388,89 @@ impl Store {
         Some((off, cls))
     }
 
+    /// Return an oversized block (`base` points at its `[cap: u64]` header) to
+    /// the free list, merging it with any physically adjacent free blocks and
+    /// giving space back to the bump pointer when it lands at the top.
+    ///
+    /// The naive version — push onto a LIFO list and never merge — leaks
+    /// capacity in a way no amount of eviction recovers. Blocks are laid out
+    /// contiguously by bump and freed blocks were never coalesced, so a
+    /// workload writing growing values (10 MiB, then 20, then 40) consumed
+    /// fresh bump space every time while the free list filled with blocks that
+    /// were individually too small to satisfy the next request. `data_bump`
+    /// only ever moved up, so eventually every large allocation failed with
+    /// most of the arena sitting free but unusable. Eviction did not help: it
+    /// frees onto the same list.
+    ///
+    /// Keeping the list ordered by offset makes both fixes cheap. Adjacency is
+    /// decidable because a block occupies exactly `8 + cap` bytes, so the
+    /// neighbour begins where this block ends.
+    unsafe fn oversized_free(&self, p: u32, base: u64) {
+        let meta = self.meta(p);
+        let data = self.data_ptr(p);
+        let cap_at = |b: u64| *(data.add(b as usize) as *const u64);
+        let next_at = |b: u64| *(data.add(b as usize + 8) as *const u64);
+        let set_next = |b: u64, v: u64| *(data.add(b as usize + 8) as *mut u64) = v;
+
+        // Ordered insert: find the last free block before `base`.
+        let mut prev: Option<u64> = None;
+        let mut cur = (*meta).free_oversized;
+        while cur != 0 && cur - 1 < base {
+            prev = Some(cur - 1);
+            cur = next_at(cur - 1);
+        }
+        let next = if cur == 0 { None } else { Some(cur - 1) };
+
+        set_next(base, cur);
+        match prev {
+            Some(pb) => set_next(pb, base + 1),
+            None => (*meta).free_oversized = base + 1,
+        }
+
+        // Merge forward: this block's end meets the next free block's start.
+        let mut cap = cap_at(base);
+        if let Some(nb) = next {
+            if base + 8 + cap == nb {
+                let ncap = cap_at(nb);
+                cap += 8 + ncap; // absorb the neighbour, header included
+                *(data.add(base as usize) as *mut u64) = cap;
+                set_next(base, next_at(nb));
+            }
+        }
+
+        // Merge backward: the previous free block's end meets this one's start.
+        let mut head = base;
+        if let Some(pb) = prev {
+            let pcap = cap_at(pb);
+            if pb + 8 + pcap == base {
+                let merged = pcap + 8 + cap;
+                *(data.add(pb as usize) as *mut u64) = merged;
+                set_next(pb, next_at(base));
+                head = pb;
+                cap = merged;
+            }
+        }
+
+        // At the top of the arena: hand it back to the bump pointer rather than
+        // holding it on the list, so the space is available at any size again.
+        if head + 8 + cap == (*meta).data_bump {
+            // unlink `head`
+            let mut link = &mut (*meta).free_oversized as *mut u64;
+            while *link != 0 {
+                let b = *link - 1;
+                if b == head {
+                    *link = next_at(b);
+                    break;
+                }
+                link = data.add(b as usize + 8) as *mut u64;
+            }
+            (*meta).data_bump = head;
+        }
+    }
+
     unsafe fn slab_free(&self, p: u32, off: u64, cls: u32) {
         if cls == OVERSIZED {
-            // Push the block (base = off-8, capacity kept at base[0..8]) onto the
-            // oversized free list so a later oversized alloc can reuse it.
-            let base = off - 8;
-            let meta = self.meta(p);
-            *(self.data_ptr(p).add(base as usize + 8) as *mut u64) = (*meta).free_oversized;
-            (*meta).free_oversized = base + 1;
+            self.oversized_free(p, off - 8);
             return;
         }
         let meta = self.meta(p);
@@ -1282,5 +1357,64 @@ mod tests {
         let v2 = s.version_of(b"k").unwrap();
         assert_ne!(v1, v2);
         assert!(s.read_staged(b"k", v2).is_some());
+    }
+
+    /// Oversized space must be genuinely reclaimed, not merely listed.
+    ///
+    /// Blocks are laid out contiguously by bump. Freeing one used to push it
+    /// onto a LIFO list with no coalescing and no way to move `data_bump` back
+    /// down, so a workload of growing values consumed fresh arena on every step
+    /// while the free list filled with blocks individually too small to serve
+    /// the next request. Eviction could not recover it either, since eviction
+    /// frees onto the same list.
+    ///
+    /// `data_used` is `data_bump`, so the reclamation is directly observable.
+    #[test]
+    fn oversized_space_is_reclaimed_not_just_listed() {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 256,
+            data_bytes_per_part: 8 * 1024 * 1024,
+        };
+        let s = Store::create("t_oversize_frag", &cfg).unwrap();
+        let used = || s.stats(0).data_used;
+
+        // Warm up so the key's own slab block (a size class, not oversized) is
+        // already bumped and reused thereafter; only the value's oversized
+        // block should move the bump pointer from here on.
+        assert!(s.set(b"big", b"small", 0));
+        assert!(s.del(b"big"));
+        let baseline = used();
+
+        assert!(s.set(b"big", &vec![b'x'; 1024 * 1024], 0));
+        let peak = used();
+        assert!(peak > baseline + 1024 * 1024, "1 MiB write should consume arena");
+        assert!(s.del(b"big"));
+        assert_eq!(
+            used(),
+            baseline,
+            "freeing the top block must return its space to the bump pointer,              not strand it on the free list"
+        );
+
+        // A strictly growing series, each value freed before the next. Every
+        // step needs more than any block the free list holds, so without
+        // reclamation each one consumes fresh arena and the total far exceeds
+        // the 8 MiB available.
+        assert!(s.set(b"grow", b"small", 0)); // warm the key's slab block
+        assert!(s.del(b"grow"));
+        let grow_baseline = used();
+        let mut size = 64 * 1024usize;
+        while size <= 4 * 1024 * 1024 {
+            assert!(
+                s.set(b"grow", &vec![b'y'; size], 0),
+                "{size}-byte write failed: freed oversized space never became                  reusable (data_used {} of {})",
+                used(),
+                s.stats(0).data_cap
+            );
+            assert!(s.del(b"grow"));
+            assert_eq!(used(), grow_baseline, "{size}-byte round leaked arena");
+            size *= 2;
+        }
     }
 }
