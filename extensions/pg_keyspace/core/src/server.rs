@@ -1085,24 +1085,103 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'set'");
                     return;
                 }
+                // Options are a mix of pairs (EX 10) and bare flags (KEEPTTL, NX).
+                // The old parser stepped two at a time and so never saw a flag at
+                // all: `SET k v KEEPTTL` silently dropped the TTL and `SET k v NX`
+                // silently overwrote. Unknown options are a syntax error, as in
+                // Redis — accepting and ignoring one is how those bugs hid.
                 let mut ttl_micros = 0i64;
+                let mut keep_ttl = false;
+                let (mut only_if_absent, mut only_if_present, mut want_old) = (false, false, false);
                 let mut i = 3;
-                while i + 1 < nargs {
+                let mut bad_syntax = false;
+                while i < nargs {
                     let mut opt = args[i].clone();
                     opt.make_ascii_uppercase();
-                    let n: i64 = std::str::from_utf8(&args[i + 1])
-                        .ok()
-                        .and_then(|t| t.parse().ok())
-                        .unwrap_or(0);
+                    // Pair options consume the next argument as a number.
+                    let mut pair = |factor: i64, absolute: bool| -> Option<i64> {
+                        let raw: i64 = args
+                            .get(i + 1)
+                            .and_then(|a| std::str::from_utf8(a).ok())
+                            .and_then(|t| t.parse().ok())?;
+                        Some(if absolute {
+                            // EXAT/PXAT are absolute deadlines; store TTL is relative.
+                            (raw * factor - now_micros()).max(1)
+                        } else {
+                            raw * factor
+                        })
+                    };
                     match opt.as_slice() {
-                        b"EX" => ttl_micros = n * 1_000_000,
-                        b"PX" => ttl_micros = n * 1_000,
-                        _ => {}
+                        b"EX" => match pair(1_000_000, false) {
+                            Some(v) => { ttl_micros = v; i += 2; }
+                            None => { bad_syntax = true; break; }
+                        },
+                        b"PX" => match pair(1_000, false) {
+                            Some(v) => { ttl_micros = v; i += 2; }
+                            None => { bad_syntax = true; break; }
+                        },
+                        b"EXAT" => match pair(1_000_000, true) {
+                            Some(v) => { ttl_micros = v; i += 2; }
+                            None => { bad_syntax = true; break; }
+                        },
+                        b"PXAT" => match pair(1_000, true) {
+                            Some(v) => { ttl_micros = v; i += 2; }
+                            None => { bad_syntax = true; break; }
+                        },
+                        b"KEEPTTL" => { keep_ttl = true; i += 1; }
+                        b"NX" => { only_if_absent = true; i += 1; }
+                        b"XX" => { only_if_present = true; i += 1; }
+                        b"GET" => { want_old = true; i += 1; }
+                        _ => { bad_syntax = true; break; }
                     }
-                    i += 2;
+                }
+                if bad_syntax || (only_if_absent && only_if_present) {
+                    resp::error(out, "ERR syntax error");
+                    return;
+                }
+                // Only the option-bearing forms need the prior value; a plain
+                // `SET k v` must not pay for a lookup and a copy on the hot path.
+                let needs_existing = want_old || only_if_absent || only_if_present || keep_ttl;
+                let existing = if needs_existing {
+                    store.get_typed(&args[1]).map(|(k, e, v)| (k, e, v.to_vec()))
+                } else {
+                    None
+                };
+                // GET reports the previous value, and it must be a string.
+                if want_old {
+                    if let Some((kind, _, _)) = &existing {
+                        if *kind != b's' as u32 {
+                            resp::error(
+                                out,
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                            return;
+                        }
+                    }
+                }
+                let present = existing.is_some();
+                if (only_if_absent && present) || (only_if_present && !present) {
+                    // Not set. GET still reports the old value; otherwise nil.
+                    match (want_old, &existing) {
+                        (true, Some((_, _, v))) => resp::bulk(out, v),
+                        _ => resp::null(out, resp3),
+                    }
+                    return;
+                }
+                // KEEPTTL retains the current deadline; an explicit EX/PX wins.
+                if keep_ttl && ttl_micros == 0 {
+                    if let Some((_, exp, _)) = &existing {
+                        if *exp > 0 {
+                            ttl_micros = (*exp - now_micros()).max(1);
+                        }
+                    }
                 }
                 store.set(&args[1], &args[2], ttl_micros);
-                resp::simple(out, "OK");
+                match (want_old, &existing) {
+                    (true, Some((_, _, v))) => resp::bulk(out, v),
+                    (true, None) => resp::null(out, resp3),
+                    _ => resp::simple(out, "OK"),
+                }
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
                     let exp = if ttl_micros > 0 { now_micros() + ttl_micros } else { 0 };
