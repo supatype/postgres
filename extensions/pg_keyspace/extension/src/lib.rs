@@ -250,6 +250,52 @@ fn ks_tier() -> Tier {
     }
 }
 
+/// True when `synchronous_standby_names` is set to something Postgres will
+/// actually wait for.
+///
+/// This is the whole basis of the `replicated` tier. The persist transaction
+/// runs with `synchronous_commit = remote_apply`, and Postgres only waits when
+/// `synchronous_standby_names` is non-empty. With it unset, `remote_apply` does
+/// not wait at all and an acknowledged "replicated" write is local-durable
+/// only.
+///
+/// Note what is NOT a degradation: a standby that is named but currently
+/// disconnected does not silently fall back, Postgres blocks the commit until
+/// one appears. That surfaces correctly as a stalled persist worker, held acks
+/// and (once the ring fills) client-visible errors, which is the right
+/// behaviour for a synchronous tier.
+///
+/// The dangerous case is the empty setting, and because
+/// `synchronous_standby_names` is `sighup` context it can be emptied at
+/// runtime with `pg_reload_conf()`. A startup-only check would therefore
+/// guarantee nothing after the first reload, which is why the persist worker
+/// re-checks this before every commit.
+fn sync_standby_configured() -> bool {
+    unsafe {
+        let s = pg_sys::GetConfigOption(c"synchronous_standby_names".as_ptr(), true, false);
+        if s.is_null() {
+            false
+        } else {
+            !CStr::from_ptr(s).to_string_lossy().trim().is_empty()
+        }
+    }
+}
+
+/// Human-readable reason the `replicated` tier cannot be honoured, if any.
+fn check_sync_standby() -> Result<(), String> {
+    if !sync_standby_configured() {
+        return Err(
+            "pg_keyspace.durability = 'replicated' requires synchronous_standby_names \
+             to be set: without it synchronous_commit = remote_apply does not wait for \
+             any standby, so an acknowledged write would be local-durable only. Set \
+             synchronous_standby_names, or use pg_keyspace.durability = 'durable' if \
+             local durability is what you want"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// A cheap `Store` view over the shared segment, valid in any backend.
 fn store_view() -> Option<Store> {
     let base = SEG_BASE.load(Ordering::Acquire);
@@ -675,6 +721,19 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         }
     }
 
+    // Fail closed on a durability promise the cluster cannot keep, the same way
+    // a bad TLS cert refuses above. Serving `replicated` with no synchronous
+    // standby would acknowledge writes as replicated that are only local.
+    if matches!(ks_tier(), Tier::Replicated) {
+        if let Err(why) = check_sync_standby() {
+            log!("pg_keyspace worker: REFUSING to start — {why}");
+            while !BackgroundWorker::sigterm_received() {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            return;
+        }
+    }
+
     // Connect SPI (always): needed to create/read the schema, run the
     // security self-check, load RESP AUTH credentials, and recover from tables.
     let dbname = GUC_DATABASE
@@ -863,6 +922,7 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         Tier::Replicated => "remote_apply", // needs a synchronous standby
         _ => "off",                          // relaxed: RESP already acked
     };
+    let replicated = matches!(ks_tier(), Tier::Replicated);
     log!("pg_keyspace persist {idx}: draining ring {idx} -> supacache.kv (synchronous_commit={sync_commit})");
 
     // Backoff after a failed batch. The records stay in the ring, so a retry
@@ -877,6 +937,22 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
             consumer.peek(20_000, |k, v, e, kind| batch.push((k.to_vec(), v.to_vec(), e, kind)));
         if batch.is_empty() {
             std::thread::sleep(idle);
+            continue;
+        }
+        // `synchronous_standby_names` is sighup context, so the promise the
+        // replicated tier makes can be withdrawn at runtime by a reload. The
+        // startup refusal cannot cover that, and committing anyway would ack
+        // writes as replicated that Postgres never waited to replicate. Fail
+        // closed: leave the batch in the ring, hold its acks, and say so. If
+        // the setting comes back the same records commit on a later pass.
+        if replicated && !sync_standby_configured() {
+            log!(
+                "pg_keyspace persist {idx}: REFUSING to commit {count} record(s) — \
+                 durability is 'replicated' but synchronous_standby_names is now empty, \
+                 so Postgres would not wait for any standby. Records retained in the \
+                 ring and durable acks held until it is restored"
+            );
+            std::thread::sleep(Duration::from_secs(1));
             continue;
         }
         match bulk_upsert(batch, sync_commit, ttl_bucket_us()) {
@@ -2164,6 +2240,48 @@ mod supacache {
     #[pg_extern]
     fn ping() -> &'static str {
         "PONG"
+    }
+
+    /// Whether the `replicated` tier's promise is currently being kept.
+    ///
+    /// `tier` is the configured durability. `standby_configured` reflects
+    /// `synchronous_standby_names`, which is what decides whether Postgres
+    /// waits at all; it is `sighup` context, so it can change under a running
+    /// server. `sync_standbys_connected` counts standbys in `pg_stat_replication`
+    /// currently in a synchronous state.
+    ///
+    /// `honoured` is the one to alert on: false means acknowledged writes are
+    /// not getting the durability the tier advertises. Note that
+    /// `standby_configured` true with zero connected standbys is not a silent
+    /// downgrade, Postgres blocks the commit instead, which shows up as a
+    /// growing `ring_stats().backlog_bytes` rather than as lost durability.
+    #[pg_extern]
+    fn replication_status() -> TableIterator<
+        'static,
+        (
+            name!(tier, String),
+            name!(standby_configured, bool),
+            name!(sync_standbys_connected, i64),
+            name!(honoured, bool),
+        ),
+    > {
+        let tier = match ks_tier() {
+            Tier::Ephemeral => "ephemeral",
+            Tier::Relaxed => "relaxed",
+            Tier::Durable => "durable",
+            Tier::Replicated => "replicated",
+        };
+        let configured = sync_standby_configured();
+        let connected = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pg_stat_replication WHERE sync_state IN ('sync','quorum')",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        // Only the replicated tier makes a replication promise; the others are
+        // trivially honoured because they promise nothing about a standby.
+        let honoured = !matches!(ks_tier(), Tier::Replicated) || configured;
+        TableIterator::once((tier.to_string(), configured, connected, honoured))
     }
 
     /// Register/replace a RESP AUTH credential, storing a SALTED SHA-256 verifier
