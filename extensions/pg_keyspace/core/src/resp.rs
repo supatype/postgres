@@ -6,6 +6,30 @@
 //! `double`/`boolean`) take the connection's protocol and fall back to the RESP2
 //! wire form when it is not on RESP3.
 
+/// Largest bulk string this server will accept, and therefore the largest
+/// value that can be stored.
+///
+/// This is not an arbitrary policy number, it is a hard structural limit. The
+/// persistence ring packs a value's type tag into the top byte of the record's
+/// `val_len` field and masks the length to 24 bits (`ring::Producer::push`), so
+/// a length of 16 MiB or more cannot be represented. Accepting one used to
+/// truncate the recorded length to zero while still writing the full payload,
+/// which desynchronised the ring: the consumer advanced `head` by the recorded
+/// length, landed mid-payload, and parsed value bytes as the next record
+/// header, yielding multi-gigabyte allocations and garbage keys in
+/// `supacache.kv`.
+///
+/// 8 MiB leaves headroom under that ceiling. Redis's `proto-max-bulk-len`
+/// default is 512 MiB, so clients sending very large values will see an error
+/// here that they would not see against Redis; that is the correct trade,
+/// because the alternative is silent corruption.
+pub const MAX_BULK_LEN: usize = 8 * 1024 * 1024;
+
+/// Largest number of arguments in one command. Bounds `args` growth (and the
+/// buffering that a huge announced array would otherwise force) so a hostile
+/// client cannot exhaust memory with a header alone.
+pub const MAX_MULTIBULK_LEN: i64 = 1024 * 1024;
+
 /// Result of trying to parse one request from the front of `buf`.
 pub enum Parse {
     /// A full command: `args` holds (start,end) byte ranges into `buf`;
@@ -36,7 +60,7 @@ fn parse_array(buf: &[u8], args: &mut Vec<(usize, usize)>) -> Parse {
         Some(x) => x,
         None => return Parse::Incomplete,
     };
-    if n < 0 {
+    if n < 0 || n > MAX_MULTIBULK_LEN {
         return Parse::Error;
     }
     pos += adv;
@@ -51,7 +75,12 @@ fn parse_array(buf: &[u8], args: &mut Vec<(usize, usize)>) -> Parse {
             Some(x) => x,
             None => return Parse::Incomplete,
         };
-        if len < 0 {
+        // Reject on the announced length, before buffering the payload: an
+        // oversized bulk string must not be accepted (it would desynchronise
+        // the persistence ring) and must not be buffered either (announcing a
+        // huge length is otherwise a memory-exhaustion vector, since the
+        // connection would keep reading until the bytes arrived).
+        if len < 0 || len as usize > MAX_BULK_LEN {
             return Parse::Error;
         }
         pos += adv;
@@ -310,5 +339,53 @@ mod tests {
         boolean(&mut b, true, false);
         assert_eq!(s(&a), "#t\r\n");
         assert_eq!(s(&b), ":1\r\n");
+    }
+
+    /// An announced bulk length over the cap is rejected on the header, before
+    /// the payload is buffered. Rejecting late would still be a memory
+    /// exhaustion vector, because the connection would keep reading until the
+    /// announced bytes arrived; rejecting by truncation would desynchronise
+    /// the persistence ring (see `ring::MAX_REC_VAL`).
+    #[test]
+    fn oversized_bulk_length_is_rejected_on_the_header() {
+        let mut args = Vec::new();
+        // Announce one byte over the cap, and send no payload at all: the
+        // decision must not depend on having the bytes.
+        let over = MAX_BULK_LEN + 1;
+        let req = format!("*2\r\n$3\r\nSET\r\n${over}\r\n");
+        assert!(
+            matches!(parse(req.as_bytes(), &mut args), Parse::Error),
+            "a bulk length of {over} must be refused without buffering it"
+        );
+
+        // At the cap it is accepted as a well-formed header and simply needs
+        // more bytes, so the limit is inclusive and off-by-one free.
+        let at = MAX_BULK_LEN;
+        let req = format!("*2\r\n$3\r\nSET\r\n${at}\r\n");
+        assert!(matches!(parse(req.as_bytes(), &mut args), Parse::Incomplete));
+    }
+
+    /// A huge announced argument count is refused too, so `args` growth and
+    /// the buffering it would force are both bounded.
+    #[test]
+    fn oversized_multibulk_count_is_rejected() {
+        let mut args = Vec::new();
+        let over = MAX_MULTIBULK_LEN + 1;
+        let req = format!("*{over}\r\n");
+        assert!(matches!(parse(req.as_bytes(), &mut args), Parse::Error));
+    }
+
+    /// Ordinary commands are unaffected by the caps.
+    #[test]
+    fn normal_command_still_parses_under_the_caps() {
+        let mut args = Vec::new();
+        match parse(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nhi\r\n", &mut args) {
+            Parse::Complete { consumed } => {
+                // *3\r\n $3\r\nSET\r\n $1\r\nk\r\n $2\r\nhi\r\n
+                assert_eq!(consumed, 28);
+                assert_eq!(args.len(), 3);
+            }
+            _ => panic!("a normal SET must still parse"),
+        }
     }
 }

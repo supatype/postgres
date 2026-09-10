@@ -15,6 +15,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const HDR_ALIGN: usize = 64;
 const REC_HDR: usize = 16; // u32 + u32 + i64
 
+/// One more than the largest value length a record can encode. The top byte of
+/// the `val_len` field carries the value's type tag, leaving 24 bits, so a
+/// length must fit in `0x00FF_FFFF`.
+pub const MAX_REC_VAL: usize = 0x0100_0000; // 16 MiB
+
 #[repr(C)]
 struct RingHeader {
     capacity: u64,
@@ -129,9 +134,17 @@ impl Producer {
     /// seq lets a durable write wait until `committed() >= seq`.
     ///
     /// `kind` (the value's type tag) is packed into the free top byte of the
-    /// `val_len` field — values are far below the 16MB that byte would encroach
-    /// on — so the record layout and size are unchanged.
+    /// `val_len` field, so only 24 bits are left for the length and a value of
+    /// [`MAX_REC_VAL`] or more cannot be represented. Such a value is refused
+    /// here rather than written: masking the length while still copying the
+    /// payload desynchronises the ring, because the consumer would advance
+    /// `head` by the truncated length, land mid-payload and parse value bytes
+    /// as the next record header. The RESP parser rejects oversized values
+    /// first (`resp::MAX_BULK_LEN`); this is the backstop for any other caller.
     pub fn push(&self, key: &[u8], val: &[u8], expires: i64, kind: u8) -> Option<u64> {
+        if val.len() >= MAX_REC_VAL {
+            return None;
+        }
         let rec = REC_HDR + key.len() + val.len();
         unsafe {
             let h = &*self.0.hdr;
@@ -440,5 +453,43 @@ mod tests {
              (seq 1) acks immediately with nothing persisted",
             prod2.committed()
         );
+    }
+
+    /// A value the record layout cannot encode must be refused, never
+    /// truncated. Truncating the length while still writing the payload
+    /// desynchronised the ring: the consumer advanced `head` by the recorded
+    /// length (0), landed mid-payload, and parsed value bytes as the next
+    /// record header, giving `key_len == 0x78787878` (~2 GiB) and garbage keys
+    /// in `supacache.kv`. Before the cap this failed with the 16 MiB value
+    /// round-tripping as 0 bytes.
+    #[test]
+    fn oversized_value_is_refused_not_truncated() {
+        let cap = 32 * 1024 * 1024usize;
+        let mut buf = vec![0u8; bytes_for(cap)];
+        let base = buf.as_mut_ptr();
+        unsafe { init(base, cap) };
+        let prod = unsafe { Producer::attach(base) };
+        let cons = unsafe { Consumer::attach(base) };
+
+        // Exactly at the limit: the first length the 24-bit field cannot hold.
+        let big = vec![b'x'; MAX_REC_VAL];
+        assert!(
+            prod.push(b"big", &big, 0, b's').is_none(),
+            "a {MAX_REC_VAL}-byte value must be refused, not silently truncated"
+        );
+        // Refusing must leave the ring completely untouched.
+        assert_eq!(cons.peek(usize::MAX, |_, _, _, _| {}), (0, 0));
+
+        // Just under the limit still round-trips intact.
+        let ok = vec![b'y'; MAX_REC_VAL - 1];
+        assert!(prod.push(b"ok", &ok, 0, b's').is_some());
+        let mut got = 0usize;
+        let (n, _) = cons.peek(1, |k, v, _, kind| {
+            assert_eq!(k, b"ok");
+            assert_eq!(kind, b's');
+            got = v.len();
+        });
+        assert_eq!(n, 1);
+        assert_eq!(got, MAX_REC_VAL - 1, "value just under the cap must survive");
     }
 }
