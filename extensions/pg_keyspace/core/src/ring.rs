@@ -36,10 +36,18 @@ pub fn bytes_for(capacity: usize) -> usize {
     hdr_bytes() + capacity.next_power_of_two()
 }
 
-/// Initialise a ring in a freshly-zeroed region (call once, by the creator).
+/// Initialise a ring in a region (call once, by the creator).
+///
+/// Every counter is reset, not just the ones Postgres would have zeroed for
+/// us. `drained` and `committed` matter most: a stale `committed` left over
+/// from a previous life of the segment sits above every sequence number the
+/// new producer will issue, so durable writes would ack immediately with
+/// nothing persisted. Postgres hands out zeroed shared memory, but the
+/// standalone daemon attaches to a pre-existing POSIX segment, so this must
+/// not depend on the caller.
 ///
 /// # Safety
-/// `base` must point at `bytes_for(capacity)` writable, zeroed bytes.
+/// `base` must point at `bytes_for(capacity)` writable bytes.
 pub unsafe fn init(base: *mut u8, capacity: usize) {
     let cap = capacity.next_power_of_two() as u64;
     let h = base as *mut RingHeader;
@@ -48,6 +56,8 @@ pub unsafe fn init(base: *mut u8, capacity: usize) {
     (*h).tail.store(0, Ordering::Relaxed);
     (*h).dropped.store(0, Ordering::Relaxed);
     (*h).pushed.store(0, Ordering::Relaxed);
+    (*h).drained.store(0, Ordering::Relaxed);
+    (*h).committed.store(0, Ordering::Relaxed);
 }
 
 struct Ring {
@@ -162,17 +172,28 @@ impl Consumer {
         Consumer(Ring::new(base))
     }
 
-    /// Drain up to `max` records, calling `f(key, val, expires)` for each.
-    /// Returns the number of records consumed.
-    pub fn drain<F: FnMut(&[u8], &[u8], i64, u8)>(&self, max: usize, mut f: F) -> usize {
+    /// Read up to `max` records WITHOUT consuming them, calling
+    /// `f(key, val, expires, kind)` for each. Returns `(count, bytes)`: the
+    /// number of records read and the number of ring bytes they occupy, which
+    /// is what [`Consumer::commit`] needs to release them.
+    ///
+    /// Reading is deliberately separated from consuming. The records stay in
+    /// the ring, and `head` does not move, until the caller has actually made
+    /// them durable and calls `commit`. A consumer whose downstream transaction
+    /// fails, or which is killed mid-batch, therefore loses nothing: the
+    /// restarted consumer re-reads exactly the same records. This is what makes
+    /// a durable ack truthful, since `committed` can only ever advance over
+    /// records that reached Postgres.
+    pub fn peek<F: FnMut(&[u8], &[u8], i64, u8)>(&self, max: usize, mut f: F) -> (usize, u64) {
         unsafe {
             let h = &*self.0.hdr;
             let tail = h.tail.load(Ordering::Acquire);
-            let mut head = h.head.load(Ordering::Relaxed);
+            let start = h.head.load(Ordering::Relaxed);
+            let mut pos = start;
             let mut count = 0usize;
             let mut hdr = [0u8; REC_HDR];
-            while head < tail && count < max {
-                self.0.read_wrapped(head, &mut hdr);
+            while pos < tail && count < max {
+                self.0.read_wrapped(pos, &mut hdr);
                 let key_len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
                 let val_field = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
                 let val_len = (val_field & 0x00FF_FFFF) as usize;
@@ -182,28 +203,49 @@ impl Consumer {
                 ]);
                 let mut key = vec![0u8; key_len];
                 let mut val = vec![0u8; val_len];
-                self.0.read_wrapped(head + 16, &mut key);
-                self.0.read_wrapped(head + 16 + key_len as u64, &mut val);
+                self.0.read_wrapped(pos + 16, &mut key);
+                self.0.read_wrapped(pos + 16 + key_len as u64, &mut val);
                 f(&key, &val, expires, kind);
-                head += (REC_HDR + key_len + val_len) as u64;
+                pos += (REC_HDR + key_len + val_len) as u64;
                 count += 1;
             }
-            if count > 0 {
-                h.head.store(head, Ordering::Release);
-                h.drained.fetch_add(count as u64, Ordering::Relaxed);
-            }
-            count
+            (count, pos - start)
         }
     }
 
-    /// Publish that everything drained so far is now durably committed, so
-    /// durable writes waiting on `committed() >= seq` can be acked.
-    pub fn mark_committed(&self) {
+    /// Release the `count` records occupying `bytes`, exactly as returned by a
+    /// preceding [`Consumer::peek`], and publish them as durably committed.
+    ///
+    /// Call this ONLY after the records are safe in Postgres. It advances
+    /// `head` (freeing ring space for the producer) and `committed` (releasing
+    /// any durable ack waiting on `committed() >= seq`) as one step, so the two
+    /// can never disagree.
+    pub fn commit(&self, count: usize, bytes: u64) {
+        if count == 0 {
+            return;
+        }
         unsafe {
             let h = &*self.0.hdr;
-            let d = h.drained.load(Ordering::Relaxed);
+            let head = h.head.load(Ordering::Relaxed);
+            // head first: frees space for the producer.
+            h.head.store(head + bytes, Ordering::Release);
+            // Records are consumed strictly in order, so the running drained
+            // count is also the seq of the last committed record.
+            let d = h.drained.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
             h.committed.store(d, Ordering::Release);
         }
+    }
+
+    /// Read and immediately commit up to `max` records, returning how many.
+    ///
+    /// Only safe where there is no failure point between reading a record and
+    /// it being durable. The persistence worker must NOT use this: it has a
+    /// Postgres transaction in between, so it needs `peek` then `commit`.
+    #[cfg(test)]
+    pub fn drain<F: FnMut(&[u8], &[u8], i64, u8)>(&self, max: usize, f: F) -> usize {
+        let (count, bytes) = self.peek(max, f);
+        self.commit(count, bytes);
+        count
     }
 
     pub fn stats(&self) -> (u64, u64, u64) {
@@ -251,5 +293,152 @@ mod tests {
         }
         consumed += cons.drain(usize::MAX, |_, _, _, _| {}) as u64;
         assert_eq!(produced, consumed, "every pushed record must be drained");
+    }
+
+    /// Saturation is refusal, not overwrite: a full ring rejects the push and
+    /// leaves the unread records intact, so the producer can apply backpressure.
+    /// (`shard_push` in server.rs retries for 5s, then drops and counts.)
+    #[test]
+    fn full_ring_refuses_the_push_and_keeps_earlier_records() {
+        let cap = 1024usize;
+        let mut buf = vec![0u8; bytes_for(cap)];
+        let base = buf.as_mut_ptr();
+        unsafe { init(base, cap) };
+        let prod = unsafe { Producer::attach(base) };
+        let cons = unsafe { Consumer::attach(base) };
+
+        let val = vec![b'x'; 100];
+        let mut accepted = 0u64;
+        while prod.push(b"k", &val, 0, b's').is_some() {
+            accepted += 1;
+            assert!(accepted < 1000, "ring never reported full");
+        }
+        assert!(accepted > 0, "ring rejected even the first record");
+        // Refused, not silently overwritten: everything accepted is still readable.
+        let drained = cons.drain(usize::MAX, |k, v, _, _| {
+            assert_eq!(k, b"k");
+            assert_eq!(v.len(), 100);
+        }) as u64;
+        assert_eq!(
+            drained, accepted,
+            "a full ring must not overwrite records it already accepted"
+        );
+        // Space freed, the producer is unblocked again.
+        assert!(prod.push(b"k", &val, 0, b's').is_some());
+    }
+
+    /// A durable ack must never be released for a write whose persist batch did
+    /// not commit.
+    ///
+    /// The failure this pins down: `peek` must not move `head` or `drained`, so
+    /// a batch whose Postgres transaction fails (disk full, permission error,
+    /// serialization failure) or whose worker is SIGKILLed mid-batch stays in
+    /// the ring. The restarted worker re-reads exactly those records, and
+    /// `committed` never runs ahead of what actually reached `supacache.kv`.
+    ///
+    /// Before the two-phase change this failed with `committed=4`, releasing
+    /// the ack for k1 whose batch never committed.
+    #[test]
+    fn committed_must_not_cover_a_batch_that_never_committed() {
+        let cap = 4096usize;
+        let mut buf = vec![0u8; bytes_for(cap)];
+        let base = buf.as_mut_ptr();
+        unsafe { init(base, cap) };
+        let prod = unsafe { Producer::attach(base) };
+        let cons = unsafe { Consumer::attach(base) };
+
+        // Three durable writes. Each RESP connection is holding its +OK until
+        // committed() >= its seq.
+        let s1 = prod.push(b"k1", b"v1", 0, b's').expect("push k1");
+        let s2 = prod.push(b"k2", b"v2", 0, b's').expect("push k2");
+        let s3 = prod.push(b"k3", b"v3", 0, b's').expect("push k3");
+        assert_eq!((s1, s2, s3), (1, 2, 3));
+
+        // The persist worker reads them into its batch, then bulk_upsert fails
+        // or the worker is killed. `commit` is never reached for this batch.
+        let (n, _bytes) = cons.peek(usize::MAX, |_, _, _, _| {});
+        assert_eq!(n, 3);
+        assert_eq!(prod.committed(), 0, "no batch has committed yet");
+
+        // The worker restarts. Nothing was lost: it re-reads the same three
+        // records, plus anything written since.
+        prod.push(b"k4", b"v4", 0, b's').expect("push k4");
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let (n2, bytes2) = cons.peek(usize::MAX, |k, _, _, _| seen.push(k.to_vec()));
+        assert_eq!(
+            seen,
+            vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec(), b"k4".to_vec()],
+            "an uncommitted batch must stay in the ring for the restarted worker"
+        );
+        assert_eq!(n2, 4);
+
+        // Only now, once they are durable, does the watermark move.
+        cons.commit(n2, bytes2);
+        assert_eq!(
+            prod.committed(),
+            4,
+            "committed must cover exactly the records that reached Postgres"
+        );
+    }
+
+    /// `committed` must never run ahead of the number of records actually
+    /// committed, however the batches are sliced.
+    #[test]
+    fn committed_tracks_only_committed_records() {
+        let cap = 8192usize;
+        let mut buf = vec![0u8; bytes_for(cap)];
+        let base = buf.as_mut_ptr();
+        unsafe { init(base, cap) };
+        let prod = unsafe { Producer::attach(base) };
+        let cons = unsafe { Consumer::attach(base) };
+
+        for i in 0..10u64 {
+            prod.push(format!("k{i}").as_bytes(), b"v", 0, b's').expect("push");
+        }
+        // Commit in uneven slices, with a failed batch in the middle.
+        let (n1, b1) = cons.peek(3, |_, _, _, _| {});
+        cons.commit(n1, b1);
+        assert_eq!(prod.committed(), 3);
+
+        let (nf, _bf) = cons.peek(4, |_, _, _, _| {}); // batch fails: no commit
+        assert_eq!(nf, 4);
+        assert_eq!(prod.committed(), 3, "a failed batch must not advance committed");
+
+        let (n2, b2) = cons.peek(usize::MAX, |_, _, _, _| {});
+        assert_eq!(n2, 7, "the failed batch's records are still queued");
+        cons.commit(n2, b2);
+        assert_eq!(prod.committed(), 10);
+    }
+
+    /// `init` must reset every counter, not only the ones Postgres would have
+    /// zeroed. A stale `committed` on a reused region sits above every seq the
+    /// new producer will hand out, so durable writes ack instantly with nothing
+    /// persisted. Before the fix this failed with `committed=5`.
+    #[test]
+    fn init_resets_every_counter_even_on_a_dirty_region() {
+        let cap = 4096usize;
+        let mut buf = vec![0u8; bytes_for(cap)];
+        let base = buf.as_mut_ptr();
+
+        // First life of the segment: push and commit some records.
+        unsafe { init(base, cap) };
+        let prod = unsafe { Producer::attach(base) };
+        let cons = unsafe { Consumer::attach(base) };
+        for i in 0..5u64 {
+            prod.push(format!("k{i}").as_bytes(), b"v", 0, b's').expect("push");
+        }
+        cons.drain(usize::MAX, |_, _, _, _| {});
+        assert_eq!(prod.committed(), 5);
+
+        // Re-init the same region without zeroing it.
+        unsafe { init(base, cap) };
+        let prod2 = unsafe { Producer::attach(base) };
+        assert_eq!(
+            prod2.committed(),
+            0,
+            "init left committed={} on a reused region: the next durable write \
+             (seq 1) acks immediately with nothing persisted",
+            prod2.committed()
+        );
     }
 }

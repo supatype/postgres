@@ -865,24 +865,55 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
     };
     log!("pg_keyspace persist {idx}: draining ring {idx} -> supacache.kv (synchronous_commit={sync_commit})");
 
+    // Backoff after a failed batch. The records stay in the ring, so a retry
+    // is safe and lossless; the delay stops a permanently broken batch (bad
+    // permissions, disk full) from spinning the worker at full tilt.
+    let mut backoff = Duration::from_millis(0);
     while !BackgroundWorker::sigterm_received() {
         let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
-        consumer.drain(20_000, |k, v, e, kind| batch.push((k.to_vec(), v.to_vec(), e, kind)));
+        // peek, not drain: the records stay queued until the transaction has
+        // actually committed, so a failure here loses nothing and acks nothing.
+        let (count, bytes) =
+            consumer.peek(20_000, |k, v, e, kind| batch.push((k.to_vec(), v.to_vec(), e, kind)));
         if batch.is_empty() {
             std::thread::sleep(idle);
             continue;
         }
-        bulk_upsert(batch, sync_commit, ttl_bucket_us());
-        consumer.mark_committed(); // release durable acks waiting on these records
+        match bulk_upsert(batch, sync_commit, ttl_bucket_us()) {
+            Ok(()) => {
+                // Only now are these records durable: release the ring space
+                // and the durable acks waiting on them.
+                consumer.commit(count, bytes);
+                backoff = Duration::from_millis(0);
+            }
+            Err(e) => {
+                // No commit: `head` does not move, the records are retried on
+                // the next pass, and every durable ack stays held. The RESP
+                // side surfaces this as backpressure rather than a false +OK.
+                log!(
+                    "pg_keyspace persist {idx}: batch of {count} record(s) FAILED to \
+                     persist ({e}); records retained in the ring, durable acks held, \
+                     retrying in {backoff:?}"
+                );
+                backoff = (backoff + Duration::from_millis(50)).min(Duration::from_secs(5));
+                std::thread::sleep(backoff);
+            }
+        }
     }
     // final drain on shutdown
     let mut tail: Vec<server::PendingWrite> = Vec::new();
-    consumer.drain(usize::MAX, |k, v, e, kind| tail.push((k.to_vec(), v.to_vec(), e, kind)));
+    let (tcount, tbytes) =
+        consumer.peek(usize::MAX, |k, v, e, kind| tail.push((k.to_vec(), v.to_vec(), e, kind)));
     if !tail.is_empty() {
-        bulk_upsert(tail, sync_commit, ttl_bucket_us());
-        consumer.mark_committed();
+        match bulk_upsert(tail, sync_commit, ttl_bucket_us()) {
+            Ok(()) => consumer.commit(tcount, tbytes),
+            Err(e) => log!(
+                "pg_keyspace persist {idx}: final batch of {tcount} record(s) FAILED \
+                 to persist ({e}); they remain in the ring for the next start"
+            ),
+        }
     }
-    log!("pg_keyspace persist: shutting down");
+    log!("pg_keyspace persist {idx}: shutting down");
 }
 
 /// verify `supatype_mask` is present in shared_preload_libraries AND
@@ -1159,10 +1190,14 @@ fn pg_recover(store: &Store) -> i64 {
 /// (last op wins), then split three ways: no-TTL upserts -> `supacache.kv`;
 /// TTL'd upserts -> `supacache.kv_ttl` (range-partitioned by expiry bucket, so
 /// expiry is a partition DROP); tombstones -> delete from both.
-fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, bucket_us: i64) {
+fn bulk_upsert(
+    batch: Vec<server::PendingWrite>,
+    sync_commit: &'static str,
+    bucket_us: i64,
+) -> Result<(), pgrx::spi::Error> {
     use std::collections::{HashMap, HashSet};
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
     let mut latest: HashMap<Vec<u8>, (Vec<u8>, i64, u8)> = HashMap::with_capacity(batch.len());
     for (k, v, e, kind) in batch {
@@ -1215,14 +1250,19 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
     let clear_from_kv = tkeys.clone();
 
     BackgroundWorker::transaction(move || {
-        let _ = Spi::connect(|mut client| {
+        Spi::connect(|mut client| {
             // Durability tier: relaxed=off (async, RESP already acked),
             // durable=on (fsync), replicated=remote_apply (needs a standby).
-            let _ = client.update(
+            //
+            // Propagated, not discarded: if this fails the batch would commit
+            // at the cluster default durability instead of the configured
+            // tier, which is exactly the silent downgrade a durable ack must
+            // never hide.
+            client.update(
                 &format!("SET LOCAL synchronous_commit = '{sync_commit}'"),
                 None,
                 None,
-            );
+            )?;
             if !keys.is_empty() {
                 let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), keys.into_datum()),
@@ -1303,8 +1343,8 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
                 )?;
             }
             Ok::<(), pgrx::spi::Error>(())
-        });
-    });
+        })
+    })
 }
 
 /// The expiry worker: periodically DROP TTL partitions whose whole
