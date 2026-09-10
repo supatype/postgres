@@ -15,10 +15,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const HDR_ALIGN: usize = 64;
 const REC_HDR: usize = 16; // u32 + u32 + i64
 
-/// One more than the largest value length a record can encode. The top byte of
-/// the `val_len` field carries the value's type tag, leaving 24 bits, so a
-/// length must fit in `0x00FF_FFFF`.
+/// One more than the largest value length a record can encode *inline*. The top
+/// byte of the `val_len` field carries the value's type tag, leaving 24 bits.
+///
+/// Values anywhere near this never travel inline: past
+/// [`crate::server::INLINE_MAX`] they are staged by reference instead (see
+/// [`KIND_REF`]), so this bound applies only to small values and cannot be
+/// reached in practice. It is enforced anyway, because silently truncating a
+/// length while copying the full payload desynchronises the ring.
 pub const MAX_REC_VAL: usize = 0x0100_0000; // 16 MiB
+
+/// Set on a record's `kind` byte to mean "the value is not in this record".
+///
+/// The payload of such a record is the 8-byte entry `version` at stage time,
+/// not the value: the value stays in the shared-memory store and the
+/// persistence worker reads it from there. This is what stops the ring's
+/// capacity from bounding how large a value can be, and removes the second
+/// copy of every large value.
+///
+/// The real type tag occupies the low bits, so `kind & !KIND_REF` recovers it.
+/// Kinds are ASCII ('s', 'h', 'l', 'z', 'S'), so the top bit is free.
+pub const KIND_REF: u8 = 0x80;
 
 #[repr(C)]
 struct RingHeader {

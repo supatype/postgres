@@ -54,6 +54,17 @@ pub const DELETE_TOMBSTONE: i64 = -1;
 /// `resolve_acks` defers replies, is the proper fix and is not done here.
 pub const PUSH_DEADLINE: Duration = Duration::from_secs(2);
 
+/// Values at or below this are copied into the ring; larger ones are staged by
+/// reference (see [`ring::KIND_REF`]).
+///
+/// 8 KiB is the store's largest slab class, so this is exactly the line between
+/// a value that fits a size class and one that takes the OVERSIZED path. Below
+/// it the copy is a few microseconds and buys complete independence from
+/// eviction, which is worth keeping for the overwhelming majority of traffic.
+/// Above it the copy is both expensive and the thing that made ring capacity a
+/// ceiling on value size, so those go by reference.
+pub const INLINE_MAX: usize = 8 * 1024;
+
 /// Which ring a key's records go to. A key always maps to the same shard, so
 /// its writes and deletes stay ordered and cannot conflict on `ON CONFLICT`.
 #[inline]
@@ -462,6 +473,19 @@ impl Worker {
                         self.flush(fd);
                     }
                 }
+            }
+            // Publish how far persistence has committed so eviction knows which
+            // referenced values are safe to drop. The minimum across rings is
+            // used because sequence numbers are per-ring: conservative, and
+            // exact for the default single persist shard.
+            if !self.producers.is_empty() {
+                let w = self
+                    .producers
+                    .iter()
+                    .map(|p| p.committed())
+                    .min()
+                    .unwrap_or(0);
+                self.store.set_commit_watermark(w);
             }
             // Durable tier: release replies whose ring records have committed,
             // then retry anything parked waiting for ring space to free up.
@@ -3461,7 +3485,39 @@ impl Worker {
         for (k, v, e, kind) in stages {
             // sharded so a given key always lands on the same ring/persist worker
             // — no cross-worker key conflicts on ON CONFLICT.
-            match shard_push(&self.producers, &k, &v, e, kind) {
+            //
+            // Large values are staged by reference: the record carries the
+            // entry's version instead of the value, and the persistence worker
+            // reads the bytes straight out of the shared segment. That removes
+            // the second copy of the value and stops ring capacity from
+            // bounding how large a value may be. `stage_by_ref` also records
+            // the sequence on the entry so eviction cannot drop it before the
+            // worker has committed it.
+            let staged = match (v.len() > INLINE_MAX && e != DELETE_TOMBSTONE)
+                .then(|| store.version_of(&k))
+                .flatten()
+            {
+                Some(version) => {
+                    let r = shard_push(
+                        &self.producers,
+                        &k,
+                        &version.to_le_bytes(),
+                        e,
+                        kind | ring::KIND_REF,
+                    );
+                    // Marked after the push so the sequence is known. Safe to
+                    // do in this order: eviction runs on this same thread, so
+                    // nothing can drop the entry in between.
+                    if let Some((_, seq)) = r {
+                        store.set_staged_seq(&k, seq);
+                    }
+                    r
+                }
+                // Small value, a tombstone, or a key that vanished under us:
+                // copy it into the ring as before.
+                None => shard_push(&self.producers, &k, &v, e, kind),
+            };
+            match staged {
                 Some(sa) => acks.push(sa),
                 None => {
                     queue_failed = true;

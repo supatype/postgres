@@ -16,7 +16,10 @@
 
 use crate::shmem::Shmem;
 
-const MAGIC: u64 = 0x70_67_6b_73_5f_76_32_00; // "pgks_v2\0" (v2: oversized free list)
+// v3 widens Entry with `staged_seq` and PartMeta with `commit_watermark`, for
+// values handed to the persistence worker by reference instead of being copied
+// through the ring. The layout is not compatible with v2.
+const MAGIC: u64 = 0x70_67_6b_73_5f_76_33_00; // "pgks_v3\0"
 
 // Size classes for the slab allocator ("size-classed, 32B..8KB").
 const CLASS_SIZES: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
@@ -63,6 +66,15 @@ struct PartMeta {
     // an oversized value that is rewritten (e.g. a large hash growing field by
     // field) would leak its old region on every write and exhaust the arena.
     free_oversized: u64,
+    // Highest ring sequence the persistence worker has durably committed, as
+    // last observed by this worker's event loop. Eviction compares an entry's
+    // `staged_seq` against it: at or below, the value is safe in Postgres and
+    // the entry can go; above, its only copy is here.
+    //
+    // Written and read by the same single worker thread, so a plain field is
+    // sufficient. Conservative with several persist shards, since the minimum
+    // across rings is used and sequence numbers are per-ring.
+    commit_watermark: u64,
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -82,6 +94,17 @@ struct Entry {
     val_class: u32,
     expires_at: i64, // unix micros, 0 = no expiry
     version: u64,
+    // Ring sequence of this entry's last *referenced* staged write, or 0 when
+    // there is none. A large value is handed to the persistence worker by
+    // reference rather than copied through the ring, so the worker reads it
+    // back out of this segment at commit time. Until that commit lands the
+    // value must still be here: eviction therefore skips an entry whose
+    // `staged_seq` is above the persist worker's commit watermark.
+    //
+    // Only the referenced path sets this. Small values are copied into the
+    // ring as before and stay freely evictable, so this is 0 for them and the
+    // comparison is trivially true.
+    staged_seq: u64,
     flags: u32,
     kind: u32,
 }
@@ -871,6 +894,18 @@ impl Store {
             (*meta).clock_hand = (idx + 1) % bump;
             let e = self.entries_ptr(p).add(idx as usize);
             if (*e).flags & FLAG_OCCUPIED != 0 {
+                // A referenced staged write that has not committed yet: this
+                // segment holds the only copy of the value, because it was
+                // never copied into the ring. Evicting it would lose a write
+                // the client is still waiting to have acknowledged. Leave the
+                // reference bit alone so it is reconsidered on the next sweep.
+                if (*e).staged_seq > (*meta).commit_watermark {
+                    scanned += 1;
+                    if scanned > bump * 2 + 4 {
+                        return false;
+                    }
+                    continue;
+                }
                 if (*e).flags & FLAG_REF != 0 {
                     (*e).flags &= !FLAG_REF;
                 } else {
@@ -892,6 +927,69 @@ impl Store {
                 return false; // nothing evictable (all pinned this pass)
             }
         }
+    }
+
+    /// The entry's current `version`, or None if the key is absent. A ring
+    /// record staged by reference carries this so the persistence worker can
+    /// tell whether the value it is about to read is still the one it was told
+    /// about.
+    pub fn version_of(&self, key: &[u8]) -> Option<u64> {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            let b = found?;
+            let idx = *self.buckets_ptr(p).add(b) - 1;
+            Some((*self.entries_ptr(p).add(idx as usize)).version)
+        }
+    }
+
+    /// Record that this key's value is staged by reference at ring sequence
+    /// `seq`, so eviction leaves it in place until the persistence worker has
+    /// committed that far.
+    pub fn set_staged_seq(&self, key: &[u8], seq: u64) {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            if let Some(b) = found {
+                let idx = *self.buckets_ptr(p).add(b) - 1;
+                (*self.entries_ptr(p).add(idx as usize)).staged_seq = seq;
+            }
+        }
+    }
+
+    /// Publish how far the persistence worker has committed. Eviction uses it
+    /// to decide when a referenced value is safe to drop; call it once per
+    /// event-loop pass with the minimum committed sequence across rings.
+    pub fn set_commit_watermark(&self, w: u64) {
+        for p in 0..self.num_partitions {
+            unsafe { (*self.meta(p)).commit_watermark = w };
+        }
+    }
+
+    /// Read a value staged by reference, for the persistence worker.
+    ///
+    /// `version` is what the ring record recorded at stage time. A mismatch
+    /// means the key was overwritten after staging, so a *newer* record for
+    /// the same key is already queued behind this one (a key always maps to
+    /// one ring, and records are consumed in order). Returning None there is
+    /// correct and lossless: the newer record carries the value that should
+    /// win, and skipping avoids copying a value that is being rewritten.
+    pub fn read_staged<'a>(&'a self, key: &[u8], version: u64) -> Option<(u32, i64, &'a [u8])> {
+        let (kind, exp, val) = self.get_typed(key)?;
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            let b = found?;
+            let idx = *self.buckets_ptr(p).add(b) - 1;
+            let e = self.entries_ptr(p).add(idx as usize);
+            if (*e).version != version {
+                return None; // superseded; a newer record is queued
+            }
+        }
+        Some((kind, exp, val))
     }
 
     pub fn stats(&self, p: u32) -> PartStats {
@@ -1115,5 +1213,74 @@ mod tests {
             Lookup::Hit(v) => assert_eq!(v.len(), 20 * 1024),
             _ => panic!("miss other"),
         }
+    }
+
+    /// A value staged by reference is the only copy there is: it was never
+    /// copied into the ring, so evicting it before the persistence worker
+    /// commits would lose a write the client is still waiting on. Eviction
+    /// must therefore skip it until the commit watermark catches up.
+    #[test]
+    fn eviction_spares_a_referenced_value_until_it_commits() {
+        // Small arena so CLOCK is forced to evict on almost every write.
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 256,
+            data_bytes_per_part: 256 * 1024,
+        };
+        let s = Store::create("t_staged_evict", &cfg).unwrap();
+
+        let big = vec![b'v'; 16 * 1024]; // OVERSIZED, the referenced path
+        assert!(s.set(b"staged", &big, 0));
+        let version = s.version_of(b"staged").expect("entry present");
+        s.set_staged_seq(b"staged", 42); // staged at ring seq 42
+        s.set_commit_watermark(41); // ... not committed yet
+
+        // Hammer the arena. Without the guard CLOCK reclaims the big value.
+        for i in 0..2000u32 {
+            s.set(format!("filler{i}").as_bytes(), &[b'x'; 512], 0);
+        }
+        match s.read_staged(b"staged", version) {
+            Some((_, _, v)) => assert_eq!(v.len(), big.len(), "value corrupted"),
+            None => panic!("uncommitted referenced value was evicted: the write is lost"),
+        }
+
+        // Once the worker has committed past it, it is ordinary cache data.
+        s.set_commit_watermark(42);
+        for i in 0..2000u32 {
+            s.set(format!("later{i}").as_bytes(), &[b'x'; 512], 0);
+        }
+        assert!(
+            s.version_of(b"staged").is_none(),
+            "a committed entry must be evictable again, or the arena fills with pins"
+        );
+    }
+
+    /// The version on the record is what makes a stale reference safe: if the
+    /// key was overwritten after staging, the worker must not persist the new
+    /// bytes under the old record. A newer record is already queued for it.
+    #[test]
+    fn read_staged_rejects_a_superseded_version() {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 256,
+            data_bytes_per_part: 1024 * 1024,
+        };
+        let s = Store::create("t_staged_version", &cfg).unwrap();
+        let big = vec![b'a'; 16 * 1024];
+        assert!(s.set(b"k", &big, 0));
+        let v1 = s.version_of(b"k").unwrap();
+        assert!(s.read_staged(b"k", v1).is_some());
+
+        // Overwrite: the old reference must stop resolving.
+        assert!(s.set(b"k", &vec![b'b'; 16 * 1024], 0));
+        assert!(
+            s.read_staged(b"k", v1).is_none(),
+            "a superseded reference must not resolve to the newer value"
+        );
+        let v2 = s.version_of(b"k").unwrap();
+        assert_ne!(v1, v2);
+        assert!(s.read_staged(b"k", v2).is_some());
     }
 }

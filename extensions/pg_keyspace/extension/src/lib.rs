@@ -933,8 +933,32 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
         // peek, not drain: the records stay queued until the transaction has
         // actually committed, so a failure here loses nothing and acks nothing.
-        let (count, bytes) =
-            consumer.peek(20_000, |k, v, e, kind| batch.push((k.to_vec(), v.to_vec(), e, kind)));
+        // A record whose kind carries ring::KIND_REF does not contain the
+        // value: its payload is the entry version at stage time, and the value
+        // itself is still in the shared segment, which this worker maps too.
+        // Resolve it here so `bulk_upsert` sees a normal (key, value) pair.
+        //
+        // A version mismatch, or a key that is no longer there, means the write
+        // was superseded or deleted after staging. A newer record for that key
+        // is already queued behind this one (a key always maps to one ring and
+        // records are consumed in order), so dropping this one is correct and
+        // loses nothing.
+        let (count, bytes) = consumer.peek(20_000, |k, v, e, kind| {
+            if kind & ring::KIND_REF == 0 {
+                batch.push((k.to_vec(), v.to_vec(), e, kind));
+                return;
+            }
+            let version = if v.len() == 8 {
+                u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
+            } else {
+                return;
+            };
+            if let Some(store) = store_view() {
+                if let Some((_, _, val)) = store.read_staged(k, version) {
+                    batch.push((k.to_vec(), val.to_vec(), e, kind & !ring::KIND_REF));
+                }
+            }
+        });
         if batch.is_empty() {
             std::thread::sleep(idle);
             continue;
