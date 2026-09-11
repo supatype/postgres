@@ -48,8 +48,9 @@ pub fn parse(buf: &[u8], args: &mut Vec<(usize, usize)>, max_bulk: usize) -> Par
 fn parse_array(buf: &[u8], args: &mut Vec<(usize, usize)>, max_bulk: usize) -> Parse {
     let mut pos = 0;
     let (n, adv) = match read_int_line(&buf[pos..]) {
-        Some(x) => x,
-        None => return Parse::Incomplete,
+        IntLine::Ok(v, a) => (v, a),
+        IntLine::NeedMore => return Parse::Incomplete,
+        IntLine::Bad => return Parse::Error,
     };
     if n < 0 || n > MAX_MULTIBULK_LEN {
         return Parse::Error;
@@ -63,8 +64,9 @@ fn parse_array(buf: &[u8], args: &mut Vec<(usize, usize)>, max_bulk: usize) -> P
             return Parse::Error;
         }
         let (len, adv) = match read_int_line(&buf[pos..]) {
-            Some(x) => x,
-            None => return Parse::Incomplete,
+            IntLine::Ok(v, a) => (v, a),
+            IntLine::NeedMore => return Parse::Incomplete,
+            IntLine::Bad => return Parse::Error,
         };
         // Reject on the announced length, before buffering the payload: an
         // oversized bulk string must not be accepted (it would desynchronise
@@ -115,11 +117,33 @@ fn parse_inline(buf: &[u8], args: &mut Vec<(usize, usize)>) -> Parse {
 }
 
 /// Parse `<prefix><int>\r\n` starting at buf[0] (prefix already at [0]).
-/// Returns (value, bytes_consumed_including_crlf).
-fn read_int_line(buf: &[u8]) -> Option<(i64, usize)> {
-    let nl = buf.iter().position(|&c| c == b'\n')?;
+/// Outcome of reading a `<prefix><number>\r\n` header line.
+///
+/// "Not yet" and "never" have to be different answers. Collapsing them makes a
+/// malformed header look like a short read, so the connection sits waiting for
+/// bytes that cannot fix it while the client waits for a reply that never comes.
+enum IntLine {
+    /// Value, and bytes consumed including the CRLF.
+    Ok(i64, usize),
+    /// The line has not arrived in full yet.
+    NeedMore,
+    /// The line is present and is not a number.
+    Bad,
+}
+
+/// Read one `<prefix><number>\r\n` line.
+///
+/// The accumulation is checked because the digits come off the wire: a client
+/// is free to send twenty of them, and `val * 10` on an i64 either panics in a
+/// debug build or wraps in a release one, handing the caller a length nobody
+/// sent and no client could have sent.
+fn read_int_line(buf: &[u8]) -> IntLine {
+    let nl = match buf.iter().position(|&c| c == b'\n') {
+        Some(n) => n,
+        None => return IntLine::NeedMore,
+    };
     if nl < 2 || buf[nl - 1] != b'\r' {
-        return None;
+        return IntLine::Bad;
     }
     let mut val: i64 = 0;
     let mut neg = false;
@@ -128,15 +152,24 @@ fn read_int_line(buf: &[u8]) -> Option<(i64, usize)> {
         neg = true;
         i += 1;
     }
+    if i >= nl - 1 {
+        return IntLine::Bad; // a prefix with no digits behind it
+    }
     while i < nl - 1 {
         let c = buf[i];
         if !c.is_ascii_digit() {
-            return None;
+            return IntLine::Bad;
         }
-        val = val * 10 + (c - b'0') as i64;
+        val = match val
+            .checked_mul(10)
+            .and_then(|v| v.checked_add((c - b'0') as i64))
+        {
+            Some(v) => v,
+            None => return IntLine::Bad,
+        };
         i += 1;
     }
-    Some((if neg { -val } else { val }, nl + 1))
+    IntLine::Ok(if neg { -val } else { val }, nl + 1)
 }
 
 // ---- reply encoders (append into an output buffer) -----------------------
@@ -381,6 +414,182 @@ mod tests {
                 assert_eq!(args.len(), 3);
             }
             _ => panic!("a normal SET must still parse"),
+        }
+    }
+}
+
+/// Randomised protocol tests.
+///
+/// The parser reads lengths straight off the wire and indexes a buffer with
+/// them, so the interesting failures are not "rejects a valid command" but
+/// "accepts something it should not" and "indexes past the end". Both are
+/// reached by inputs nobody writes by hand, which is what these generate.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+
+    /// Deterministic xorshift, so a failure is reproducible from the seed
+    /// printed in the assertion rather than only on the run that found it.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() & 0xff) as u8
+        }
+    }
+
+    /// Bytes that sit on the parser's edges: terminators, sign characters, and
+    /// the digits that build an overflowing length.
+    const NASTY: &[u8] = b"*$\r\n+-:0123456789 \t\0";
+
+    fn gen(rng: &mut Rng) -> Vec<u8> {
+        let n = rng.below(96);
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            // Mostly protocol-shaped bytes, sometimes arbitrary ones, so the
+            // generator spends its time near the grammar rather than far from it.
+            if rng.below(4) == 0 {
+                v.push(rng.byte());
+            } else {
+                v.push(NASTY[rng.below(NASTY.len())]);
+            }
+        }
+        v
+    }
+
+    fn check_ranges(buf: &[u8], args: &[(usize, usize)], consumed: usize, seed: u64) {
+        assert!(consumed <= buf.len(), "consumed past the buffer (seed {seed})");
+        for &(s, e) in args {
+            assert!(s <= e, "inverted range {s}..{e} (seed {seed})");
+            assert!(e <= buf.len(), "range end {e} past buffer {} (seed {seed})", buf.len());
+            assert!(e <= consumed, "range end {e} past consumed {consumed} (seed {seed})");
+        }
+    }
+
+    #[test]
+    fn arbitrary_input_never_panics_and_never_points_out_of_bounds() {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let mut args = Vec::new();
+        for _ in 0..20_000 {
+            let seed = rng.0;
+            let buf = gen(&mut rng);
+            if let Parse::Complete { consumed } = parse(&buf, &mut args, DEFAULT_MAX_BULK_LEN) {
+                check_ranges(&buf, &args, consumed, seed);
+            }
+        }
+    }
+
+    #[test]
+    fn a_truncated_command_is_never_complete() {
+        // The streaming contract: the parser sees whatever has arrived so far,
+        // so a prefix of a complete command must ask for more rather than
+        // report a command the sender never finished.
+        let mut rng = Rng(0x2545F4914F6CDD1D);
+        let mut args = Vec::new();
+        for _ in 0..4_000 {
+            let seed = rng.0;
+            let buf = gen(&mut rng);
+            let full = parse(&buf, &mut args, DEFAULT_MAX_BULK_LEN);
+            if let Parse::Complete { consumed } = full {
+                for cut in 0..consumed {
+                    match parse(&buf[..cut], &mut args, DEFAULT_MAX_BULK_LEN) {
+                        Parse::Complete { consumed: c2 } => panic!(
+                            "prefix of {cut} bytes parsed as complete ({c2}) when the \
+                             whole command needs {consumed} (seed {seed}): {:?}",
+                            &buf[..consumed]
+                        ),
+                        Parse::Incomplete | Parse::Error => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_do_not_change_the_command_in_front_of_them() {
+        // A pipelined client sends several commands in one packet. Parsing must
+        // depend only on the first command's own bytes.
+        let mut rng = Rng(0x1D872E4A9C6F1B3F);
+        let (mut a1, mut a2) = (Vec::new(), Vec::new());
+        for _ in 0..4_000 {
+            let seed = rng.0;
+            let buf = gen(&mut rng);
+            if let Parse::Complete { consumed } = parse(&buf, &mut a1, DEFAULT_MAX_BULK_LEN) {
+                let first = a1.clone();
+                let mut longer = buf[..consumed].to_vec();
+                longer.extend_from_slice(&gen(&mut rng));
+                match parse(&longer, &mut a2, DEFAULT_MAX_BULK_LEN) {
+                    Parse::Complete { consumed: c2 } => {
+                        assert_eq!(c2, consumed, "consumed changed (seed {seed})");
+                        assert_eq!(a2, first, "args changed (seed {seed})");
+                    }
+                    other => panic!(
+                        "appending bytes made a complete command un-parseable: {:?} (seed {seed})",
+                        match other {
+                            Parse::Incomplete => "Incomplete",
+                            _ => "Error",
+                        }
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bulk_longer_than_the_limit_is_refused() {
+        // The limit is what stops a hostile length allocating the process to
+        // death, so it has to be enforced on the header, before the body.
+        let mut args = Vec::new();
+        let over = format!("*1\r\n${}\r\n", 1024 + 1);
+        assert!(matches!(
+            parse(over.as_bytes(), &mut args, 1024),
+            Parse::Error
+        ));
+        // The boundary itself stays acceptable: a length equal to the limit is
+        // legal and merely incomplete until its body arrives.
+        let at = format!("*1\r\n${}\r\n", 1024);
+        assert!(matches!(
+            parse(at.as_bytes(), &mut args, 1024),
+            Parse::Incomplete
+        ));
+    }
+
+    #[test]
+    fn a_multibulk_count_past_the_limit_is_refused() {
+        let mut args = Vec::new();
+        let over = format!("*{}\r\n", MAX_MULTIBULK_LEN + 1);
+        assert!(matches!(
+            parse(over.as_bytes(), &mut args, DEFAULT_MAX_BULK_LEN),
+            Parse::Error
+        ));
+    }
+
+    #[test]
+    fn lengths_that_overflow_are_refused_rather_than_wrapping() {
+        let mut args = Vec::new();
+        for text in [
+            "*1\r\n$99999999999999999999\r\n",
+            "*99999999999999999999\r\n",
+            "*1\r\n$-9223372036854775808\r\n",
+        ] {
+            match parse(text.as_bytes(), &mut args, DEFAULT_MAX_BULK_LEN) {
+                Parse::Error | Parse::Incomplete => {}
+                Parse::Complete { consumed } => {
+                    check_ranges(text.as_bytes(), &args, consumed, 0);
+                    panic!("{text:?} parsed as a complete command");
+                }
+            }
         }
     }
 }
