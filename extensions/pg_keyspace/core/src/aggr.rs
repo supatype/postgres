@@ -589,7 +589,29 @@ pub fn parse_score(b: &[u8]) -> Option<f64> {
     match s.to_ascii_lowercase().as_str() {
         "inf" | "+inf" | "infinity" | "+infinity" => Some(f64::INFINITY),
         "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
-        _ => s.parse::<f64>().ok(),
+        // Rust parses "nan", "NaN" and "NAN" as a float; Valkey rejects all of
+        // them with "value is not a valid float", and it has to. A sorted set
+        // is ordered by score, and every comparison against NaN is false, so a
+        // single NaN score leaves the set with no well-defined order: its
+        // position under ZRANGE is arbitrary and ZRANGEBYSCORE can never match
+        // it, including with -inf +inf.
+        _ => s.parse::<f64>().ok().filter(|v| !v.is_nan()),
+    }
+}
+
+/// Apply a ZINCRBY delta, or `None` if the result would not be a number.
+///
+/// `inf + -inf` is NaN, and reaches this from two perfectly ordinary commands
+/// rather than from a hostile input. Valkey answers "resulting score is not a
+/// number (NaN)" and leaves the set alone; the check belongs here, before the
+/// member is written, so a refused increment does not leave the score it was
+/// refusing behind.
+pub fn incr_score(current: f64, by: f64) -> Option<f64> {
+    let next = current + by;
+    if next.is_nan() {
+        None
+    } else {
+        Some(next)
     }
 }
 
@@ -1635,6 +1657,35 @@ mod score_parity {
             }
             assert_eq!(fmt_score(-v), format!("-{want}"), "score -{v:e}");
         }
+    }
+
+    /// Valkey refuses a NaN score in both paths it can arrive by:
+    ///
+    ///     ZADD z nan m     -> ERR value is not a valid float
+    ///     ZINCRBY z -inf a -> ERR resulting score is not a number (NaN)   (a = inf)
+    ///
+    /// measured against valkey/valkey:8. Rust's float parser accepts "nan", so
+    /// without the filter the first one would have been stored, and a sorted
+    /// set with a NaN score has no well-defined order at all.
+    #[test]
+    fn a_nan_score_is_refused_however_it_arrives() {
+        for text in ["nan", "NaN", "NAN", "+nan", "-nan"] {
+            assert!(
+                parse_score(text.as_bytes()).is_none(),
+                "parse_score accepted {text:?}"
+            );
+        }
+        // Still a valid float, still ordered: these must keep working.
+        assert_eq!(parse_score(b"inf"), Some(f64::INFINITY));
+        assert_eq!(parse_score(b"-inf"), Some(f64::NEG_INFINITY));
+        assert_eq!(parse_score(b"1.5"), Some(1.5));
+
+        // The increment path, which no amount of input validation can cover
+        // because both operands are individually legal.
+        assert_eq!(incr_score(f64::INFINITY, f64::NEG_INFINITY), None);
+        assert_eq!(incr_score(f64::NEG_INFINITY, f64::INFINITY), None);
+        assert_eq!(incr_score(1.0, 2.0), Some(3.0));
+        assert_eq!(incr_score(f64::INFINITY, 1.0), Some(f64::INFINITY));
     }
 
     #[test]

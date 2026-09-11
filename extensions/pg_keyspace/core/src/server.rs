@@ -2813,7 +2813,15 @@ impl Worker {
                     Some(x) => x,
                     None => return,
                 };
-                let next = z.score(&args[3]).unwrap_or(0.0) + by;
+                // Checked before the member is touched: an increment that
+                // would refuse must leave the set exactly as it found it.
+                let next = match aggr::incr_score(z.score(&args[3]).unwrap_or(0.0), by) {
+                    Some(v) => v,
+                    None => {
+                        resp::error(out, "ERR resulting score is not a number (NaN)");
+                        return;
+                    }
+                };
                 z.add(&args[3], next);
                 if !save_zset(&store, &args[1], &z, exp, out) {
                     return;
