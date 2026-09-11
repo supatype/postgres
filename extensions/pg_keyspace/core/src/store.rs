@@ -680,7 +680,7 @@ impl Store {
         if let Some(b) = found {
             // overwrite value in place, reusing the slab if the class matches.
             let idx = *self.buckets_ptr(p).add(b) - 1;
-            let e = self.entries_ptr(p).add(idx as usize);
+            let mut e = self.entries_ptr(p).add(idx as usize);
             let want = class_for(val.len());
             // Reuse the existing region in place when it still fits: same size
             // class, or an oversized block whose capacity covers the new length.
@@ -689,27 +689,56 @@ impl Store {
                     let cap = *(self.data_ptr(p).add(((*e).val_off - 8) as usize) as *const u64);
                     (val.len() as u64) <= cap
                 });
+            let mut installed = true;
             if reuse {
                 let vp = self.data_ptr(p).add((*e).val_off as usize);
                 std::ptr::copy_nonoverlapping(val.as_ptr(), vp, val.len());
                 (*e).val_len = val.len() as u32;
             } else {
-                self.slab_free(p, (*e).val_off, (*e).val_class);
-                let (voff, vcls) = match self.ensure_alloc(p, val.len()) {
+                // Allocate the replacement BEFORE releasing the old block.
+                //
+                // Freeing first and then failing to allocate left the entry
+                // pointing into the free list: the previous value was destroyed
+                // even though the write failed, and a later read returned
+                // whatever had since been handed to another key. A failed
+                // overwrite must be a no-op, not a silent corruption.
+                let got = self.ensure_alloc(p, val.len());
+                let (voff, vcls) = match got {
                     Some(x) => x,
+                    // Nothing to undo: the old value is still intact and
+                    // readable, which is the correct outcome for a write that
+                    // could not be served.
                     None => return false,
                 };
-                let vp = self.data_ptr(p).add(voff as usize);
-                std::ptr::copy_nonoverlapping(val.as_ptr(), vp, val.len());
-                (*e).val_off = voff;
-                (*e).val_class = vcls;
-                (*e).val_len = val.len() as u32;
+                // `ensure_alloc` evicts to make room and CLOCK can evict *this*
+                // entry, so the earlier pointer may now be a free slot. Re-probe
+                // rather than writing through it.
+                match self.probe(p, hash, key).0 {
+                    Some(b2) => {
+                        let idx2 = *self.buckets_ptr(p).add(b2) - 1;
+                        e = self.entries_ptr(p).add(idx2 as usize);
+                        self.slab_free(p, (*e).val_off, (*e).val_class);
+                        let vp = self.data_ptr(p).add(voff as usize);
+                        std::ptr::copy_nonoverlapping(val.as_ptr(), vp, val.len());
+                        (*e).val_off = voff;
+                        (*e).val_class = vcls;
+                        (*e).val_len = val.len() as u32;
+                    }
+                    None => {
+                        // Evicted while we were making room for it. Release the
+                        // block we took and insert the key afresh below.
+                        self.slab_free(p, voff, vcls);
+                        installed = false;
+                    }
+                }
             }
-            (*e).expires_at = exp;
-            (*e).version += 1;
-            (*e).flags |= FLAG_REF;
-            (*e).kind = kind;
-            return true;
+            if installed {
+                (*e).expires_at = exp;
+                (*e).version += 1;
+                (*e).flags |= FLAG_REF;
+                (*e).kind = kind;
+                return true;
+            }
         }
 
         // insert new. Compact first if the table is getting full, so a probe
@@ -783,7 +812,33 @@ impl Store {
     }
 
     /// Allocate slab space, evicting under CLOCK until it fits.
+    /// Arena bytes a `size`-byte allocation actually consumes, matching what
+    /// `slab_alloc` will reserve: a size class rounds to its class, an
+    /// oversized block rounds its capacity to a power of two and adds the
+    /// 8-byte capacity header.
+    fn alloc_footprint(&self, size: usize) -> u64 {
+        let cls = class_for(size);
+        if cls == OVERSIZED {
+            8 + (align_up(size, 8) as u64).max(16).next_power_of_two()
+        } else {
+            CLASS_SIZES[cls as usize] as u64
+        }
+    }
+
     unsafe fn ensure_alloc(&self, p: u32, size: usize) -> Option<(u64, u32)> {
+        // Refuse an allocation the arena could never satisfy, before evicting
+        // anything. Without this, a single write too large for the arena evicts
+        // the entire keyspace one entry at a time and then fails regardless:
+        // the write does not land and every other key is gone with it.
+        //
+        // This must measure what `slab_alloc` will actually ask for, not the
+        // caller's size. An oversized block rounds its capacity up to a power
+        // of two and carries an 8-byte header, so a 9 MiB value really needs
+        // 16 MiB: checking the raw size let it through, and the doomed
+        // eviction loop ran anyway.
+        if self.alloc_footprint(size) > self.data_bytes {
+            return None;
+        }
         loop {
             if let Some(x) = self.slab_alloc(p, size) {
                 return Some(x);
@@ -1416,5 +1471,91 @@ mod tests {
             assert_eq!(used(), grow_baseline, "{size}-byte round leaked arena");
             size *= 2;
         }
+    }
+
+    /// A failed overwrite must leave the previous value intact.
+    ///
+    /// The old code released the existing block before allocating the
+    /// replacement, so when the allocation then failed the entry still pointed
+    /// at freed space: the previous value was destroyed even though the write
+    /// failed, and a later read returned whatever had since been handed to
+    /// another key. Allocation also evicts, and CLOCK could evict the very
+    /// entry being overwritten, after which the old code wrote through a
+    /// pointer to a freed slot.
+    #[test]
+    fn failed_overwrite_leaves_the_old_value_intact() {
+        // Room for one oversized value and little else.
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 64,
+            data_bytes_per_part: 512 * 1024,
+        };
+        let s = Store::create("t_failed_overwrite", &cfg).unwrap();
+
+        let original = vec![b'a'; 64 * 1024];
+        assert!(s.set(b"k", &original, 0), "initial write should fit");
+
+        // Ask for more than the arena can ever hold. This must fail...
+        let impossible = vec![b'b'; 4 * 1024 * 1024];
+        assert!(!s.set(b"k", &impossible, 0), "oversized overwrite must fail");
+
+        // ...and must not have disturbed what was already there.
+        match s.get(b"k") {
+            Lookup::Hit(v) => {
+                assert_eq!(v.len(), original.len(), "old value truncated by a failed write");
+                assert!(
+                    v.iter().all(|&b| b == b'a'),
+                    "old value corrupted by a failed write: read back bytes that are                      not the value we stored, so the entry pointed at reclaimed space"
+                );
+            }
+            Lookup::Miss => panic!("a failed overwrite destroyed the existing value"),
+        }
+
+        // The key is still writable afterwards, so nothing was left wedged.
+        assert!(s.set(b"k", &vec![b'c'; 1024], 0));
+        match s.get(b"k") {
+            Lookup::Hit(v) => assert!(v.len() == 1024 && v.iter().all(|&b| b == b'c')),
+            Lookup::Miss => panic!("key lost after a successful rewrite"),
+        }
+    }
+
+    /// A write too large for the arena must be refused without evicting.
+    ///
+    /// `ensure_alloc` evicts in a loop until the allocation succeeds or nothing
+    /// is evictable. For a request larger than the whole arena that loop can
+    /// never succeed, so it used to evict every entry in the keyspace and then
+    /// fail anyway: one oversized write destroyed the entire cache.
+    #[test]
+    fn impossible_write_does_not_evict_the_keyspace() {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 256,
+            data_bytes_per_part: 512 * 1024,
+        };
+        let s = Store::create("t_impossible_write", &cfg).unwrap();
+
+        for i in 0..100u32 {
+            assert!(s.set(format!("k{i}").as_bytes(), &[b'v'; 256], 0));
+        }
+        let before = s.stats(0).evictions;
+
+        // Larger than the whole arena: cannot ever be served.
+        assert!(!s.set(b"impossible", &vec![b'x'; 4 * 1024 * 1024], 0));
+
+        let after = s.stats(0).evictions;
+        assert_eq!(
+            before, after,
+            "an impossible write evicted {} entries before giving up",
+            after - before
+        );
+        let mut alive = 0;
+        for i in 0..100u32 {
+            if matches!(s.get(format!("k{i}").as_bytes()), Lookup::Hit(_)) {
+                alive += 1;
+            }
+        }
+        assert_eq!(alive, 100, "an impossible write destroyed existing keys");
     }
 }
