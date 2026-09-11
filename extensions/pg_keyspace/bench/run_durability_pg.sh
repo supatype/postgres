@@ -358,6 +358,45 @@ fi
 chk "no dropped records across the multi-worker run" "0" "$(psql_ "SELECT dropped FROM supacache.ring_stats()")"
 chk "no unresolved references" "0" "$(psql_ "SELECT unresolved FROM supacache.ring_stats()")"
 
+echo "########## Q. cross-worker pub/sub ##########"
+# The workers are separate processes. A SUBSCRIBE on one and a PUBLISH on
+# another only meet if the routing table and inboxes live in shared memory;
+# with the in-process bus the message is dropped and PUBLISH answers 0, which
+# is exactly what "nobody is listening" looks like, so neither side can tell.
+SUBW=$((MW_WORKERS-1))
+rm -f /tmp/sub.out /tmp/psub.out
+
+( timeout 10 redis-cli -p $((RESP+SUBW)) SUBSCRIBE xw:chan > /tmp/sub.out 2>&1 ) &
+( timeout 10 redis-cli -p $((RESP+SUBW)) PSUBSCRIBE "xw:*" > /tmp/psub.out 2>&1 ) &
+sleep 3
+
+RECV=$(timeout 5 redis-cli -p $RESP PUBLISH xw:chan hello-across 2>&1)
+chk "PUBLISH on worker 0 counts the subscribers on worker $SUBW" "2" "$RECV"
+
+# A channel nobody subscribed to must still report nobody, so the count above
+# is the routing table working rather than a broadcast to every worker. The
+# name deliberately falls outside "xw:*" too: the pattern subscriber above
+# matches anything under that prefix, so xw:quiet would have had a real
+# receiver and this would have been asserting the wrong thing.
+chk "an unsubscribed channel still reports no receivers" "0" \
+    "$(timeout 5 redis-cli -p $RESP PUBLISH zz:quiet nobody 2>&1)"
+
+wait 2>/dev/null || true
+if grep -q "hello-across" /tmp/sub.out 2>/dev/null; then
+  echo "PASS  the channel subscriber on worker $SUBW received it"; pass=$((pass+1))
+else
+  echo "FAIL  worker $SUBW never received the channel message"; fail=$((fail+1))
+fi
+if grep -q "hello-across" /tmp/psub.out 2>/dev/null; then
+  echo "PASS  the pattern subscriber on worker $SUBW received it"; pass=$((pass+1))
+else
+  echo "FAIL  worker $SUBW never received the pattern message"; fail=$((fail+1))
+fi
+
+chk "no pub/sub messages dropped" "0" "$(psql_ "SELECT dropped FROM supacache.pubsub_stats()")"
+chk "no subscriptions refused for table space" "0" "$(psql_ "SELECT route_full FROM supacache.pubsub_stats()")"
+chk "no subscriptions refused for name length" "0" "$(psql_ "SELECT name_too_long FROM supacache.pubsub_stats()")"
+
 stop_pg; sleep 1
 set_conf "pg_keyspace.workers" "1"
 set_conf "pg_keyspace.persist_workers" "1"

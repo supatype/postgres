@@ -1,7 +1,7 @@
 //! Cross-worker pub/sub bus.
 //!
 //! The slot workers are shared-nothing on the *key* path, but pub/sub
-//! channels are not sharded — a PUBLISH on one worker must reach subscribers on
+//! channels are not sharded: a PUBLISH on one worker must reach subscribers on
 //! any worker. When workers are threads of one process (the scale-out daemon)
 //! they share this `Bus`: a routing table (channel/pattern -> which workers hold
 //! subscribers, and how many) plus a per-worker inbox and a wake fd (an
@@ -16,6 +16,8 @@ use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+use crate::pubsub_shm::ShmBus;
 
 /// Which workers hold subscribers for a key, and how many each has.
 #[derive(Default)]
@@ -70,6 +72,11 @@ fn make_wake() -> (RawFd, RawFd) {
 }
 
 pub struct Bus {
+    /// Set when the workers are separate processes and the routing table and
+    /// inboxes live in a shared segment. When it is `None` the in-process
+    /// fields below are the backing, which is correct only for workers that are
+    /// threads of one process.
+    shared: Option<ShmBus>,
     routing: Mutex<Routing>,
     slots: Vec<Slot>,
     // Number of connections across all workers with CLIENT TRACKING on. The
@@ -91,18 +98,60 @@ impl Bus {
             });
         }
         Bus {
+            shared: None,
             routing: Mutex::new(Routing::default()),
             slots,
             trackers: AtomicUsize::new(0),
         }
     }
 
+    /// Create a bus whose routing table and inboxes live in `base`, a shared
+    /// segment sized by [`crate::pubsub_shm::bytes_for`].
+    ///
+    /// The wake descriptors are still created here, in the caller's process, and
+    /// that is the point: Postgres forks its background workers from the
+    /// postmaster, so descriptors this constructor opens before the fork are
+    /// usable by every worker afterwards. Build the bus after the fork and each
+    /// worker gets private descriptors that wake nobody.
+    ///
+    /// # Safety
+    /// `base` must point at a region of at least
+    /// `pubsub_shm::bytes_for(nworkers, max_routes, ring_bytes)` writable bytes
+    /// that no other process is reading yet.
+    pub unsafe fn new_shared(
+        base: *mut u8,
+        nworkers: usize,
+        max_routes: usize,
+        ring_bytes: usize,
+    ) -> Bus {
+        let mut bus = Bus::new(nworkers);
+        bus.shared = Some(ShmBus::init(base, nworkers, max_routes, ring_bytes));
+        bus
+    }
+
+    /// Whether this bus reaches other processes.
+    pub fn is_shared(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    /// `(dropped, route_full, name_too_long)` for a shared bus; zeros for an
+    /// in-process one, which has no bounded table or ring to overflow.
+    pub fn shm_stats(&self) -> (u64, u64, u64) {
+        self.shared.map_or((0, 0, 0), |s| s.stats())
+    }
+
     /// Record that a connection turned CLIENT TRACKING on / off. `tracking_active`
     /// then tells the write path whether any worker has a tracker at all.
     pub fn tracker_add(&self) {
+        if let Some(shm) = self.shared {
+            return shm.tracker_add();
+        }
         self.trackers.fetch_add(1, Ordering::Relaxed);
     }
     pub fn tracker_remove(&self) {
+        if let Some(shm) = self.shared {
+            return shm.tracker_remove();
+        }
         // saturating: never wrap below zero if counts ever get out of step.
         let mut cur = self.trackers.load(Ordering::Relaxed);
         while cur > 0 {
@@ -119,6 +168,9 @@ impl Bus {
     }
     /// Whether any connection anywhere has tracking on.
     pub fn tracking_active(&self) -> bool {
+        if let Some(shm) = self.shared {
+            return shm.tracking_active();
+        }
         self.trackers.load(Ordering::Relaxed) > 0
     }
 
@@ -138,6 +190,9 @@ impl Bus {
 
     /// Record that worker `wid` gained a subscriber on `key`.
     pub fn subscribe(&self, wid: usize, key: &[u8], pattern: bool) {
+        if let Some(shm) = self.shared {
+            return shm.subscribe(wid, key, pattern);
+        }
         let mut r = self.routing.lock().unwrap();
         *Self::table(&mut r, pattern)
             .entry(key.to_vec())
@@ -148,6 +203,9 @@ impl Bus {
 
     /// Record that worker `wid` lost a subscriber on `key`.
     pub fn unsubscribe(&self, wid: usize, key: &[u8], pattern: bool) {
+        if let Some(shm) = self.shared {
+            return shm.unsubscribe(wid, key, pattern);
+        }
         let mut r = self.routing.lock().unwrap();
         let map = Self::table(&mut r, pattern);
         if let Some(per) = map.get_mut(key) {
@@ -174,6 +232,9 @@ impl Bus {
         msg: &[u8],
         glob: F,
     ) -> usize {
+        if let Some(shm) = self.shared {
+            return shm.publish(from, channel, msg, glob, |w| self.wake(w));
+        }
         // Collect target workers + their subscriber counts under the lock.
         let mut targets: HashMap<usize, usize> = HashMap::new();
         {
@@ -212,6 +273,9 @@ impl Bus {
     /// than routing by subscription, because the tracking tables live per-worker.
     /// Callers gate this on `tracking_active` so it never runs when nobody tracks.
     pub fn invalidate(&self, from: usize, key: Option<&[u8]>) {
+        if let Some(shm) = self.shared {
+            return shm.invalidate(from, key, |w| self.wake(w));
+        }
         for wid in 0..self.slots.len() {
             if wid == from {
                 continue; // the caller already invalidated its own trackers
@@ -239,7 +303,7 @@ impl Bus {
     }
 
     /// Drain this worker's inbox (called after its wake fd fires). Also fully
-    /// drains the wake fd itself so it does not re-fire spuriously — read until
+    /// drains the wake fd itself so it does not re-fire spuriously, reading until
     /// EAGAIN, which empties both an eventfd counter and a pipe with queued bytes
     /// (mio is edge-triggered, so a partial drain would miss later wakes).
     pub fn drain(&self, wid: usize) -> Vec<BusMsg> {
@@ -255,6 +319,9 @@ impl Bus {
             if n <= 0 {
                 break; // EAGAIN (drained) or error
             }
+        }
+        if let Some(shm) = self.shared {
+            return shm.drain(wid);
         }
         let mut ib = self.slots[wid].inbox.lock().unwrap();
         ib.drain(..).collect()
@@ -273,5 +340,72 @@ impl Drop for Bus {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pubsub_shm::bytes_for;
+
+    fn exact(pat: &[u8], ch: &[u8]) -> bool {
+        pat == ch
+    }
+
+    /// A shared bus must route through the segment, not through the in-process
+    /// tables that happen to sit alongside it. Delivery alone would not show
+    /// that: the in-process backing would pass the same assertion while
+    /// reaching no other process at all. So this also asserts the in-process
+    /// routing table stayed empty.
+    #[test]
+    fn a_shared_bus_routes_through_the_segment() {
+        let mut region = vec![0u8; bytes_for(3, 16, 4096)];
+        let bus = unsafe { Bus::new_shared(region.as_mut_ptr(), 3, 16, 4096) };
+        assert!(bus.is_shared());
+
+        bus.subscribe(2, b"news", false);
+        assert_eq!(bus.publish(0, b"news", b"hello", exact), 1);
+
+        assert!(
+            bus.routing.lock().unwrap().channels.is_empty(),
+            "the in-process routing table must be untouched"
+        );
+
+        let got = bus.drain(2);
+        assert_eq!(got.len(), 1);
+        match &got[0] {
+            BusMsg::Publish(c, m) => {
+                assert_eq!(c, b"news");
+                assert_eq!(m, b"hello");
+            }
+            _ => panic!("wrong kind"),
+        }
+    }
+
+    /// The in-process bus keeps working unchanged, so the daemon is unaffected.
+    #[test]
+    fn an_in_process_bus_still_uses_its_own_tables() {
+        let bus = Bus::new(3);
+        assert!(!bus.is_shared());
+        bus.subscribe(2, b"news", false);
+        assert!(!bus.routing.lock().unwrap().channels.is_empty());
+        assert_eq!(bus.publish(0, b"news", b"hello", exact), 1);
+        assert_eq!(bus.drain(2).len(), 1);
+    }
+
+    #[test]
+    fn tracking_counts_live_in_the_segment_when_shared() {
+        let mut region = vec![0u8; bytes_for(2, 4, 1024)];
+        let bus = unsafe { Bus::new_shared(region.as_mut_ptr(), 2, 4, 1024) };
+        assert!(!bus.tracking_active());
+        bus.tracker_add();
+        assert!(bus.tracking_active());
+        assert_eq!(
+            bus.trackers.load(Ordering::Relaxed),
+            0,
+            "the in-process counter must be untouched"
+        );
+        bus.tracker_remove();
+        assert!(!bus.tracking_active());
     }
 }
