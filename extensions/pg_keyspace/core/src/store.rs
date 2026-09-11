@@ -812,13 +812,31 @@ impl Store {
     }
 
     /// Allocate slab space, evicting under CLOCK until it fits.
+    /// Arena bytes a `size`-byte allocation actually consumes, matching what
+    /// `slab_alloc` will reserve: a size class rounds to its class, an
+    /// oversized block rounds its capacity to a power of two and adds the
+    /// 8-byte capacity header.
+    fn alloc_footprint(&self, size: usize) -> u64 {
+        let cls = class_for(size);
+        if cls == OVERSIZED {
+            8 + (align_up(size, 8) as u64).max(16).next_power_of_two()
+        } else {
+            CLASS_SIZES[cls as usize] as u64
+        }
+    }
+
     unsafe fn ensure_alloc(&self, p: u32, size: usize) -> Option<(u64, u32)> {
         // Refuse an allocation the arena could never satisfy, before evicting
-        // anything. Without this, a single write larger than the whole arena
-        // evicts the entire keyspace one entry at a time and then fails
-        // regardless: the write does not land and every other key is gone
-        // with it. The 8 bytes cover an oversized block's capacity header.
-        if size as u64 + 8 > self.data_bytes {
+        // anything. Without this, a single write too large for the arena evicts
+        // the entire keyspace one entry at a time and then fails regardless:
+        // the write does not land and every other key is gone with it.
+        //
+        // This must measure what `slab_alloc` will actually ask for, not the
+        // caller's size. An oversized block rounds its capacity up to a power
+        // of two and carries an 8-byte header, so a 9 MiB value really needs
+        // 16 MiB: checking the raw size let it through, and the doomed
+        // eviction loop ran anyway.
+        if self.alloc_footprint(size) > self.data_bytes {
             return None;
         }
         loop {

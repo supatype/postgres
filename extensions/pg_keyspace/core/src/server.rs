@@ -552,7 +552,7 @@ impl Worker {
                 Some(k) => k,
                 None => continue,
             };
-            let val_bound = if aggregate {
+            let inline_bound = if aggregate {
                 // current blob (if any) + everything this command could add
                 let cur = self
                     .store
@@ -563,6 +563,13 @@ impl Worker {
             } else {
                 arg_bytes
             };
+            // A record never carries more than `INLINE_MAX` of value: past that
+            // the value is staged by reference and the record holds an 8-byte
+            // version instead. Sizing this check by the value itself made a
+            // write larger than `ring_mb` demand ring space it would never use,
+            // so `has_room` could never be satisfied and the connection parked
+            // forever with no error and no timeout.
+            let val_bound = inline_bound.min(INLINE_MAX);
             if !self.producers[shard_of(n, key)].has_room(key.len(), val_bound) {
                 return false;
             }
