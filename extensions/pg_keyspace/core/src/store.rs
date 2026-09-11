@@ -15,6 +15,7 @@
 //! Not MVCC. No tuple headers. No vacuum. Entries are overwritten in place.
 
 use crate::shmem::Shmem;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // v3 widens Entry with `staged_seq` and PartMeta with `commit_watermark`, for
 // values handed to the persistence worker by reference instead of being copied
@@ -93,7 +94,15 @@ struct Entry {
     key_class: u32,
     val_class: u32,
     expires_at: i64, // unix micros, 0 = no expiry
-    version: u64,
+    // Seqlock. Even means the entry is stable; odd means a writer is partway
+    // through replacing the value. A reader in another backend samples this
+    // before and after copying and retries if it moved, which is what stops it
+    // splicing the head of a new value onto the tail of an old one.
+    //
+    // Also the change counter WATCH compares, and what a by-reference ring
+    // record carries so the persistence worker can tell whether the value it
+    // is about to read is still the one it was told about.
+    version: AtomicU64,
     // Ring sequence of this entry's last *referenced* staged write, or 0 when
     // there is none. A large value is handed to the persistence worker by
     // reference rather than copied through the ring, so the worker reads it
@@ -132,6 +141,36 @@ fn class_for(size: usize) -> u32 {
         }
     }
     OVERSIZED
+}
+
+/// Open a write on an entry: version goes odd, so a concurrent reader in
+/// another backend knows the value is being replaced and retries.
+/// Read a settled version, waiting out a write that is in progress. Bounded:
+/// a writer holds the odd window for a memcpy, so this spins only briefly, and
+/// giving up returns the odd value rather than looping forever if a writer
+/// died mid-update.
+#[inline]
+unsafe fn stable_version(e: *mut Entry) -> u64 {
+    for _ in 0..1024 {
+        let v = (*e).version.load(Ordering::Acquire);
+        if v & 1 == 0 {
+            return v;
+        }
+        std::hint::spin_loop();
+    }
+    (*e).version.load(Ordering::Acquire)
+}
+
+#[inline]
+unsafe fn seq_begin(e: *mut Entry) {
+    (*e).version.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Close a write: version goes even again, one higher than any reader that
+/// sampled it before the write started, so the retry sees the change.
+#[inline]
+unsafe fn seq_end(e: *mut Entry) {
+    (*e).version.fetch_add(1, Ordering::Release);
 }
 
 #[inline]
@@ -691,6 +730,7 @@ impl Store {
                 });
             let mut installed = true;
             if reuse {
+                seq_begin(e);
                 let vp = self.data_ptr(p).add((*e).val_off as usize);
                 std::ptr::copy_nonoverlapping(val.as_ptr(), vp, val.len());
                 (*e).val_len = val.len() as u32;
@@ -717,6 +757,10 @@ impl Store {
                     Some(b2) => {
                         let idx2 = *self.buckets_ptr(p).add(b2) - 1;
                         e = self.entries_ptr(p).add(idx2 as usize);
+                        // Opened only now: the allocation above can evict, and
+                        // an entry left with an odd version while that ran
+                        // would spin every reader for no reason.
+                        seq_begin(e);
                         self.slab_free(p, (*e).val_off, (*e).val_class);
                         let vp = self.data_ptr(p).add(voff as usize);
                         std::ptr::copy_nonoverlapping(val.as_ptr(), vp, val.len());
@@ -734,9 +778,9 @@ impl Store {
             }
             if installed {
                 (*e).expires_at = exp;
-                (*e).version += 1;
-                (*e).flags |= FLAG_REF;
                 (*e).kind = kind;
+                (*e).flags |= FLAG_REF;
+                seq_end(e);
                 return true;
             }
         }
@@ -786,7 +830,7 @@ impl Store {
         (*e).val_len = val.len() as u32;
         (*e).val_class = vcls;
         (*e).expires_at = exp;
-        (*e).version = 1;
+        (*e).version.store(2, Ordering::Release); // even: stable
         (*e).flags = FLAG_OCCUPIED | FLAG_REF;
         (*e).kind = kind;
 
@@ -912,7 +956,7 @@ impl Store {
                 self.remove_at(p, b, idx);
                 return None;
             }
-            Some((*e).version)
+            Some(stable_version(e))
         }
     }
 
@@ -1070,7 +1114,7 @@ impl Store {
             let (found, _) = self.probe(p, hash, key);
             let b = found?;
             let idx = *self.buckets_ptr(p).add(b) - 1;
-            Some((*self.entries_ptr(p).add(idx as usize)).version)
+            Some(stable_version(self.entries_ptr(p).add(idx as usize)))
         }
     }
 
@@ -1106,20 +1150,83 @@ impl Store {
     /// one ring, and records are consumed in order). Returning None there is
     /// correct and lossless: the newer record carries the value that should
     /// win, and skipping avoids copying a value that is being rewritten.
-    pub fn read_staged<'a>(&'a self, key: &[u8], version: u64) -> Option<(u32, i64, &'a [u8])> {
-        let (kind, exp, val) = self.get_typed(key)?;
+    pub fn read_staged(&self, key: &[u8], version: u64) -> Option<(u32, i64, Vec<u8>)> {
         let hash = fnv1a(key);
         let p = self.partition_for_hash(hash);
         unsafe {
-            let (found, _) = self.probe(p, hash, key);
-            let b = found?;
-            let idx = *self.buckets_ptr(p).add(b) - 1;
-            let e = self.entries_ptr(p).add(idx as usize);
-            if (*e).version != version {
-                return None; // superseded; a newer record is queued
+            for _ in 0..256 {
+                let (found, _) = self.probe(p, hash, key);
+                let b = found?;
+                let idx = *self.buckets_ptr(p).add(b) - 1;
+                let e = self.entries_ptr(p).add(idx as usize);
+                let v1 = (*e).version.load(Ordering::Acquire);
+                if v1 & 1 == 1 {
+                    std::hint::spin_loop();
+                    continue; // mid-write; wait for it to settle
+                }
+                if v1 != version {
+                    return None; // superseded; a newer record is queued behind
+                }
+                let exp = (*e).expires_at;
+                let kind = (*e).kind;
+                let off = (*e).val_off as usize;
+                let len = (*e).val_len as usize;
+                let mut out = vec![0u8; len];
+                std::ptr::copy_nonoverlapping(self.data_ptr(p).add(off), out.as_mut_ptr(), len);
+                // Re-check only after the copy. Validating first and handing
+                // back a borrow, as this used to, left the caller copying
+                // outside the guard: a rewrite in that window put a spliced
+                // value into supacache.kv.
+                if (*e).version.load(Ordering::Acquire) == v1 {
+                    return Some((kind, exp, out));
+                }
+                std::hint::spin_loop();
             }
+            None
         }
-        Some((kind, exp, val))
+    }
+
+    /// Copy a value out under the seqlock, for a reader in another backend.
+    ///
+    /// `get` hands back a slice that points straight into shared memory, which
+    /// is right for the RESP worker (it owns its partition and is the only
+    /// writer) and wrong for anyone else: the worker can rewrite the entry
+    /// while the caller is still reading, so the caller can see the head of
+    /// one value and the tail of another. This samples the version, copies,
+    /// and re-samples; a change means the copy is untrustworthy and it starts
+    /// again.
+    ///
+    /// Returns `None` if the key is absent or expired. Contention is resolved
+    /// by retrying, since a writer holds the window only for a memcpy.
+    pub fn get_stable(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            for _ in 0..256 {
+                let (found, _) = self.probe(p, hash, key);
+                let b = found?;
+                let idx = *self.buckets_ptr(p).add(b) - 1;
+                let e = self.entries_ptr(p).add(idx as usize);
+                let exp = (*e).expires_at;
+                if exp != 0 && exp <= now_micros() {
+                    return None;
+                }
+                let v1 = (*e).version.load(Ordering::Acquire);
+                if v1 & 1 == 1 {
+                    std::hint::spin_loop();
+                    continue; // a write is in flight
+                }
+                let off = (*e).val_off as usize;
+                let len = (*e).val_len as usize;
+                let mut out = vec![0u8; len];
+                std::ptr::copy_nonoverlapping(self.data_ptr(p).add(off), out.as_mut_ptr(), len);
+                if (*e).version.load(Ordering::Acquire) == v1 {
+                    return Some(out); // nothing moved underneath us
+                }
+                std::hint::spin_loop();
+            }
+            None
+        }
     }
 
     pub fn stats(&self, p: u32) -> PartStats {
@@ -1557,5 +1664,64 @@ mod tests {
             }
         }
         assert_eq!(alive, 100, "an impossible write destroyed existing keys");
+    }
+
+    /// A reader in another backend must never see half of one value and half
+    /// of another.
+    ///
+    /// `get` hands back a slice into shared memory, so a caller that is not the
+    /// owning worker reads it while the worker may be rewriting that key in
+    /// place. This drives exactly that race: one thread alternates between two
+    /// values of the same length made of distinct bytes, another reads
+    /// concurrently, and every observation must be wholly one or wholly the
+    /// other. Run with `get` instead of `get_stable` and it fails.
+    #[test]
+    fn concurrent_reader_never_observes_a_spliced_value() {
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::sync::Arc;
+
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 64,
+            data_bytes_per_part: 1024 * 1024,
+        };
+        let s = Arc::new(Store::create("t_seqlock_tear", &cfg).unwrap());
+        // 4 KiB: a size class, so rewrites land in place, which is the case
+        // that splices rather than swapping a pointer.
+        let a = vec![b'a'; 4096];
+        let b = vec![b'b'; 4096];
+        assert!(s.set(b"k", &a, 0));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (s, stop, a, b) = (s.clone(), stop.clone(), a.clone(), b.clone());
+            std::thread::spawn(move || {
+                while !stop.load(O::Relaxed) {
+                    s.set(b"k", &a, 0);
+                    s.set(b"k", &b, 0);
+                }
+            })
+        };
+
+        let mut reads = 0u64;
+        let mut torn = 0u64;
+        for _ in 0..200_000 {
+            if let Some(v) = s.get_stable(b"k") {
+                reads += 1;
+                let first = v[0];
+                if v.len() != 4096 || v.iter().any(|&c| c != first) {
+                    torn += 1;
+                }
+            }
+        }
+        stop.store(true, O::Relaxed);
+        writer.join().unwrap();
+
+        assert!(reads > 1000, "test did not actually read much ({reads})");
+        assert_eq!(
+            torn, 0,
+            "{torn} of {reads} reads observed a spliced value: the reader saw              bytes from two different writes in one buffer"
+        );
     }
 }
