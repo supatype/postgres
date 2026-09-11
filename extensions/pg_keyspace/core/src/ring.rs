@@ -167,6 +167,28 @@ impl Producer {
         }
     }
 
+    /// True if a record with a `val_bytes` value and a `key_bytes` key would
+    /// fit right now.
+    ///
+    /// Safe to act on before mutating anything, which is what makes
+    /// check-then-write sound: there is exactly one producer per ring (the
+    /// worker's event loop), and the consumer only ever *frees* space. So room
+    /// observed here cannot disappear before this producer's own `push`; it can
+    /// only grow.
+    pub fn has_room(&self, key_bytes: usize, val_bytes: usize) -> bool {
+        if val_bytes >= MAX_REC_VAL {
+            return false; // unencodable regardless of free space
+        }
+        let rec = (REC_HDR + key_bytes + val_bytes) as u64;
+        unsafe {
+            let h = &*self.0.hdr;
+            let head = h.head.load(Ordering::Acquire);
+            let tail = h.tail.load(Ordering::Relaxed);
+            let cap = self.0.mask + 1;
+            cap - (tail - head) >= rec
+        }
+    }
+
     /// Record that a write was ultimately dropped (persistence wedged past the
     /// backpressure deadline). Rare and loud; surfaced via `Consumer::stats`.
     pub fn note_drop(&self) {
@@ -491,5 +513,43 @@ mod tests {
         });
         assert_eq!(n, 1);
         assert_eq!(got, MAX_REC_VAL - 1, "value just under the cap must survive");
+    }
+
+    /// `has_room` must agree with `push`, because the write path now checks it
+    /// before mutating the store and parks the connection if it says no. If it
+    /// were optimistic, a write would be applied to shared memory and then fail
+    /// to queue, leaving a value that is readable but will never be durable.
+    #[test]
+    fn has_room_agrees_with_push() {
+        let cap = 1024usize;
+        let mut buf = vec![0u8; bytes_for(cap)];
+        let base = buf.as_mut_ptr();
+        unsafe { init(base, cap) };
+        let prod = unsafe { Producer::attach(base) };
+        let cons = unsafe { Consumer::attach(base) };
+
+        let key = b"k";
+        let val = vec![b'x'; 100];
+        // Fill, checking the prediction before every attempt.
+        loop {
+            let predicted = prod.has_room(key.len(), val.len());
+            let actual = prod.push(key, &val, 0, b's').is_some();
+            assert_eq!(
+                predicted, actual,
+                "has_room said {predicted} but push {}",
+                if actual { "succeeded" } else { "failed" }
+            );
+            if !actual {
+                break;
+            }
+        }
+        // Still refused while full, then allowed again once space is freed.
+        assert!(!prod.has_room(key.len(), val.len()));
+        cons.drain(usize::MAX, |_, _, _, _| {});
+        assert!(prod.has_room(key.len(), val.len()));
+        assert!(prod.push(key, &val, 0, b's').is_some());
+
+        // A value the record cannot encode is refused however empty the ring.
+        assert!(!prod.has_room(1, MAX_REC_VAL));
     }
 }

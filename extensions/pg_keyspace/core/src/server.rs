@@ -41,11 +41,30 @@ pub const DELETE_TOMBSTONE: i64 = -1;
 /// Enqueue one record into the ring sharded by key slot (same shard function as
 /// the write path, so a key's writes and deletes always reach the same worker).
 ///
-/// No-loss backpressure: if the ring is full, wait (bounded) for the persistence
-/// worker to drain rather than dropping the write. Under sustained overload this
-/// throttles the RESP write path to the drain rate instead of silently losing
-/// durability. The bound only trips if persistence is wedged, in which case the
-/// record is dropped and counted (`ring_stats.dropped`) — a loud, rare event.
+/// Backpressure: if the ring is full, wait (bounded) for the persistence worker
+/// to drain rather than giving up immediately. Under sustained overload this
+/// throttles the RESP write path to the drain rate. Past the deadline the push
+/// fails and is counted (`ring_stats.dropped`); in a sync-ack tier the caller
+/// turns that into a client-visible error rather than a `+OK`, so a failure
+/// here is never silent data loss.
+///
+/// The wait is still inline on the event loop, so it stalls every connection on
+/// this worker for up to `PUSH_DEADLINE`. That is why the deadline is short and
+/// tunable; parking the connection and resuming it on drain, the way
+/// `resolve_acks` defers replies, is the proper fix and is not done here.
+pub const PUSH_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Which ring a key's records go to. A key always maps to the same shard, so
+/// its writes and deletes stay ordered and cannot conflict on `ON CONFLICT`.
+#[inline]
+fn shard_of(n: usize, key: &[u8]) -> usize {
+    if n <= 1 {
+        0
+    } else {
+        crc16::key_slot(key) as usize % n
+    }
+}
+
 fn shard_push(
     producers: &[ring::Producer],
     key: &[u8],
@@ -57,23 +76,21 @@ fn shard_push(
     if n == 0 {
         return None;
     }
-    let shard = if n == 1 {
-        0
-    } else {
-        crc16::key_slot(key) as usize % n
-    };
+    let shard = shard_of(n, key);
     let p = &producers[shard];
     if let Some(seq) = p.push(key, val, exp, kind) {
         return Some((shard, seq));
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PUSH_DEADLINE;
     loop {
         std::thread::sleep(Duration::from_micros(50));
         if let Some(seq) = p.push(key, val, exp, kind) {
             return Some((shard, seq));
         }
         if Instant::now() >= deadline {
-            p.note_drop(); // persistence wedged: drop + count, rather than hang forever
+            // Persistence is wedged or the value cannot be encoded. Count it
+            // and let the caller decide: a sync-ack tier answers with an error.
+            p.note_drop();
             return None;
         }
     }
@@ -225,6 +242,12 @@ struct Conn {
     // durable sync-ack: (ring, seq) the connection's reply is waiting on. While
     // non-empty the reply is held (not flushed) and no further commands are read.
     ack: Vec<(usize, u64)>,
+    // Backpressure park: the persistence ring had no room for this command's
+    // record, so the command was NOT applied and NOT consumed from `rbuf`. It
+    // is retried verbatim once the ring drains. Nothing is mutated and nothing
+    // is replied while this is set, which is what keeps the shared-memory
+    // store and `supacache.kv` from diverging under overload.
+    parked: bool,
     // When set, this connection is TLS: ciphertext on the socket, plaintext in
     // rbuf/wbuf. `wpos` then counts wbuf bytes already fed to the TLS writer.
     tls: Option<Box<rustls::ServerConnection>>,
@@ -440,9 +463,73 @@ impl Worker {
                     }
                 }
             }
-            // Durable tier: release replies whose ring records have committed.
+            // Durable tier: release replies whose ring records have committed,
+            // then retry anything parked waiting for ring space to free up.
             if self.sync_ack {
                 self.resolve_acks();
+                self.resume_parked();
+            }
+        }
+    }
+
+    /// Whether every ring this command will write to can take its record(s).
+    ///
+    /// Sizes are upper bounds, deliberately. A string write persists the value
+    /// it was given, so that one is exact. An aggregate write (`HSET`, `LPUSH`,
+    /// `ZADD`, …) persists the *whole* post-mutation blob, whose size is not
+    /// known until after the mutation we are trying to avoid, so bound it by
+    /// the current blob plus every argument byte: the new blob cannot exceed
+    /// what is already stored plus what is being added. Over-estimating parks
+    /// slightly early, which is the safe direction.
+    fn rings_have_room(&self, cmd: &[u8], args: &[Vec<u8>], key_idxs: &[usize]) -> bool {
+        let n = self.producers.len();
+        if n == 0 {
+            return true;
+        }
+        let arg_bytes: usize = args.iter().map(|a| a.len()).sum();
+        let aggregate = is_aggregate_write(cmd);
+        for &ki in key_idxs {
+            let key = match args.get(ki) {
+                Some(k) => k,
+                None => continue,
+            };
+            let val_bound = if aggregate {
+                // current blob (if any) + everything this command could add
+                let cur = self
+                    .store
+                    .get_typed(key)
+                    .map(|(_, _, blob)| blob.len())
+                    .unwrap_or(0);
+                cur + arg_bytes
+            } else {
+                arg_bytes
+            };
+            if !self.producers[shard_of(n, key)].has_room(key.len(), val_bound) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Retry connections parked on a full persistence ring. Called once per
+    /// event-loop pass in a sync-ack tier: the poll has a bounded timeout, so
+    /// a parked connection is retried promptly without needing its own timer,
+    /// and the retry is just `process` re-reading the command still sitting in
+    /// `rbuf`.
+    fn resume_parked(&mut self) {
+        let parked: Vec<RawFd> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.parked)
+            .map(|(fd, _)| *fd)
+            .collect();
+        for fd in parked {
+            if let Some(c) = self.conns.get_mut(&fd) {
+                c.parked = false; // re-evaluated by the pre-flight on retry
+            }
+            self.process(fd);
+            if self.conns.contains_key(&fd) {
+                self.flush(fd);
             }
         }
     }
@@ -514,6 +601,7 @@ impl Worker {
                     tenant: String::new(),
                     exempt: false,
                     ack: Vec::new(),
+                    parked: false,
                     tls,
                     subs: HashSet::new(),
                     psubs: HashSet::new(),
@@ -663,6 +751,12 @@ impl Worker {
                 }
                 Parse::Complete { consumed } => {
                     self.dispatch(fd, &cmd_args);
+                    // Parked on a full ring: the command was neither applied
+                    // nor answered, so it must stay in `rbuf` to be retried
+                    // verbatim. Consuming it here would lose the write.
+                    if self.conns.get(&fd).map(|c| c.parked).unwrap_or(false) {
+                        break;
+                    }
                     consumed_total += consumed;
                     let stop = self
                         .conns
@@ -809,6 +903,30 @@ impl Worker {
         // (ring, seq) records enqueued this command; a durable write's reply is
         // held until all of them commit.
         let mut acks: Vec<(usize, u64)> = Vec::new();
+
+        // ---- backpressure pre-flight (sync-ack tiers only) ----------------
+        // Check the ring BEFORE touching the store. Applying the write first
+        // and discovering afterwards that it cannot be queued leaves the
+        // shared-memory store holding a value that will never be durable: the
+        // client is told the write failed, the very next GET returns it, and a
+        // restart loses it. Ordering the check first makes that impossible.
+        //
+        // The check is sound without a lock because there is one producer per
+        // ring (this event loop) and the consumer only frees space, so room
+        // seen here still exists at push time.
+        if sync_ack && persist_on && is_write_cmd(&cmd) {
+            if !self.rings_have_room(&cmd, args, &key_idxs) {
+                // Park: nothing mutated, nothing replied. `process` leaves the
+                // command in `rbuf` and retries it once the ring drains.
+                if let Some(c) = self.conns.get_mut(&fd) {
+                    c.parked = true;
+                }
+                return;
+            }
+        }
+
+        // Where this command's reply begins, so a late failure can rewind it.
+        let reply_start = self.conns.get(&fd).map_or(0, |c| c.wbuf.len());
         let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
 
         match cmd.as_slice() {
@@ -3339,15 +3457,39 @@ impl Worker {
             });
         }
 
+        let mut queue_failed = false;
         for (k, v, e, kind) in stages {
             // sharded so a given key always lands on the same ring/persist worker
             // — no cross-worker key conflicts on ON CONFLICT.
-            if let Some(sa) = shard_push(&self.producers, &k, &v, e, kind) {
-                acks.push(sa);
+            match shard_push(&self.producers, &k, &v, e, kind) {
+                Some(sa) => acks.push(sa),
+                None => {
+                    queue_failed = true;
+                    break;
+                }
             }
         }
-        // Durable tier: hold this command's reply until its record(s) commit.
-        if sync_ack && !acks.is_empty() {
+        if queue_failed && sync_ack {
+            // A sync-ack tier promises that a successful reply means the write
+            // reached supacache.kv. The record could not even be queued, so the
+            // promise cannot be kept: replace the reply already written with an
+            // error instead of flushing a +OK for a write that is not durable.
+            //
+            // The shared-memory mutation has already been applied and is NOT
+            // rolled back: undoing it is not generally possible (INCR, LPUSH and
+            // the aggregate commands are not invertible from here). So the value
+            // may be readable until the next restart while never becoming
+            // durable. The error says exactly that, and it is the honest report
+            // of an ambiguous outcome rather than a false success.
+            let c = self.conns.get_mut(&fd).unwrap();
+            c.wbuf.truncate(reply_start);
+            resp::error(
+                &mut c.wbuf,
+                "ERR persistence backlog full: write applied in memory but NOT durable",
+            );
+            c.ack.clear();
+        } else if sync_ack && !acks.is_empty() {
+            // Durable tier: hold this command's reply until its record(s) commit.
             self.conns.get_mut(&fd).unwrap().ack = acks;
         }
 
