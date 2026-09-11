@@ -72,6 +72,12 @@ static GUC_PORT: GucSetting<i32> = GucSetting::<i32>::new(6380);
 static GUC_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 static GUC_KEYS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 static GUC_VAL_BYTES: GucSetting<i32> = GucSetting::<i32>::new(512);
+// Largest bulk string accepted from a RESP client. Matches Valkey/Redis
+// proto-max-bulk-len so a client that works against them works here. The
+// real bound on what can be stored is the keyspace arena; this bounds what
+// the server will buffer for a value that may be refused anyway.
+static GUC_MAX_VALUE_BYTES: GucSetting<i32> =
+    GucSetting::<i32>::new(server::DEFAULT_MAX_VALUE_BYTES);
 static GUC_DURABILITY: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"ephemeral"));
 static GUC_COMMIT_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
@@ -272,6 +278,77 @@ fn ks_tier() -> Tier {
     }
 }
 
+/// True when `synchronous_standby_names` is set to something Postgres will
+/// actually wait for.
+///
+/// This is the whole basis of the `replicated` tier. The persist transaction
+/// runs with `synchronous_commit = remote_apply`, and Postgres only waits when
+/// `synchronous_standby_names` is non-empty. With it unset, `remote_apply` does
+/// not wait at all and an acknowledged "replicated" write is local-durable
+/// only.
+///
+/// Note what is NOT a degradation: a standby that is named but currently
+/// disconnected does not silently fall back, Postgres blocks the commit until
+/// one appears. That surfaces correctly as a stalled persist worker, held acks
+/// and (once the ring fills) client-visible errors, which is the right
+/// behaviour for a synchronous tier.
+///
+/// The dangerous case is the empty setting, and because
+/// `synchronous_standby_names` is `sighup` context it can be emptied at
+/// runtime with `pg_reload_conf()`. A startup-only check would therefore
+/// guarantee nothing after the first reload, which is why the persist worker
+/// re-checks this before every commit.
+fn sync_standby_configured() -> bool {
+    unsafe {
+        let s = pg_sys::GetConfigOption(c"synchronous_standby_names".as_ptr(), true, false);
+        if s.is_null() {
+            false
+        } else {
+            !CStr::from_ptr(s).to_string_lossy().trim().is_empty()
+        }
+    }
+}
+
+/// Human-readable reason the `replicated` tier cannot be honoured, if any.
+fn check_sync_standby() -> Result<(), String> {
+    if !sync_standby_configured() {
+        return Err(
+            "pg_keyspace.durability = 'replicated' requires synchronous_standby_names \
+             to be set: without it synchronous_commit = remote_apply does not wait for \
+             any standby, so an acknowledged write would be local-durable only. Set \
+             synchronous_standby_names, or use pg_keyspace.durability = 'durable' if \
+             local durability is what you want"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// A cheap `Store` view over the shared segment, valid in any backend.
+fn store_view() -> Option<Store> {
+    store_view_for(0)
+}
+
+/// A `Store` view over worker `w`'s segment.
+///
+/// Shared memory holds one segment per RESP worker, and a key lives only in
+/// the segment of the worker that owns its slot. Anything resolving a value on
+/// behalf of a specific worker, rather than for the local backend, has to say
+/// which one: a by-reference ring record read against the wrong segment finds
+/// either the wrong bytes or nothing at all, and finding nothing is
+/// indistinguishable from a legitimately superseded write, so it would lose a
+/// durable write silently.
+///
+/// `store_view()` is worker 0 and is correct for single-worker deployments and
+/// for the SQL surface, which today only serves worker 0's keyspace.
+fn store_view_for(w: usize) -> Option<Store> {
+    let base = seg_base_for(w);
+    if base.is_null() {
+        return None;
+    }
+    Some(unsafe { Store::from_raw(base, &ks_config(), false) })
+}
+
 /// A cheap `Store` view over slot worker `w`'s segment, valid in any backend.
 fn store_view_for_worker(w: usize) -> Option<Store> {
     let base = seg_base_for(w);
@@ -340,6 +417,16 @@ pub extern "C" fn _PG_init() {
         &GUC_VAL_BYTES,
         1,
         1_000_000,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.max_value_bytes",
+        "Largest value (bulk string) accepted from a RESP client",
+        "Equivalent to Valkey/Redis proto-max-bulk-len. A value still has to fit          the keyspace arena to be stored; one that does not is refused with the          standard OOM error rather than acknowledged.",
+        &GUC_MAX_VALUE_BYTES,
+        1024,
+        i32::MAX,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -688,6 +775,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             return;
         }
     };
+    worker.set_max_value_bytes(GUC_MAX_VALUE_BYTES.get().max(1024) as usize);
 
     // TLS: if a cert+key are configured, wrap the RESP wire in TLS. If TLS
     // was requested but the files fail to load, FAIL CLOSED — park rather than
@@ -713,6 +801,19 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         _ => {
             log!("pg_keyspace worker: REFUSING to start — set BOTH pg_keyspace.tls_cert_file \
                   and pg_keyspace.tls_key_file, or neither");
+            while !BackgroundWorker::sigterm_received() {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            return;
+        }
+    }
+
+    // Fail closed on a durability promise the cluster cannot keep, the same way
+    // a bad TLS cert refuses above. Serving `replicated` with no synchronous
+    // standby would acknowledge writes as replicated that are only local.
+    if matches!(ks_tier(), Tier::Replicated) {
+        if let Err(why) = check_sync_standby() {
+            log!("pg_keyspace worker: REFUSING to start — {why}");
             while !BackgroundWorker::sigterm_received() {
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -969,57 +1070,128 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         Tier::Replicated => "remote_apply", // needs a synchronous standby
         _ => "off",                          // relaxed: RESP already acked
     };
+    let replicated = matches!(ks_tier(), Tier::Replicated);
     log!(
-        "pg_keyspace persist {idx}: draining shard {idx} of {nworkers} slot worker(s) \
-         -> supacache.kv (synchronous_commit={sync_commit})"
+        "pg_keyspace persist {idx}: draining shard {idx} of {nworkers} slot worker(s)          -> supacache.kv (synchronous_commit={sync_commit})"
     );
 
-    // Drain every ring into one batch. `per_ring` caps each ring's share so a
-    // single hot slot worker cannot starve the others out of a batch.
+    // `per_ring` caps each ring's share of a batch so one hot slot worker
+    // cannot starve the others.
     let per_ring = (20_000 / nworkers.max(1)).max(1_000);
-    let drain_all = |max: usize, batch: &mut Vec<server::PendingWrite>| {
-        for c in &consumers {
-            c.drain(max, |k, v, e, kind| batch.push((k.to_vec(), v.to_vec(), e, kind)));
-        }
-    };
-    // Marking a ring that contributed nothing to this batch is harmless: this is
-    // the only consumer of these rings, so it rewrites the same value.
-    //
-    // The unsafe case is the other one, and it is not fixed here. `bulk_upsert`
-    // returns no result and discards its SPI error, so a batch that failed to
-    // commit is indistinguishable from one that succeeded, and the marking below
-    // releases its durable acks anyway (#30). Aggregating N rings into one batch
-    // widens that: a single failed upsert now falsely acks up to
-    // `workers * persist_workers` rings' worth of writes instead of one ring's.
-    //
-    // Gating on a Result here would not be enough on its own — `drain` has
-    // already advanced `head`, so the records are gone from the ring either way.
-    // The fix is #30's two-phase `peek`/`commit`, which keeps an uncommitted
-    // batch in the ring; this loop should be rebased onto it.
-    let mark_all = || {
-        for c in &consumers {
-            c.mark_committed();
-        }
-    };
 
+    // Backoff after a failed batch. The records stay in their rings, so a retry
+    // is safe and lossless; the delay stops a permanently broken batch (bad
+    // permissions, disk full) from spinning the worker at full tilt.
+    let mut backoff = Duration::from_millis(0);
     while !BackgroundWorker::sigterm_received() {
         let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
-        drain_all(per_ring, &mut batch);
+        let slices = peek_rings(&consumers, per_ring, idx, &mut batch);
+        let count: usize = slices.iter().map(|(n, _)| n).sum();
         if batch.is_empty() {
             std::thread::sleep(idle);
             continue;
         }
-        bulk_upsert(batch, sync_commit, ttl_bucket_us());
-        mark_all(); // release durable acks waiting on these records
+        // `synchronous_standby_names` is sighup context, so the promise the
+        // replicated tier makes can be withdrawn at runtime by a reload. The
+        // startup refusal cannot cover that, and committing anyway would ack
+        // writes as replicated that Postgres never waited to replicate. Fail
+        // closed: leave the batch in the rings, hold its acks, and say so.
+        if replicated && !sync_standby_configured() {
+            log!(
+                "pg_keyspace persist {idx}: REFUSING to commit {count} record(s):                  durability is 'replicated' but synchronous_standby_names is now empty,                  so Postgres would not wait for any standby. Records retained in the                  rings and durable acks held until it is restored"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        match bulk_upsert(batch, sync_commit, ttl_bucket_us()) {
+            Ok(()) => {
+                // Only now are these records durable: release the ring space
+                // and the durable acks waiting on them, for every ring that
+                // contributed to this batch.
+                commit_rings(&consumers, &slices);
+                backoff = Duration::from_millis(0);
+            }
+            Err(e) => {
+                // Nothing is committed, so no `head` moves and every record is
+                // re-read next pass with its durable ack still held. This is
+                // why the batch spans N rings safely: a failure cannot acknowledge
+                // one ring's share while losing another's.
+                log!(
+                    "pg_keyspace persist {idx}: batch of {count} record(s) FAILED to                      persist ({e}); records retained in the rings, durable acks held,                      retrying in {backoff:?}"
+                );
+                backoff = (backoff + Duration::from_millis(50)).min(Duration::from_secs(5));
+                std::thread::sleep(backoff);
+            }
+        }
     }
     // final drain on shutdown
     let mut tail: Vec<server::PendingWrite> = Vec::new();
-    drain_all(usize::MAX, &mut tail);
+    let tslices = peek_rings(&consumers, usize::MAX, idx, &mut tail);
+    let tcount: usize = tslices.iter().map(|(n, _)| n).sum();
     if !tail.is_empty() {
-        bulk_upsert(tail, sync_commit, ttl_bucket_us());
-        mark_all();
+        match bulk_upsert(tail, sync_commit, ttl_bucket_us()) {
+            Ok(()) => commit_rings(&consumers, &tslices),
+            Err(e) => log!(
+                "pg_keyspace persist {idx}: final batch of {tcount} record(s) FAILED                  to persist ({e}); they remain in the rings for the next start"
+            ),
+        }
     }
     log!("pg_keyspace persist {idx}: shutting down");
+}
+
+/// Read from every ring this worker owns without consuming anything, appending
+/// to `batch`. Returns, per ring, how many records were read and how many bytes
+/// they occupy: what [`ring::Consumer::commit`] needs once they are durable.
+///
+/// A record whose kind carries [`ring::KIND_REF`] does not hold the value. Its
+/// payload is the entry version at stage time, and the value is still in the
+/// producing slot worker's keyspace segment, so it has to be resolved against
+/// *that* worker's segment. `consumers[w]` is worker `w`'s ring, which is what
+/// makes the index meaningful here. Resolving against worker 0's segment
+/// instead, as a single-segment view would, finds either the wrong bytes or
+/// nothing at all, and finding nothing is indistinguishable from a legitimately
+/// superseded write: it would lose large durable writes in silence.
+fn peek_rings(
+    consumers: &[ring::Consumer],
+    max: usize,
+    idx: usize,
+    batch: &mut Vec<server::PendingWrite>,
+) -> Vec<(usize, u64)> {
+    let mut slices = Vec::with_capacity(consumers.len());
+    for (w, c) in consumers.iter().enumerate() {
+        slices.push(c.peek(max, |k, v, e, kind| {
+            if kind & ring::KIND_REF == 0 {
+                batch.push((k.to_vec(), v.to_vec(), e, kind));
+                return;
+            }
+            let version = if v.len() == 8 {
+                u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
+            } else {
+                return;
+            };
+            match store_view_for_worker(w).and_then(|st| st.read_staged(k, version)) {
+                Some((_, _, val)) => {
+                    batch.push((k.to_vec(), val, e, kind & !ring::KIND_REF))
+                }
+                // Usually benign: the key was overwritten after staging, so a
+                // newer record is queued behind this one. It is also what
+                // resolving against the wrong segment looks like, which is not
+                // benign, so say so rather than dropping in silence.
+                None => log!(
+                    "pg_keyspace persist {idx}: reference from worker {w} did not resolve (superseded, or not in that segment)"
+                ),
+            }
+        }));
+    }
+    slices
+}
+
+/// Release the records a preceding [`peek_rings`] read, ring by ring, once the
+/// transaction carrying them has committed.
+fn commit_rings(consumers: &[ring::Consumer], slices: &[(usize, u64)]) {
+    for (c, (count, bytes)) in consumers.iter().zip(slices.iter()) {
+        c.commit(*count, *bytes);
+    }
 }
 
 /// verify `supatype_mask` is present in shared_preload_libraries AND
@@ -1335,10 +1507,14 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
 /// (last op wins), then split three ways: no-TTL upserts -> `supacache.kv`;
 /// TTL'd upserts -> `supacache.kv_ttl` (range-partitioned by expiry bucket, so
 /// expiry is a partition DROP); tombstones -> delete from both.
-fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, bucket_us: i64) {
+fn bulk_upsert(
+    batch: Vec<server::PendingWrite>,
+    sync_commit: &'static str,
+    bucket_us: i64,
+) -> Result<(), pgrx::spi::Error> {
     use std::collections::{HashMap, HashSet};
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
     let mut latest: HashMap<Vec<u8>, (Vec<u8>, i64, u8)> = HashMap::with_capacity(batch.len());
     for (k, v, e, kind) in batch {
@@ -1391,14 +1567,19 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
     let clear_from_kv = tkeys.clone();
 
     BackgroundWorker::transaction(move || {
-        let _ = Spi::connect(|mut client| {
+        Spi::connect(|mut client| {
             // Durability tier: relaxed=off (async, RESP already acked),
             // durable=on (fsync), replicated=remote_apply (needs a standby).
-            let _ = client.update(
+            //
+            // Propagated, not discarded: if this fails the batch would commit
+            // at the cluster default durability instead of the configured
+            // tier, which is exactly the silent downgrade a durable ack must
+            // never hide.
+            client.update(
                 &format!("SET LOCAL synchronous_commit = '{sync_commit}'"),
                 None,
                 None,
-            );
+            )?;
             if !keys.is_empty() {
                 let args: Vec<(PgOid, Option<pg_sys::Datum>)> = vec![
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), keys.into_datum()),
@@ -1479,8 +1660,8 @@ fn bulk_upsert(batch: Vec<server::PendingWrite>, sync_commit: &'static str, buck
                 )?;
             }
             Ok::<(), pgrx::spi::Error>(())
-        });
-    });
+        })
+    })
 }
 
 /// The expiry worker: periodically DROP TTL partitions whose whole
@@ -2253,13 +2434,14 @@ mod supacache {
     /// STABLE, never IMMUTABLE: forbids anything downstream of a mask
     /// predicate from being folded/cached by identity — an IMMUTABLE cache read
     /// would let the planner bake one caller's value into a generic plan.
+    /// Reads through the entry's seqlock rather than borrowing the shared
+    /// bytes directly: this runs in an ordinary backend, not the worker that
+    /// owns the partition, so the value can be rewritten underneath it. A
+    /// plain borrow could return the head of one value and the tail of the
+    /// next.
     #[pg_extern(stable, parallel_safe)]
     fn get(key: &str) -> Option<Vec<u8>> {
-        let store = store_view_for_key(key.as_bytes())?;
-        match store.get(key.as_bytes()) {
-            Lookup::Hit(v) => Some(v.to_vec()),
-            Lookup::Miss => None,
-        }
+        store_view_for_key(key.as_bytes())?.get_stable(key.as_bytes())
     }
 
     #[pg_extern]
@@ -2291,10 +2473,9 @@ mod supacache {
     #[pg_extern]
     fn getset(key: &str, val: &[u8]) -> Option<Vec<u8>> {
         let store = store_view_for_key(key.as_bytes())?;
-        let old = match store.get(key.as_bytes()) {
-            Lookup::Hit(v) => Some(v.to_vec()),
-            Lookup::Miss => None,
-        };
+        // Seqlock read: this is an ordinary backend, not the worker that owns
+        // the partition, so the value can be rewritten mid-read.
+        let old = store.get_stable(key.as_bytes());
         store.set(key.as_bytes(), val, 0);
         old
     }
@@ -2302,6 +2483,48 @@ mod supacache {
     #[pg_extern]
     fn ping() -> &'static str {
         "PONG"
+    }
+
+    /// Whether the `replicated` tier's promise is currently being kept.
+    ///
+    /// `tier` is the configured durability. `standby_configured` reflects
+    /// `synchronous_standby_names`, which is what decides whether Postgres
+    /// waits at all; it is `sighup` context, so it can change under a running
+    /// server. `sync_standbys_connected` counts standbys in `pg_stat_replication`
+    /// currently in a synchronous state.
+    ///
+    /// `honoured` is the one to alert on: false means acknowledged writes are
+    /// not getting the durability the tier advertises. Note that
+    /// `standby_configured` true with zero connected standbys is not a silent
+    /// downgrade, Postgres blocks the commit instead, which shows up as a
+    /// growing `ring_stats().backlog_bytes` rather than as lost durability.
+    #[pg_extern]
+    fn replication_status() -> TableIterator<
+        'static,
+        (
+            name!(tier, String),
+            name!(standby_configured, bool),
+            name!(sync_standbys_connected, i64),
+            name!(honoured, bool),
+        ),
+    > {
+        let tier = match ks_tier() {
+            Tier::Ephemeral => "ephemeral",
+            Tier::Relaxed => "relaxed",
+            Tier::Durable => "durable",
+            Tier::Replicated => "replicated",
+        };
+        let configured = sync_standby_configured();
+        let connected = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pg_stat_replication WHERE sync_state IN ('sync','quorum')",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        // Only the replicated tier makes a replication promise; the others are
+        // trivially honoured because they promise nothing about a standby.
+        let honoured = !matches!(ks_tier(), Tier::Replicated) || configured;
+        TableIterator::once((tier.to_string(), configured, connected, honoured))
     }
 
     /// Register/replace a RESP AUTH credential, storing a SALTED SHA-256 verifier

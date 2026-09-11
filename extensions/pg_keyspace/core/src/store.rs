@@ -15,8 +15,12 @@
 //! Not MVCC. No tuple headers. No vacuum. Entries are overwritten in place.
 
 use crate::shmem::Shmem;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-const MAGIC: u64 = 0x70_67_6b_73_5f_76_32_00; // "pgks_v2\0" (v2: oversized free list)
+// v3 widens Entry with `staged_seq` and PartMeta with `commit_watermark`, for
+// values handed to the persistence worker by reference instead of being copied
+// through the ring. The layout is not compatible with v2.
+const MAGIC: u64 = 0x70_67_6b_73_5f_76_33_00; // "pgks_v3\0"
 
 // Size classes for the slab allocator ("size-classed, 32B..8KB").
 const CLASS_SIZES: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
@@ -63,6 +67,15 @@ struct PartMeta {
     // an oversized value that is rewritten (e.g. a large hash growing field by
     // field) would leak its old region on every write and exhaust the arena.
     free_oversized: u64,
+    // Highest ring sequence the persistence worker has durably committed, as
+    // last observed by this worker's event loop. Eviction compares an entry's
+    // `staged_seq` against it: at or below, the value is safe in Postgres and
+    // the entry can go; above, its only copy is here.
+    //
+    // Written and read by the same single worker thread, so a plain field is
+    // sufficient. Conservative with several persist shards, since the minimum
+    // across rings is used and sequence numbers are per-ring.
+    commit_watermark: u64,
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -81,7 +94,26 @@ struct Entry {
     key_class: u32,
     val_class: u32,
     expires_at: i64, // unix micros, 0 = no expiry
-    version: u64,
+    // Seqlock. Even means the entry is stable; odd means a writer is partway
+    // through replacing the value. A reader in another backend samples this
+    // before and after copying and retries if it moved, which is what stops it
+    // splicing the head of a new value onto the tail of an old one.
+    //
+    // Also the change counter WATCH compares, and what a by-reference ring
+    // record carries so the persistence worker can tell whether the value it
+    // is about to read is still the one it was told about.
+    version: AtomicU64,
+    // Ring sequence of this entry's last *referenced* staged write, or 0 when
+    // there is none. A large value is handed to the persistence worker by
+    // reference rather than copied through the ring, so the worker reads it
+    // back out of this segment at commit time. Until that commit lands the
+    // value must still be here: eviction therefore skips an entry whose
+    // `staged_seq` is above the persist worker's commit watermark.
+    //
+    // Only the referenced path sets this. Small values are copied into the
+    // ring as before and stay freely evictable, so this is 0 for them and the
+    // comparison is trivially true.
+    staged_seq: u64,
     flags: u32,
     kind: u32,
 }
@@ -109,6 +141,36 @@ fn class_for(size: usize) -> u32 {
         }
     }
     OVERSIZED
+}
+
+/// Open a write on an entry: version goes odd, so a concurrent reader in
+/// another backend knows the value is being replaced and retries.
+/// Read a settled version, waiting out a write that is in progress. Bounded:
+/// a writer holds the odd window for a memcpy, so this spins only briefly, and
+/// giving up returns the odd value rather than looping forever if a writer
+/// died mid-update.
+#[inline]
+unsafe fn stable_version(e: *mut Entry) -> u64 {
+    for _ in 0..1024 {
+        let v = (*e).version.load(Ordering::Acquire);
+        if v & 1 == 0 {
+            return v;
+        }
+        std::hint::spin_loop();
+    }
+    (*e).version.load(Ordering::Acquire)
+}
+
+#[inline]
+unsafe fn seq_begin(e: *mut Entry) {
+    (*e).version.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Close a write: version goes even again, one higher than any reader that
+/// sampled it before the write started, so the retry sees the change.
+#[inline]
+unsafe fn seq_end(e: *mut Entry) {
+    (*e).version.fetch_add(1, Ordering::Release);
 }
 
 #[inline]
@@ -365,14 +427,89 @@ impl Store {
         Some((off, cls))
     }
 
+    /// Return an oversized block (`base` points at its `[cap: u64]` header) to
+    /// the free list, merging it with any physically adjacent free blocks and
+    /// giving space back to the bump pointer when it lands at the top.
+    ///
+    /// The naive version — push onto a LIFO list and never merge — leaks
+    /// capacity in a way no amount of eviction recovers. Blocks are laid out
+    /// contiguously by bump and freed blocks were never coalesced, so a
+    /// workload writing growing values (10 MiB, then 20, then 40) consumed
+    /// fresh bump space every time while the free list filled with blocks that
+    /// were individually too small to satisfy the next request. `data_bump`
+    /// only ever moved up, so eventually every large allocation failed with
+    /// most of the arena sitting free but unusable. Eviction did not help: it
+    /// frees onto the same list.
+    ///
+    /// Keeping the list ordered by offset makes both fixes cheap. Adjacency is
+    /// decidable because a block occupies exactly `8 + cap` bytes, so the
+    /// neighbour begins where this block ends.
+    unsafe fn oversized_free(&self, p: u32, base: u64) {
+        let meta = self.meta(p);
+        let data = self.data_ptr(p);
+        let cap_at = |b: u64| *(data.add(b as usize) as *const u64);
+        let next_at = |b: u64| *(data.add(b as usize + 8) as *const u64);
+        let set_next = |b: u64, v: u64| *(data.add(b as usize + 8) as *mut u64) = v;
+
+        // Ordered insert: find the last free block before `base`.
+        let mut prev: Option<u64> = None;
+        let mut cur = (*meta).free_oversized;
+        while cur != 0 && cur - 1 < base {
+            prev = Some(cur - 1);
+            cur = next_at(cur - 1);
+        }
+        let next = if cur == 0 { None } else { Some(cur - 1) };
+
+        set_next(base, cur);
+        match prev {
+            Some(pb) => set_next(pb, base + 1),
+            None => (*meta).free_oversized = base + 1,
+        }
+
+        // Merge forward: this block's end meets the next free block's start.
+        let mut cap = cap_at(base);
+        if let Some(nb) = next {
+            if base + 8 + cap == nb {
+                let ncap = cap_at(nb);
+                cap += 8 + ncap; // absorb the neighbour, header included
+                *(data.add(base as usize) as *mut u64) = cap;
+                set_next(base, next_at(nb));
+            }
+        }
+
+        // Merge backward: the previous free block's end meets this one's start.
+        let mut head = base;
+        if let Some(pb) = prev {
+            let pcap = cap_at(pb);
+            if pb + 8 + pcap == base {
+                let merged = pcap + 8 + cap;
+                *(data.add(pb as usize) as *mut u64) = merged;
+                set_next(pb, next_at(base));
+                head = pb;
+                cap = merged;
+            }
+        }
+
+        // At the top of the arena: hand it back to the bump pointer rather than
+        // holding it on the list, so the space is available at any size again.
+        if head + 8 + cap == (*meta).data_bump {
+            // unlink `head`
+            let mut link = &mut (*meta).free_oversized as *mut u64;
+            while *link != 0 {
+                let b = *link - 1;
+                if b == head {
+                    *link = next_at(b);
+                    break;
+                }
+                link = data.add(b as usize + 8) as *mut u64;
+            }
+            (*meta).data_bump = head;
+        }
+    }
+
     unsafe fn slab_free(&self, p: u32, off: u64, cls: u32) {
         if cls == OVERSIZED {
-            // Push the block (base = off-8, capacity kept at base[0..8]) onto the
-            // oversized free list so a later oversized alloc can reuse it.
-            let base = off - 8;
-            let meta = self.meta(p);
-            *(self.data_ptr(p).add(base as usize + 8) as *mut u64) = (*meta).free_oversized;
-            (*meta).free_oversized = base + 1;
+            self.oversized_free(p, off - 8);
             return;
         }
         let meta = self.meta(p);
@@ -582,7 +719,7 @@ impl Store {
         if let Some(b) = found {
             // overwrite value in place, reusing the slab if the class matches.
             let idx = *self.buckets_ptr(p).add(b) - 1;
-            let e = self.entries_ptr(p).add(idx as usize);
+            let mut e = self.entries_ptr(p).add(idx as usize);
             let want = class_for(val.len());
             // Reuse the existing region in place when it still fits: same size
             // class, or an oversized block whose capacity covers the new length.
@@ -591,27 +728,61 @@ impl Store {
                     let cap = *(self.data_ptr(p).add(((*e).val_off - 8) as usize) as *const u64);
                     (val.len() as u64) <= cap
                 });
+            let mut installed = true;
             if reuse {
+                seq_begin(e);
                 let vp = self.data_ptr(p).add((*e).val_off as usize);
                 std::ptr::copy_nonoverlapping(val.as_ptr(), vp, val.len());
                 (*e).val_len = val.len() as u32;
             } else {
-                self.slab_free(p, (*e).val_off, (*e).val_class);
-                let (voff, vcls) = match self.ensure_alloc(p, val.len()) {
+                // Allocate the replacement BEFORE releasing the old block.
+                //
+                // Freeing first and then failing to allocate left the entry
+                // pointing into the free list: the previous value was destroyed
+                // even though the write failed, and a later read returned
+                // whatever had since been handed to another key. A failed
+                // overwrite must be a no-op, not a silent corruption.
+                let got = self.ensure_alloc(p, val.len());
+                let (voff, vcls) = match got {
                     Some(x) => x,
+                    // Nothing to undo: the old value is still intact and
+                    // readable, which is the correct outcome for a write that
+                    // could not be served.
                     None => return false,
                 };
-                let vp = self.data_ptr(p).add(voff as usize);
-                std::ptr::copy_nonoverlapping(val.as_ptr(), vp, val.len());
-                (*e).val_off = voff;
-                (*e).val_class = vcls;
-                (*e).val_len = val.len() as u32;
+                // `ensure_alloc` evicts to make room and CLOCK can evict *this*
+                // entry, so the earlier pointer may now be a free slot. Re-probe
+                // rather than writing through it.
+                match self.probe(p, hash, key).0 {
+                    Some(b2) => {
+                        let idx2 = *self.buckets_ptr(p).add(b2) - 1;
+                        e = self.entries_ptr(p).add(idx2 as usize);
+                        // Opened only now: the allocation above can evict, and
+                        // an entry left with an odd version while that ran
+                        // would spin every reader for no reason.
+                        seq_begin(e);
+                        self.slab_free(p, (*e).val_off, (*e).val_class);
+                        let vp = self.data_ptr(p).add(voff as usize);
+                        std::ptr::copy_nonoverlapping(val.as_ptr(), vp, val.len());
+                        (*e).val_off = voff;
+                        (*e).val_class = vcls;
+                        (*e).val_len = val.len() as u32;
+                    }
+                    None => {
+                        // Evicted while we were making room for it. Release the
+                        // block we took and insert the key afresh below.
+                        self.slab_free(p, voff, vcls);
+                        installed = false;
+                    }
+                }
             }
-            (*e).expires_at = exp;
-            (*e).version += 1;
-            (*e).flags |= FLAG_REF;
-            (*e).kind = kind;
-            return true;
+            if installed {
+                (*e).expires_at = exp;
+                (*e).kind = kind;
+                (*e).flags |= FLAG_REF;
+                seq_end(e);
+                return true;
+            }
         }
 
         // insert new. Compact first if the table is getting full, so a probe
@@ -659,7 +830,7 @@ impl Store {
         (*e).val_len = val.len() as u32;
         (*e).val_class = vcls;
         (*e).expires_at = exp;
-        (*e).version = 1;
+        (*e).version.store(2, Ordering::Release); // even: stable
         (*e).flags = FLAG_OCCUPIED | FLAG_REF;
         (*e).kind = kind;
 
@@ -685,7 +856,33 @@ impl Store {
     }
 
     /// Allocate slab space, evicting under CLOCK until it fits.
+    /// Arena bytes a `size`-byte allocation actually consumes, matching what
+    /// `slab_alloc` will reserve: a size class rounds to its class, an
+    /// oversized block rounds its capacity to a power of two and adds the
+    /// 8-byte capacity header.
+    fn alloc_footprint(&self, size: usize) -> u64 {
+        let cls = class_for(size);
+        if cls == OVERSIZED {
+            8 + (align_up(size, 8) as u64).max(16).next_power_of_two()
+        } else {
+            CLASS_SIZES[cls as usize] as u64
+        }
+    }
+
     unsafe fn ensure_alloc(&self, p: u32, size: usize) -> Option<(u64, u32)> {
+        // Refuse an allocation the arena could never satisfy, before evicting
+        // anything. Without this, a single write too large for the arena evicts
+        // the entire keyspace one entry at a time and then fails regardless:
+        // the write does not land and every other key is gone with it.
+        //
+        // This must measure what `slab_alloc` will actually ask for, not the
+        // caller's size. An oversized block rounds its capacity up to a power
+        // of two and carries an 8-byte header, so a 9 MiB value really needs
+        // 16 MiB: checking the raw size let it through, and the doomed
+        // eviction loop ran anyway.
+        if self.alloc_footprint(size) > self.data_bytes {
+            return None;
+        }
         loop {
             if let Some(x) = self.slab_alloc(p, size) {
                 return Some(x);
@@ -759,7 +956,7 @@ impl Store {
                 self.remove_at(p, b, idx);
                 return None;
             }
-            Some((*e).version)
+            Some(stable_version(e))
         }
     }
 
@@ -871,6 +1068,18 @@ impl Store {
             (*meta).clock_hand = (idx + 1) % bump;
             let e = self.entries_ptr(p).add(idx as usize);
             if (*e).flags & FLAG_OCCUPIED != 0 {
+                // A referenced staged write that has not committed yet: this
+                // segment holds the only copy of the value, because it was
+                // never copied into the ring. Evicting it would lose a write
+                // the client is still waiting to have acknowledged. Leave the
+                // reference bit alone so it is reconsidered on the next sweep.
+                if (*e).staged_seq > (*meta).commit_watermark {
+                    scanned += 1;
+                    if scanned > bump * 2 + 4 {
+                        return false;
+                    }
+                    continue;
+                }
                 if (*e).flags & FLAG_REF != 0 {
                     (*e).flags &= !FLAG_REF;
                 } else {
@@ -891,6 +1100,132 @@ impl Store {
             if scanned > bump * 2 + 4 {
                 return false; // nothing evictable (all pinned this pass)
             }
+        }
+    }
+
+    /// The entry's current `version`, or None if the key is absent. A ring
+    /// record staged by reference carries this so the persistence worker can
+    /// tell whether the value it is about to read is still the one it was told
+    /// about.
+    pub fn version_of(&self, key: &[u8]) -> Option<u64> {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            let b = found?;
+            let idx = *self.buckets_ptr(p).add(b) - 1;
+            Some(stable_version(self.entries_ptr(p).add(idx as usize)))
+        }
+    }
+
+    /// Record that this key's value is staged by reference at ring sequence
+    /// `seq`, so eviction leaves it in place until the persistence worker has
+    /// committed that far.
+    pub fn set_staged_seq(&self, key: &[u8], seq: u64) {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            if let Some(b) = found {
+                let idx = *self.buckets_ptr(p).add(b) - 1;
+                (*self.entries_ptr(p).add(idx as usize)).staged_seq = seq;
+            }
+        }
+    }
+
+    /// Publish how far the persistence worker has committed. Eviction uses it
+    /// to decide when a referenced value is safe to drop; call it once per
+    /// event-loop pass with the minimum committed sequence across rings.
+    pub fn set_commit_watermark(&self, w: u64) {
+        for p in 0..self.num_partitions {
+            unsafe { (*self.meta(p)).commit_watermark = w };
+        }
+    }
+
+    /// Read a value staged by reference, for the persistence worker.
+    ///
+    /// `version` is what the ring record recorded at stage time. A mismatch
+    /// means the key was overwritten after staging, so a *newer* record for
+    /// the same key is already queued behind this one (a key always maps to
+    /// one ring, and records are consumed in order). Returning None there is
+    /// correct and lossless: the newer record carries the value that should
+    /// win, and skipping avoids copying a value that is being rewritten.
+    pub fn read_staged(&self, key: &[u8], version: u64) -> Option<(u32, i64, Vec<u8>)> {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            for _ in 0..256 {
+                let (found, _) = self.probe(p, hash, key);
+                let b = found?;
+                let idx = *self.buckets_ptr(p).add(b) - 1;
+                let e = self.entries_ptr(p).add(idx as usize);
+                let v1 = (*e).version.load(Ordering::Acquire);
+                if v1 & 1 == 1 {
+                    std::hint::spin_loop();
+                    continue; // mid-write; wait for it to settle
+                }
+                if v1 != version {
+                    return None; // superseded; a newer record is queued behind
+                }
+                let exp = (*e).expires_at;
+                let kind = (*e).kind;
+                let off = (*e).val_off as usize;
+                let len = (*e).val_len as usize;
+                let mut out = vec![0u8; len];
+                std::ptr::copy_nonoverlapping(self.data_ptr(p).add(off), out.as_mut_ptr(), len);
+                // Re-check only after the copy. Validating first and handing
+                // back a borrow, as this used to, left the caller copying
+                // outside the guard: a rewrite in that window put a spliced
+                // value into supacache.kv.
+                if (*e).version.load(Ordering::Acquire) == v1 {
+                    return Some((kind, exp, out));
+                }
+                std::hint::spin_loop();
+            }
+            None
+        }
+    }
+
+    /// Copy a value out under the seqlock, for a reader in another backend.
+    ///
+    /// `get` hands back a slice that points straight into shared memory, which
+    /// is right for the RESP worker (it owns its partition and is the only
+    /// writer) and wrong for anyone else: the worker can rewrite the entry
+    /// while the caller is still reading, so the caller can see the head of
+    /// one value and the tail of another. This samples the version, copies,
+    /// and re-samples; a change means the copy is untrustworthy and it starts
+    /// again.
+    ///
+    /// Returns `None` if the key is absent or expired. Contention is resolved
+    /// by retrying, since a writer holds the window only for a memcpy.
+    pub fn get_stable(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            for _ in 0..256 {
+                let (found, _) = self.probe(p, hash, key);
+                let b = found?;
+                let idx = *self.buckets_ptr(p).add(b) - 1;
+                let e = self.entries_ptr(p).add(idx as usize);
+                let exp = (*e).expires_at;
+                if exp != 0 && exp <= now_micros() {
+                    return None;
+                }
+                let v1 = (*e).version.load(Ordering::Acquire);
+                if v1 & 1 == 1 {
+                    std::hint::spin_loop();
+                    continue; // a write is in flight
+                }
+                let off = (*e).val_off as usize;
+                let len = (*e).val_len as usize;
+                let mut out = vec![0u8; len];
+                std::ptr::copy_nonoverlapping(self.data_ptr(p).add(off), out.as_mut_ptr(), len);
+                if (*e).version.load(Ordering::Acquire) == v1 {
+                    return Some(out); // nothing moved underneath us
+                }
+                std::hint::spin_loop();
+            }
+            None
         }
     }
 
@@ -1115,5 +1450,278 @@ mod tests {
             Lookup::Hit(v) => assert_eq!(v.len(), 20 * 1024),
             _ => panic!("miss other"),
         }
+    }
+
+    /// A value staged by reference is the only copy there is: it was never
+    /// copied into the ring, so evicting it before the persistence worker
+    /// commits would lose a write the client is still waiting on. Eviction
+    /// must therefore skip it until the commit watermark catches up.
+    #[test]
+    fn eviction_spares_a_referenced_value_until_it_commits() {
+        // Small arena so CLOCK is forced to evict on almost every write.
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 256,
+            data_bytes_per_part: 256 * 1024,
+        };
+        let s = Store::create("t_staged_evict", &cfg).unwrap();
+
+        let big = vec![b'v'; 16 * 1024]; // OVERSIZED, the referenced path
+        assert!(s.set(b"staged", &big, 0));
+        let version = s.version_of(b"staged").expect("entry present");
+        s.set_staged_seq(b"staged", 42); // staged at ring seq 42
+        s.set_commit_watermark(41); // ... not committed yet
+
+        // Hammer the arena. Without the guard CLOCK reclaims the big value.
+        for i in 0..2000u32 {
+            s.set(format!("filler{i}").as_bytes(), &[b'x'; 512], 0);
+        }
+        match s.read_staged(b"staged", version) {
+            Some((_, _, v)) => assert_eq!(v.len(), big.len(), "value corrupted"),
+            None => panic!("uncommitted referenced value was evicted: the write is lost"),
+        }
+
+        // Once the worker has committed past it, it is ordinary cache data.
+        s.set_commit_watermark(42);
+        for i in 0..2000u32 {
+            s.set(format!("later{i}").as_bytes(), &[b'x'; 512], 0);
+        }
+        assert!(
+            s.version_of(b"staged").is_none(),
+            "a committed entry must be evictable again, or the arena fills with pins"
+        );
+    }
+
+    /// The version on the record is what makes a stale reference safe: if the
+    /// key was overwritten after staging, the worker must not persist the new
+    /// bytes under the old record. A newer record is already queued for it.
+    #[test]
+    fn read_staged_rejects_a_superseded_version() {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 256,
+            data_bytes_per_part: 1024 * 1024,
+        };
+        let s = Store::create("t_staged_version", &cfg).unwrap();
+        let big = vec![b'a'; 16 * 1024];
+        assert!(s.set(b"k", &big, 0));
+        let v1 = s.version_of(b"k").unwrap();
+        assert!(s.read_staged(b"k", v1).is_some());
+
+        // Overwrite: the old reference must stop resolving.
+        assert!(s.set(b"k", &vec![b'b'; 16 * 1024], 0));
+        assert!(
+            s.read_staged(b"k", v1).is_none(),
+            "a superseded reference must not resolve to the newer value"
+        );
+        let v2 = s.version_of(b"k").unwrap();
+        assert_ne!(v1, v2);
+        assert!(s.read_staged(b"k", v2).is_some());
+    }
+
+    /// Oversized space must be genuinely reclaimed, not merely listed.
+    ///
+    /// Blocks are laid out contiguously by bump. Freeing one used to push it
+    /// onto a LIFO list with no coalescing and no way to move `data_bump` back
+    /// down, so a workload of growing values consumed fresh arena on every step
+    /// while the free list filled with blocks individually too small to serve
+    /// the next request. Eviction could not recover it either, since eviction
+    /// frees onto the same list.
+    ///
+    /// `data_used` is `data_bump`, so the reclamation is directly observable.
+    #[test]
+    fn oversized_space_is_reclaimed_not_just_listed() {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 256,
+            data_bytes_per_part: 8 * 1024 * 1024,
+        };
+        let s = Store::create("t_oversize_frag", &cfg).unwrap();
+        let used = || s.stats(0).data_used;
+
+        // Warm up so the key's own slab block (a size class, not oversized) is
+        // already bumped and reused thereafter; only the value's oversized
+        // block should move the bump pointer from here on.
+        assert!(s.set(b"big", b"small", 0));
+        assert!(s.del(b"big"));
+        let baseline = used();
+
+        assert!(s.set(b"big", &vec![b'x'; 1024 * 1024], 0));
+        let peak = used();
+        assert!(peak > baseline + 1024 * 1024, "1 MiB write should consume arena");
+        assert!(s.del(b"big"));
+        assert_eq!(
+            used(),
+            baseline,
+            "freeing the top block must return its space to the bump pointer,              not strand it on the free list"
+        );
+
+        // A strictly growing series, each value freed before the next. Every
+        // step needs more than any block the free list holds, so without
+        // reclamation each one consumes fresh arena and the total far exceeds
+        // the 8 MiB available.
+        assert!(s.set(b"grow", b"small", 0)); // warm the key's slab block
+        assert!(s.del(b"grow"));
+        let grow_baseline = used();
+        let mut size = 64 * 1024usize;
+        while size <= 4 * 1024 * 1024 {
+            assert!(
+                s.set(b"grow", &vec![b'y'; size], 0),
+                "{size}-byte write failed: freed oversized space never became                  reusable (data_used {} of {})",
+                used(),
+                s.stats(0).data_cap
+            );
+            assert!(s.del(b"grow"));
+            assert_eq!(used(), grow_baseline, "{size}-byte round leaked arena");
+            size *= 2;
+        }
+    }
+
+    /// A failed overwrite must leave the previous value intact.
+    ///
+    /// The old code released the existing block before allocating the
+    /// replacement, so when the allocation then failed the entry still pointed
+    /// at freed space: the previous value was destroyed even though the write
+    /// failed, and a later read returned whatever had since been handed to
+    /// another key. Allocation also evicts, and CLOCK could evict the very
+    /// entry being overwritten, after which the old code wrote through a
+    /// pointer to a freed slot.
+    #[test]
+    fn failed_overwrite_leaves_the_old_value_intact() {
+        // Room for one oversized value and little else.
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 64,
+            data_bytes_per_part: 512 * 1024,
+        };
+        let s = Store::create("t_failed_overwrite", &cfg).unwrap();
+
+        let original = vec![b'a'; 64 * 1024];
+        assert!(s.set(b"k", &original, 0), "initial write should fit");
+
+        // Ask for more than the arena can ever hold. This must fail...
+        let impossible = vec![b'b'; 4 * 1024 * 1024];
+        assert!(!s.set(b"k", &impossible, 0), "oversized overwrite must fail");
+
+        // ...and must not have disturbed what was already there.
+        match s.get(b"k") {
+            Lookup::Hit(v) => {
+                assert_eq!(v.len(), original.len(), "old value truncated by a failed write");
+                assert!(
+                    v.iter().all(|&b| b == b'a'),
+                    "old value corrupted by a failed write: read back bytes that are                      not the value we stored, so the entry pointed at reclaimed space"
+                );
+            }
+            Lookup::Miss => panic!("a failed overwrite destroyed the existing value"),
+        }
+
+        // The key is still writable afterwards, so nothing was left wedged.
+        assert!(s.set(b"k", &vec![b'c'; 1024], 0));
+        match s.get(b"k") {
+            Lookup::Hit(v) => assert!(v.len() == 1024 && v.iter().all(|&b| b == b'c')),
+            Lookup::Miss => panic!("key lost after a successful rewrite"),
+        }
+    }
+
+    /// A write too large for the arena must be refused without evicting.
+    ///
+    /// `ensure_alloc` evicts in a loop until the allocation succeeds or nothing
+    /// is evictable. For a request larger than the whole arena that loop can
+    /// never succeed, so it used to evict every entry in the keyspace and then
+    /// fail anyway: one oversized write destroyed the entire cache.
+    #[test]
+    fn impossible_write_does_not_evict_the_keyspace() {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 256,
+            data_bytes_per_part: 512 * 1024,
+        };
+        let s = Store::create("t_impossible_write", &cfg).unwrap();
+
+        for i in 0..100u32 {
+            assert!(s.set(format!("k{i}").as_bytes(), &[b'v'; 256], 0));
+        }
+        let before = s.stats(0).evictions;
+
+        // Larger than the whole arena: cannot ever be served.
+        assert!(!s.set(b"impossible", &vec![b'x'; 4 * 1024 * 1024], 0));
+
+        let after = s.stats(0).evictions;
+        assert_eq!(
+            before, after,
+            "an impossible write evicted {} entries before giving up",
+            after - before
+        );
+        let mut alive = 0;
+        for i in 0..100u32 {
+            if matches!(s.get(format!("k{i}").as_bytes()), Lookup::Hit(_)) {
+                alive += 1;
+            }
+        }
+        assert_eq!(alive, 100, "an impossible write destroyed existing keys");
+    }
+
+    /// A reader in another backend must never see half of one value and half
+    /// of another.
+    ///
+    /// `get` hands back a slice into shared memory, so a caller that is not the
+    /// owning worker reads it while the worker may be rewriting that key in
+    /// place. This drives exactly that race: one thread alternates between two
+    /// values of the same length made of distinct bytes, another reads
+    /// concurrently, and every observation must be wholly one or wholly the
+    /// other. Run with `get` instead of `get_stable` and it fails.
+    #[test]
+    fn concurrent_reader_never_observes_a_spliced_value() {
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::sync::Arc;
+
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 64,
+            data_bytes_per_part: 1024 * 1024,
+        };
+        let s = Arc::new(Store::create("t_seqlock_tear", &cfg).unwrap());
+        // 4 KiB: a size class, so rewrites land in place, which is the case
+        // that splices rather than swapping a pointer.
+        let a = vec![b'a'; 4096];
+        let b = vec![b'b'; 4096];
+        assert!(s.set(b"k", &a, 0));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (s, stop, a, b) = (s.clone(), stop.clone(), a.clone(), b.clone());
+            std::thread::spawn(move || {
+                while !stop.load(O::Relaxed) {
+                    s.set(b"k", &a, 0);
+                    s.set(b"k", &b, 0);
+                }
+            })
+        };
+
+        let mut reads = 0u64;
+        let mut torn = 0u64;
+        for _ in 0..200_000 {
+            if let Some(v) = s.get_stable(b"k") {
+                reads += 1;
+                let first = v[0];
+                if v.len() != 4096 || v.iter().any(|&c| c != first) {
+                    torn += 1;
+                }
+            }
+        }
+        stop.store(true, O::Relaxed);
+        writer.join().unwrap();
+
+        assert!(reads > 1000, "test did not actually read much ({reads})");
+        assert_eq!(
+            torn, 0,
+            "{torn} of {reads} reads observed a spliced value: the reader saw              bytes from two different writes in one buffer"
+        );
     }
 }
