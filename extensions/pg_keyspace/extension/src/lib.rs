@@ -72,6 +72,12 @@ static GUC_PORT: GucSetting<i32> = GucSetting::<i32>::new(6380);
 static GUC_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 static GUC_KEYS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 static GUC_VAL_BYTES: GucSetting<i32> = GucSetting::<i32>::new(512);
+// Largest bulk string accepted from a RESP client. Matches Valkey/Redis
+// proto-max-bulk-len so a client that works against them works here. The
+// real bound on what can be stored is the keyspace arena; this bounds what
+// the server will buffer for a value that may be refused anyway.
+static GUC_MAX_VALUE_BYTES: GucSetting<i32> =
+    GucSetting::<i32>::new(server::DEFAULT_MAX_VALUE_BYTES);
 static GUC_DURABILITY: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"ephemeral"));
 static GUC_COMMIT_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
@@ -354,6 +360,16 @@ pub extern "C" fn _PG_init() {
         &GUC_VAL_BYTES,
         1,
         1_000_000,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.max_value_bytes",
+        "Largest value (bulk string) accepted from a RESP client",
+        "Equivalent to Valkey/Redis proto-max-bulk-len. A value still has to fit          the keyspace arena to be stored; one that does not is refused with the          standard OOM error rather than acknowledged.",
+        &GUC_MAX_VALUE_BYTES,
+        1024,
+        i32::MAX,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -689,6 +705,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             return;
         }
     };
+    worker.set_max_value_bytes(GUC_MAX_VALUE_BYTES.get().max(1024) as usize);
 
     // TLS: if a cert+key are configured, wrap the RESP wire in TLS. If TLS
     // was requested but the files fail to load, FAIL CLOSED — park rather than

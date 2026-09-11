@@ -54,6 +54,29 @@ pub const DELETE_TOMBSTONE: i64 = -1;
 /// `resolve_acks` defers replies, is the proper fix and is not done here.
 pub const PUSH_DEADLINE: Duration = Duration::from_secs(2);
 
+/// Reply for a write the store could not hold. Redis uses this exact text when
+/// memory pressure prevents a write, and clients special-case it, so reusing it
+/// means an existing client library handles the condition it already knows.
+/// `resp::DEFAULT_MAX_BULK_LEN` as an i32, for the GUC definition.
+pub const DEFAULT_MAX_VALUE_BYTES: i32 = 512 * 1024 * 1024;
+
+pub const OOM_ERR: &str = "OOM command not allowed when used memory > 'maxmemory'.";
+
+/// Report a store write that did not happen, instead of replying success.
+///
+/// `Store::set`/`set_typed` return false when the value cannot be allocated:
+/// larger than the arena, or the arena is full of entries that cannot be
+/// evicted (a referenced value awaiting persistence, for instance). Every call
+/// site used to discard that, so the client was told `+OK` for a value the very
+/// next `GET` would not return.
+#[must_use]
+fn wrote(out: &mut Vec<u8>, ok: bool) -> bool {
+    if !ok {
+        resp::error(out, OOM_ERR);
+    }
+    ok
+}
+
 /// Values at or below this are copied into the ring; larger ones are staged by
 /// reference (see [`ring::KIND_REF`]).
 ///
@@ -302,6 +325,12 @@ pub struct Worker {
     auth: Option<AuthConfig>,
     // durable tier: hold each write's RESP reply until its ring record commits.
     sync_ack: bool,
+    // Largest bulk string accepted from a client, from
+    // `pg_keyspace.max_value_bytes`. The arena is the real bound on what
+    // can be stored; this bounds what will even be buffered, so a hostile
+    // client cannot make the server hold an arbitrary amount for a value
+    // that is going to be refused anyway.
+    max_value_bytes: usize,
     // TLS: when set, every accepted connection is wrapped in a TLS session so
     // the RESP wire is encrypted (the AUTH password is otherwise sent in clear).
     tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -356,6 +385,7 @@ impl Worker {
             producers: Vec::new(),
             auth: None,
             sync_ack: false,
+            max_value_bytes: resp::DEFAULT_MAX_BULK_LEN,
             tls_config: None,
             channels: HashMap::new(),
             patterns: HashMap::new(),
@@ -382,6 +412,11 @@ impl Worker {
     /// Durable tier: hold each write's reply until its ring record has committed.
     pub fn set_sync_ack(&mut self, on: bool) {
         self.sync_ack = on;
+    }
+
+    /// Largest bulk string to accept from a client (`pg_keyspace.max_value_bytes`).
+    pub fn set_max_value_bytes(&mut self, n: usize) {
+        self.max_value_bytes = n.max(1);
     }
 
     /// Enable TLS: every accepted connection is wrapped in a server-side TLS
@@ -750,6 +785,9 @@ impl Worker {
             return;
         }
         let mut consumed_total = 0usize;
+        // Copied out before the borrows below: `self.args` is taken mutably
+        // inside the block, so `self.max_value_bytes` cannot also be read there.
+        let max_value_bytes = self.max_value_bytes;
         loop {
             // Parse one command and materialise its args as owned bytes, so the
             // immutable borrow of rbuf is dropped before we touch wbuf/store.
@@ -759,7 +797,7 @@ impl Worker {
                     None => return,
                 };
                 let buf = &c.rbuf[consumed_total..];
-                let parse = resp::parse(buf, &mut self.args);
+                let parse = resp::parse(buf, &mut self.args, max_value_bytes);
                 let cmd_args: Vec<Vec<u8>> = if let Parse::Complete { .. } = parse {
                     self.args.iter().map(|&(s, e)| buf[s..e].to_vec()).collect()
                 } else {
@@ -1009,7 +1047,9 @@ impl Worker {
                     }
                     i += 2;
                 }
-                store.set(&args[1], &args[2], ttl_micros);
+                if !wrote(out, store.set(&args[1], &args[2], ttl_micros)) {
+                    return;
+                }
                 resp::simple(out, "OK");
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
@@ -1022,7 +1062,9 @@ impl Worker {
                 let n = if exists {
                     0
                 } else {
-                    store.set(&args[1], &args[2], 0);
+                    if !wrote(out, store.set(&args[1], &args[2], 0)) {
+                        return;
+                    }
                     durable_log(&batcher, tier, &args[1], &args[2]);
                     if persist_on {
                         stages.push((args[1].clone(), args[2].clone(), 0, b's'));
@@ -1040,7 +1082,9 @@ impl Worker {
                     Lookup::Hit(v) => Some(v.to_vec()),
                     Lookup::Miss => None,
                 };
-                store.set(&args[1], &args[2], 0);
+                if !wrote(out, store.set(&args[1], &args[2], 0)) {
+                    return;
+                }
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
                     stages.push((args[1].clone(), args[2].clone(), 0, b's'));
@@ -1267,7 +1311,9 @@ impl Worker {
                 }
                 let mut i = 1;
                 while i + 1 < nargs {
-                    store.set(&args[i], &args[i + 1], 0);
+                    if !wrote(out, store.set(&args[i], &args[i + 1], 0)) {
+                        return;
+                    }
                     durable_log(&batcher, tier, &args[i], &args[i + 1]);
                     if persist_on {
                         stages.push((args[i].clone(), args[i + 1].clone(), 0, b's'));
@@ -1296,7 +1342,9 @@ impl Worker {
                 } else {
                     let mut i = 1;
                     while i + 1 < nargs {
-                        store.set(&args[i], &args[i + 1], 0);
+                        if !wrote(out, store.set(&args[i], &args[i + 1], 0)) {
+                            return;
+                        }
                         durable_log(&batcher, tier, &args[i], &args[i + 1]);
                         if persist_on {
                             stages.push((args[i].clone(), args[i + 1].clone(), 0, b's'));
@@ -1324,7 +1372,9 @@ impl Worker {
                     return;
                 }
                 let ttl = if cmd == b"PSETEX" { n * 1_000 } else { n * 1_000_000 };
-                store.set(&args[1], &args[3], ttl);
+                if !wrote(out, store.set(&args[1], &args[3], ttl)) {
+                    return;
+                }
                 resp::simple(out, "OK");
                 durable_log(&batcher, tier, &args[1], &args[3]);
                 if persist_on {
@@ -1402,7 +1452,9 @@ impl Worker {
                 };
                 buf.extend_from_slice(&args[2]);
                 let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
-                store.set(&args[1], &buf, ttl);
+                if !wrote(out, store.set(&args[1], &buf, ttl)) {
+                    return;
+                }
                 resp::integer(out, buf.len() as i64);
                 durable_log(&batcher, tier, &args[1], &buf);
                 if persist_on {
@@ -1470,7 +1522,9 @@ impl Worker {
                 }
                 buf[off..end].copy_from_slice(&args[3]);
                 let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
-                store.set(&args[1], &buf, ttl);
+                if !wrote(out, store.set(&args[1], &buf, ttl)) {
+                    return;
+                }
                 resp::integer(out, buf.len() as i64);
                 durable_log(&batcher, tier, &args[1], &buf);
                 if persist_on {
@@ -1511,7 +1565,9 @@ impl Worker {
                 }
                 let s = aggr::fmt_score(nv).into_bytes();
                 let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
-                store.set(&args[1], &s, ttl);
+                if !wrote(out, store.set(&args[1], &s, ttl)) {
+                    return;
+                }
                 resp::bulk(out, &s);
                 durable_log(&batcher, tier, &args[1], &s);
                 if persist_on {
@@ -1544,7 +1600,9 @@ impl Worker {
                     resp::simple(out, "OK");
                     return;
                 }
-                store.set_typed(&dst, &blob, remaining_ttl(exp), kind);
+                if !wrote(out, store.set_typed(&dst, &blob, remaining_ttl(exp), kind)) {
+                    return;
+                }
                 store.del(&src);
                 if persist_on {
                     stages.push((dst, blob, if exp > 0 { exp } else { 0 }, kind as u8));
@@ -1576,7 +1634,9 @@ impl Worker {
                     resp::integer(out, 0);
                     return;
                 }
-                store.set_typed(&args[2], &blob, remaining_ttl(exp), kind);
+                if !wrote(out, store.set_typed(&args[2], &blob, remaining_ttl(exp), kind)) {
+                    return;
+                }
                 if persist_on {
                     stages.push((args[2].clone(), blob, if exp > 0 { exp } else { 0 }, kind as u8));
                 }
@@ -1824,7 +1884,9 @@ impl Worker {
                     }
                     i += 2;
                 }
-                store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
+                    return;
+                }
                 if cmd == b"HMSET" {
                     resp::simple(out, "OK");
                 } else {
@@ -1844,7 +1906,9 @@ impl Worker {
                     resp::integer(out, 0);
                 } else {
                     h.set(&args[2], &args[3]);
-                    store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                    if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
+                        return;
+                    }
                     resp::integer(out, 1);
                 }
             }
@@ -1897,7 +1961,9 @@ impl Worker {
                 if h.is_empty() {
                     store.del(&args[1]); // Redis drops an emptied hash
                 } else {
-                    store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                    if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
+                        return;
+                    }
                 }
                 resp::integer(out, removed);
             }
@@ -1982,7 +2048,9 @@ impl Worker {
                 };
                 let next = cur + by;
                 h.set(&args[2], &itoa(next));
-                store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
+                    return;
+                }
                 resp::integer(out, next);
             }
             // ---- lists --------------------------------------------
@@ -2009,7 +2077,9 @@ impl Worker {
                     }
                 }
                 let n = l.len() as i64;
-                save_list(&store, &args[1], &l, exp);
+                if !save_list(&store, &args[1], &l, exp, out) {
+                    return;
+                }
                 resp::integer(out, n);
             }
             b"LPOP" | b"RPOP" => {
@@ -2060,7 +2130,9 @@ impl Worker {
                         }
                     }
                 }
-                save_list(&store, &args[1], &l, exp);
+                if !save_list(&store, &args[1], &l, exp, out) {
+                    return;
+                }
             }
             b"LLEN" => {
                 let raw = match list_raw(&store, &args[1], out) {
@@ -2134,7 +2206,9 @@ impl Worker {
                 match l.real_index(i) {
                     Some(idx) => {
                         l.items[idx] = args[3].clone();
-                        save_list(&store, &args[1], &l, exp);
+                        if !save_list(&store, &args[1], &l, exp, out) {
+                            return;
+                        }
                         resp::simple(out, "OK");
                     }
                     None => resp::error(out, "ERR index out of range"),
@@ -2153,7 +2227,9 @@ impl Worker {
                 };
                 let (lo, hi) = l.range_bounds(start, stop);
                 l.items = l.items[lo..hi].to_vec();
-                save_list(&store, &args[1], &l, exp);
+                if !save_list(&store, &args[1], &l, exp, out) {
+                    return;
+                }
                 resp::simple(out, "OK");
             }
             // ---- sorted sets --------------------------------------
@@ -2212,7 +2288,9 @@ impl Worker {
                         changed += 1;
                     }
                 }
-                save_zset(&store, &args[1], &z, exp);
+                if !save_zset(&store, &args[1], &z, exp, out) {
+                    return;
+                }
                 resp::integer(out, if ch { changed } else { added });
             }
             b"ZSCORE" => {
@@ -2268,7 +2346,9 @@ impl Worker {
                         removed += 1;
                     }
                 }
-                save_zset(&store, &args[1], &z, exp);
+                if !save_zset(&store, &args[1], &z, exp, out) {
+                    return;
+                }
                 resp::integer(out, removed);
             }
             b"ZINCRBY" => {
@@ -2289,7 +2369,9 @@ impl Worker {
                 };
                 let next = z.score(&args[3]).unwrap_or(0.0) + by;
                 z.add(&args[3], next);
-                save_zset(&store, &args[1], &z, exp);
+                if !save_zset(&store, &args[1], &z, exp, out) {
+                    return;
+                }
                 resp::double(out, &aggr::fmt_score(next), resp3);
             }
             b"ZRANK" | b"ZREVRANK" => {
@@ -2450,7 +2532,9 @@ impl Worker {
                 }
                 let s = aggr::fmt_score(nv);
                 h.set(&args[2], s.as_bytes());
-                store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH);
+                if !wrote(out, store.set_typed(&args[1], &h.encode(), remaining_ttl(exp), KIND_HASH)) {
+                    return;
+                }
                 resp::bulk(out, s.as_bytes());
             }
             b"HRANDFIELD" => {
@@ -2526,7 +2610,9 @@ impl Worker {
                         let at = if before { idx } else { idx + 1 };
                         l.items.insert(at, args[4].clone());
                         let n = l.len() as i64;
-                        save_list(&store, &args[1], &l, exp);
+                        if !save_list(&store, &args[1], &l, exp, out) {
+                            return;
+                        }
                         resp::integer(out, n);
                     }
                     None => resp::integer(out, -1), // pivot not found
@@ -2574,7 +2660,9 @@ impl Worker {
                         }
                     }
                 }
-                save_list(&store, &args[1], &l, exp);
+                if !save_list(&store, &args[1], &l, exp, out) {
+                    return;
+                }
                 resp::integer(out, removed);
             }
             b"LPOS" => {
@@ -2694,7 +2782,9 @@ impl Worker {
                             } else {
                                 l.rpush(&v);
                             }
-                            save_list(&store, &args[1], &l, exp);
+                            if !save_list(&store, &args[1], &l, exp, out) {
+                                return;
+                            }
                             resp::bulk(out, &v);
                         }
                     }
@@ -2720,8 +2810,12 @@ impl Worker {
                             } else {
                                 dst.rpush(&v);
                             }
-                            save_list(&store, &args[1], &src, sexp);
-                            save_list(&store, &args[2], &dst, dexp);
+                            if !save_list(&store, &args[1], &src, sexp, out) {
+                                return;
+                            }
+                            if !save_list(&store, &args[2], &dst, dexp, out) {
+                                return;
+                            }
                             resp::bulk(out, &v);
                         }
                     }
@@ -2764,7 +2858,9 @@ impl Worker {
                 for (m, _) in &chosen {
                     z.remove(m);
                 }
-                save_zset(&store, &args[1], &z, exp);
+                if !save_zset(&store, &args[1], &z, exp, out) {
+                    return;
+                }
                 // Valkey pairs the counted form under RESP3; the bare form stays flat.
                 reply_scored(out, &chosen, resp3 && count_given, resp3);
             }
@@ -2822,7 +2918,9 @@ impl Worker {
                         added += 1;
                     }
                 }
-                save_set(&store, &args[1], &s, exp);
+                if !save_set(&store, &args[1], &s, exp, out) {
+                    return;
+                }
                 resp::integer(out, added);
             }
             b"SREM" => {
@@ -2840,7 +2938,9 @@ impl Worker {
                         removed += 1;
                     }
                 }
-                save_set(&store, &args[1], &s, exp);
+                if !save_set(&store, &args[1], &s, exp, out) {
+                    return;
+                }
                 resp::integer(out, removed);
             }
             b"SCARD" => {
@@ -2912,7 +3012,9 @@ impl Worker {
                     }
                     let i = (rng_next(&mut rand_seed()) as usize) % s.len();
                     let m = s.members.remove(i);
-                    save_set(&store, &args[1], &s, exp);
+                    if !save_set(&store, &args[1], &s, exp, out) {
+                        return;
+                    }
                     resp::bulk(out, &m);
                     return;
                 }
@@ -2933,7 +3035,9 @@ impl Worker {
                 for i in idx {
                     popped.push(s.members.remove(i));
                 }
-                save_set(&store, &args[1], &s, exp);
+                if !save_set(&store, &args[1], &s, exp, out) {
+                    return;
+                }
                 resp::array_header(out, popped.len());
                 for m in &popped {
                     resp::bulk(out, m);
@@ -2990,8 +3094,12 @@ impl Worker {
                     return;
                 }
                 dst.add(&args[3]);
-                save_set(&store, &args[1], &src, sexp);
-                save_set(&store, &args[2], &dst, dexp);
+                if !save_set(&store, &args[1], &src, sexp, out) {
+                    return;
+                }
+                if !save_set(&store, &args[2], &dst, dexp, out) {
+                    return;
+                }
                 resp::integer(out, 1);
                 if persist_on {
                     for k in [&args[1], &args[2]] {
@@ -3042,7 +3150,9 @@ impl Worker {
                 if ns.is_empty() {
                     store.del(&args[1]);
                 } else {
-                    store.set_typed(&args[1], &ns.encode(), 0, KIND_SET);
+                    if !wrote(out, store.set_typed(&args[1], &ns.encode(), 0, KIND_SET)) {
+                        return;
+                    }
                 }
                 resp::integer(out, ns.len() as i64);
             }
@@ -3187,7 +3297,9 @@ impl Worker {
                     if z.is_empty() {
                         store.del(&args[1]);
                     } else {
-                        store.set_typed(&args[1], &z.encode(), 0, KIND_ZSET);
+                        if !wrote(out, store.set_typed(&args[1], &z.encode(), 0, KIND_ZSET)) {
+                            return;
+                        }
                     }
                     resp::integer(out, result.len() as i64);
                 } else if withscores {
@@ -3246,7 +3358,9 @@ impl Worker {
                     for (m, _) in &chosen {
                         z.remove(m);
                     }
-                    save_zset(&store, k, &z, exp);
+                    if !save_zset(&store, k, &z, exp, out) {
+                        return;
+                    }
                     resp::array_header(out, 2);
                     resp::bulk(out, k);
                     resp::array_header(out, chosen.len());
@@ -3406,7 +3520,9 @@ impl Worker {
                 if nz.is_empty() {
                     store.del(&args[1]);
                 } else {
-                    store.set_typed(&args[1], &nz.encode(), 0, KIND_ZSET);
+                    if !wrote(out, store.set_typed(&args[1], &nz.encode(), 0, KIND_ZSET)) {
+                        return;
+                    }
                 }
                 resp::integer(out, n as i64);
                 if persist_on {
@@ -4877,12 +4993,13 @@ fn load_list(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::List
 }
 
 /// Store a list back, or delete the key if it became empty (Redis semantics).
-fn save_list(store: &Store, key: &[u8], l: &aggr::List, exp: i64) {
+#[must_use]
+fn save_list(store: &Store, key: &[u8], l: &aggr::List, exp: i64, out: &mut Vec<u8>) -> bool {
     if l.is_empty() {
         store.del(key);
-    } else {
-        store.set_typed(key, &l.encode(), remaining_ttl(exp), KIND_LIST);
+        return true;
     }
+    wrote(out, store.set_typed(key, &l.encode(), remaining_ttl(exp), KIND_LIST))
 }
 
 /// Borrow the raw zset blob at `key` for sub-linear reads (ZSCORE/ZRANK/ZRANGE/
@@ -4914,12 +5031,13 @@ fn load_zset(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::ZSet
 }
 
 /// Store a sorted set back, or delete the key if it became empty.
-fn save_zset(store: &Store, key: &[u8], z: &aggr::ZSet, exp: i64) {
+#[must_use]
+fn save_zset(store: &Store, key: &[u8], z: &aggr::ZSet, exp: i64, out: &mut Vec<u8>) -> bool {
     if z.is_empty() {
         store.del(key);
-    } else {
-        store.set_typed(key, &z.encode(), remaining_ttl(exp), KIND_ZSET);
+        return true;
     }
+    wrote(out, store.set_typed(key, &z.encode(), remaining_ttl(exp), KIND_ZSET))
 }
 
 /// Borrow the raw set blob at `key` for O(1) SISMEMBER/SCARD off the stored
@@ -4949,12 +5067,13 @@ fn load_set(store: &Store, key: &[u8], out: &mut Vec<u8>) -> Option<(aggr::Set, 
 }
 
 /// Store a set back, or delete the key if it became empty (Redis semantics).
-fn save_set(store: &Store, key: &[u8], s: &aggr::Set, exp: i64) {
+#[must_use]
+fn save_set(store: &Store, key: &[u8], s: &aggr::Set, exp: i64, out: &mut Vec<u8>) -> bool {
     if s.is_empty() {
         store.del(key);
-    } else {
-        store.set_typed(key, &s.encode(), remaining_ttl(exp), KIND_SET);
+        return true;
     }
+    wrote(out, store.set_typed(key, &s.encode(), remaining_ttl(exp), KIND_SET))
 }
 
 /// Parse the trailing options of an H/S/ZSCAN (`[MATCH p] [COUNT n] [NOVALUES]`)
