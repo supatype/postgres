@@ -663,12 +663,10 @@ Scoping for this version — the extension works; these are the edges to know:
   slew is harmless. On-disk reclamation also lags expiry by up to
   `ttl_bucket_secs + ttl_sweep_secs` (about 15 s at defaults), though reads
   filter on `expires_at` so nothing expired is ever served.
-- **A read from SQL can observe a torn value** while the RESP worker rewrites
-  that key. The RESP path itself is single-writer and safe; this affects
-  `supacache.get` and friends from another backend.
 - **There are no per-tenant quotas.** Keys and channels are force-scoped to
   `{tenant}:`, which is an isolation boundary, not an accounting one: one tenant
   can evict another's hot data or fill the persistence ring.
 - Operational metrics are partial. `supacache.stats()`, `ring_stats()`,
-  `rowcache_stats()` and `replication_status()` exist; persistence error counts,
-  commit lag and invalidation lag do not yet.
+  `rowcache_stats()` and `replication_status()` exist, and `ring_stats()` reports
+  commit lag, failed batches and unresolved references; row cache invalidation
+  lag is still not exposed.
