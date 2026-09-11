@@ -271,4 +271,10 @@ jobs:
       - name: Durability + fault injection suite
         env:
           PGKS_BUILD_PROFILE: debug
-        run: sudo -E bash extensions/pg_keyspace/bench/run_durability_pg.sh
+        # Root is needed to install into the PG prefix and to run initdb as the
+        # postgres user, but sudo resets PATH from secure_path, so cargo (in
+        # ~/.cargo/bin) disappears. PGRX_HOME has to come along too: the init
+        # step above wrote it under the runner's home, not root's.
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_durability_pg.sh
