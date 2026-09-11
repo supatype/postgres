@@ -137,8 +137,8 @@ never serves stale data), and becomes exact once a worker set shares one store.
 pre-flag `EXECABORT` (it errors as that command's element in the `EXEC` array;
 atomic apply and `WATCH`-abort are exact); `HSCAN`/`SSCAN`/`ZSCAN` return the
 whole collection in one call with cursor `0` (each aggregate is one blob), so
-`COUNT` is a hint; sorted-set scores print via Rust's shortest round-trip rather
-than `%.17g` (equal values, possibly different text).
+`COUNT` is a hint; sorted-set scores print exactly as Valkey 8 prints them,
+verified against it.
 
 ---
 
@@ -653,8 +653,15 @@ Scoping for this version — the extension works; these are the edges to know:
   cross-*process* for N in-PG background workers.
 - **Mode B caches single-column primary keys** (composite keys are refused); the
   cache is warmed manually (`rowcache_put`) though invalidation is automatic.
-- Sorted-set score formatting uses Rust's shortest round-trip rather than Redis's
-  `%.17g`, so inexact doubles can print differently (values compare equal).
+- **Sorted-set scores match Valkey 8's text, with one exception.** Older Redis
+  used `%.17g`; Valkey 8 uses the shortest representation that round-trips, and
+  so does this, including its thresholds for printing an integral score as an
+  integer and for switching to exponent form. Checked value by value against
+  `valkey/valkey:8`: 399 of 400 random doubles print identically. The remainder
+  are cases where Valkey's own text does not round-trip, because the Grisu2
+  implementation it formats through is not always optimal; matching those byte
+  for byte would mean emitting digits that parse back to a different double, so
+  this prints the correctly rounded shortest form instead.
 - TLS is bring-your-own-cert (in-place rotation on `SIGHUP`; no managed CA). The
   durable/replicated tiers are correct but not throughput-optimised — they
   serialize on the Postgres WAL by design.

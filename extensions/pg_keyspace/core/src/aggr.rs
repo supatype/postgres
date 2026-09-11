@@ -502,18 +502,85 @@ pub fn list_get(buf: &[u8], i: usize) -> Option<&[u8]> {
 
 // ---- Sorted set -----------------------------------------------------------
 
-/// Format a score the way clients expect: integers without a decimal point,
-/// `inf`/`-inf` for infinities, else the shortest string that round-trips.
-/// (Redis uses `%.17g`, which prints more digits for inexact doubles; this
-/// round-trips identically and is cleaner. Tests use exact scores.)
+/// Format a sorted-set score the way Valkey does.
+///
+/// Not `%.17g`, despite what older Redis documentation says. Valkey 8 prints
+/// `0.1` as `0.1`, not `0.10000000000000001`: it uses the shortest
+/// representation that round-trips, same as Rust. Checked against
+/// valkey/valkey:8, which agrees with a plain Rust `{}` on ordinary scores.
+///
+/// It diverges at the extremes, in two ways that `{}` does not reproduce:
+///
+/// - an integral score prints as an integer only while it fits in *half* the
+///   signed 64-bit range, the bound Valkey's `double2ll` uses. Past it, `5e18`
+///   prints as `5e+18` where Rust would print all nineteen digits.
+/// - very large and very small magnitudes switch to exponent form. Rust never
+///   does: it prints `1e-7` as `0.0000001` and `1e20` in full.
+///
+/// The thresholds below are those of the `fpconv_dtoa` Valkey emits through,
+/// so the two agree character for character rather than merely numerically.
+/// That matters because a client is free to compare a score as a string, which
+/// is the only reason this is worth matching at all.
 pub fn fmt_score(s: f64) -> String {
+    if s.is_nan() {
+        return "nan".into();
+    }
     if s.is_infinite() {
         return if s > 0.0 { "inf".into() } else { "-inf".into() };
     }
-    if s == s.trunc() && s.abs() < 1e17 {
+    // (i64::MAX / 2) as f64, the bound in Valkey's double2ll.
+    const LL_HALF: f64 = 4_611_686_018_427_387_903.0;
+    if s == s.trunc() && s >= -LL_HALF && s <= LL_HALF {
         return format!("{}", s as i64);
     }
-    format!("{s}")
+    fmt_shortest(s)
+}
+
+/// The shortest round-trip digits, laid out as `fpconv_dtoa` lays them out.
+///
+/// Rust's `{:e}` yields the same shortest digit string; only the decision of
+/// where to put the point, and whether to use exponent form at all, differs.
+fn fmt_shortest(v: f64) -> String {
+    let sci = format!("{v:e}");
+    let (mant, exp) = match sci.split_once('e') {
+        Some(x) => x,
+        None => return sci,
+    };
+    let e: i32 = match exp.parse() {
+        Ok(x) => x,
+        Err(_) => return sci,
+    };
+    let neg = mant.starts_with('-');
+    let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+    let nd = digits.len() as i32;
+    // value == digits * 10^k
+    let k = e - (nd - 1);
+    let exp_abs = e.abs();
+    let sign = if neg { "-" } else { "" };
+
+    if k >= 0 && exp_abs < nd + 7 {
+        // Plain integer: every digit, then the trailing zeros.
+        format!("{sign}{digits}{}", "0".repeat(k as usize))
+    } else if k < 0 && (k > -7 || exp_abs < 4) {
+        // Plain decimal.
+        let point = nd + k;
+        if point <= 0 {
+            format!("{sign}0.{}{digits}", "0".repeat((-point) as usize))
+        } else {
+            let (a, b) = digits.split_at(point as usize);
+            format!("{sign}{a}.{b}")
+        }
+    } else {
+        // Exponent form. The sign is always written, the exponent never padded.
+        let m = if nd == 1 {
+            digits
+        } else {
+            let (a, b) = digits.split_at(1);
+            format!("{a}.{b}")
+        };
+        let es = if e < 0 { "-" } else { "+" };
+        format!("{sign}{m}e{es}{exp_abs}")
+    }
 }
 
 /// Parse a score, accepting `inf`/`+inf`/`-inf`/`infinity`.
@@ -1508,5 +1575,92 @@ mod tests {
         let blob = s.encode();
         assert_eq!(blob[0], S_INDEXED);
         assert!(set_contains(&blob, &vec![b'x'; SET_INDEX_VALUE_MAX + 1]));
+    }
+}
+
+/// Score formatting measured against a real server.
+///
+/// Every expectation below was produced by `ZADD`/`ZSCORE` against
+/// `valkey/valkey:8-alpine` rather than derived from a specification, because
+/// the specification is the part that was wrong: the documented `%.17g` would
+/// print `0.1` as `0.10000000000000001`, and Valkey does not.
+#[cfg(test)]
+mod score_parity {
+    use super::*;
+
+    /// (input, exactly what valkey 8 replied to ZSCORE)
+    const VALKEY: &[(f64, &str)] = &[
+        // Ordinary scores, where the shortest round-trip form already agreed.
+        (0.1, "0.1"),
+        (1.1, "1.1"),
+        (2.5, "2.5"),
+        (3.0e-5, "0.00003"),
+        (3.0000000000000004, "3.0000000000000004"),
+        // Integral values print in full while they fit half the i64 range.
+        (1e14, "100000000000000"),
+        (1e15, "1000000000000000"),
+        (1e16, "10000000000000000"),
+        (1e17, "100000000000000000"),
+        (1e18, "1000000000000000000"),
+        (123456789012345678.0, "123456789012345680"),
+        (4e18, "4000000000000000000"),
+        (4.6e18, "4600000000000000000"),
+        // ...and switch to exponent form past it. This is the boundary:
+        // i64::MAX / 2 is 4611686018427387903.
+        (4.7e18, "4.7e+18"),
+        (5e18, "5e+18"),
+        (9e18, "9e+18"),
+        (1e19, "1e+19"),
+        (1e20, "1e+20"),
+        (1e21, "1e+21"),
+        // Small magnitudes stay decimal down to 1e-6 and go exponent at 1e-7.
+        (0.0001, "0.0001"),
+        (0.00001, "0.00001"),
+        (0.000001, "0.000001"),
+        (1e-7, "1e-7"),
+    ];
+
+    #[test]
+    fn matches_valkey_8_character_for_character() {
+        for &(v, want) in VALKEY {
+            assert_eq!(fmt_score(v), want, "score {v:e}");
+        }
+    }
+
+    #[test]
+    fn negatives_mirror_their_positives() {
+        for &(v, want) in VALKEY {
+            if v == 0.0 {
+                continue;
+            }
+            assert_eq!(fmt_score(-v), format!("-{want}"), "score -{v:e}");
+        }
+    }
+
+    #[test]
+    fn infinities_and_nan() {
+        assert_eq!(fmt_score(f64::INFINITY), "inf");
+        assert_eq!(fmt_score(f64::NEG_INFINITY), "-inf");
+        assert_eq!(fmt_score(f64::NAN), "nan");
+    }
+
+    #[test]
+    fn every_formatted_score_parses_back_to_itself() {
+        // Formatting is only allowed to change how a score looks, never what it
+        // is, so the round trip has to hold across the branches above.
+        let mut x = 0x243F_6A88_85A3_08D3u64;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let v = f64::from_bits(x);
+            if !v.is_finite() {
+                continue;
+            }
+            let text = fmt_score(v);
+            let back = parse_score(text.as_bytes())
+                .unwrap_or_else(|| panic!("{text} did not parse back (from {v:e})"));
+            assert_eq!(back, v, "round trip through {text:?}");
+        }
     }
 }
