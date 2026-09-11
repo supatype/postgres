@@ -19,7 +19,7 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 use pgrx::{AnyElement, FromDatum, IntoDatum, PgBuiltInOids, PgOid};
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -62,6 +62,8 @@ const RING_NAME: &CStr = c"pg_keyspace_ring";
 const ROWCACHE_NAME: &CStr = c"pg_keyspace_rowcache";
 // Cross-process pub/sub routing table and inboxes.
 const PUBSUB_NAME: &CStr = c"pg_keyspace_pubsub";
+// Per-worker liveness, so a worker that goes away can be noticed and relaunched.
+const HEALTH_NAME: &CStr = c"pg_keyspace_health";
 
 // Base address of the Postgres shared-memory segment, published by the startup
 // hook and inherited by every forked backend. Each context rebuilds a cheap
@@ -73,6 +75,8 @@ static RING_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static ROWCACHE_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // Base of the cross-process pub/sub segment.
 static PUBSUB_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+// Base of the worker liveness table.
+static HEALTH_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // The bus itself, built by the postmaster in the shmem startup hook so that the
 // wake descriptors it opens are inherited by every worker that forks from it.
 // Built after the fork, each worker would hold private descriptors and wake
@@ -101,6 +105,7 @@ static GUC_PERSIST_WINDOW_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static GUC_RING_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 static GUC_PUBSUB_ROUTES: GucSetting<i32> = GucSetting::<i32>::new(4096);
 static GUC_PUBSUB_RING_KB: GucSetting<i32> = GucSetting::<i32>::new(256);
+static GUC_WATCHDOG_SECS: GucSetting<i32> = GucSetting::<i32>::new(30);
 static GUC_PERSIST_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 // TTL by partition drop: time-bucket width and sweep interval.
 static GUC_TTL_BUCKET_SECS: GucSetting<i32> = GucSetting::<i32>::new(10);
@@ -252,6 +257,184 @@ fn ring_index(w: usize, shard: usize) -> usize {
 /// Bytes for one ring (header + power-of-two capacity).
 fn ring_stride() -> usize {
     ring::bytes_for((GUC_RING_MB.get().max(1) as usize) * 1024 * 1024)
+}
+
+/// One worker's liveness record.
+///
+/// `pg_terminate_backend` on a background worker calls `TerminateBackgroundWorker`,
+/// which makes the postmaster *deregister* it rather than restart it, whatever
+/// `bgw_restart_time` says. A persistence worker lost that way stays lost for the
+/// life of the cluster, and since a durable write then holds its acknowledgement
+/// rather than failing, the only outward sign is that writes stop completing.
+///
+/// So every worker beats here on the tick it already has, and every worker also
+/// scans for gaps. As long as one of them survives, the rest come back. There is
+/// deliberately no supervisor process, because a supervisor is one more thing
+/// that can be terminated.
+#[repr(C)]
+struct WorkerSlot {
+    /// Last heartbeat, microseconds. 0 means the slot has never been claimed.
+    last_seen_us: AtomicI64,
+    /// When a relaunch was last attempted, so several workers noticing the same
+    /// gap produce one relaunch between them rather than one each.
+    last_launch_us: AtomicI64,
+    owner_pid: AtomicU32,
+    _pad: u32,
+}
+
+const HEALTH_STRIDE: usize = 64;
+
+/// Slots are laid out RESP workers, then persistence shards, then the expiry
+/// worker, so an index maps back to exactly what to relaunch.
+fn health_slot_count() -> usize {
+    worker_count() + persist_shards() + 1
+}
+
+fn health_expiry_slot() -> usize {
+    worker_count() + persist_shards()
+}
+
+fn health_bytes() -> usize {
+    health_slot_count() * HEALTH_STRIDE
+}
+
+fn health_slot(i: usize) -> Option<&'static WorkerSlot> {
+    let base = HEALTH_BASE.load(Ordering::Acquire);
+    if base.is_null() || i >= health_slot_count() {
+        return None;
+    }
+    unsafe { Some(&*(base.add(i * HEALTH_STRIDE) as *const WorkerSlot)) }
+}
+
+/// How old a heartbeat may get before the worker is presumed gone.
+fn health_stale_us() -> i64 {
+    (GUC_WATCHDOG_SECS.get().max(1) as i64) * 1_000_000
+}
+
+fn health_beat(i: usize) {
+    if let Some(sl) = health_slot(i) {
+        sl.last_seen_us.store(store::now_micros(), Ordering::Release);
+    }
+}
+
+/// Take ownership of a slot, or refuse because somebody live already holds it.
+///
+/// This is what makes an over-eager relaunch harmless rather than destructive.
+/// The persistence ring is single-producer/single-consumer, so two workers
+/// draining one shard would corrupt it; a worker that cannot claim its slot
+/// exits instead of draining.
+fn health_claim(i: usize) -> bool {
+    let sl = match health_slot(i) {
+        Some(s) => s,
+        None => return true, // no table: nothing to coordinate through
+    };
+    let now = store::now_micros();
+    let last = sl.last_seen_us.load(Ordering::Acquire);
+    let prev = sl.owner_pid.load(Ordering::Acquire);
+    let me = unsafe { pg_sys::MyProcPid } as u32;
+    // A fresh heartbeat is not enough on its own to refuse. Postgres restarts a
+    // worker that exits non-zero after two seconds, well inside the staleness
+    // window, so the replacement would be locked out by the heartbeat its own
+    // predecessor left behind. What matters is whether that predecessor is still
+    // running.
+    if last != 0
+        && now.saturating_sub(last) < health_stale_us()
+        && prev != 0
+        && prev != me
+        && pid_alive(prev)
+    {
+        return false;
+    }
+    if sl
+        .owner_pid
+        .compare_exchange(prev, me, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    sl.last_seen_us.store(now, Ordering::Release);
+    true
+}
+
+/// Whether a recorded owner is still running. Signal 0 checks for the process
+/// without sending anything.
+fn pid_alive(pid: u32) -> bool {
+    pid != 0 && unsafe { libc::kill(pid as i32, 0) } == 0
+}
+
+fn health_release(i: usize) {
+    if let Some(sl) = health_slot(i) {
+        sl.owner_pid.store(0, Ordering::Release);
+        sl.last_seen_us.store(0, Ordering::Release);
+    }
+}
+
+/// Relaunch any worker whose heartbeat has gone stale.
+///
+/// Called from the tick of every pg_keyspace worker. Registration is dynamic
+/// because a statically registered worker cannot be re-registered after the
+/// postmaster has dropped it.
+fn health_watchdog() {
+    if GUC_WATCHDOG_SECS.get() <= 0 || HEALTH_BASE.load(Ordering::Acquire).is_null() {
+        return;
+    }
+    let persisted = ks_tier() != Tier::Ephemeral;
+    let now = store::now_micros();
+    let stale = health_stale_us();
+    let nworkers = worker_count();
+    for i in 0..health_slot_count() {
+        // Workers that are not supposed to be running are not gaps.
+        if !persisted && i >= nworkers {
+            continue;
+        }
+        let sl = match health_slot(i) {
+            Some(s) => s,
+            None => continue,
+        };
+        let last = sl.last_seen_us.load(Ordering::Acquire);
+        // Never claimed means nobody has started yet, which startup handles.
+        if last == 0 || now.saturating_sub(last) < stale {
+            continue;
+        }
+        // One relaunch between all the workers that noticed, not one each.
+        let launched = sl.last_launch_us.load(Ordering::Acquire);
+        if now.saturating_sub(launched) < stale {
+            continue;
+        }
+        if sl
+            .last_launch_us
+            .compare_exchange(launched, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        health_relaunch(i, nworkers);
+    }
+}
+
+fn health_relaunch(i: usize, nworkers: usize) {
+    let (name, func, arg) = if i < nworkers {
+        (format!("pg_keyspace: RESP slot worker {i}"), "pg_keyspace_worker_main", i as i32)
+    } else if i < health_expiry_slot() {
+        let sh = i - nworkers;
+        (format!("pg_keyspace: persistence worker {sh}"), "pg_keyspace_persist_main", sh as i32)
+    } else {
+        ("pg_keyspace: expiry worker".to_string(), "pg_keyspace_expiry_main", 0)
+    };
+    log!("pg_keyspace watchdog: '{name}' has not beaten in {}s; relaunching it", GUC_WATCHDOG_SECS.get());
+    let built = BackgroundWorkerBuilder::new(&name)
+        .set_library("pg_keyspace")
+        .set_function(func)
+        .set_argument(arg.into_datum())
+        .set_restart_time(Some(Duration::from_secs(2)))
+        .enable_spi_access()
+        .set_notify_pid(0)
+        .load_dynamic();
+    if built.is_err() {
+        log!(
+            "pg_keyspace watchdog: could not relaunch '{name}' (max_worker_processes reached?);              will retry"
+        );
+    }
 }
 
 /// Shared bytes for the cross-process pub/sub bus.
@@ -490,6 +673,16 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_int_guc(
+        "pg_keyspace.watchdog_secs",
+        "Relaunch a pg_keyspace worker whose heartbeat is this old, 0 to disable",
+        "pg_terminate_backend deregisters a background worker permanently rather          than restarting it, so without this persistence stops until the cluster does.",
+        &GUC_WATCHDOG_SECS,
+        0,
+        3600,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
         "pg_keyspace.pubsub_routes",
         "Distinct pub/sub channels and patterns the shared routing table holds",
         "Subscriptions beyond this are refused and counted in pubsub_stats().",
@@ -713,6 +906,7 @@ extern "C" fn ks_shmem_request() {
         pg_sys::RequestAddinShmemSpace(ring_total_bytes());
         pg_sys::RequestAddinShmemSpace(rowcache_config().total_bytes());
         pg_sys::RequestAddinShmemSpace(pubsub_bytes());
+        pg_sys::RequestAddinShmemSpace(health_bytes());
     }
 }
 
@@ -765,6 +959,18 @@ extern "C" fn ks_shmem_startup() {
             let _ = Store::from_raw(rcptr, &rc_cfg, !rc_found);
             ROWCACHE_BASE.store(rcptr, Ordering::Release);
         }
+        // Worker liveness table. Zeroed means "never claimed", which is what
+        // startup expects, so nothing else needs initialising here.
+        let h_bytes = health_bytes();
+        let mut h_found = false;
+        let hptr = pg_sys::ShmemInitStruct(HEALTH_NAME.as_ptr(), h_bytes, &mut h_found) as *mut u8;
+        if !hptr.is_null() {
+            if !h_found {
+                std::ptr::write_bytes(hptr, 0, h_bytes);
+            }
+            HEALTH_BASE.store(hptr, Ordering::Release);
+        }
+
         // Cross-process pub/sub. Only the creator builds the Bus: it is the
         // postmaster, and its wake descriptors are what every worker inherits.
         let ps_bytes = pubsub_bytes();
@@ -1041,10 +1247,23 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     // SIGHUP hot-reloads RESP credentials + ACL from the table (and refreshes
     // GUC-derived values like exempt_roles) with no restart: change the creds via
     // supacache.set_credential, then `SELECT pg_reload_conf()`.
+    // The RESP worker's own liveness, and the watchdog for everyone else's.
+    health_claim(w);
+    let mut last_watch = std::time::Instant::now();
     let _ = worker.run_with(
         || {
             if BackgroundWorker::sigterm_received() {
+                // No health_release: see the persistence worker's shutdown.
                 return server::Tick::Stop;
+            }
+            // The heartbeat is one atomic store, so it goes on every tick: a
+            // beat that is only as fresh as the scan interval would leave this
+            // worker looking half-stale to everyone else. The scan itself walks
+            // every slot, so it is rate-limited.
+            health_beat(w);
+            if last_watch.elapsed() >= Duration::from_secs(5) {
+                last_watch = std::time::Instant::now();
+                health_watchdog();
             }
             if BackgroundWorker::sighup_received() {
                 unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
@@ -1121,9 +1340,22 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         return;
     }
 
+    // Claim this shard before attaching to any ring. The rings are strictly
+    // single-consumer, so a second worker draining the same shard would corrupt
+    // them; the watchdog relaunches on a heartbeat, which is a guess about
+    // liveness, and this is what makes a wrong guess harmless.
+    let health = worker_count() + idx;
+    if !health_claim(health) {
+        log!(
+            "pg_keyspace persist {idx}: shard {idx} is already being drained by a live              worker; exiting rather than sharing its rings"
+        );
+        return;
+    }
+
     let rbase = RING_BASE.load(Ordering::Acquire);
     if rbase.is_null() {
         log!("pg_keyspace persist {idx}: ring not ready, exiting");
+        health_release(health);
         return;
     }
     // This worker owns shard `idx` of every slot worker's ring set — one
@@ -1155,7 +1387,13 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
     // is safe and lossless; the delay stops a permanently broken batch (bad
     // permissions, disk full) from spinning the worker at full tilt.
     let mut backoff = Duration::from_millis(0);
+    let mut last_watch = std::time::Instant::now();
     while !BackgroundWorker::sigterm_received() {
+        health_beat(health);
+        if last_watch.elapsed() >= Duration::from_secs(5) {
+            last_watch = std::time::Instant::now();
+            health_watchdog();
+        }
         let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
         let slices = peek_rings(&consumers, per_ring, idx, &mut batch);
         let count: usize = slices.iter().map(|(n, _)| n).sum();
@@ -1217,6 +1455,11 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
             ),
         }
     }
+    // Deliberately no health_release here. A cluster shutdown and a
+    // pg_terminate_backend deliver the same SIGTERM, so clearing the slot would
+    // erase the one case this table exists to catch. Leaving the heartbeat to go
+    // stale is correct for both: on a real shutdown the segment is destroyed
+    // anyway, and a postmaster that is shutting down refuses new registrations.
     log!("pg_keyspace persist {idx}: shutting down");
 }
 
@@ -1778,7 +2021,14 @@ pub extern "C" fn pg_keyspace_expiry_main(_arg: pg_sys::Datum) {
     }
     let sweep = Duration::from_secs(GUC_TTL_SWEEP_SECS.get().max(1) as u64);
     log!("pg_keyspace expiry: dropping past TTL partitions every {sweep:?}");
+    let expiry_slot = health_expiry_slot();
+    if !health_claim(expiry_slot) {
+        log!("pg_keyspace expiry: another expiry worker is live; exiting");
+        return;
+    }
     while !BackgroundWorker::sigterm_received() {
+        health_beat(expiry_slot);
+        health_watchdog();
         let now_bucket = store::now_micros() / ttl_bucket_us();
         let dropped = drop_expired_partitions(now_bucket);
         if dropped > 0 {
