@@ -304,7 +304,23 @@ fn check_sync_standby() -> Result<(), String> {
 
 /// A cheap `Store` view over the shared segment, valid in any backend.
 fn store_view() -> Option<Store> {
-    let base = SEG_BASE.load(Ordering::Acquire);
+    store_view_for(0)
+}
+
+/// A `Store` view over worker `w`'s segment.
+///
+/// Shared memory holds one segment per RESP worker, and a key lives only in
+/// the segment of the worker that owns its slot. Anything resolving a value on
+/// behalf of a specific worker, rather than for the local backend, has to say
+/// which one: a by-reference ring record read against the wrong segment finds
+/// either the wrong bytes or nothing at all, and finding nothing is
+/// indistinguishable from a legitimately superseded write, so it would lose a
+/// durable write silently.
+///
+/// `store_view()` is worker 0 and is correct for single-worker deployments and
+/// for the SQL surface, which today only serves worker 0's keyspace.
+fn store_view_for(w: usize) -> Option<Store> {
+    let base = seg_base_for(w);
     if base.is_null() {
         return None;
     }
@@ -932,6 +948,19 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         log!("pg_keyspace persist {idx}: ring not ready, exiting");
         return;
     }
+    // Values above INLINE_MAX are staged by reference and resolved out of a
+    // keyspace segment, and a ring record does not yet say which worker
+    // produced it. With one worker that is unambiguous; with several it would
+    // resolve against worker 0's segment and quietly lose every large write
+    // owned by any other worker. Refuse rather than trust the caller's guard to
+    // stay in place: whoever makes the ring topology worker-aware should lift
+    // this deliberately and switch the resolution below to store_view_for(w).
+    if worker_count() > 1 {
+        log!(
+            "pg_keyspace persist {idx}: REFUSING to start - persistence with              pg_keyspace.workers > 1 needs worker-aware reference resolution,              which this build does not have"
+        );
+        return;
+    }
     let consumer = unsafe { ring::Consumer::attach(rbase.add(idx * ring_stride())) };
     let idle = Duration::from_millis(GUC_PERSIST_WINDOW_MS.get().max(1) as u64);
     let sync_commit: &'static str = match ks_tier() {
@@ -971,8 +1000,21 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
                 return;
             };
             if let Some(store) = store_view() {
-                if let Some((_, _, val)) = store.read_staged(k, version) {
-                    batch.push((k.to_vec(), val.to_vec(), e, kind & !ring::KIND_REF));
+                // `read_staged` copies under the entry's seqlock and hands back
+                // owned bytes, so there is no window between validating the
+                // version and taking the copy.
+                match store.read_staged(k, version) {
+                    Some((_, _, val)) => batch.push((k.to_vec(), val, e, kind & !ring::KIND_REF)),
+                    // Usually benign: the key was overwritten after staging, so
+                    // a newer record is queued behind this one. It is also what
+                    // resolving against the wrong segment looks like, which is
+                    // not benign at all, so say so rather than dropping in
+                    // silence. A real counter belongs with the other
+                    // persistence metrics.
+                    None => log!(
+                        "pg_keyspace persist {idx}: reference for a {}-byte key did not                          resolve (superseded, or the value is not in this segment)",
+                        k.len()
+                    ),
                 }
             }
         });
@@ -2234,13 +2276,14 @@ mod supacache {
     /// STABLE, never IMMUTABLE: forbids anything downstream of a mask
     /// predicate from being folded/cached by identity — an IMMUTABLE cache read
     /// would let the planner bake one caller's value into a generic plan.
+    /// Reads through the entry's seqlock rather than borrowing the shared
+    /// bytes directly: this runs in an ordinary backend, not the worker that
+    /// owns the partition, so the value can be rewritten underneath it. A
+    /// plain borrow could return the head of one value and the tail of the
+    /// next.
     #[pg_extern(stable, parallel_safe)]
     fn get(key: &str) -> Option<Vec<u8>> {
-        let store = store_view()?;
-        match store.get(key.as_bytes()) {
-            Lookup::Hit(v) => Some(v.to_vec()),
-            Lookup::Miss => None,
-        }
+        store_view()?.get_stable(key.as_bytes())
     }
 
     #[pg_extern]
@@ -2270,10 +2313,9 @@ mod supacache {
     #[pg_extern]
     fn getset(key: &str, val: &[u8]) -> Option<Vec<u8>> {
         let store = store_view()?;
-        let old = match store.get(key.as_bytes()) {
-            Lookup::Hit(v) => Some(v.to_vec()),
-            Lookup::Miss => None,
-        };
+        // Seqlock read for the same reason as `get`: this is a backend, not
+        // the owning worker.
+        let old = store.get_stable(key.as_bytes());
         store.set(key.as_bytes(), val, 0);
         old
     }

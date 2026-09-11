@@ -79,7 +79,7 @@ ceiling for deep Postgres integration.
 | Pipelined throughput (1 worker) | ~500–556 k ops/s | ~537–628 k ops/s |
 | Horizontal scale-out | N shared-nothing workers (**2.46 M SET/s** at 4) | Cluster mode / multiple shards |
 | SQL access to the same data | **Yes** — `supacache.*`, ~9 ns in-backend | No (separate datastore) |
-| Transparent PostgREST/row cache | **Yes** — planner `CustomScan`, auto-coherent | No (app-managed) |
+| Transparent PostgREST/row cache | **Yes** — planner `CustomScan`; coherent within a bounded window ([details](#what-the-row-cache-guarantees-and-what-it-does-not)) | No (app-managed) |
 | Auth / ACL / multi-tenant isolation | Postgres roles, keyspace ACL, forced tenant scoping | Redis ACLs (separate user store) |
 | Column masking / RLS on cached rows | **Yes** — re-applied above the cache | N/A |
 | Durability | Tiered: ephemeral→relaxed→durable(fsync)→replicated; crash-recovers from PG tables | RDB / AOF snapshots & log |
@@ -316,7 +316,44 @@ pgkeyspaced --tier replicated --replica-addr standby-host --replica-port 7400
 
 Inside the extension, `pg_keyspace.durability = 'replicated'` runs the durable
 persist path with `synchronous_commit = remote_apply`, so it relies on Postgres's
-own streaming replication for the standby.
+own streaming replication for the standby. **It refuses to start unless
+`synchronous_standby_names` is set**, and the persist worker re-checks before
+every commit: with that setting empty Postgres does not wait for anything, so
+the tier would quietly be plain `durable`. Query `supacache.replication_status()`
+for the live picture.
+
+#### What an acknowledgement means
+
+The point of the tiers is that a successful reply means something specific.
+These are the exact guarantees, and they are what `bench/run_durability_pg.sh`
+asserts under injected failure on every CI run:
+
+| Tier | A successful reply means |
+|---|---|
+| `ephemeral` | Visible in shared memory on this worker. Lost on restart, crash or eviction. Nothing is persisted. |
+| `relaxed` | Visible in shared memory **and** queued for persistence. Lost if Postgres fails before the persist worker commits, bounded by `persist_window_ms` plus one batch. |
+| `durable` | The persist transaction has committed with `synchronous_commit=on`. Survives `kill -9` and restart. |
+| `replicated` | As `durable`, and a synchronous standby has applied the record. |
+
+Three properties hold across all of them:
+
+- **A write is never acknowledged and then lost.** If the record cannot be
+  queued, a sync-ack tier holds the reply rather than answering `+OK`; if the
+  persist transaction fails, the records stay in the ring, the acks stay held,
+  and the same records commit once the failure clears.
+- **A write the store cannot hold is refused**, with Redis's `OOM command not
+  allowed when used memory > 'maxmemory'.` rather than acknowledged. A value
+  larger than the arena is refused without evicting anything.
+- **Backpressure is latency, not loss.** When the persistence ring is full a
+  sync-ack connection parks and the command is retried when the ring drains.
+  Nothing is dropped; `supacache.ring_stats().dropped` should stay at zero.
+
+What is *not* guaranteed: with concurrent writers to one key, an intermediate
+value may never reach `supacache.kv` at all. Writes are coalesced per key per
+batch, so the durable store converges on the last write rather than replaying
+every one. And the ring lives in Postgres shared memory, so anything in flight
+and **not yet acknowledged** is gone if the whole cluster restarts, which is
+what "not yet acknowledged" means.
 
 ### Multi-worker scale-out
 
@@ -348,6 +385,39 @@ pg_keyspace.rowcache_decode = on     # keys-only decode worker drops changed key
 pg_keyspace.rowcache_refill = on     # (optional) re-cache a changed hot key instead of dropping
 ```
 
+#### What the row cache guarantees, and what it does not
+
+The invalidation worker polls the replication slot, so coherence is **eventual
+with a bound, not read-your-writes**:
+
+> A row served from the cache reflects a state committed at or before the read,
+> and no more than `pg_keyspace.rowcache_decode_ms` (default **200 ms**) plus
+> decode time behind the current committed state.
+
+Concretely:
+
+- `INSERT` then `SELECT` is safe. A row not in the cache falls through to the
+  normal index path; the cache is only consulted for keys it already holds.
+- `ROLLBACK` then `SELECT` is safe. Invalidation is driven by logical decoding,
+  which only ever sees committed changes, so an aborted transaction never
+  poisons the cache.
+- A write and a read **in the same transaction** are safe: the cache path is
+  skipped for a relation that is the target of a data-modifying statement and
+  for anything carrying a `FOR UPDATE`/`FOR SHARE` rowmark.
+- `UPDATE` then an immediate `SELECT` **in another session** can return the
+  previous row for up to that window. `DELETE` likewise: the deleted row can
+  still be served until the invalidation lands.
+
+Two operational consequences worth planning for. The decode slot is **retained
+across shutdown** so invalidation can resume, which means a stopped worker pins
+WAL from its `restart_lsn`: set `max_slot_wal_keep_size`. And if the slot is
+lost, the worker exits and the cache keeps serving whatever it holds with no
+further invalidation, so alert on the worker being alive rather than assuming.
+
+RLS is not subject to any of this. The quals re-apply above the cached row on
+every query, so a stale row is still filtered by the *current* policy for the
+*current* role.
+
 ### RESP AUTH, tenant scoping & TLS
 
 ```sql
@@ -374,6 +444,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.workers` | 1 | shared-nothing RESP slot workers; >1 forces ephemeral |
 | `pg_keyspace.keys` | 1000000 | keyspace capacity per worker (sizes the segment) |
 | `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
+| `pg_keyspace.max_value_bytes` | 536870912 | largest value accepted from a client; matches Valkey/Redis `proto-max-bulk-len` |
 | `pg_keyspace.durability` | `ephemeral` | `ephemeral` \| `relaxed` \| `durable` \| `replicated` |
 | `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables |
 | `pg_keyspace.persist_workers` | 1 | persist workers/rings draining in parallel |
@@ -384,6 +455,51 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.rowcache_mb` | 64 | Mode B row-cache segment size (never RESP-addressable) |
 | `pg_keyspace.rowcache_decode` | `off` | keys-only Mode B invalidation worker (needs `wal_level=logical`) |
 | `pg_keyspace.rowcache_refill` | `off` | on: re-cache a changed hot key; off: drop-only (lazy) |
+
+### Sizing
+
+All of it is Postgres shared memory, reserved at postmaster start. That is
+deliberate: a configuration that will not fit fails at startup rather than
+degrading at 3am, the same bargain as `shared_buffers`. It also means you pay
+for it whether or not the cache is full.
+
+Per worker, with k = `keys` and v = `val_bytes`:
+
+```text
+buckets = max(1024, next_pow2(2k))   x 4 B
+entries = floor(1.1k) + 16           x 72 B
+arena   = entries x align64(64 + v) + 1 MiB
+```
+
+Measured, and pinned by `keyspace_memory_sizing_is_a_closed_formula` so a
+change to the layout breaks a test rather than every deployment's memory floor:
+
+| Configuration | RAM per worker |
+|---|---|
+| 100K keys / 128 B | 28.9 MiB |
+| 1M keys / 128 B | 277.6 MiB |
+| **1M keys / 512 B (defaults)** | **680.4 MiB** |
+| 10M keys / 512 B | 6.68 GiB |
+| 1M keys / 1 KB | 1.19 GiB |
+
+Total is `workers x` the above, plus `persist_workers x ring_mb` for the rings
+and `rowcache_mb` for the row cache. Two things that catch people out:
+
+- **`keys` is per worker, and the keyspace is sharded across workers, not
+  replicated.** Raising `workers` without lowering `keys` multiplies the
+  reservation for the same logical capacity. This is the most likely
+  misconfiguration here.
+- **Rings are allocated even when `durability = ephemeral`**, so an ephemeral
+  deployment still reserves `ring_mb` it will never use.
+
+The arena is also the real ceiling on a single value: `max_value_bytes` is a
+protocol limit, but a value still has to fit in shared memory to be stored,
+exactly as it has to fit `maxmemory` under Valkey. One that does not is refused
+with the Redis OOM error rather than acknowledged.
+
+Values over 8 KiB take the OVERSIZED path, which bump-allocates with a
+coalescing free list. Sustained churn of *large* values of many different sizes
+can therefore fragment the arena, so leave headroom if that is the workload.
 
 ---
 
@@ -431,6 +547,39 @@ real synchronous replication (`run_replication.sh`), a real PostgREST v12.2.3
 end-to-end (`run_postgrest_e2e.sh`), and scale-out (`run_scaleout.sh`,
 `run_scaleout_inpg.sh`). Each prints its own `# result: N passed, M failed`.
 
+Those all drive the standalone daemon. `run_durability_pg.sh` is the exception
+and covers what only exists in-process: it installs the extension into a real
+PostgreSQL 17, starts a cluster with it preloaded, and exercises the persistence
+tiers, crash recovery, the large-value reference path, slab reclamation and the
+replicated tier's startup refusal, **including injected failures**. A
+persistence transaction is failed with a `CHECK (false) NOT VALID` constraint,
+the persist worker is killed by name, and saturation comes from `ring_mb = 1`;
+no test-only hook ships in the extension. It runs in CI on every change to
+`extensions/pg_keyspace/`.
+
+---
+
+## Backup, restore and upgrade
+
+`supacache.kv` and the `supacache.kv_ttl` partitions are ordinary tables, so
+most of this falls out for free: `pg_dump` includes them, physical backups and
+PITR include them, TTLs survive (they are a column, not runtime state), and a
+restored cluster rebuilds the cache on the next worker start through the same
+path as crash recovery.
+
+The consequence worth knowing: **a dump of a busy cache silently contains the
+whole cache**, which can surprise on both dump size and data retention. If the
+cache is disposable, exclude it:
+
+```bash
+pg_dump --exclude-schema=supacache ...
+```
+
+The shared-memory layout is versioned (`pgks_v3`) but Postgres recreates the
+segment on every start, so an upgrade never has to migrate it. Persisted data
+evolves by additive columns, so an older binary reading a newer table ignores
+what it does not know. Downgrade is untested.
+
 ---
 
 ## Current limitations
@@ -448,3 +597,17 @@ Scoping for this version — the extension works; these are the edges to know:
 - TLS is bring-your-own-cert (in-place rotation on `SIGHUP`; no managed CA). The
   durable/replicated tiers are correct but not throughput-optimised — they
   serialize on the Postgres WAL by design.
+- **TTL expiry is wall-clock, not monotonic.** Expiry compares against
+  `CLOCK_REALTIME`, so a system clock *step* moves every key's deadline; NTP
+  slew is harmless. On-disk reclamation also lags expiry by up to
+  `ttl_bucket_secs + ttl_sweep_secs` (about 15 s at defaults), though reads
+  filter on `expires_at` so nothing expired is ever served.
+- **A read from SQL can observe a torn value** while the RESP worker rewrites
+  that key. The RESP path itself is single-writer and safe; this affects
+  `supacache.get` and friends from another backend.
+- **There are no per-tenant quotas.** Keys and channels are force-scoped to
+  `{tenant}:`, which is an isolation boundary, not an accounting one: one tenant
+  can evict another's hot data or fill the persistence ring.
+- Operational metrics are partial. `supacache.stats()`, `ring_stats()`,
+  `rowcache_stats()` and `replication_status()` exist; persistence error counts,
+  commit lag and invalidation lag do not yet.
