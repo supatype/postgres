@@ -46,6 +46,15 @@ struct RingHeader {
     pushed: AtomicU64,    // total records enqueued (producer); also assigns seq
     drained: AtomicU64,   // total records read by the consumer
     committed: AtomicU64, // total records durably committed (persist worker)
+    // Batches attempted but not committed: failures, plus any in flight right
+    // now. A worker killed mid-batch leaves its attempt counted, which is the
+    // point, since that is how a Postgres ERROR actually manifests.
+    // References it could
+    // not resolve. Both are already logged, but a log line is not something an
+    // operator can alert on: a persistence failure is otherwise invisible
+    // unless somebody greps the Postgres log at the right moment.
+    errors: AtomicU64,
+    unresolved: AtomicU64,
 }
 
 fn hdr_bytes() -> usize {
@@ -80,6 +89,8 @@ pub unsafe fn init(base: *mut u8, capacity: usize) {
     (*h).pushed.store(0, Ordering::Relaxed);
     (*h).drained.store(0, Ordering::Relaxed);
     (*h).committed.store(0, Ordering::Relaxed);
+    (*h).errors.store(0, Ordering::Relaxed);
+    (*h).unresolved.store(0, Ordering::Relaxed);
 }
 
 struct Ring {
@@ -300,13 +311,47 @@ impl Consumer {
         count
     }
 
-    pub fn stats(&self) -> (u64, u64, u64) {
+    /// Mark a batch as being attempted. Paired with [`Consumer::note_commit`]
+    /// on success, so the difference is the number of batches that did not
+    /// make it.
+    ///
+    /// Counted around the attempt rather than on the error path because the
+    /// error path is not always reached: a Postgres ERROR (a constraint
+    /// violation, a permission failure) unwinds out of the worker and kills
+    /// it, so an `Err` branch never runs. Bracketing the attempt catches both
+    /// that and an error returned normally, at the cost of a batch in flight
+    /// reading as one outstanding.
+    pub fn note_attempt(&self) {
+        unsafe { (*self.0.hdr).errors.fetch_add(1, Ordering::Relaxed) };
+    }
+
+    /// Mark the attempted batch as committed.
+    pub fn note_commit(&self) {
+        unsafe { (*self.0.hdr).errors.fetch_sub(1, Ordering::Relaxed) };
+    }
+
+    /// Count a by-reference record whose value could not be resolved. Usually
+    /// benign (the key was overwritten, so a newer record follows), but it is
+    /// also what resolving against the wrong keyspace segment looks like, and
+    /// that silently loses a durable write. Worth being able to alert on.
+    pub fn note_unresolved(&self) {
+        unsafe { (*self.0.hdr).unresolved.fetch_add(1, Ordering::Relaxed) };
+    }
+
+    /// `(pushed, dropped, backlog_bytes, committed, errors, unresolved)`.
+    ///
+    /// `pushed - committed` is the durable-tier lag: how many acknowledged
+    /// writes are still waiting on Postgres.
+    pub fn stats(&self) -> (u64, u64, u64, u64, u64, u64) {
         unsafe {
             let h = &*self.0.hdr;
             (
                 h.pushed.load(Ordering::Relaxed),
                 h.dropped.load(Ordering::Relaxed),
                 h.tail.load(Ordering::Relaxed) - h.head.load(Ordering::Relaxed),
+                h.committed.load(Ordering::Relaxed),
+                h.errors.load(Ordering::Relaxed),
+                h.unresolved.load(Ordering::Relaxed),
             )
         }
     }

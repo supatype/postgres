@@ -1103,11 +1103,20 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
+        // Bracket the attempt on every ring: a Postgres ERROR unwinds out of
+        // this worker rather than returning, so counting only on the Err branch
+        // would miss the most common failure entirely.
+        for c in &consumers {
+            c.note_attempt();
+        }
         match bulk_upsert(batch, sync_commit, ttl_bucket_us()) {
             Ok(()) => {
                 // Only now are these records durable: release the ring space
                 // and the durable acks waiting on them, for every ring that
                 // contributed to this batch.
+                for c in &consumers {
+                    c.note_commit();
+                }
                 commit_rings(&consumers, &slices);
                 backoff = Duration::from_millis(0);
             }
@@ -1177,9 +1186,12 @@ fn peek_rings(
                 // newer record is queued behind this one. It is also what
                 // resolving against the wrong segment looks like, which is not
                 // benign, so say so rather than dropping in silence.
-                None => log!(
-                    "pg_keyspace persist {idx}: reference from worker {w} did not resolve (superseded, or not in that segment)"
-                ),
+                None => {
+                    c.note_unresolved();
+                    log!(
+                        "pg_keyspace persist {idx}: reference from worker {w} did not resolve (superseded, or not in that segment)"
+                    )
+                }
             }
         }));
     }
@@ -2569,12 +2581,31 @@ mod supacache {
     /// Persistence ring diagnostics: total writes enqueued, writes dropped due
     /// to ring-full backpressure, and current unconsumed backlog in bytes.
     #[pg_extern]
+    /// Health of the persistence path, summed across rings.
+    ///
+    /// `lag` is `pushed - committed`: acknowledged writes still waiting on
+    /// Postgres. In a sync-ack tier it should sit near zero and return there;
+    /// a number that climbs and stays is persistence falling behind.
+    ///
+    /// `errors` counts batches that failed to commit. The records are retained
+    /// and retried, so this is a health signal rather than a loss count, but it
+    /// is the signal that a persistence failure is happening at all: without
+    /// it, a failing batch is visible only by grepping the Postgres log.
+    ///
+    /// `unresolved` counts by-reference records whose value could not be read
+    /// back. Usually benign, since a key overwritten after staging has a newer
+    /// record queued behind it, but it is also what resolving against the wrong
+    /// keyspace segment looks like, and that silently loses a durable write.
     fn ring_stats() -> TableIterator<
         'static,
         (
             name!(pushed, i64),
             name!(dropped, i64),
             name!(backlog_bytes, i64),
+            name!(committed, i64),
+            name!(lag, i64),
+            name!(failed_batches, i64),
+            name!(unresolved, i64),
         ),
     > {
         let base = RING_BASE.load(Ordering::Acquire);
@@ -2582,14 +2613,18 @@ mod supacache {
         if !base.is_null() {
             let stride = ring_stride();
             let (mut p, mut d, mut b) = (0i64, 0i64, 0i64);
+            let (mut c_, mut e, mut u) = (0i64, 0i64, 0i64);
             for i in 0..ring_count() {
                 let c = unsafe { ring::Consumer::attach(base.add(i * stride)) };
-                let (pushed, dropped, backlog) = c.stats();
+                let (pushed, dropped, backlog, committed, errors, unresolved) = c.stats();
                 p += pushed as i64;
                 d += dropped as i64;
                 b += backlog as i64;
+                c_ += committed as i64;
+                e += errors as i64;
+                u += unresolved as i64;
             }
-            rows.push((p, d, b));
+            rows.push((p, d, b, c_, (p - c_).max(0), e, u));
         }
         TableIterator::new(rows)
     }

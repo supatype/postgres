@@ -227,8 +227,14 @@ for _ in $(seq 1 20); do
   [ "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='fi:k1'::bytea")" = "1" ] && break
   sleep 1
 done
+ERRS=$(psql_ "SELECT failed_batches FROM supacache.ring_stats()")
+if [ "$ERRS" -gt 0 ]; then
+  echo "PASS  the failure is countable, not just loggable (errors=$ERRS)"; pass=$((pass+1))
+else
+  echo "FAIL  persistence failed but ring_stats().failed_batches stayed at 0"; fail=$((fail+1)); fi
 chk "retained record commits after recovery" "1"  "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='fi:k1'::bytea")"
 chk "and its value is correct"              "v1" "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='fi:k1'::bytea")"
+chk "lag returns to zero once persistence recovers" "0" "$(psql_ "SELECT lag FROM supacache.ring_stats()")"
 
 echo ""
 echo "########## M. killing the persist worker loses nothing that was acked ##########"
@@ -304,11 +310,11 @@ echo ""
 echo "########## O. multi-worker persistence ##########"
 # The case the single-worker sections cannot reach. Values above INLINE_MAX are
 # staged by reference and resolved out of a keyspace segment, and with several
-# workers a key lives only in the segment of the worker that owns its slot.
+# workers a key lives only in the segment of the worker owning its slot.
 # Resolving against the wrong segment finds either the wrong bytes or nothing,
 # and finding nothing is indistinguishable from a legitimately superseded
 # write, so the failure would be silent. The only way to catch it is to write a
-# large value to a key owned by a worker other than 0 and check it really lands.
+# large value to a key owned by a worker other than 0 and check it lands.
 stop_pg; sleep 1
 set_conf() {
   sed -i "s/^$1 = .*/$1 = $2/" $PGDATA/postgresql.conf 2>/dev/null
@@ -317,8 +323,6 @@ set_conf() {
 set_conf "pg_keyspace.workers" "$MW_WORKERS"
 set_conf "pg_keyspace.persist_workers" "$MW_PERSIST"
 set_conf "pg_keyspace.durability" "'durable'"
-# Persisted multi-worker publishes a cluster topology, so clients need an
-# address to be redirected to; the worker refuses to start without one.
 set_conf "pg_keyspace.cluster_announce_host" "'127.0.0.1'"
 start_pg; wait_ready; sleep 5
 
@@ -327,12 +331,8 @@ for w in $(seq 0 $((MW_WORKERS-1))); do
   timeout 5 redis-cli -p $((RESP+w)) PING 2>/dev/null | grep -q PONG && UP=$((UP+1))
 done
 chk "all $MW_WORKERS workers listening" "$MW_WORKERS" "$UP"
+chk "$MW_PERSIST persistence workers running" "$MW_PERSIST" "$(ps -eo args | grep -c '[p]ersistence worker' || true)"
 
-PW_RUNNING=$(ps -eo args | grep -c "[p]ersistence worker" || true)
-chk "$MW_PERSIST persistence workers running" "$MW_PERSIST" "$PW_RUNNING"
-
-# Find a key this worker actually owns. A misrouted key is answered MOVED
-# rather than served, so the first key accepted here belongs to that worker.
 TARGET=$((MW_WORKERS-1))
 OWNED=""
 for i in $(seq 1 60); do
@@ -343,13 +343,9 @@ if [ -z "$OWNED" ]; then
   echo "FAIL  could not find a key owned by worker $TARGET"; fail=$((fail+1))
 else
   echo "  worker $TARGET owns $OWNED"
-  # The regression test: a large value goes by reference, so persisting it
-  # requires resolving against worker $TARGET's segment, not worker 0's.
   chk "1MiB SET on worker $TARGET accepted" "OK" "$(timeout 25 redis-cli -p $((RESP+TARGET)) -x SET "$OWNED" < /tmp/big.txt 2>&1)"
   sleep 4
   chk "it persisted byte-identical from worker $TARGET segment" "t"       "$(psql_ "SELECT val = repeat('x',1048576)::bytea FROM supacache.kv WHERE key='$OWNED'::bytea")"
-
-  # And it must come back to the worker that owns it, not to worker 0.
   stop_pg; sleep 1; start_pg; wait_ready; sleep 5
   chk "recovered to the owning worker" "1048576" "$(timeout 10 redis-cli -p $((RESP+TARGET)) STRLEN "$OWNED" 2>&1)"
   OW0=$(timeout 5 redis-cli -p $RESP STRLEN "$OWNED" 2>&1)
@@ -359,15 +355,51 @@ else
     *)      echo "FAIL  worker 0 answered [$OW0] for a key owned by worker $TARGET"; fail=$((fail+1)) ;;
   esac
 fi
-
 chk "no dropped records across the multi-worker run" "0" "$(psql_ "SELECT dropped FROM supacache.ring_stats()")"
-chk "no unresolved references logged" "0" "$(grep -c 'did not resolve' $PGDATA/log || true)"
+chk "no unresolved references" "0" "$(psql_ "SELECT unresolved FROM supacache.ring_stats()")"
 
-# Back to single worker for anything that follows.
 stop_pg; sleep 1
 set_conf "pg_keyspace.workers" "1"
 set_conf "pg_keyspace.persist_workers" "1"
 start_pg; wait_ready; sleep 2
+
+echo "########## P. backing table unavailable ##########"
+# A different failure class from the constraint case in L: there the statement
+# is rejected, here the relation is gone entirely (undefined_table). Both must
+# hold the ack and retain the records, and the point of testing two is that the
+# handling is not special-cased to one error.
+#
+# Note on what is NOT injected here: the persistence worker connects as a
+# superuser, and superusers bypass table ACLs, so REVOKE INSERT would not fail
+# for it. A genuine permission failure needs the worker to run as a
+# non-superuser role, which is a change to the extension rather than to this
+# harness.
+BEFORE_P=$(psql_ "SELECT count(*) FROM supacache.kv")
+psql_ "ALTER TABLE supacache.kv RENAME TO kv_hidden" >/dev/null 2>&1
+OUT=$(timeout 6 redis-cli -p $RESP SET tbl:k1 v1 2>&1); RC=$?
+echo "  SET with the table renamed away -> [$OUT] (rc=$RC)"
+if [ "$OUT" = "OK" ]; then
+  echo "FAIL  ack released while the backing table was missing"; fail=$((fail+1))
+else
+  echo "PASS  ack held while the backing table was missing"; pass=$((pass+1)); fi
+BACKLOG=$(psql_ "SELECT backlog_bytes FROM supacache.ring_stats()")
+if [ "$BACKLOG" -gt 0 ]; then
+  echo "PASS  record retained in the ring (backlog $BACKLOG bytes)"; pass=$((pass+1))
+else
+  echo "FAIL  record not retained (backlog $BACKLOG)"; fail=$((fail+1)); fi
+
+psql_ "ALTER TABLE supacache.kv_hidden RENAME TO kv" >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  [ "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='tbl:k1'::bytea")" = "1" ] && break
+  sleep 1
+done
+chk "the retained record commits once the table returns" "1"  "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='tbl:k1'::bytea")"
+chk "with the right value"                                "v1" "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='tbl:k1'::bytea")"
+AFTER_P=$(psql_ "SELECT count(*) FROM supacache.kv")
+if [ "$AFTER_P" -ge "$BEFORE_P" ]; then
+  echo "PASS  nothing already durable was lost across the outage"; pass=$((pass+1))
+else
+  echo "FAIL  rows lost across the outage ($BEFORE_P -> $AFTER_P)"; fail=$((fail+1)); fi
 
 echo ""
 echo "================================================"
