@@ -27,6 +27,33 @@ chk "MSETNX all new -> 1"          "1"       "$($K MSETNX n1 a n2 b)"
 chk "MSETNX with one existing -> 0" "0"      "$($K MSETNX n1 z n3 c)"
 chk "MSETNX did not set n3"         "0"       "$($K EXISTS n3)"
 
+# SET options. These are flags, not pairs — an option parser that stepped two
+# arguments at a time never saw them, so KEEPTTL silently dropped the TTL and
+# NX/XX silently did nothing while still replying OK.
+$K DEL so >/dev/null 2>&1
+$K SET so v1 EX 300 >/dev/null
+chk "SET EX sets a TTL"                        "300"  "$($K TTL so)"
+chk "plain SET clears the TTL"                 "-1"   "$($K SET so v2 >/dev/null; $K TTL so)"
+$K SET so v3 EX 300 >/dev/null
+chk "SET KEEPTTL retains the TTL"              "300"  "$($K SET so v4 KEEPTTL >/dev/null; $K TTL so)"
+chk "SET KEEPTTL still wrote the value"        "v4"   "$($K GET so)"
+chk "SET EX overrides KEEPTTL"                 "100"  "$($K SET so v5 KEEPTTL EX 100 >/dev/null; $K TTL so)"
+chk "SET NX on an existing key -> nil"         ""     "$($K SET so v6 NX)"
+chk "SET NX did not overwrite"                 "v5"   "$($K GET so)"
+$K DEL so2 >/dev/null 2>&1
+chk "SET NX on a missing key -> OK"            "OK"   "$($K SET so2 fresh NX)"
+chk "SET XX on a missing key -> nil"           ""     "$($K SET so3 nope XX)"
+chk "SET XX did not create the key"            "0"    "$($K EXISTS so3)"
+chk "SET XX on an existing key -> OK"          "OK"   "$($K SET so2 replaced XX)"
+chk "SET GET returns the previous value"       "replaced" "$($K SET so2 next GET)"
+chk "SET GET on a missing key -> nil"          ""     "$($K SET so4 v GET)"
+chk "SET NX GET reports old, does not write"   "next" "$($K SET so2 blocked NX GET)"
+chk "SET NX GET left the value alone"          "next" "$($K GET so2)"
+chk "SET EXAT sets an absolute deadline"       "ok"   "$(t=$($K SET so2 v EXAT $(( $(date +%s) + 200 )) >/dev/null; $K TTL so2); [ "$t" -gt 150 ] && [ "$t" -le 200 ] && echo ok || echo "got $t")"
+chk "SET with an unknown option -> error"      "ERR"  "$($K SET so2 v BOGUS 2>&1 | grep -o ERR | head -1)"
+chk "SET NX XX together -> error"              "ERR"  "$($K SET so2 v NX XX 2>&1 | grep -o ERR | head -1)"
+$K DEL so so2 so3 so4 >/dev/null 2>&1
+
 # SETEX / PSETEX + TTL
 chk "SETEX -> OK"                  "OK"      "$($K SETEX s 100 hi)"
 t=$($K TTL s); [ "$t" -ge 90 ] && [ "$t" -le 100 ] && { echo "  PASS  SETEX sets a ~100s TTL ($t)"; pass=$((pass+1)); } || { echo "  FAIL  SETEX TTL got=$t"; fail=$((fail+1)); }

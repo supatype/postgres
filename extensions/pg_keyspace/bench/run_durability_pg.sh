@@ -307,63 +307,62 @@ sleep 8
 chk "no panics after the whole run" "0" "$(grep -ci panic $PGDATA/log || true)"
 
 echo ""
-echo "########## O. multi-worker topology ##########"
-# Two things are being checked here, and only one of them is about scale-out.
-#
-# The first is that N shared-nothing workers serve independently: a key written
-# to one port is not visible on another, which is the documented behaviour and
-# what client-side sharding relies on.
-#
-# The second matters more. Values above INLINE_MAX are staged by reference and
-# resolved out of a keyspace segment, but a ring record does not yet say which
-# worker produced it, so resolution would use worker 0's segment for every
-# worker. With several workers that silently loses large durable writes owned
-# by anyone else, and a lost reference looks exactly like a legitimately
-# superseded one. The persistence worker therefore refuses to start rather than
-# trusting an upstream guard. This asserts the refusal, so that whoever makes
-# the ring worker-aware has to change this test deliberately.
+echo "########## O. multi-worker persistence ##########"
+# The case the single-worker sections cannot reach. Values above INLINE_MAX are
+# staged by reference and resolved out of a keyspace segment, and with several
+# workers a key lives only in the segment of the worker owning its slot.
+# Resolving against the wrong segment finds either the wrong bytes or nothing,
+# and finding nothing is indistinguishable from a legitimately superseded
+# write, so the failure would be silent. The only way to catch it is to write a
+# large value to a key owned by a worker other than 0 and check it lands.
 stop_pg; sleep 1
-sed -i "s/^pg_keyspace.workers = .*/pg_keyspace.workers = $MW_WORKERS/" $PGDATA/postgresql.conf 2>/dev/null
-grep -q "^pg_keyspace.workers" $PGDATA/postgresql.conf || echo "pg_keyspace.workers = $MW_WORKERS" >> $PGDATA/postgresql.conf
-sed -i "s/^pg_keyspace.persist_workers = .*/pg_keyspace.persist_workers = $MW_PERSIST/" $PGDATA/postgresql.conf 2>/dev/null
-grep -q "^pg_keyspace.persist_workers" $PGDATA/postgresql.conf || echo "pg_keyspace.persist_workers = $MW_PERSIST" >> $PGDATA/postgresql.conf
-start_pg; wait_ready; sleep 4
+set_conf() {
+  sed -i "s/^$1 = .*/$1 = $2/" $PGDATA/postgresql.conf 2>/dev/null
+  grep -q "^$1" $PGDATA/postgresql.conf || echo "$1 = $2" >> $PGDATA/postgresql.conf
+}
+set_conf "pg_keyspace.workers" "$MW_WORKERS"
+set_conf "pg_keyspace.persist_workers" "$MW_PERSIST"
+set_conf "pg_keyspace.durability" "'durable'"
+set_conf "pg_keyspace.cluster_announce_host" "'127.0.0.1'"
+start_pg; wait_ready; sleep 5
 
 UP=0
 for w in $(seq 0 $((MW_WORKERS-1))); do
   timeout 5 redis-cli -p $((RESP+w)) PING 2>/dev/null | grep -q PONG && UP=$((UP+1))
 done
-chk "all $MW_WORKERS workers are listening" "$MW_WORKERS" "$UP"
+chk "all $MW_WORKERS workers listening" "$MW_WORKERS" "$UP"
+chk "$MW_PERSIST persistence workers running" "$MW_PERSIST" "$(ps -eo args | grep -c '[p]ersistence worker' || true)"
 
-# Shared-nothing: a key on one worker is invisible on the next.
-timeout 5 redis-cli -p $RESP SET mw:only-here v >/dev/null 2>&1
-OTHER=$(timeout 5 redis-cli -p $((RESP+1)) GET mw:only-here 2>&1)
-chk "workers are shared-nothing (key absent on another port)" "" "$OTHER"
-
-# Protection comes from two places and either is sufficient: the persistence
-# workers are not registered at all when workers > 1, and the persistence
-# worker itself refuses if it ever is started that way. Assert the observable
-# outcome rather than one mechanism, so lifting either one deliberately shows
-# up here.
-PW_RUNNING=$(ps -eo args | grep -c "[p]ersistence worker" || true)
-chk "no persistence worker runs with workers > 1" "0" "$PW_RUNNING"
-if grep -q "persisted=false" $PGDATA/log; then
-  echo "PASS  the tier is reported as downgraded, not silently assumed durable"; pass=$((pass+1))
+TARGET=$((MW_WORKERS-1))
+OWNED=""
+for i in $(seq 1 60); do
+  R=$(timeout 5 redis-cli -p $((RESP+TARGET)) SET "mw:probe$i" v 2>&1)
+  if [ "$R" = "OK" ]; then OWNED="mw:probe$i"; break; fi
+done
+if [ -z "$OWNED" ]; then
+  echo "FAIL  could not find a key owned by worker $TARGET"; fail=$((fail+1))
 else
-  echo "FAIL  workers > 1 did not report the tier downgrade"; fail=$((fail+1)); fi
-# And nothing reaches the durable store, which is the thing that would be
-# silently wrong if a reference were resolved against the wrong segment.
-timeout 8 redis-cli -p $RESP -x SET mw:big < /tmp/big.txt >/dev/null 2>&1
-sleep 2
-chk "nothing is persisted while multi-worker" "0"     "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='mw:big'::bytea")"
+  echo "  worker $TARGET owns $OWNED"
+  chk "1MiB SET on worker $TARGET accepted" "OK" "$(timeout 25 redis-cli -p $((RESP+TARGET)) -x SET "$OWNED" < /tmp/big.txt 2>&1)"
+  sleep 4
+  chk "it persisted byte-identical from worker $TARGET segment" "t"       "$(psql_ "SELECT val = repeat('x',1048576)::bytea FROM supacache.kv WHERE key='$OWNED'::bytea")"
+  stop_pg; sleep 1; start_pg; wait_ready; sleep 5
+  chk "recovered to the owning worker" "1048576" "$(timeout 10 redis-cli -p $((RESP+TARGET)) STRLEN "$OWNED" 2>&1)"
+  OW0=$(timeout 5 redis-cli -p $RESP STRLEN "$OWNED" 2>&1)
+  case "$OW0" in
+    MOVED*) echo "PASS  worker 0 redirects rather than serving a key it does not own"; pass=$((pass+1)) ;;
+    0)      echo "PASS  the key is absent from worker 0 segment"; pass=$((pass+1)) ;;
+    *)      echo "FAIL  worker 0 answered [$OW0] for a key owned by worker $TARGET"; fail=$((fail+1)) ;;
+  esac
+fi
+chk "no dropped records across the multi-worker run" "0" "$(psql_ "SELECT dropped FROM supacache.ring_stats()")"
+chk "no unresolved references" "0" "$(psql_ "SELECT unresolved FROM supacache.ring_stats()")"
 
-# Restore the single-worker topology for anything that follows.
 stop_pg; sleep 1
-sed -i "s/^pg_keyspace.workers = .*/pg_keyspace.workers = 1/" $PGDATA/postgresql.conf
-sed -i "s/^pg_keyspace.persist_workers = .*/pg_keyspace.persist_workers = 1/" $PGDATA/postgresql.conf
+set_conf "pg_keyspace.workers" "1"
+set_conf "pg_keyspace.persist_workers" "1"
 start_pg; wait_ready; sleep 2
 
-echo ""
 echo "########## P. backing table unavailable ##########"
 # A different failure class from the constraint case in L: there the statement
 # is rejected, here the relation is gone entirely (undefined_table). Both must

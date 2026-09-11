@@ -22,9 +22,8 @@ Postgres-native RESP keyspace + RLS-aware row cache. The Supatype platform can
 [Security](#resp-auth-tenant-scoping--tls)); that integration is opt-in, not a
 prerequisite.
 
-> **Status:** built and benchmarked against PostgreSQL 17.6. A working extension;
-> some capabilities (persistence, the row cache) are single-worker in this
-> version — see [Current limitations](#current-limitations).
+> **Status:** built and benchmarked against PostgreSQL 17.6. A working extension
+> — see [Current limitations](#current-limitations) for the edges to know.
 
 ---
 
@@ -360,8 +359,61 @@ what "not yet acknowledged" means.
 ```ini
 pg_keyspace.workers = 4     # N shared-nothing workers on port, port+1, … port+N-1
 ```
-Clients shard keys across the ports (Redis-Cluster style). Persistence/row-cache
-stay single-worker in this slice, so `workers > 1` runs the ephemeral tier.
+Clients shard keys across the ports (Redis-Cluster style). Each worker owns a
+disjoint, contiguous range of the 16384-slot CRC16 keyspace, its own shared-memory
+segment, and its own persistence rings, so **scale-out composes with every
+durability tier** — `workers > 1` no longer forces the ephemeral tier.
+
+The slot map is the routing table, and it is queryable:
+
+```sql
+SELECT * FROM supacache.slot_ranges();   -- worker | port | slot_lo | slot_hi
+SELECT supacache.key_worker('user:42');  -- which worker owns this key
+```
+
+**Routing is enforced when a persisted tier runs with `workers > 1`.** A key sent
+to a worker that does not own it is answered with a Redis-Cluster `MOVED <slot>
+<host>:<port>` (or `CROSSSLOT` for a multi-key command spanning workers) rather
+than served. This is a durability requirement, not a style preference: crash
+recovery restores each key into the segment whose slot range covers it, so a
+worker that accepted a key it does not own would lose that key on the next
+restart — after having acked the write as durable.
+
+In that mode the cluster is discoverable, so a stock cluster client configures
+itself: `INFO` reports `redis_mode:cluster` / `cluster_enabled:1`, and `CLUSTER
+SLOTS`, `CLUSTER SHARDS`, `CLUSTER NODES`, `CLUSTER MYID`, `CLUSTER INFO` and
+`CLUSTER KEYSLOT` publish the same map `supacache.slot_ranges()` returns. Node
+ids are derived from the endpoint, so a worker keeps its id across restarts and
+clients do not see the topology churn. Point the cluster constructor at any
+worker's port and it discovers the rest:
+
+```js
+new Redis.Cluster([{ host: 'db.internal', port: 6379 }])   // ioredis
+```
+```go
+redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"db.internal:6379"}})
+```
+
+Because those clients connect to the addresses the topology names,
+**`pg_keyspace.cluster_announce_host` is required** here — the workers bind
+`0.0.0.0` and cannot infer an address a client can reach, and a wrong one is a
+connection failure rather than a confusing error. A persisted multi-worker
+cluster refuses to start without it; use `127.0.0.1` for a local-only deployment.
+
+A *standalone* client (the default constructor in every driver — `new Redis()`,
+`redis.NewClient()`, `JedisPool`) does not follow `MOVED` and will surface it as
+an error. Multi-worker durability needs the cluster constructor. Clients that
+auto-detect (valkey-go/rueidis, StackExchange.Redis) pick cluster mode up from
+`INFO` and the slot map with no code change.
+
+Ephemeral multi-worker deployments are unchanged: no slot enforcement, no cluster
+advertisement (`redis_mode:standalone`), any key may live on any worker.
+
+Two sizing notes: the keyspace segment and the persistence rings are both
+allocated **per worker**, so `workers = 4` with `ring_mb = 64` reserves 256 MB of
+rings (`pg_keyspace.persist_workers` multiplies this further, as it is a count of
+rings *per worker*). Persistence worker *processes* do not scale with `workers` —
+persistence worker `s` drains shard `s` of every slot worker's ring set.
 
 ### Mode B — transparent PostgREST row cache
 
@@ -545,7 +597,9 @@ row-cache coherence for int/uuid/text/TOAST PKs (`run_rowcache.sh`,
 (`run_resp3.sh`) including cross-worker invalidation (`run_tracking_xworker.sh`),
 real synchronous replication (`run_replication.sh`), a real PostgREST v12.2.3
 end-to-end (`run_postgrest_e2e.sh`), and scale-out (`run_scaleout.sh`,
-`run_scaleout_inpg.sh`). Each prints its own `# result: N passed, M failed`.
+`run_scaleout_inpg.sh`) including durability and scale-out together — slot-routed
+writes, `MOVED` on misrouting, and per-worker crash recovery
+(`run_persist_multiworker.sh`). Each prints its own `# result: N passed, M failed`.
 
 Those all drive the standalone daemon. `run_durability_pg.sh` is the exception
 and covers what only exists in-process: it installs the extension into a real
@@ -586,8 +640,15 @@ what it does not know. Downgrade is untested.
 
 Scoping for this version — the extension works; these are the edges to know:
 
-- **Persistence and the Mode B row cache are single-worker.** `pg_keyspace.workers
-  > 1` runs the ephemeral (Mode A) tier only.
+- **A persisted multi-worker cluster requires the client's *cluster* constructor**
+  (`Redis.Cluster`, `NewClusterClient`, `JedisCluster`, …), not the standalone
+  default, since each worker serves only its own slot range and redirects the
+  rest. The topology is discoverable over `CLUSTER SLOTS`/`SHARDS`/`NODES`, so no
+  client-side slot table is needed — see
+  [Multi-worker scale-out](#multi-worker-scale-out). Single-worker and ephemeral
+  multi-worker deployments are unaffected. Online resharding (live slot
+  migration, `ASKING`/`MIGRATE`) is not supported; changing `pg_keyspace.workers`
+  is a restart.
 - **Pub/sub is cross-worker within one process** (the scale-out daemon), not yet
   cross-*process* for N in-PG background workers.
 - **Mode B caches single-column primary keys** (composite keys are refused); the

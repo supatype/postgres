@@ -116,6 +116,13 @@ static GUC_TLS_KEY: GucSetting<Option<&'static CStr>> =
 /// which consumes a replication slot (output plugin `supacache_keys`) and drops
 /// changed rows from the row cache so it stays coherent with committed writes.
 /// Off by default — it needs `wal_level = logical` and holds a replication slot.
+/// Host advertised in `MOVED` redirects and the `CLUSTER` topology (the workers
+/// bind 0.0.0.0, so they cannot infer an address a remote client can reach).
+/// Deliberately unset by default: a persisted multi-worker cluster refuses to
+/// start without it rather than publishing an address that may only resolve on
+/// the server host.
+static GUC_ANNOUNCE_HOST: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
 static GUC_ROWCACHE_DECODE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static GUC_ROWCACHE_SLOT: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"supacache_rowcache"));
@@ -208,10 +215,25 @@ fn ttl_bucket_us() -> i64 {
     GUC_TTL_BUCKET_SECS.get().max(1) as i64 * 1_000_000
 }
 
-/// Number of persistence workers = number of rings (writes are sharded across
-/// them by key slot).
-fn ring_count() -> usize {
+/// Persistence shards **per slot worker**: within one slot worker, writes are
+/// sharded across this many rings by key slot, so a key's writes and deletes
+/// always reach the same persistence worker in order.
+fn persist_shards() -> usize {
     GUC_PERSIST_WORKERS.get().max(1) as usize
+}
+/// Total rings = one per (slot worker, persistence shard).
+///
+/// The ring is strictly single-producer/single-consumer, and slot workers are
+/// separate *processes*, so they cannot share one ring: each slot worker owns
+/// its own set of `persist_shards()` rings. Persistence worker `s` then consumes
+/// ring `(w, s)` for every `w`, which keeps one consumer per ring while holding
+/// the persistence-worker process count independent of `pg_keyspace.workers`.
+fn ring_count() -> usize {
+    worker_count() * persist_shards()
+}
+/// Flat index of slot worker `w`'s shard-`s` ring within the contiguous block.
+fn ring_index(w: usize, shard: usize) -> usize {
+    w * persist_shards() + shard
 }
 /// Bytes for one ring (header + power-of-two capacity).
 fn ring_stride() -> usize {
@@ -325,6 +347,25 @@ fn store_view_for(w: usize) -> Option<Store> {
         return None;
     }
     Some(unsafe { Store::from_raw(base, &ks_config(), false) })
+}
+
+/// A cheap `Store` view over slot worker `w`'s segment, valid in any backend.
+fn store_view_for_worker(w: usize) -> Option<Store> {
+    let base = seg_base_for(w);
+    if base.is_null() {
+        return None;
+    }
+    Some(unsafe { Store::from_raw(base, &ks_config(), false) })
+}
+
+/// A `Store` view over the segment that owns `key`.
+///
+/// Workers are shared-nothing: a key lives in exactly one segment, the one whose
+/// slot range covers it (`crc16::key_owner`). The SQL surface must route by the
+/// same function the RESP workers and recovery use, or `supacache.get` would
+/// read worker 0's segment for a key that lives on worker 3 and report a miss.
+fn store_view_for_key(key: &[u8]) -> Option<Store> {
+    store_view_for_worker(crc16::key_owner(key, worker_count()))
 }
 
 // ---- extension init ------------------------------------------------------
@@ -465,6 +506,17 @@ pub extern "C" fn _PG_init() {
         GucContext::Postmaster,
         GucFlags::empty(),
     );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.cluster_announce_host",
+        "Host advertised in MOVED redirects and CLUSTER topology replies",
+        "Slot workers bind 0.0.0.0, so a redirect or slot map must name an address \
+         the client can reach. Required when a persisted tier runs with workers > 1; \
+         set it to the hostname or IP your clients connect to (e.g. 127.0.0.1 for \
+         a purely local deployment).",
+        &GUC_ANNOUNCE_HOST,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
     GucRegistry::define_int_guc(
         "pg_keyspace.rowcache_mb",
         "Size of the Mode B row-cache shared-memory segment, in MB",
@@ -559,7 +611,7 @@ pub extern "C" fn _PG_init() {
     // N shared-nothing RESP slot workers: each attaches its own keyspace
     // segment and listens on port + its index. The index is the bgworker arg.
     let nworkers = worker_count();
-    let persisted = ks_tier() != Tier::Ephemeral && nworkers == 1;
+    let persisted = ks_tier() != Tier::Ephemeral;
     for w in 0..nworkers {
         BackgroundWorkerBuilder::new(&format!("pg_keyspace: RESP slot worker {w}"))
             .set_library("pg_keyspace")
@@ -570,12 +622,13 @@ pub extern "C" fn _PG_init() {
             .load();
     }
 
-    // Dedicated persistence workers: each drains its own ring and bulk-upserts
+    // Dedicated persistence workers: each drains its own rings and bulk-upserts
     // into supacache.kv, so the RESP worker never touches SPI on the hot path.
-    // Each is passed its ring index as the bgworker argument. Persistence stays
-    // single-worker in this slice (multi-worker forces the ephemeral tier).
+    // Each is passed its *shard* index as the bgworker argument and drains that
+    // shard's ring from every slot worker, so the process count is set by
+    // pg_keyspace.persist_workers alone and does not scale with workers.
     if persisted {
-        for i in 0..ring_count() {
+        for i in 0..persist_shards() {
             BackgroundWorkerBuilder::new(&format!("pg_keyspace: persistence worker {i}"))
                 .set_library("pg_keyspace")
                 .set_function("pg_keyspace_persist_main")
@@ -708,9 +761,10 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     }
     let cfg = ks_config();
     let store = Arc::new(unsafe { Store::from_raw(base, &cfg, false) });
-    // Persistence/recovery stay single-worker in this slice; a multi-worker
-    // deployment is shared-nothing ephemeral (Mode A scale-out).
-    let persisted = ks_tier() != Tier::Ephemeral && worker_count() == 1;
+    // Persistence and recovery are per slot worker: this worker owns a disjoint
+    // slot range (crc16::slot_range), its own segment, and its own ring set, so
+    // durability and scale-out compose instead of excluding each other.
+    let persisted = ks_tier() != Tier::Ephemeral;
 
     let port = GUC_PORT.get() as u16 + w as u16;
     let mut worker = match server::Worker::new(store.clone(), None, Tier::Ephemeral, "0.0.0.0", port)
@@ -821,6 +875,29 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         None => log!("pg_keyspace worker: no RESP credentials configured — local/no-auth mode"),
     }
 
+    // A persisted multi-worker cluster publishes a slot map and redirects
+    // clients by address, so it must know an address clients can reach. Guessing
+    // (127.0.0.1) would hand remote clients a topology pointing at themselves —
+    // a confusing connection failure rather than a clear misconfiguration. Fail
+    // closed, as with a bad TLS cert.
+    let announce_host = GUC_ANNOUNCE_HOST
+        .get()
+        .and_then(|c| c.to_str().ok().map(str::to_string))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if persisted && worker_count() > 1 && announce_host.is_none() {
+        log!(
+            "pg_keyspace worker {w}: REFUSING to start — a persisted tier with \
+             pg_keyspace.workers > 1 redirects clients by address, so \
+             pg_keyspace.cluster_announce_host must be set to a host your clients \
+             can reach (use '127.0.0.1' for a local-only deployment)"
+        );
+        while !BackgroundWorker::sigterm_received() {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        return;
+    }
+
     // storage & durability: recover shmem from the tables at startup; the
     // steady-state persistence is offloaded to the persistence worker via the
     // ring, so the RESP hot path never touches SPI.
@@ -832,24 +909,53 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             std::thread::sleep(Duration::from_millis(100));
         }
         let t0 = std::time::Instant::now();
-        let n = pg_recover(&store);
+        let nworkers = worker_count();
+        let (lo, hi) = crc16::slot_range(w, nworkers);
+        let n = pg_recover(&store, w, nworkers);
         log!(
-            "pg_keyspace worker: recovered {n} keys from supacache.kv in {:?}",
+            "pg_keyspace worker {w}: recovered {n} keys (slots {lo}..{hi}) from \
+             supacache.kv in {:?}",
             t0.elapsed()
         );
         let rbase = RING_BASE.load(Ordering::Acquire);
         if !rbase.is_null() {
             let stride = ring_stride();
-            let nr = ring_count();
-            let producers: Vec<ring::Producer> =
-                (0..nr).map(|i| unsafe { ring::Producer::attach(rbase.add(i * stride)) }).collect();
+            let ps = persist_shards();
+            // This worker's own rings only. The ring is SPSC and slot workers are
+            // separate processes, so two workers must never share a producer end.
+            let producers: Vec<ring::Producer> = (0..ps)
+                .map(|sh| unsafe { ring::Producer::attach(rbase.add(ring_index(w, sh) * stride)) })
+                .collect();
             worker.set_ring_producers(producers);
             // durable/replicated: hold each write's RESP OK until it commits.
             let sync_ack = matches!(ks_tier(), Tier::Durable | Tier::Replicated);
             worker.set_sync_ack(sync_ack);
             log!(
-                "pg_keyspace worker: persistence ON ({nr} rings -> {nr} workers, sync_ack={sync_ack})"
+                "pg_keyspace worker {w}: persistence ON ({ps} ring(s) -> {ps} persistence \
+                 worker(s), sync_ack={sync_ack})"
             );
+            // Persisted + multi-worker: serve only this worker's slot range and
+            // redirect the rest. Recovery restores each key into the segment its
+            // slot range covers, so a worker that accepted a key it does not own
+            // would lose it on the next restart despite having acked it durable.
+            // A cluster-aware client follows the MOVED and lands on the right
+            // port; a single-port client gets a loud error instead of silent loss.
+            if nworkers > 1 {
+                // Checked above: a persisted multi-worker cluster does not reach
+                // here without an announce host.
+                let host = announce_host.clone().unwrap_or_default();
+                let base = GUC_PORT.get() as u16;
+                let endpoints: Vec<String> =
+                    (0..nworkers).map(|i| format!("{host}:{}", base + i as u16)).collect();
+                worker.set_slot_routing(w, nworkers, endpoints);
+                let (lo, hi) = crc16::slot_range(w, nworkers);
+                log!(
+                    "pg_keyspace worker {w}: serving slots {lo}..{hi}; keys outside it \
+                     answer MOVED, topology published via CLUSTER SLOTS/SHARDS/NODES \
+                     (announced as {host}:{})",
+                    base + w as u16
+                );
+            }
         }
     }
 
@@ -948,20 +1054,16 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         log!("pg_keyspace persist {idx}: ring not ready, exiting");
         return;
     }
-    // Values above INLINE_MAX are staged by reference and resolved out of a
-    // keyspace segment, and a ring record does not yet say which worker
-    // produced it. With one worker that is unambiguous; with several it would
-    // resolve against worker 0's segment and quietly lose every large write
-    // owned by any other worker. Refuse rather than trust the caller's guard to
-    // stay in place: whoever makes the ring topology worker-aware should lift
-    // this deliberately and switch the resolution below to store_view_for(w).
-    if worker_count() > 1 {
-        log!(
-            "pg_keyspace persist {idx}: REFUSING to start - persistence with              pg_keyspace.workers > 1 needs worker-aware reference resolution,              which this build does not have"
-        );
-        return;
-    }
-    let consumer = unsafe { ring::Consumer::attach(rbase.add(idx * ring_stride())) };
+    // This worker owns shard `idx` of every slot worker's ring set — one
+    // consumer per ring, so the ring stays strictly SPSC while N slot workers
+    // feed a single persistence process. Their keyspaces are disjoint (each slot
+    // worker owns its own slot range), so records from different rings can share
+    // one transaction without ever colliding on a key.
+    let stride = ring_stride();
+    let nworkers = worker_count();
+    let consumers: Vec<ring::Consumer> = (0..nworkers)
+        .map(|w| unsafe { ring::Consumer::attach(rbase.add(ring_index(w, idx) * stride)) })
+        .collect();
     let idle = Duration::from_millis(GUC_PERSIST_WINDOW_MS.get().max(1) as u64);
     let sync_commit: &'static str = match ks_tier() {
         Tier::Durable => "on",
@@ -969,27 +1071,104 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         _ => "off",                          // relaxed: RESP already acked
     };
     let replicated = matches!(ks_tier(), Tier::Replicated);
-    log!("pg_keyspace persist {idx}: draining ring {idx} -> supacache.kv (synchronous_commit={sync_commit})");
+    log!(
+        "pg_keyspace persist {idx}: draining shard {idx} of {nworkers} slot worker(s)          -> supacache.kv (synchronous_commit={sync_commit})"
+    );
 
-    // Backoff after a failed batch. The records stay in the ring, so a retry
+    // `per_ring` caps each ring's share of a batch so one hot slot worker
+    // cannot starve the others.
+    let per_ring = (20_000 / nworkers.max(1)).max(1_000);
+
+    // Backoff after a failed batch. The records stay in their rings, so a retry
     // is safe and lossless; the delay stops a permanently broken batch (bad
     // permissions, disk full) from spinning the worker at full tilt.
     let mut backoff = Duration::from_millis(0);
     while !BackgroundWorker::sigterm_received() {
         let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
-        // peek, not drain: the records stay queued until the transaction has
-        // actually committed, so a failure here loses nothing and acks nothing.
-        // A record whose kind carries ring::KIND_REF does not contain the
-        // value: its payload is the entry version at stage time, and the value
-        // itself is still in the shared segment, which this worker maps too.
-        // Resolve it here so `bulk_upsert` sees a normal (key, value) pair.
-        //
-        // A version mismatch, or a key that is no longer there, means the write
-        // was superseded or deleted after staging. A newer record for that key
-        // is already queued behind this one (a key always maps to one ring and
-        // records are consumed in order), so dropping this one is correct and
-        // loses nothing.
-        let (count, bytes) = consumer.peek(20_000, |k, v, e, kind| {
+        let slices = peek_rings(&consumers, per_ring, idx, &mut batch);
+        let count: usize = slices.iter().map(|(n, _)| n).sum();
+        if batch.is_empty() {
+            std::thread::sleep(idle);
+            continue;
+        }
+        // `synchronous_standby_names` is sighup context, so the promise the
+        // replicated tier makes can be withdrawn at runtime by a reload. The
+        // startup refusal cannot cover that, and committing anyway would ack
+        // writes as replicated that Postgres never waited to replicate. Fail
+        // closed: leave the batch in the rings, hold its acks, and say so.
+        if replicated && !sync_standby_configured() {
+            log!(
+                "pg_keyspace persist {idx}: REFUSING to commit {count} record(s):                  durability is 'replicated' but synchronous_standby_names is now empty,                  so Postgres would not wait for any standby. Records retained in the                  rings and durable acks held until it is restored"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        // Bracket the attempt on every ring: a Postgres ERROR unwinds out of
+        // this worker rather than returning, so counting only on the Err branch
+        // would miss the most common failure entirely.
+        for c in &consumers {
+            c.note_attempt();
+        }
+        match bulk_upsert(batch, sync_commit, ttl_bucket_us()) {
+            Ok(()) => {
+                // Only now are these records durable: release the ring space
+                // and the durable acks waiting on them, for every ring that
+                // contributed to this batch.
+                for c in &consumers {
+                    c.note_commit();
+                }
+                commit_rings(&consumers, &slices);
+                backoff = Duration::from_millis(0);
+            }
+            Err(e) => {
+                // Nothing is committed, so no `head` moves and every record is
+                // re-read next pass with its durable ack still held. This is
+                // why the batch spans N rings safely: a failure cannot acknowledge
+                // one ring's share while losing another's.
+                log!(
+                    "pg_keyspace persist {idx}: batch of {count} record(s) FAILED to                      persist ({e}); records retained in the rings, durable acks held,                      retrying in {backoff:?}"
+                );
+                backoff = (backoff + Duration::from_millis(50)).min(Duration::from_secs(5));
+                std::thread::sleep(backoff);
+            }
+        }
+    }
+    // final drain on shutdown
+    let mut tail: Vec<server::PendingWrite> = Vec::new();
+    let tslices = peek_rings(&consumers, usize::MAX, idx, &mut tail);
+    let tcount: usize = tslices.iter().map(|(n, _)| n).sum();
+    if !tail.is_empty() {
+        match bulk_upsert(tail, sync_commit, ttl_bucket_us()) {
+            Ok(()) => commit_rings(&consumers, &tslices),
+            Err(e) => log!(
+                "pg_keyspace persist {idx}: final batch of {tcount} record(s) FAILED                  to persist ({e}); they remain in the rings for the next start"
+            ),
+        }
+    }
+    log!("pg_keyspace persist {idx}: shutting down");
+}
+
+/// Read from every ring this worker owns without consuming anything, appending
+/// to `batch`. Returns, per ring, how many records were read and how many bytes
+/// they occupy: what [`ring::Consumer::commit`] needs once they are durable.
+///
+/// A record whose kind carries [`ring::KIND_REF`] does not hold the value. Its
+/// payload is the entry version at stage time, and the value is still in the
+/// producing slot worker's keyspace segment, so it has to be resolved against
+/// *that* worker's segment. `consumers[w]` is worker `w`'s ring, which is what
+/// makes the index meaningful here. Resolving against worker 0's segment
+/// instead, as a single-segment view would, finds either the wrong bytes or
+/// nothing at all, and finding nothing is indistinguishable from a legitimately
+/// superseded write: it would lose large durable writes in silence.
+fn peek_rings(
+    consumers: &[ring::Consumer],
+    max: usize,
+    idx: usize,
+    batch: &mut Vec<server::PendingWrite>,
+) -> Vec<(usize, u64)> {
+    let mut slices = Vec::with_capacity(consumers.len());
+    for (w, c) in consumers.iter().enumerate() {
+        slices.push(c.peek(max, |k, v, e, kind| {
             if kind & ring::KIND_REF == 0 {
                 batch.push((k.to_vec(), v.to_vec(), e, kind));
                 return;
@@ -999,87 +1178,32 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
             } else {
                 return;
             };
-            if let Some(store) = store_view() {
-                // `read_staged` copies under the entry's seqlock and hands back
-                // owned bytes, so there is no window between validating the
-                // version and taking the copy.
-                match store.read_staged(k, version) {
-                    Some((_, _, val)) => batch.push((k.to_vec(), val, e, kind & !ring::KIND_REF)),
-                    // Usually benign: the key was overwritten after staging, so
-                    // a newer record is queued behind this one. It is also what
-                    // resolving against the wrong segment looks like, which is
-                    // not benign at all, so say so rather than dropping in
-                    // silence. A real counter belongs with the other
-                    // persistence metrics.
-                    None => {
-                        consumer.note_unresolved();
-                        log!(
-                            "pg_keyspace persist {idx}: a by-reference record did not resolve (superseded, or the value is not in this segment)"
-                        )
-                    }
+            match store_view_for_worker(w).and_then(|st| st.read_staged(k, version)) {
+                Some((_, _, val)) => {
+                    batch.push((k.to_vec(), val, e, kind & !ring::KIND_REF))
+                }
+                // Usually benign: the key was overwritten after staging, so a
+                // newer record is queued behind this one. It is also what
+                // resolving against the wrong segment looks like, which is not
+                // benign, so say so rather than dropping in silence.
+                None => {
+                    c.note_unresolved();
+                    log!(
+                        "pg_keyspace persist {idx}: reference from worker {w} did not resolve (superseded, or not in that segment)"
+                    )
                 }
             }
-        });
-        if batch.is_empty() {
-            std::thread::sleep(idle);
-            continue;
-        }
-        // `synchronous_standby_names` is sighup context, so the promise the
-        // replicated tier makes can be withdrawn at runtime by a reload. The
-        // startup refusal cannot cover that, and committing anyway would ack
-        // writes as replicated that Postgres never waited to replicate. Fail
-        // closed: leave the batch in the ring, hold its acks, and say so. If
-        // the setting comes back the same records commit on a later pass.
-        if replicated && !sync_standby_configured() {
-            log!(
-                "pg_keyspace persist {idx}: REFUSING to commit {count} record(s) — \
-                 durability is 'replicated' but synchronous_standby_names is now empty, \
-                 so Postgres would not wait for any standby. Records retained in the \
-                 ring and durable acks held until it is restored"
-            );
-            std::thread::sleep(Duration::from_secs(1));
-            continue;
-        }
-        // Bracket the attempt: a Postgres ERROR unwinds out of this worker
-        // rather than returning, so counting only on the Err branch would miss
-        // the most common failure entirely.
-        consumer.note_attempt();
-        match bulk_upsert(batch, sync_commit, ttl_bucket_us()) {
-            Ok(()) => {
-                consumer.note_commit();
-                // Only now are these records durable: release the ring space
-                // and the durable acks waiting on them.
-                consumer.commit(count, bytes);
-                backoff = Duration::from_millis(0);
-            }
-            Err(e) => {
-                // No commit: `head` does not move, the records are retried on
-                // the next pass, and every durable ack stays held. The RESP
-                // side surfaces this as backpressure rather than a false +OK.
-                log!(
-                    "pg_keyspace persist {idx}: batch of {count} record(s) FAILED to \
-                     persist ({e}); records retained in the ring, durable acks held, \
-                     retrying in {backoff:?}"
-                );
-                backoff = (backoff + Duration::from_millis(50)).min(Duration::from_secs(5));
-                std::thread::sleep(backoff);
-            }
-        }
+        }));
     }
-    // final drain on shutdown
-    let mut tail: Vec<server::PendingWrite> = Vec::new();
-    let (tcount, tbytes) =
-        consumer.peek(usize::MAX, |k, v, e, kind| tail.push((k.to_vec(), v.to_vec(), e, kind)));
-    if !tail.is_empty() {
-        match bulk_upsert(tail, sync_commit, ttl_bucket_us()) {
-            Ok(()) => consumer.commit(tcount, tbytes),
-            Err(e) => log!(
-                "pg_keyspace persist {idx}: final batch of {tcount} record(s) FAILED \
-                 to persist ({e}); they remain in the ring for the next start"
-            ),
-        }
+    slices
+}
+
+/// Release the records a preceding [`peek_rings`] read, ring by ring, once the
+/// transaction carrying them has committed.
+fn commit_rings(consumers: &[ring::Consumer], slices: &[(usize, u64)]) {
+    for (c, (count, bytes)) in consumers.iter().zip(slices.iter()) {
+        c.commit(*count, *bytes);
     }
-    log!("pg_keyspace persist {idx}: shutting down");
 }
 
 /// verify `supatype_mask` is present in shared_preload_libraries AND
@@ -1193,6 +1317,11 @@ fn pg_ensure_schema() {
         let _ = Spi::run(
             "ALTER TABLE supacache.kv_ttl ADD COLUMN IF NOT EXISTS kind \"char\" NOT NULL DEFAULT 's'",
         );
+        // Crash recovery in a multi-worker cluster reads one contiguous slot
+        // range per worker (see pg_recover), so index the column it ranges over.
+        // Single-worker recovery scans unfiltered and ignores these.
+        let _ = Spi::run("CREATE INDEX IF NOT EXISTS kv_slot_idx ON supacache.kv (slot)");
+        let _ = Spi::run("CREATE INDEX IF NOT EXISTS kv_ttl_slot_idx ON supacache.kv_ttl (slot)");
     });
 }
 
@@ -1294,19 +1423,37 @@ fn load_auth_config() -> Option<AuthConfig> {
 
 /// Load live keys from `supacache.kv` into shmem at startup (crash recovery).
 /// Expired rows are skipped. Returns the number of keys restored.
-fn pg_recover(store: &Store) -> i64 {
+fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
     use std::panic::AssertUnwindSafe;
     let now = store::now_micros();
+    // Recover only the slot range this worker serves. `supacache.kv.slot` is the
+    // key's CRC16 slot, written on every persist, so a key comes back into the
+    // same segment the RESP path and the SQL surface will look for it in. A
+    // single-worker cluster owns everything, so it keeps the unfiltered scan.
+    let (lo, hi) = crc16::slot_range(w, nworkers);
+    let sharded = nworkers > 1;
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
         Spi::connect(|client| {
             let mut cnt = 0i64;
             // no-TTL keys from kv, then non-expired TTL keys from kv_ttl (latest
             // expiry per key wins, so a re-SET into a newer bucket takes effect).
-            let tup = client.select(
-                "SELECT key, val, expires_at, kind::text FROM supacache.kv",
-                None,
-                None,
-            )?;
+            let tup = if sharded {
+                client.select(
+                    "SELECT key, val, expires_at, kind::text FROM supacache.kv \
+                     WHERE slot >= $1 AND slot < $2",
+                    None,
+                    Some(vec![
+                        (PgOid::BuiltIn(PgBuiltInOids::INT4OID), (lo as i32).into_datum()),
+                        (PgOid::BuiltIn(PgBuiltInOids::INT4OID), (hi as i32).into_datum()),
+                    ]),
+                )?
+            } else {
+                client.select(
+                    "SELECT key, val, expires_at, kind::text FROM supacache.kv",
+                    None,
+                    None,
+                )?
+            };
             for row in tup {
                 let k: Option<Vec<u8>> = row.get(1)?;
                 let v: Option<Vec<u8>> = row.get(2)?;
@@ -1324,15 +1471,31 @@ fn pg_recover(store: &Store) -> i64 {
                     cnt += 1;
                 }
             }
-            let tup = client.select(
-                "SELECT DISTINCT ON (key) key, val, expires_at, kind::text FROM supacache.kv_ttl \
-                 WHERE expires_at > $1 ORDER BY key, expires_at DESC",
-                None,
-                Some(vec![(
-                    PgOid::BuiltIn(PgBuiltInOids::INT8OID),
-                    now.into_datum(),
-                )]),
-            )?;
+            let tup = if sharded {
+                client.select(
+                    "SELECT DISTINCT ON (key) key, val, expires_at, kind::text \
+                     FROM supacache.kv_ttl \
+                     WHERE expires_at > $1 AND slot >= $2 AND slot < $3 \
+                     ORDER BY key, expires_at DESC",
+                    None,
+                    Some(vec![
+                        (PgOid::BuiltIn(PgBuiltInOids::INT8OID), now.into_datum()),
+                        (PgOid::BuiltIn(PgBuiltInOids::INT4OID), (lo as i32).into_datum()),
+                        (PgOid::BuiltIn(PgBuiltInOids::INT4OID), (hi as i32).into_datum()),
+                    ]),
+                )?
+            } else {
+                client.select(
+                    "SELECT DISTINCT ON (key) key, val, expires_at, kind::text \
+                     FROM supacache.kv_ttl \
+                     WHERE expires_at > $1 ORDER BY key, expires_at DESC",
+                    None,
+                    Some(vec![(
+                        PgOid::BuiltIn(PgBuiltInOids::INT8OID),
+                        now.into_datum(),
+                    )]),
+                )?
+            };
             for row in tup {
                 let k: Option<Vec<u8>> = row.get(1)?;
                 let v: Option<Vec<u8>> = row.get(2)?;
@@ -2290,12 +2453,12 @@ mod supacache {
     /// next.
     #[pg_extern(stable, parallel_safe)]
     fn get(key: &str) -> Option<Vec<u8>> {
-        store_view()?.get_stable(key.as_bytes())
+        store_view_for_key(key.as_bytes())?.get_stable(key.as_bytes())
     }
 
     #[pg_extern]
     fn set(key: &str, val: &[u8], ttl_seconds: default!(i64, 0)) -> bool {
-        let store = match store_view() {
+        let store = match store_view_for_key(key.as_bytes()) {
             Some(s) => s,
             None => return false,
         };
@@ -2309,19 +2472,21 @@ mod supacache {
 
     #[pg_extern]
     fn incr(key: &str, by: default!(i64, 1)) -> Option<i64> {
-        store_view().and_then(|s| s.incr(key.as_bytes(), by))
+        store_view_for_key(key.as_bytes()).and_then(|s| s.incr(key.as_bytes(), by))
     }
 
     #[pg_extern]
     fn del(key: &str) -> bool {
-        store_view().map(|s| s.del(key.as_bytes())).unwrap_or(false)
+        store_view_for_key(key.as_bytes())
+            .map(|s| s.del(key.as_bytes()))
+            .unwrap_or(false)
     }
 
     #[pg_extern]
     fn getset(key: &str, val: &[u8]) -> Option<Vec<u8>> {
-        let store = store_view()?;
-        // Seqlock read for the same reason as `get`: this is a backend, not
-        // the owning worker.
+        let store = store_view_for_key(key.as_bytes())?;
+        // Seqlock read: this is an ordinary backend, not the worker that owns
+        // the partition, so the value can be rewritten mid-read.
         let old = store.get_stable(key.as_bytes());
         store.set(key.as_bytes(), val, 0);
         old
@@ -2464,6 +2629,42 @@ mod supacache {
         TableIterator::new(rows)
     }
 
+    /// The slot range and RESP port of every shared-nothing slot worker.
+    ///
+    /// This is the routing table a client must follow: worker `w` serves exactly
+    /// the keys whose CRC16 slot falls in `[slot_lo, slot_hi)`, on `port`. It is
+    /// also the mapping crash recovery uses to put each persisted key back into
+    /// the segment that will serve it, so a client that shards by these ranges
+    /// gets its data back after a restart, on the same worker.
+    #[pg_extern(stable, parallel_safe)]
+    fn slot_ranges() -> TableIterator<
+        'static,
+        (
+            name!(worker, i32),
+            name!(port, i32),
+            name!(slot_lo, i32),
+            name!(slot_hi, i32),
+        ),
+    > {
+        let n = worker_count();
+        let base = GUC_PORT.get();
+        let rows: Vec<(i32, i32, i32, i32)> = (0..n)
+            .map(|w| {
+                let (lo, hi) = crc16::slot_range(w, n);
+                (w as i32, base + w as i32, lo as i32, hi as i32)
+            })
+            .collect();
+        TableIterator::new(rows)
+    }
+
+    /// Which slot worker owns `key`, by the same function the RESP workers, the
+    /// SQL surface, and crash recovery use. Pairs with `slot_ranges()` for
+    /// routing a key to its port.
+    #[pg_extern(stable, parallel_safe)]
+    fn key_worker(key: &str) -> i32 {
+        crc16::key_owner(key.as_bytes(), worker_count()) as i32
+    }
+
     // ---- in-backend micro-benchmarks --------------------------------
     // These time the raw shared-memory op inside the calling backend, with no
     // client protocol round-trip, so they isolate the ~1-2µs claim from the
@@ -2472,7 +2673,7 @@ mod supacache {
     /// Returns nanoseconds per `get` hit, averaged over `iters` iterations.
     #[pg_extern]
     fn bench_get(key: &str, val: &[u8], iters: i64) -> f64 {
-        let store = match store_view() {
+        let store = match store_view_for_key(key.as_bytes()) {
             Some(s) => s,
             None => return -1.0,
         };
@@ -2494,7 +2695,7 @@ mod supacache {
     /// Returns nanoseconds per `set` (overwrite in place), over `iters`.
     #[pg_extern]
     fn bench_set(key: &str, val: &[u8], iters: i64) -> f64 {
-        let store = match store_view() {
+        let store = match store_view_for_key(key.as_bytes()) {
             Some(s) => s,
             None => return -1.0,
         };
@@ -2510,7 +2711,7 @@ mod supacache {
     /// Returns nanoseconds per `incr`, over `iters`.
     #[pg_extern]
     fn bench_incr(key: &str, iters: i64) -> f64 {
-        let store = match store_view() {
+        let store = match store_view_for_key(key.as_bytes()) {
             Some(s) => s,
             None => return -1.0,
         };
@@ -2526,16 +2727,22 @@ mod supacache {
     /// Preload `n` keys of `val_bytes` each, so RESP GET benchmarks hit.
     #[pg_extern]
     fn warm(n: i64, val_bytes: i64) -> i64 {
-        let store = match store_view() {
-            Some(s) => s,
-            None => return 0,
-        };
+        // Each key goes into the segment that owns it, so a RESP GET on the
+        // worker a cluster client routes to actually hits.
+        let nworkers = worker_count();
+        let views: Vec<Option<Store>> = (0..nworkers).map(store_view_for_worker).collect();
+        if views.iter().all(|v| v.is_none()) {
+            return 0;
+        }
         let val = vec![b'x'; val_bytes.max(1) as usize];
         let mut done = 0i64;
         for i in 0..n.max(0) {
             let key = format!("key:{i}");
-            if store.set(key.as_bytes(), &val, 0) {
-                done += 1;
+            let owner = crc16::key_owner(key.as_bytes(), nworkers);
+            if let Some(Some(store)) = views.get(owner) {
+                if store.set(key.as_bytes(), &val, 0) {
+                    done += 1;
+                }
             }
         }
         done
@@ -2707,11 +2914,19 @@ mod supacache {
         ),
     > {
         let mut rows = Vec::new();
-        if let Some(store) = store_view() {
-            for p in 0..store.num_partitions() {
+        // One row per (slot worker, partition). `partition` is the global index
+        // `worker * num_partitions + partition`, so with the default single
+        // partition per segment it reads as the slot worker index.
+        for w in 0..worker_count() {
+            let store = match store_view_for_worker(w) {
+                Some(s) => s,
+                None => continue,
+            };
+            let nparts = store.num_partitions();
+            for p in 0..nparts {
                 let s = store.stats(p);
                 rows.push((
-                    p as i32,
+                    (w as u32 * nparts + p) as i32,
                     s.entries as i64,
                     s.hits as i64,
                     s.misses as i64,
