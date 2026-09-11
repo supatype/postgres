@@ -212,3 +212,69 @@ jobs:
           echo "===================================="
           [ "$fail" -eq 0 ] && echo "all benches passed" || echo "some benches FAILED"
           exit $fail
+
+  # Job 3: the in-Postgres durability suite. The other jobs drive the
+  # standalone daemon, so every in-process path (persistence tiers, crash
+  # recovery, the large-value reference path, slab reclamation, the replicated
+  # tier's startup refusal) ran nowhere in CI. This installs the extension into
+  # a real PostgreSQL and exercises them, including injected failures.
+  #
+  # A debug build is deliberate: the release profile uses thin LTO with one
+  # codegen unit and takes upwards of ten minutes. Correctness here does not
+  # need the optimiser; the release build is covered by the packaging jobs.
+  durability-in-postgres:
+    name: durability + fault injection (in PG${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            extensions/pg_keyspace/extension/target
+          key: pgks-durability-${{ runner.os }}-pg${{ matrix.pg }}-${{ hashFiles('extensions/pg_keyspace/**/Cargo.lock') }}
+
+      - name: Add the PostgreSQL apt repository
+        run: |
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+      - name: Install PostgreSQL ${{ matrix.pg }} + build deps + redis-cli
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} \
+            clang libclang-dev llvm-dev redis-tools
+
+      - name: Install cargo-pgrx ${{ env.PGRX_VERSION }}
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+
+      - name: Initialise pgrx against the system PostgreSQL ${{ matrix.pg }}
+        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      # The runner's own cluster would collide on the data directory and port.
+      - name: Stop any preinstalled PostgreSQL
+        run: sudo systemctl stop postgresql || true
+
+      - name: Durability + fault injection suite
+        env:
+          PGKS_BUILD_PROFILE: debug
+        # Root is needed to install into the PG prefix and to run initdb as the
+        # postgres user, but sudo resets PATH from secure_path, so cargo (in
+        # ~/.cargo/bin) disappears. PGRX_HOME has to come along too: the init
+        # step above wrote it under the runner's home, not root's.
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_durability_pg.sh

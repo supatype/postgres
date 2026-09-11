@@ -569,4 +569,29 @@ mod tests {
         // A value the record cannot encode is refused however empty the ring.
         assert!(!prod.has_room(1, MAX_REC_VAL));
     }
+
+    /// A value far larger than the whole ring must still be admissible.
+    ///
+    /// Values past `server::INLINE_MAX` are staged by reference, so the record
+    /// is the key plus an 8-byte version and its size is unrelated to the
+    /// value. The write path's pre-flight originally sized the check by the
+    /// value itself, so a value bigger than `ring_mb` could never satisfy
+    /// `has_room`: the connection parked forever, with no error and no timeout.
+    /// A real 9 MiB write against an 8 MiB ring hung for over two hours.
+    #[test]
+    fn a_referenced_record_fits_a_ring_far_smaller_than_its_value() {
+        let cap = 64 * 1024usize; // tiny ring
+        let mut buf = vec![0u8; bytes_for(cap)];
+        let base = buf.as_mut_ptr();
+        unsafe { init(base, cap) };
+        let prod = unsafe { Producer::attach(base) };
+
+        // What a referenced record actually carries: the key and a version.
+        let version = 7u64.to_le_bytes();
+        assert!(
+            prod.has_room(b"big:9m".len(), version.len()),
+            "a referenced record must fit a ring far smaller than its value"
+        );
+        assert!(prod.push(b"big:9m", &version, 0, b's' | KIND_REF).is_some());
+    }
 }
