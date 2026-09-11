@@ -30,6 +30,11 @@ PROFILE=${PGKS_BUILD_PROFILE:-release}
 # held until its record commits, so an unbounded call hangs the whole suite
 # when anything goes wrong: an earlier run sat on one SET for over two hours.
 RCLI_TIMEOUT=${PGKS_RCLI_TIMEOUT:-20}
+# Topology under test. The multi-worker section below deliberately uses an
+# uneven split (3 does not divide 16384) because the slot-range arithmetic is
+# where off-by-one errors live.
+MW_WORKERS=${PGKS_MW_WORKERS:-3}
+MW_PERSIST=${PGKS_MW_PERSIST:-2}
 pass=0; fail=0
 
 chk() {
@@ -222,8 +227,14 @@ for _ in $(seq 1 20); do
   [ "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='fi:k1'::bytea")" = "1" ] && break
   sleep 1
 done
+ERRS=$(psql_ "SELECT failed_batches FROM supacache.ring_stats()")
+if [ "$ERRS" -gt 0 ]; then
+  echo "PASS  the failure is countable, not just loggable (errors=$ERRS)"; pass=$((pass+1))
+else
+  echo "FAIL  persistence failed but ring_stats().failed_batches stayed at 0"; fail=$((fail+1)); fi
 chk "retained record commits after recovery" "1"  "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='fi:k1'::bytea")"
 chk "and its value is correct"              "v1" "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='fi:k1'::bytea")"
+chk "lag returns to zero once persistence recovers" "0" "$(psql_ "SELECT lag FROM supacache.ring_stats()")"
 
 echo ""
 echo "########## M. killing the persist worker loses nothing that was acked ##########"
@@ -294,6 +305,102 @@ else
 psql_ "ALTER TABLE supacache.kv DROP CONSTRAINT fi_block" >/dev/null
 sleep 8
 chk "no panics after the whole run" "0" "$(grep -ci panic $PGDATA/log || true)"
+
+echo ""
+echo "########## O. multi-worker topology ##########"
+# Two things are being checked here, and only one of them is about scale-out.
+#
+# The first is that N shared-nothing workers serve independently: a key written
+# to one port is not visible on another, which is the documented behaviour and
+# what client-side sharding relies on.
+#
+# The second matters more. Values above INLINE_MAX are staged by reference and
+# resolved out of a keyspace segment, but a ring record does not yet say which
+# worker produced it, so resolution would use worker 0's segment for every
+# worker. With several workers that silently loses large durable writes owned
+# by anyone else, and a lost reference looks exactly like a legitimately
+# superseded one. The persistence worker therefore refuses to start rather than
+# trusting an upstream guard. This asserts the refusal, so that whoever makes
+# the ring worker-aware has to change this test deliberately.
+stop_pg; sleep 1
+sed -i "s/^pg_keyspace.workers = .*/pg_keyspace.workers = $MW_WORKERS/" $PGDATA/postgresql.conf 2>/dev/null
+grep -q "^pg_keyspace.workers" $PGDATA/postgresql.conf || echo "pg_keyspace.workers = $MW_WORKERS" >> $PGDATA/postgresql.conf
+sed -i "s/^pg_keyspace.persist_workers = .*/pg_keyspace.persist_workers = $MW_PERSIST/" $PGDATA/postgresql.conf 2>/dev/null
+grep -q "^pg_keyspace.persist_workers" $PGDATA/postgresql.conf || echo "pg_keyspace.persist_workers = $MW_PERSIST" >> $PGDATA/postgresql.conf
+start_pg; wait_ready; sleep 4
+
+UP=0
+for w in $(seq 0 $((MW_WORKERS-1))); do
+  timeout 5 redis-cli -p $((RESP+w)) PING 2>/dev/null | grep -q PONG && UP=$((UP+1))
+done
+chk "all $MW_WORKERS workers are listening" "$MW_WORKERS" "$UP"
+
+# Shared-nothing: a key on one worker is invisible on the next.
+timeout 5 redis-cli -p $RESP SET mw:only-here v >/dev/null 2>&1
+OTHER=$(timeout 5 redis-cli -p $((RESP+1)) GET mw:only-here 2>&1)
+chk "workers are shared-nothing (key absent on another port)" "" "$OTHER"
+
+# Protection comes from two places and either is sufficient: the persistence
+# workers are not registered at all when workers > 1, and the persistence
+# worker itself refuses if it ever is started that way. Assert the observable
+# outcome rather than one mechanism, so lifting either one deliberately shows
+# up here.
+PW_RUNNING=$(ps -eo args | grep -c "[p]ersistence worker" || true)
+chk "no persistence worker runs with workers > 1" "0" "$PW_RUNNING"
+if grep -q "persisted=false" $PGDATA/log; then
+  echo "PASS  the tier is reported as downgraded, not silently assumed durable"; pass=$((pass+1))
+else
+  echo "FAIL  workers > 1 did not report the tier downgrade"; fail=$((fail+1)); fi
+# And nothing reaches the durable store, which is the thing that would be
+# silently wrong if a reference were resolved against the wrong segment.
+timeout 8 redis-cli -p $RESP -x SET mw:big < /tmp/big.txt >/dev/null 2>&1
+sleep 2
+chk "nothing is persisted while multi-worker" "0"     "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='mw:big'::bytea")"
+
+# Restore the single-worker topology for anything that follows.
+stop_pg; sleep 1
+sed -i "s/^pg_keyspace.workers = .*/pg_keyspace.workers = 1/" $PGDATA/postgresql.conf
+sed -i "s/^pg_keyspace.persist_workers = .*/pg_keyspace.persist_workers = 1/" $PGDATA/postgresql.conf
+start_pg; wait_ready; sleep 2
+
+echo ""
+echo "########## P. backing table unavailable ##########"
+# A different failure class from the constraint case in L: there the statement
+# is rejected, here the relation is gone entirely (undefined_table). Both must
+# hold the ack and retain the records, and the point of testing two is that the
+# handling is not special-cased to one error.
+#
+# Note on what is NOT injected here: the persistence worker connects as a
+# superuser, and superusers bypass table ACLs, so REVOKE INSERT would not fail
+# for it. A genuine permission failure needs the worker to run as a
+# non-superuser role, which is a change to the extension rather than to this
+# harness.
+BEFORE_P=$(psql_ "SELECT count(*) FROM supacache.kv")
+psql_ "ALTER TABLE supacache.kv RENAME TO kv_hidden" >/dev/null 2>&1
+OUT=$(timeout 6 redis-cli -p $RESP SET tbl:k1 v1 2>&1); RC=$?
+echo "  SET with the table renamed away -> [$OUT] (rc=$RC)"
+if [ "$OUT" = "OK" ]; then
+  echo "FAIL  ack released while the backing table was missing"; fail=$((fail+1))
+else
+  echo "PASS  ack held while the backing table was missing"; pass=$((pass+1)); fi
+BACKLOG=$(psql_ "SELECT backlog_bytes FROM supacache.ring_stats()")
+if [ "$BACKLOG" -gt 0 ]; then
+  echo "PASS  record retained in the ring (backlog $BACKLOG bytes)"; pass=$((pass+1))
+else
+  echo "FAIL  record not retained (backlog $BACKLOG)"; fail=$((fail+1)); fi
+
+psql_ "ALTER TABLE supacache.kv_hidden RENAME TO kv" >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  [ "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='tbl:k1'::bytea")" = "1" ] && break
+  sleep 1
+done
+chk "the retained record commits once the table returns" "1"  "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='tbl:k1'::bytea")"
+chk "with the right value"                                "v1" "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='tbl:k1'::bytea")"
+AFTER_P=$(psql_ "SELECT count(*) FROM supacache.kv")
+if [ "$AFTER_P" -ge "$BEFORE_P" ]; then
+  echo "PASS  nothing already durable was lost across the outage"; pass=$((pass+1))
+else
+  echo "FAIL  rows lost across the outage ($BEFORE_P -> $AFTER_P)"; fail=$((fail+1)); fi
 
 echo ""
 echo "================================================"

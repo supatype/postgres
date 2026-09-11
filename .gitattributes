@@ -1,0 +1,15 @@
+# Shell scripts must keep LF endings in the working tree, on every platform.
+#
+# With core.autocrlf=true a Windows checkout rewrites them to CRLF, and bash
+# then fails on the carriage returns: `set: pipefail: invalid option name`,
+# `syntax error near unexpected token $'{\r'`. The files are stored LF and run
+# fine in CI, so the breakage only appears for a developer on Windows, which
+# makes it needlessly confusing to diagnose.
+*.sh text eol=lf
+
+# Same reasoning for anything else consumed by a Unix tool or shipped into a
+# container, where a stray CR is either a syntax error or silent corruption.
+*.bash text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
