@@ -78,6 +78,24 @@ wait_coherent() {
   echo 0
 }
 
+# Anything the row cache is warmed with is taken back out again by a change the
+# invalidation worker has not consumed yet -- correctly, since that change
+# predates the cached copy and the worker cannot know it does not. A fresh
+# logical slot also takes a while to reach a consistent point, so a table's own
+# INSERTs can arrive on the channel some seconds after they committed. Rather
+# than sleep a guessed amount, cache a canary and wait for it to survive a full
+# decode interval: once it does, the worker has caught up with this table and
+# every assertion after it is deterministic. Returns 1 if it settled, 0 if not.
+wait_rowcache_quiet() {
+  local tbl=$1 pk=$2 tries=${3:-45}
+  for _ in $(seq 1 "$tries"); do
+    psql_ "SELECT supacache.rowcache_put('$tbl', $pk)" >/dev/null
+    sleep 2
+    [ -n "$(psql_ "SELECT supacache.rowcache_cached_has_external('$tbl', ${pk}::bigint)")" ] && { echo 1; return; }
+  done
+  echo 0
+}
+
 echo "=== build + install the extension ==="
 cd "$EXT_DIR"
 REL_FLAG=""; [ "$PROFILE" = "release" ] && REL_FLAG="--release"
@@ -1885,6 +1903,98 @@ chk "and the cache is served again" "1" \
     "$(psql_ "SELECT supacache.rowcache_put('public.fc', 2)" >/dev/null; psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.fc WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
 set_conf "pg_keyspace.watchdog_secs" "${AI_WATCHDOG_WAS:-30}"
 stop_pg_reload
+
+echo ""
+echo "########## AJ. read-through warms the row cache on a miss (#10) ##########"
+# Before this, the only way a row entered the row cache was an explicit
+# rowcache_put: invalidation and refill were automatic, but the initial warm was
+# a manual step, so "zero-config caching" was not on offer. Read-through closes
+# the loop -- a pk lookup on a registered table is served by the cache whether or
+# not the row is there yet, and a miss reads the row and stores it.
+#
+# It is opt-in (pg_keyspace.rowcache_readthrough, off by default) because a miss
+# becomes a fetch through the cache node rather than a plain index scan, which is
+# the wrong trade for random access over a table much larger than
+# pg_keyspace.rowcache_mb.
+psql_ "DROP TABLE IF EXISTS public.rt CASCADE" >/dev/null 2>&1
+psql_ "CREATE TABLE public.rt(id bigint primary key, v text)" >/dev/null
+psql_ "INSERT INTO public.rt VALUES (1,'one'),(2,'two'),(3,'three'),(4,'canary')" >/dev/null
+psql_ "SELECT supacache.rowcache_register('public.rt', 1)" >/dev/null
+chk "the invalidation worker is up, so the cache is served at all" "1" "$(wait_coherent 30)"
+chk "and it has caught up with this table, so the cache can hold a row" "1" \
+    "$(wait_rowcache_quiet public.rt 4)"
+
+# --- the default: a miss stays a miss ---------------------------------------
+# Asserted first, and on the same cluster, so the warming assertions below
+# cannot pass because of something other than read-through.
+chk "read-through is off by default" "off" "$(psql_ "SHOW pg_keyspace.rowcache_readthrough")"
+chk "an uncached row is not planned through the cache" "0" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.rt WHERE id=1" | grep -c 'pg_keyspace_rowcache')"
+chk "it reads correctly through the ordinary index path" "one" \
+    "$(psql_ "SELECT v FROM public.rt WHERE id=1")"
+chk "and that read cached nothing" "" \
+    "$(psql_ "SELECT supacache.rowcache_cached_has_external('public.rt', 1::bigint)")"
+
+# --- read-through on --------------------------------------------------------
+# Postmaster-scoped: the plan-time gate is read on every planning pass, so
+# flipping it under a running cluster would change plans mid-flight.
+stop_pg; sleep 1
+set_conf "pg_keyspace.rowcache_readthrough" "on"
+start_pg; wait_ready; sleep 2
+chk "read-through is on after the restart" "on" "$(psql_ "SHOW pg_keyspace.rowcache_readthrough")"
+chk "and the cache is served again" "1" "$(wait_coherent 30)"
+# Registrations live in the cache itself, which is shared memory, so a restart
+# clears them along with everything else. Re-register, or the assertions below
+# fail for want of a registration rather than for want of read-through -- which
+# is exactly how they first failed.
+chk "the table registers again after the restart" "t" \
+    "$(psql_ "SELECT supacache.rowcache_register('public.rt', 1)")"
+chk "and the cache can hold a row again" "1" "$(wait_rowcache_quiet public.rt 4)"
+chk "an uncached row is now planned through the cache" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.rt WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
+
+# One read, one entry, no rowcache_put anywhere. Measured around the read rather
+# than after a wait, so nothing else can account for the entry.
+RT_BEFORE=$(psql_ "SELECT sum(entries)::text FROM supacache.rowcache_stats()")
+chk "the row is not cached before it is read" "" \
+    "$(psql_ "SELECT supacache.rowcache_cached_has_external('public.rt', 2::bigint)")"
+chk "reading it returns the right value" "two" "$(psql_ "SELECT v FROM public.rt WHERE id=2")"
+chk "and that single read cached it, with no rowcache_put" "t" \
+    "$([ -n "$(psql_ "SELECT supacache.rowcache_cached_has_external('public.rt', 2::bigint)")" ] && echo t || echo f)"
+RT_AFTER=$(psql_ "SELECT sum(entries)::text FROM supacache.rowcache_stats()")
+chk "the cache gained exactly one entry" "$(( ${RT_BEFORE:-0} + 1 ))" "${RT_AFTER:-0}"
+# It must still be there a decode interval later. Without #91 it would not be:
+# the slot never advanced, so every poll replayed the same changes and dropped
+# whatever had just been cached.
+sleep 3
+chk "and it is still cached a decode interval later" "t" \
+    "$([ -n "$(psql_ "SELECT supacache.rowcache_cached_has_external('public.rt', 2::bigint)")" ] && echo t || echo f)"
+
+# A warmed row is an ordinary cached row: invalidation must still remove it, or
+# read-through would be a way of manufacturing permanently stale reads.
+psql_ "SELECT v FROM public.rt WHERE id=3" >/dev/null
+psql_ "UPDATE public.rt SET v='three_v2' WHERE id=3" >/dev/null
+RT_INVAL=0
+for _ in $(seq 1 30); do
+  [ "$(psql_ "SELECT v FROM public.rt WHERE id=3")" = "three_v2" ] && { RT_INVAL=1; break; }
+  sleep 1
+done
+chk "an UPDATE to a read-through-warmed row is still seen (within 30s)" "1" "$RT_INVAL"
+# id+0 is not a pk = Const match, so this cannot be answered from the cache --
+# a second opinion from the heap, without restarting to turn read-through off.
+chk "and the heap agrees" "three_v2" "$(psql_ "SELECT v FROM public.rt WHERE id+0=3")"
+
+# And a row that does not exist must not become a phantom: read-through stores
+# what the heap returned, and the heap returned nothing.
+chk "a miss on a row that does not exist returns no row" "" \
+    "$(psql_ "SELECT v FROM public.rt WHERE id=999")"
+chk "and caches nothing for it" "" \
+    "$(psql_ "SELECT supacache.rowcache_cached_has_external('public.rt', 999::bigint)")"
+
+stop_pg; sleep 1
+set_conf "pg_keyspace.rowcache_readthrough" "off"
+start_pg; wait_ready; sleep 2
+chk "the cluster is healthy again with read-through back off" "1" "$(psql_ "SELECT 1")"
 
 echo ""
 echo "================================================"

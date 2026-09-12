@@ -151,6 +151,7 @@ static GUC_ROWCACHE_DECODE_MS: GucSetting<i32> = GucSetting::<i32>::new(200);
 /// stays served from cache across writes. Off = drop-only (refill is lazy on the
 /// next read). Deleted rows are always dropped, never refilled.
 static GUC_ROWCACHE_REFILL: GucSetting<bool> = GucSetting::<bool>::new(false);
+static GUC_ROWCACHE_READTHROUGH: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
 /// values are raw heap-tuple bytes.
@@ -165,6 +166,20 @@ fn rowcache_config() -> Config {
         entries_per_part: entries,
         data_bytes_per_part: bytes,
     }
+}
+
+/// Whether read-through warming is both enabled and safe to act on.
+///
+/// Read-through requires automatic invalidation. Without it the cache would
+/// populate itself from every read and nothing would ever invalidate a row, so
+/// the keyspace would fill with entries that go stale and stay stale. Manual
+/// mode is safe today precisely because caching is a deliberate act: the
+/// operator chooses what to cache and knows it is theirs to keep current.
+///
+/// Enabling one without the other is a configuration mistake rather than a
+/// working setup, so it is refused here and reported at startup.
+fn rowcache_readthrough_active() -> bool {
+    GUC_ROWCACHE_READTHROUGH.get() && GUC_ROWCACHE_DECODE.get()
 }
 
 /// Whether the row cache's coherence can be trusted right now.
@@ -890,6 +905,20 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_bool_guc(
+        "pg_keyspace.rowcache_readthrough",
+        "Populate the row cache on a miss instead of requiring rowcache_put",
+        "Off (default) caches only what rowcache_put places, and a pk lookup for an \
+         uncached row takes the ordinary index path. On, a registered table's pk \
+         lookups are served by the row cache whether or not the row is cached yet, \
+         and a miss reads the row and stores it. That removes the manual warming \
+         step, at the cost of making a miss a fetch through the cache node rather \
+         than a plain index scan -- worth it for a working set that fits \
+         pg_keyspace.rowcache_mb, not for random access over a much larger table.",
+        &GUC_ROWCACHE_READTHROUGH,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
         "pg_keyspace.rowcache_refill",
         "Refill a changed hot key with the current row instead of only dropping it",
         "Off (default) is drop-only; the next read repopulates lazily. Deleted rows \
@@ -951,6 +980,18 @@ pub extern "C" fn _PG_init() {
             .set_restart_time(Some(Duration::from_secs(5)))
             .enable_spi_access()
             .load();
+    }
+
+    // A misconfiguration that would otherwise be silent: read-through fills the
+    // cache from ordinary reads, and without the invalidation worker nothing
+    // would ever take a row back out again.
+    if GUC_ROWCACHE_READTHROUGH.get() && !GUC_ROWCACHE_DECODE.get() {
+        log!(
+            "pg_keyspace: pg_keyspace.rowcache_readthrough is on but \
+             pg_keyspace.rowcache_decode is off, so nothing would invalidate what \
+             read-through caches. Read-through is INACTIVE until decode is enabled; \
+             the row cache still serves whatever rowcache_put places in it."
+        );
     }
 
     // Mode B: keys-only invalidation worker keeps the row cache coherent.
@@ -2799,8 +2840,17 @@ unsafe extern "C" fn rc_pathlist_hook(
         Some(v) => v,
         None => return,
     };
-    // Only substitute if the row is actually cached (else normal index path).
-    if !matches!(view.get(&rc_key(relid_u32, &pk)), Lookup::Hit(_)) {
+    // Normally only substitute when the row is actually cached, so an uncached
+    // row takes the ordinary index path and pays nothing for the cache existing.
+    //
+    // With read-through on, substitute for any registered table: the miss is what
+    // populates the cache, so declining here would mean it never warms without a
+    // manual rowcache_put. Safe only because a miss now reads the row rather than
+    // reporting end of scan (#85) -- before that, this would have turned every
+    // cold read into zero rows.
+    if !rowcache_readthrough_active()
+        && !matches!(view.get(&rc_key(relid_u32, &pk)), Lookup::Hit(_))
+    {
         return;
     }
 
@@ -2982,6 +3032,13 @@ unsafe extern "C" fn rc_access(ss: *mut pg_sys::ScanState) -> *mut pg_sys::Tuple
                 // right answer and matches what an index scan would return.
                 None => return pg_sys::ExecClearTuple(slot),
                 Some((raw, _)) => {
+                    // Read-through: the miss that just cost a fetch is exactly the
+                    // moment the cache should learn the row. Off by default, since
+                    // repopulating on every miss would let one scan over evicted
+                    // rows churn a cache that is doing its job.
+                    if rowcache_readthrough_active() {
+                        view.set(&rc_key(relid, pk), &raw, 0);
+                    }
                     fallback = raw;
                     &fallback[..]
                 }
