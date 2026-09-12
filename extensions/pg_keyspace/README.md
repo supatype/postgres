@@ -265,9 +265,19 @@ Durable tier, 6 deeply-pipelined connections, distinct keys, 256-byte values,
 roughly 40%, 25 → 50 ms a few percent more, and past 50 ms the curve is flat —
 by then the window is no longer what any write is waiting on. What a wider
 window costs is exactly the window: a durable ack is held up to that much
-longer, and `relaxed`'s loss bound grows by the same amount. The default stays
-at 10 ms because it favours latency; **25–50 ms is the range worth trying if
-durable write throughput is the constraint.**
+longer, and `relaxed`'s loss bound grows by the same amount. Measured
+closed-loop at 2 000 writes/s of distinct keys (`bench/k6/ladder.js`):
+
+| tier | write p50 | write p95 |
+|---|---:|---:|
+| `ephemeral` | 0.2 ms | 0.3 ms |
+| `durable`, `persist_window_ms = 10` | 6.5 ms | 13.5 ms |
+| `durable`, `persist_window_ms = 50` | 27.2 ms | 53.8 ms |
+
+So the 50 ms window that buys ~50% more durable throughput costs about **4× the
+write latency**. The default stays at 10 ms because it favours latency;
+**25–50 ms is the range worth trying if durable write throughput is the
+constraint and your writers can wait.**
 
 **More `persist_workers` does not raise the ceiling.** At a well-chosen window
 four workers are no better than one and usually worse, with a much wider spread
