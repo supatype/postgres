@@ -1483,6 +1483,39 @@ chk "a write after the upgrade records its type again" "h" \
     "$(psql_ "SELECT kind FROM supacache.kv_ttl WHERE key='ver:afterfix'::bytea")"
 
 echo ""
+echo "########## AD. the persist worker's writes reach pg_stat_user_tables (#77) ##########"
+# A background worker never runs the backend main loop, which is what normally
+# publishes pending table statistics. Without an explicit flush the persist
+# worker's row counts sit in process-local memory until the shutdown hook
+# empties them, so a running cluster reports zero writes on its own cache tables
+# however much it has written -- and autovacuum, whose thresholds are computed
+# from those same counters, never sees the churn.
+#
+# The assertion has to be a DELTA taken without a restart in the middle. Absolute
+# counters are no good: the suite has restarted this cluster several times by
+# now and each shutdown flushed whatever was pending, so they are already
+# non-zero and would pass without the fix.
+STAT_BEFORE=$(psql_ "SELECT coalesce(sum(n_tup_ins + n_tup_upd),0)::bigint FROM pg_stat_user_tables WHERE schemaname='supacache'")
+KV_STAT_BEFORE=$(psql_ "SELECT count(*) FROM supacache.kv")
+seq 1 300 | awk '{print "SET statk:"$1" v"$1}' > /tmp/pgks_stat_writes.txt
+timeout 120 redis-cli -p $RESP < /tmp/pgks_stat_writes.txt >/dev/null 2>&1
+sleep 3
+KV_STAT_AFTER=$(psql_ "SELECT count(*) FROM supacache.kv")
+# Proving the writes landed first is the point: without this a zero delta below
+# is ambiguous between "statistics are broken" and "nothing was written", and
+# the test would pass vacuously the day the write path breaks.
+chk "the writes actually persisted" "1" \
+    "$([ "$(( ${KV_STAT_AFTER:-0} - ${KV_STAT_BEFORE:-0} ))" -ge 300 ] && echo 1 || echo 0)"
+STAT_AFTER=$(psql_ "SELECT coalesce(sum(n_tup_ins + n_tup_upd),0)::bigint FROM pg_stat_user_tables WHERE schemaname='supacache'")
+chk "and the statistics views saw them, with no restart in between" "1" \
+    "$([ "${STAT_AFTER:-0}" -gt "${STAT_BEFORE:-0}" ] && echo 1 || echo 0)"
+echo "  (n_tup_ins + n_tup_upd: $STAT_BEFORE -> $STAT_AFTER over $(( ${KV_STAT_AFTER:-0} - ${KV_STAT_BEFORE:-0} )) new rows)"
+# Not asserted here: that a vacuum ran. 300 rows is far below the default
+# threshold, so asserting it would be asserting a race. What matters is that
+# the number autovacuum reads is no longer frozen at zero, which is what the
+# delta above establishes.
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
