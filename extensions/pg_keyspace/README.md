@@ -669,10 +669,55 @@ cache is disposable, exclude it:
 pg_dump --exclude-schema=supacache ...
 ```
 
-The shared-memory layout is versioned (`pgks_v3`) but Postgres recreates the
-segment on every start, so an upgrade never has to migrate it. Persisted data
-evolves by additive columns, so an older binary reading a newer table ignores
-what it does not know. Downgrade is untested.
+#### How the persisted schema evolves
+
+There is no migration script and no version table. `pg_ensure_schema()` runs the
+whole DDL as `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT
+EXISTS` / `CREATE INDEX IF NOT EXISTS` at every worker start, before recovery
+reads a single row, so the tables converge on whatever the running binary
+expects. Worker 0 runs it alone, so N workers do not race on it.
+
+Adding a column is therefore two edits, not one: the `CREATE TABLE` (which only
+covers clusters that do not exist yet) **and** an `ADD COLUMN IF NOT EXISTS ...
+DEFAULT ...` retrofit beside it (which covers every cluster that already does).
+Exactly one column has been added since the first release — `kv_ttl.kind`, so a
+TTL'd hash/list/set/zset recovers as its own type instead of a raw string — and
+it carries both halves.
+
+**Upgrading** — a newer binary against older tables — is what that buys. The
+retrofit runs ahead of recovery in the same worker, so by the time anything
+reads `supacache.kv_ttl` the column is there.
+
+**Downgrading** — an older binary against newer tables — works structurally.
+Every statement names its columns explicitly, so a column the old binary has
+never heard of is ignored on read and omitted on write. That is safe only
+because retrofitted columns carry a `DEFAULT`; a `NOT NULL` column added
+without one would make the old binary's `INSERT` fail outright. Neither
+direction loses a row.
+
+What both directions can lose is what a row *was*, in the one case where a
+column records meaning rather than data. `kv_ttl.kind` is that column, and it
+behaves the same way whichever direction you crossed it in: a TTL'd
+hash/list/set/zset that was persisted without it — written by an older binary,
+or written before the retrofit existed — carries the default `'s'`, so a
+current binary recovers it as a string. The bytes are intact, but `TYPE` says
+`string` and the aggregate's own commands answer `WRONGTYPE`. Rewriting the key
+fixes it permanently, since writes after the retrofit record the type again.
+Plain strings, and anything in `supacache.kv`, are unaffected.
+
+Both directions are asserted in section AC of `bench/run_durability_pg.sh`,
+which runs in CI: the upgrade case by dropping `kv_ttl.kind` to reproduce the
+pre-retrofit table exactly and restarting into it, the downgrade case by
+replaying the older binary's statements verbatim against today's tables — one
+row given the identical bytes of a live hash through the old column list, so
+that the type column is the only difference between a key that comes back a
+hash and a key that comes back a string. That section also fails if any future
+`NOT NULL` column lands without a default.
+
+The shared-memory segment is versioned separately (`pgks_v3` plus a layout
+version and the five geometry fields) and is never migrated: Postgres recreates
+it on every start. A mismatch is refused at attach time with the fields named
+rather than mis-read.
 
 ---
 

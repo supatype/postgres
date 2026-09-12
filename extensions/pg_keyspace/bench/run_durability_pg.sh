@@ -1369,6 +1369,120 @@ chk "and the window closes within the budget (took ${T}s)" "one_v3" \
     "$(psql_ "SELECT v FROM public.cc WHERE id=1")"
 
 echo ""
+echo "########## AC. persisted-data versioning, both directions (#42) ##########"
+# There is no migration script and no version table. `pg_ensure_schema` runs the
+# whole DDL as CREATE/ALTER ... IF NOT EXISTS at every worker start, before
+# recovery reads anything, so the schema converges on whatever the running
+# binary expects. That is the entire mechanism, and nothing asserted the two
+# properties it rests on.
+#
+# DOWNGRADE (new table, old binary) works only if every column the old binary
+# does not know is defaulted, because its INSERTs name columns explicitly and
+# simply omit them. That is a property of the table, so it needs no old binary
+# to check: replay the pre-#25 statements verbatim against today's tables.
+#
+# UPGRADE (old table, new binary) works only if every column the new binary
+# names is either original or carried by an ADD COLUMN IF NOT EXISTS retrofit.
+# One column has ever been added after the fact -- kv_ttl.kind, in #25 -- and it
+# has its retrofit. Dropping that column reproduces the pre-#25 table exactly,
+# so restarting into it is the real upgrade, not an approximation of one.
+rcli SET ver:plain v1            >/dev/null
+rcli SET ver:ttl v1 EX 3600      >/dev/null
+rcli DEL ver:hashttl             >/dev/null
+rcli HSET ver:hashttl f1 hv1     >/dev/null
+rcli EXPIRE ver:hashttl 3600     >/dev/null
+sleep 2
+chk "a TTL'd string persists with its kind" "s" "$(psql_ "SELECT kind FROM supacache.kv_ttl WHERE key='ver:ttl'::bytea")"
+chk "a TTL'd hash persists with its kind"   "h" "$(psql_ "SELECT kind FROM supacache.kv_ttl WHERE key='ver:hashttl'::bytea")"
+
+# --- downgrade: a binary that predates a column must still be able to write ---
+# The generic form of the rule, so a column added tomorrow is caught here rather
+# than by an operator rolling back. These five are supplied by every binary that
+# has ever written these tables; any other NOT NULL column without a default is
+# one an older binary could not satisfy.
+chk "no persisted column is NOT NULL without a default" "0" \
+    "$(psql_ "SELECT count(*) FROM information_schema.columns \
+              WHERE table_schema='supacache' AND table_name IN ('kv','kv_ttl') \
+                AND is_nullable='NO' AND column_default IS NULL \
+                AND column_name NOT IN ('tenant','key','slot','expires_at','bucket')")"
+
+# The concrete form: the pre-#25 INSERT, column list and all. Slot, expiry and
+# bucket come from the row the current binary just wrote, so the target
+# partition is known to exist and the arithmetic is not duplicated here.
+psql_ "INSERT INTO supacache.kv_ttl (tenant,key,slot,val,expires_at,bucket) \
+       SELECT '', 'ver:downgrade'::bytea, slot, val, expires_at, bucket \
+       FROM supacache.kv_ttl WHERE key='ver:ttl'::bytea" >/dev/null
+chk "an older binary's INSERT still succeeds against today's table" "1" \
+    "$(psql_ "SELECT count(*) FROM supacache.kv_ttl WHERE key='ver:downgrade'::bytea")"
+chk "and the column it did not know takes its default" "s" \
+    "$(psql_ "SELECT kind FROM supacache.kv_ttl WHERE key='ver:downgrade'::bytea")"
+# The pre-#25 read: still selectable, so nothing an old binary names has been
+# renamed or dropped out from under it.
+chk "an older binary's SELECT still resolves every column it names" "1" \
+    "$([ "$(psql_ "SELECT count(*) FROM (SELECT key, val, expires_at FROM supacache.kv_ttl) t")" -ge 1 ] && echo 1 || echo 0)"
+
+# What downgrade costs, set up as a controlled pair: ver:lostkind gets the exact
+# bytes of the hash at ver:hashttl, through the old column list, so the only
+# difference between the two rows is the one column the old binary cannot write.
+psql_ "INSERT INTO supacache.kv_ttl (tenant,key,slot,val,expires_at,bucket) \
+       SELECT '', 'ver:lostkind'::bytea, slot, val, expires_at, bucket \
+       FROM supacache.kv_ttl WHERE key='ver:hashttl'::bytea" >/dev/null
+chk "a hash written by an older binary records no type" "s" \
+    "$(psql_ "SELECT kind FROM supacache.kv_ttl WHERE key='ver:lostkind'::bytea")"
+
+stop_pg; sleep 1
+start_pg; wait_ready; sleep 5
+
+chk "a row an older binary wrote recovers" "v1" "$(rcli GET ver:downgrade)"
+chk "a row the current binary wrote keeps its type" "hash" "$(rcli TYPE ver:hashttl)"
+chk "and is still readable as one" "hv1" "$(rcli HGET ver:hashttl f1)"
+# Same bytes, same expiry, same partition -- only the kind column differs, and
+# that is the whole cost of a downgrade: the value survives, what it was does not.
+chk "the identical row without a type comes back as a string" "string" \
+    "$(rcli TYPE ver:lostkind)"
+chk "so hash commands refuse it rather than mis-read the bytes" "1" \
+    "$(rcli HGET ver:lostkind f1 | grep -c WRONGTYPE)"
+
+# --- upgrade: the pre-#25 table, met by today's binary -----------------------
+psql_ "ALTER TABLE supacache.kv_ttl DROP COLUMN kind" >/dev/null
+chk "the table is back in its pre-retrofit shape" "0" \
+    "$(psql_ "SELECT count(*) FROM information_schema.columns \
+              WHERE table_schema='supacache' AND table_name='kv_ttl' AND column_name='kind'")"
+# A row left behind by the old binary, written through the old column list.
+psql_ "INSERT INTO supacache.kv_ttl (tenant,key,slot,val,expires_at,bucket) \
+       SELECT '', 'ver:preretrofit'::bytea, slot, val, expires_at, bucket \
+       FROM supacache.kv_ttl WHERE key='ver:ttl'::bytea" >/dev/null
+chk "the old binary's row is there to be upgraded" "1" \
+    "$(psql_ "SELECT count(*) FROM supacache.kv_ttl WHERE key='ver:preretrofit'::bytea")"
+
+stop_pg; sleep 1
+start_pg; wait_ready; sleep 5
+
+chk "the retrofit put the column back" "1" \
+    "$(psql_ "SELECT count(*) FROM information_schema.columns \
+              WHERE table_schema='supacache' AND table_name='kv_ttl' AND column_name='kind'")"
+chk "and backfilled every pre-existing row with its default" "s" \
+    "$(psql_ "SELECT kind FROM supacache.kv_ttl WHERE key='ver:preretrofit'::bytea")"
+chk "recovery reads the upgraded table" "v1" "$(rcli GET ver:preretrofit)"
+# The cost of this direction, and the reason it is worth documenting: the column
+# did not exist when these rows were written, so the retrofit defaults them all
+# to 's'. An aggregate persisted by a pre-#25 binary comes back as a string and
+# its own commands refuse it until the key is rewritten. No row is lost; the
+# type is.
+chk "an aggregate persisted before the retrofit comes back untyped" "string" \
+    "$(rcli TYPE ver:hashttl)"
+chk "and its own commands refuse it until it is rewritten" "1" \
+    "$(rcli HGET ver:hashttl f1 | grep -c WRONGTYPE)"
+# The retrofitted column is a real column, not just a backfill: a write after
+# the upgrade records its type again, which is what makes the rewrite a fix.
+rcli DEL ver:afterfix        >/dev/null
+rcli HSET ver:afterfix f1 av1 >/dev/null
+rcli EXPIRE ver:afterfix 3600 >/dev/null
+sleep 2
+chk "a write after the upgrade records its type again" "h" \
+    "$(psql_ "SELECT kind FROM supacache.kv_ttl WHERE key='ver:afterfix'::bytea")"
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
