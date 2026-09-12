@@ -23,5 +23,6 @@ pub mod repl;
 pub mod resp;
 pub mod ring;
 pub mod server;
+pub mod share;
 pub mod shmem;
 pub mod store;

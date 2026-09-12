@@ -593,6 +593,49 @@ tenant cannot address or subscribe to another's. Point `tls_cert_file` /
 `tls_key_file` at a PEM cert+key to serve TLS (rotate by swapping the files and
 `SELECT pg_reload_conf()` — no restart).
 
+### Per-tenant share of the persistence ring
+
+Writes cross from the RESP worker to Postgres through one shared ring per
+persist shard, FIFO. Without a share, a tenant writing hard enough to keep that
+ring full starves every other tenant on it: their writes meet a full ring and
+park. Measured with a 1 MiB ring, 1 KiB values and eight flooding connections,
+against a victim tenant on one connection doing ordinary sequential writes:
+
+| over 10s, durable tier | share off | share on |
+|---|---:|---:|
+| victim writes | 1 | **10** |
+| victim p50 | 32.7 ms | **17.5 ms** |
+| victim worst | 32.7 ms | 50.5 ms |
+| flood writes | 17 572 | 9 670 |
+
+The victim's gain is around tenfold and holds across runs (1 → 25, 4 → 38,
+1 → 10 on three). The flood's own throughput moves in both directions between
+runs and is noise at this sample size, so the honest claim is that capping it
+does not collapse it, not that it helps.
+
+`pg_keyspace.tenant_ring_share` is on by default, and is inert until there is
+something to be fair about:
+
+- **Below half a ring nobody is policed.** A ring that is keeping up never sees
+  this change a decision.
+- **Connections with no tenant scope are never policed** — unauthenticated, or
+  an exempt service role — so a deployment that does not use tenant scoping is
+  unaffected.
+- **The share is dynamic**: a tenant may hold up to `capacity / active tenants`,
+  recomputed per decision, floored at 256 KiB. One tenant alone gets the whole
+  ring; two contending tenants get half each.
+
+A tenant counts as active from the moment it *attempts* a write, not from when
+it has bytes in flight — a tenant a full ring is shutting out holds nothing, and
+counting only occupancy makes the tenant that most needs the policy invisible to
+it.
+
+`INFO` reports a `# Tenants` section with in-flight bytes and how many writes
+have been held back, for the asking connection's own tenant (an unscoped or
+exempt connection sees every tenant). Measure it with
+`bench/run_tenant_fairness.sh`, which runs the same load with the share off and
+on and prints both.
+
 ### Configuration (GUCs)
 
 All are `Postmaster` context (set in `postgresql.conf`).
@@ -614,6 +657,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.rowcache_mb` | 64 | Mode B row-cache segment size (never RESP-addressable) |
 | `pg_keyspace.rowcache_decode` | `off` | keys-only Mode B invalidation worker (needs `wal_level=logical`) |
 | `pg_keyspace.rowcache_refill` | `off` | on: re-cache a changed hot key; off: drop-only (lazy) |
+| `pg_keyspace.tenant_ring_share` | `on` | give each tenant a share of the persistence ring instead of first come, first served |
 
 ### Sizing
 
@@ -700,7 +744,8 @@ harnesses, each named for what it checks: Redis parity for every type
 (`run_hardening.sh`, `run_tls.sh`, `run_threats.sh`, `run_security.sh`), Mode B
 row-cache coherence for int/uuid/text/TOAST PKs (`run_rowcache.sh`,
 `run_nonint_pk.sh`, `run_toast.sh`, `run_invalidation.sh`), tenant-scoped pub/sub
-(`run_pubsub_tenant.sh`), RESP3 typed replies and every `CLIENT TRACKING` mode
+(`run_pubsub_tenant.sh`) and the per-tenant ring share
+(`run_tenant_fairness.sh`), RESP3 typed replies and every `CLIENT TRACKING` mode
 (`run_resp3.sh`) including cross-worker invalidation (`run_tracking_xworker.sh`),
 real synchronous replication (`run_replication.sh`), a real PostgREST v12.2.3
 end-to-end (`run_postgrest_e2e.sh`), and scale-out (`run_scaleout.sh`,
@@ -831,9 +876,11 @@ Scoping for this version — the extension works; these are the edges to know:
   `pg_keyspace.watchdog_secs` (default 30, 0 disables). Set it to 0 if you need
   a worker to stay stopped.
 
-- **There are no per-tenant quotas.** Keys and channels are force-scoped to
-  `{tenant}:`, which is an isolation boundary, not an accounting one: one tenant
-  can evict another's hot data or fill the persistence ring.
+- **Per-tenant quotas cover the persistence ring only.** Keys and channels are
+  force-scoped to `{tenant}:`, which is an isolation boundary; the only axis
+  that is also *accounted* is ring capacity (`pg_keyspace.tenant_ring_share`,
+  below). Cache memory, request rate and worker placement still have no
+  per-tenant budget, so one tenant can evict another's hot data.
 - Operational metrics are partial. `supacache.stats()`, `ring_stats()`,
   `rowcache_stats()` and `replication_status()` exist, and `ring_stats()` reports
   commit lag, failed batches and unresolved references; row cache invalidation

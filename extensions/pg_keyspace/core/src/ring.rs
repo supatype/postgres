@@ -13,7 +13,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const HDR_ALIGN: usize = 64;
-const REC_HDR: usize = 16; // u32 + u32 + i64
+/// Bytes of record header: `[u32 key_len][u32 val_len][i64 expires]`. Public
+/// so the per-tenant share accounting can size a record the same way `push`
+/// does rather than re-deriving the number.
+pub const REC_HDR: usize = 16;
 
 /// One more than the largest value length a record can encode *inline*. The top
 /// byte of the `val_len` field carries the value's type tag, leaving 24 bits.
@@ -221,6 +224,31 @@ impl Producer {
     /// backpressure deadline). Rare and loud; surfaced via `Consumer::stats`.
     pub fn note_drop(&self) {
         unsafe { (*self.0.hdr).dropped.fetch_add(1, Ordering::Relaxed) };
+    }
+
+    /// The consumer's position: bytes it has released back to the ring.
+    ///
+    /// A record is out of the ring exactly when `head` has passed its end, and
+    /// records are released in order, so this is what the per-tenant share
+    /// accounting ([`crate::share::RingShare`]) reclaims against.
+    pub fn head(&self) -> u64 {
+        unsafe { (*self.0.hdr).head.load(Ordering::Acquire) }
+    }
+
+    /// The producer's position: bytes it has enqueued. Only this producer
+    /// writes it, so reading it unsynchronised is sound.
+    pub fn tail(&self) -> u64 {
+        unsafe { (*self.0.hdr).tail.load(Ordering::Relaxed) }
+    }
+
+    /// The ring's capacity in bytes (a power of two).
+    pub fn capacity(&self) -> u64 {
+        self.0.mask + 1
+    }
+
+    /// Bytes currently in flight: pushed but not yet released by the consumer.
+    pub fn used(&self) -> u64 {
+        self.tail().saturating_sub(self.head())
     }
 
     /// The number of records durably committed so far (for durable sync-ack).
