@@ -306,9 +306,9 @@ schema_bytes() {
   psql_ "SELECT coalesce(sum(pg_total_relation_size(c.oid)),0)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='supacache' AND c.relkind IN ('r','p','i')"
 }
 
-printf '\n%-8s %-7s %-6s %-12s %-11s %-9s %-8s %-10s %-9s %s\n' \
-  "skew" "rate" "pages" "achieved/s" "WAL total" "B/write" "B/row" "rows" "dedup" "dead"
-printf -- '-------------------------------------------------------------------------------------------------------\n'
+printf '\n%-8s %-7s %-6s %-11s %-10s %-9s %-7s %-10s %-8s %s\n' \
+  "skew" "rate" "pages" "achieved/s" "WAL total" "B/write" "FPI" "rows" "B/row" "dedup"
+printf -- '------------------------------------------------------------------------------------------------\n'
 
 # One configuration, measured twice: cold is the pass straight after a
 # CHECKPOINT and carries the full-page images, warm is the pass straight after
@@ -343,7 +343,14 @@ run_one() { # run_one <skew> <rate> <prefix>
     local wal
     wal=$(psql_ "SELECT pg_wal_lsn_diff('$lsn1','$lsn0')::bigint")
     wal_stats "$lsn0" "$lsn1"
-    printf '%-8s %-7s %-6s %-11s %-10s %-9s %-7s %-10s %-8s %s\n' \
+    # An offered rate the load could not actually reach would otherwise read as
+    # a measured point. Mark it, because the row is then a max-rate row wearing
+    # someone else's label.
+    local mark=""
+    if [ "$rate" != "0" ]; then
+      mark=$(awk -v a="${achieved:-0}" -v r="$rate" 'BEGIN{ print (a < 0.8*r) ? " (not reached)" : "" }')
+    fi
+    printf '%-8s %-7s %-6s %-11s %-10s %-9s %-7s %-10s %-8s %s%s\n' \
       "$skew" "$([ "$rate" = 0 ] && echo max || echo "$rate")" "$pass" \
       "$(awk -v r="${achieved:-0}" 'BEGIN{printf "%.0f", r}')" \
       "$(awk -v w="$wal" 'BEGIN{printf "%.1f MB", w/1048576}')" \
@@ -351,7 +358,8 @@ run_one() { # run_one <skew> <rate> <prefix>
       "$(awk -v f="${WS_FPI:-0}" -v c="${WS_BYTES:-0}" 'BEGIN{ if (c>0) printf "%.0f%%", 100*f/c; else print "-" }')" \
       "${WS_ROWS:-0}" \
       "$(awk -v w="$wal" -v r="${WS_ROWS:-0}" 'BEGIN{ if (r>0) printf "%.0f", w/r; else print "-" }')" \
-      "$(awk -v n="$WRITES" -v r="${WS_ROWS:-0}" 'BEGIN{ if (r>0) printf "%.1fx", n/r; else print "-" }')"
+      "$(awk -v n="$WRITES" -v r="${WS_ROWS:-0}" 'BEGIN{ if (r>0) printf "%.1fx", n/r; else print "-" }')" \
+      "$mark"
     # Growth is reported once, across both measured passes: these are pure
     # overwrites of rows that already existed, so whatever the schema gains is
     # dead versions waiting on autovacuum rather than new data.
@@ -451,9 +459,13 @@ psql_ "SELECT relname||': '||n_tup_ins||' ins, '||n_tup_upd||' upd, '||n_dead_tu
 STAT_SUM=$(psql_ "SELECT coalesce(sum(n_tup_ins+n_tup_upd),0)::bigint FROM pg_stat_user_tables WHERE schemaname='supacache'")
 if [ "${STAT_SUM:-0}" = "0" ]; then
   echo "-> zero rows written, according to the statistics views. The WAL above says otherwise."
-  echo "   The counters are pending inside the persist worker and are flushed only when it exits,"
-  echo "   so they are unusable for monitoring a running cluster and unusable as an autovacuum"
-  echo "   trigger. Overwrites still leave dead tuples; nothing is counting them."
+  echo "   The counters are pending inside the persist worker and reach shared memory only when"
+  echo "   it exits: stop the cluster and restart it and they appear in full. So for the whole"
+  echo "   life of a running cluster there is no visibility into cache write volume, and"
+  echo "   autovacuum -- whose thresholds are computed from these same counters -- cannot be"
+  echo "   triggered by any of this activity. See #77. Bloat survives it in the workload above"
+  echo "   because cache overwrites are HOT updates that page pruning reclaims without a vacuum,"
+  echo "   which is what the growth line beside each configuration is measuring."
 fi
 
 stop_pg
