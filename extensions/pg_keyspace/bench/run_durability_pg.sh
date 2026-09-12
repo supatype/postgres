@@ -1141,6 +1141,54 @@ UNION ALL SELECT v FROM public.inv66 WHERE id=200"
 fi
 
 echo ""
+echo "########## Z. recovery says so when the persisted set does not fit (#42) ##########"
+# Recovery loads every persisted key for this worker's slot range into the
+# segment. When the segment is smaller than that set, CLOCK eviction quietly
+# makes room as it loads and the cache comes back partial: every lookup still
+# answers, some of them with a miss for a key that is durably stored and was
+# never deleted. Nothing said so. pg_keyspace.keys is Postmaster-level, so the
+# way in is to persist under one size and recover under a smaller one.
+BULK=${PGKS_BULK_FILE:-/tmp/pgks_recov_bulk.txt}
+BULK_N=${PGKS_BULK_N:-2000}
+ZLOG=${PGKS_Z_LOG:-/tmp/pgks_recov_log.txt}
+seq 1 $BULK_N | awk '{print "SET recov:"$1" v"$1}' > $BULK
+# One redis-cli for the lot. The durable tier holds each ack until its record
+# commits, so this is deliberately a few thousand sequential round trips.
+timeout 180 redis-cli -p $RESP < $BULK >/dev/null 2>&1
+sleep 3
+KV_BEFORE=$(psql_ "SELECT count(*) FROM supacache.kv")
+chk "the bulk write persisted" "1" "$([ "${KV_BEFORE:-0}" -ge "$BULK_N" ] && echo 1 || echo 0)"
+
+stop_pg; sleep 1
+# 1024 is the floor the extension clamps to, which is ~1142 entries — well under
+# what was just persisted.
+set_conf "pg_keyspace.keys" "1024"
+LOG_Z=$(wc -l < $PGDATA/log)
+start_pg; wait_ready; sleep 4
+tail -n +$((LOG_Z+1)) $PGDATA/log > $ZLOG
+
+chk "recovery announces itself before it starts" "1" \
+    "$([ "$(countlog 'recovering slots' $ZLOG)" -ge 1 ] && echo 1 || echo 0)"
+chk "recovery warns that the cache came back partial" "1" \
+    "$([ "$(countlog 'recovery evicted' $ZLOG)" -ge 1 ] && echo 1 || echo 0)"
+chk "the warning names the setting to raise" "1" \
+    "$([ "$(countlog 'pg_keyspace.keys' $ZLOG)" -ge 1 ] && echo 1 || echo 0)"
+
+ENTRIES=$(psql_ "SELECT coalesce(sum(entries),0)::bigint FROM supacache.stats()")
+chk "the cache really did come back short" "1" \
+    "$([ "${ENTRIES:-0}" -lt "$BULK_N" ] && echo 1 || echo 0)"
+# The whole point of warning: the rows are all still there, the cache is not.
+KV_AFTER=$(psql_ "SELECT count(*) FROM supacache.kv")
+chk "nothing durable was lost, only cached" "$KV_BEFORE" "$KV_AFTER"
+
+# Put the size back, so anything added after this section sees the cluster the
+# rest of the suite expects.
+stop_pg; sleep 1
+set_conf "pg_keyspace.keys" "20000"
+start_pg; wait_ready; sleep 2
+chk "the cluster is healthy again at the original size" "1" "$(psql_ "SELECT 1")"
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
