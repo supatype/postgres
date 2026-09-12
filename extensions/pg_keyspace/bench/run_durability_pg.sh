@@ -1767,6 +1767,48 @@ start_pg; wait_ready; sleep 2
 chk "the cluster is healthy again at the original row-cache size" "1" "$(psql_ "SELECT 1")"
 
 echo ""
+echo "########## AH. a busy cache does not un-register its own tables (#87) ##########"
+# rowcache_register stored the pk attnum as an ordinary entry in the row cache,
+# competing with the cached rows for the same arena and the same CLOCK eviction.
+# Evicted, rc_pathlist_hook found no registration and stopped substituting the
+# CustomScan for that table, so caching silently turned itself off under exactly
+# the load it exists to serve. No wrong answers -- reads fall back to the heap --
+# but the feature stops working and nothing reports it.
+stop_pg; sleep 1
+set_conf "pg_keyspace.rowcache_mb" "1"
+start_pg; wait_ready; sleep 2
+psql_ "DROP TABLE IF EXISTS public.rp CASCADE" >/dev/null 2>&1
+psql_ "CREATE TABLE public.rp(id bigint primary key, v text)" >/dev/null
+psql_ "INSERT INTO public.rp SELECT g, repeat('x',900)||g FROM generate_series(1,4000) g" >/dev/null
+psql_ "SELECT supacache.rowcache_register('public.rp', 1)" >/dev/null
+psql_ "SELECT supacache.rowcache_put('public.rp', 7)" >/dev/null
+# Without this the section proves nothing: if the table were never usable from
+# the cache, "still usable after pressure" would hold trivially.
+chk "the table is cached before any pressure" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.rp WHERE id=7" | grep -c 'pg_keyspace_rowcache')"
+psql_ "SELECT count(*) FROM (SELECT supacache.rowcache_put('public.rp', g) FROM generate_series(100,3900) g) t" >/dev/null
+RP_ENTRIES=$(psql_ "SELECT sum(entries)::text FROM supacache.rowcache_stats()")
+# The pressure has to be real, or the registration was never at risk.
+chk "the cache filled and evicted (holding $RP_ENTRIES of 3801 put)" "1" \
+    "$([ "${RP_ENTRIES:-0}" -lt 3801 ] && echo 1 || echo 0)"
+# Re-cache the row and ask the planner again. If the registration was evicted,
+# rc_pathlist_hook declines and this is 0 however many times the row is put.
+psql_ "SELECT supacache.rowcache_put('public.rp', 7)" >/dev/null
+chk "the table is still registered after the cache filled" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.rp WHERE id=7" | grep -c 'pg_keyspace_rowcache')"
+chk "and the row still reads correctly" "901" "$(psql_ "SELECT length(v) FROM public.rp WHERE id=7")"
+# Pinning exempts an entry from eviction; it must not exempt it from an explicit
+# unregister, or a table could never be taken back out of the cache.
+psql_ "SELECT supacache.rowcache_unregister('public.rp')" >/dev/null
+chk "unregistering still works on a pinned registration" "0" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.rp WHERE id=7" | grep -c 'pg_keyspace_rowcache')"
+
+stop_pg; sleep 1
+set_conf "pg_keyspace.rowcache_mb" "64"
+start_pg; wait_ready; sleep 2
+chk "the cluster is healthy again at the original row-cache size" "1" "$(psql_ "SELECT 1")"
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
