@@ -982,6 +982,13 @@ else
   # Burn WAL until the filesystem holding it cannot take another byte.
   psql_ "CREATE TABLE IF NOT EXISTS supacache.wal_filler(b bytea)" >/dev/null 2>&1
   psql_ "ALTER TABLE supacache.wal_filler ALTER COLUMN b SET STORAGE EXTERNAL" >/dev/null 2>&1
+  # Remember where the log is now, so the assertions below read exactly this
+  # section's output. A fixed tail cannot: how much Postgres writes after the
+  # PANIC (restart attempts, recovery chatter) varies run to run, and when it
+  # runs long the line naming the cause falls off the end of the window while
+  # the PANIC itself is still there — which reads as "it went down for some
+  # other reason" and fails a row that is actually fine.
+  LOG_X=$(wc -l < $PGDATA/log)
   DOWN=0
   for i in $(seq 1 150); do
     psql_ "INSERT INTO supacache.wal_filler SELECT repeat('w', 1000000)::bytea" >/dev/null 2>&1
@@ -997,7 +1004,8 @@ else
       echo "PASS  Postgres PANICked on the WAL write rather than continuing"; pass=$((pass+1))
     else
       echo "FAIL  the server went down without a PANIC in the log"; fail=$((fail+1)); fi
-    chk_contains "the cause is recorded as a storage failure" "No space left" "$(tail -200 $PGDATA/log)"
+    chk_contains "the cause is recorded as a storage failure" "No space left" \
+        "$(tail -n +$((LOG_X+1)) $PGDATA/log)"
 
     # The realistic recovery: give the WAL filesystem more room. Nothing can be
     # freed from inside, because freeing WAL needs a checkpoint, and a
