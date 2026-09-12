@@ -1738,14 +1738,22 @@ chk "the row under test is served from the cache at plan time" "1" \
 # nothing and the section passes without testing anything. The "really was
 # evicted" assertion below exists to catch exactly that, and did.
 # The last bare line of the session is the second EXECUTE's result.
-EV_AFTER=$(timeout 300 $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tA <<'SQL' 2>&1 | tail -1
+# Sentinels around the second EXECUTE rather than `tail -1`: when it returns no
+# rows psql prints nothing, and the last line is then whatever came before it --
+# which reported the failure as the eviction count, an opaque number that looks
+# like a value. Between the markers, empty means empty.
+EV_RAW=$(timeout 300 $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tA <<'SQL' 2>&1
 SET plan_cache_mode = force_generic_plan;
 PREPARE p AS SELECT length(v) FROM public.ev WHERE id = 2;
 EXECUTE p;
 SELECT count(*) FROM (SELECT supacache.rowcache_put('public.ev', g) FROM generate_series(100,3900) g) t;
+\echo RCBEGIN
 EXECUTE p;
+\echo RCEND
 SQL
 )
+EV_AFTER=$(echo "$EV_RAW" | awk '/^RCBEGIN$/{f=1;next} /^RCEND$/{f=0} f' | tr -d '[:space:]')
+[ -z "$EV_AFTER" ] && EV_AFTER="NOROWS"
 chk "a cached plan still returns the row after its cache entry is evicted (got '${EV_AFTER:-}')" "$EV_HEAP" "$EV_AFTER"
 # And the entry really was gone, or the assertion above passed without testing
 # anything: a fresh plan for the same row must now take the heap path.
