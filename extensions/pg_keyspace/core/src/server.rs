@@ -213,6 +213,13 @@ pub const MAX_HELD_REPLY_BYTES: usize = 1 << 20;
 /// passes, small enough that a flood cannot monopolise the loop.
 pub const MAX_COMMANDS_PER_PASS: usize = 256;
 
+/// How long the loop may sleep while a connection is parked on a full ring.
+///
+/// Short enough that the connection resumes promptly once the persist worker
+/// frees space, long enough that waiting is a sleep rather than a spin. A zero
+/// timeout here starves the very worker whose progress the park is waiting for.
+pub const PARKED_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
 /// Reply for a write the store could not hold. Redis uses this exact text when
 /// memory pressure prevents a write, and clients special-case it, so reusing it
 /// means an existing client library handles the condition it already knows.
@@ -672,10 +679,17 @@ impl Worker {
                 }
                 Tick::Continue => {}
             }
-            // Work that no readability event will announce (a backlogged read
-            // buffer, a park waiting on ring space) must not wait on the poll.
-            let timeout = if self.has_pending_work() {
+            // Work that no readability event will announce must not wait on the
+            // poll at all; a park, which waits on the persist worker rather than
+            // on this loop, gets a short bounded wait so the retry is prompt
+            // without spinning.
+            let timeout = if self.has_runnable_work() {
                 Some(Duration::from_millis(0))
+            } else if self.has_parked_work() {
+                Some(match timeout {
+                    Some(t) => t.min(PARKED_RETRY_INTERVAL),
+                    None => PARKED_RETRY_INTERVAL,
+                })
             } else {
                 timeout
             };
@@ -854,10 +868,24 @@ impl Worker {
         }
     }
 
-    /// True while any connection still owes work that no poll event will wake:
-    /// a backlogged read buffer, or a park waiting on ring space.
-    fn has_pending_work(&self) -> bool {
-        self.conns.values().any(|c| c.backlogged || c.parked)
+    /// True while some connection has work this loop can actually make progress
+    /// on right now: bytes already read off its socket that no poll event will
+    /// announce.
+    ///
+    /// Deliberately NOT true for a parked connection. Parked means waiting on
+    /// the persist worker to free ring space, which this loop cannot hurry;
+    /// treating it as runnable turns the retry into a busy spin that burns the
+    /// core the persist worker and every other connection need. Measured, that
+    /// spin was worth a 1.3 s tail on an unrelated connection. Parked
+    /// connections get a short bounded wait instead, via `poll_timeout`.
+    fn has_runnable_work(&self) -> bool {
+        self.conns.values().any(|c| c.backlogged)
+    }
+
+    /// True while a connection is parked on a full ring, so the loop should
+    /// come back promptly to retry rather than sleeping out its full timeout.
+    fn has_parked_work(&self) -> bool {
+        self.conns.values().any(|c| c.parked)
     }
 
     /// Send the held reply for any connection whose durable write(s) have now
