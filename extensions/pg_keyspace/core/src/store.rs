@@ -35,6 +35,14 @@ const BUCKET_TOMB: u32 = u32::MAX;
 
 const FLAG_OCCUPIED: u32 = 1;
 const FLAG_REF: u32 = 2; // CLOCK reference bit
+/// Never evicted. For entries that are configuration rather than cache
+/// content, whose loss silently changes behaviour instead of costing a lookup.
+///
+/// Pinned entries are still deleted on request and still expire on TTL; only
+/// the CLOCK sweep skips them. Keep their number small and bounded: an arena
+/// that is entirely pinned cannot free space, and `ensure_alloc` then fails the
+/// write rather than looping, so caching degrades to not caching.
+const FLAG_PINNED: u32 = 4;
 
 pub const KIND_STR: u32 = b's' as u32;
 /// aggregate kinds: value blob is a serialized hash/list/sorted-set.
@@ -760,6 +768,37 @@ impl Store {
         }
     }
 
+    /// Store `key` and mark it never-evictable (see `FLAG_PINNED`).
+    ///
+    /// For entries whose disappearance changes behaviour rather than costing a
+    /// lookup — the row cache's table registrations are the case this exists
+    /// for: they live in the same arena as the cached rows, so a busy cache
+    /// evicted them and silently stopped caching the very tables it was
+    /// configured for.
+    ///
+    /// Sets the flag after the write so it survives an update of an existing
+    /// entry as well as a fresh insert.
+    pub fn set_pinned(&self, key: &[u8], val: &[u8]) -> bool {
+        if !self.set_typed(key, val, 0, KIND_STR) {
+            return false;
+        }
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            if let Some(b) = found {
+                let idx = *self.buckets_ptr(p).add(b) - 1;
+                (*self.entries_ptr(p).add(idx as usize)).flags |= FLAG_PINNED;
+                true
+            } else {
+                // Written and then evicted before the flag landed, which an
+                // arena under pressure can do. The caller sees the failure
+                // rather than a registration that is not actually pinned.
+                false
+            }
+        }
+    }
+
     /// Like `get`, but also returns the entry's `kind` and absolute expiry (0 =
     /// none) so a caller can enforce `WRONGTYPE` and preserve TTL on read-modify-
     /// write of an aggregate. Lazy-expires like `get`.
@@ -1167,6 +1206,15 @@ impl Store {
                     }
                     continue;
                 }
+                // Pinned: configuration, not cache content. Skipped without
+                // touching its reference bit, exactly like a staged write.
+                if (*e).flags & FLAG_PINNED != 0 {
+                    scanned += 1;
+                    if scanned > bump * 2 + 4 {
+                        return false;
+                    }
+                    continue;
+                }
                 if (*e).flags & FLAG_REF != 0 {
                     (*e).flags &= !FLAG_REF;
                 } else {
@@ -1547,6 +1595,49 @@ mod tests {
         assert!(st.evictions > 0, "expected evictions, got {}", st.evictions);
         // latest key must still be present
         assert!(matches!(s.get(b"key4999"), Lookup::Hit(_)));
+    }
+
+    #[test]
+    fn pinned_entries_survive_eviction_pressure() {
+        // Same pressure as `eviction_under_pressure`, with one pinned entry
+        // written first. Ordinary entries are evicted around it; the pinned one
+        // must still be readable at the end.
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 64 * 1024,
+        };
+        let s = Store::create("t_pinned", &cfg).unwrap();
+        assert!(s.set_pinned(b"registration", b"cfg"), "pinned write");
+        for i in 0..5000u32 {
+            let k = format!("key{i}");
+            assert!(s.set(k.as_bytes(), b"0123456789abcdef", 0), "set {i}");
+        }
+        // The pressure has to be real, or the survival below proves nothing.
+        let st = s.stats(0);
+        assert!(st.evictions > 0, "expected evictions, got {}", st.evictions);
+        match s.get(b"registration") {
+            Lookup::Hit(v) => assert_eq!(v, b"cfg"),
+            Lookup::Miss => panic!("pinned entry was evicted after {} evictions", st.evictions),
+        }
+    }
+
+    #[test]
+    fn pinned_entries_are_still_deletable() {
+        // Pinning exempts an entry from the CLOCK sweep, not from an explicit
+        // delete -- otherwise rowcache_unregister could never take effect.
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 256,
+            entries_per_part: 128,
+            data_bytes_per_part: 32 * 1024,
+        };
+        let s = Store::create("t_pinned_del", &cfg).unwrap();
+        assert!(s.set_pinned(b"reg", b"v"));
+        assert!(matches!(s.get(b"reg"), Lookup::Hit(_)));
+        assert!(s.del(b"reg"));
+        assert!(matches!(s.get(b"reg"), Lookup::Miss));
     }
 
     #[test]

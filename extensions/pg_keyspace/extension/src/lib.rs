@@ -3503,7 +3503,12 @@ mod supacache {
             None => return false,
         };
         let attn = (pk_attnum as i16).to_le_bytes();
-        view.set(&rc_reg_key(relid.as_u32()), &attn, 0)
+        // Pinned: a registration is configuration, not cache content. Stored as
+        // an ordinary entry it competed with the cached rows for the same arena,
+        // so a busy cache evicted it and rc_pathlist_hook then stopped
+        // substituting for the table -- caching silently turned itself off under
+        // exactly the load it exists to serve (#87).
+        view.set_pinned(&rc_reg_key(relid.as_u32()), &attn)
     }
 
     /// Drop a relation's registration; the planner stops substituting for it.
