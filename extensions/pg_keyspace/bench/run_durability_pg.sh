@@ -87,10 +87,25 @@ wait_coherent() {
 # decode interval: once it does, the worker has caught up with this table and
 # every assertion after it is deterministic. Returns 1 if it settled, 0 if not.
 wait_rowcache_quiet() {
-  local tbl=$1 pk=$2 tries=${3:-45}
+  local tbl=$1 pk=$2 budget=${3:-180}
+  # Wait longer than one decode pass per attempt, or this samples the wrong
+  # timescale entirely: it can call a table quiesced while an invalidation for
+  # it is still a fraction of an interval away, and under a real backlog it
+  # never sees a surviving canary at all.
+  #
+  # Derived from the configured interval rather than hard-coded. The first
+  # version slept a flat 2s, which is four passes at the 500ms interval used
+  # when it was written and HALF a pass at the 4000ms CI uses -- so it encoded
+  # its author's local configuration and timed out in CI.
+  local ms
+  ms=$(psql_ "SHOW pg_keyspace.rowcache_decode_ms" | tr -d '[:space:]')
+  local step=$(( (${ms:-500} * 2 + 999) / 1000 ))
+  [ "$step" -lt 2 ] && step=2
+  local tries=$(( budget / step ))
+  [ "$tries" -lt 3 ] && tries=3
   for _ in $(seq 1 "$tries"); do
     psql_ "SELECT supacache.rowcache_put('$tbl', $pk)" >/dev/null
-    sleep 2
+    sleep "$step"
     [ -n "$(psql_ "SELECT supacache.rowcache_cached_has_external('$tbl', ${pk}::bigint)")" ] && { echo 1; return; }
   done
   echo 0
