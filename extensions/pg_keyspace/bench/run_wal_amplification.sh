@@ -266,26 +266,40 @@ echo "full_page_writes=$(psql_ "SHOW full_page_writes"), wal_level=$(psql_ "SHOW
 # Sets three globals: WS_BYTES (combined WAL size), WS_FPI (of which full-page
 # images) and WS_ROWS (heap row versions written).
 wal_stats() { # wal_stats <lsn0> <lsn1>
-  local out
-  out=$($PGBIN/pg_waldump -p $PGDATA/pg_wal --start="$1" --end="$2" --stats=record 2>/dev/null)
-  # Each row is "Type  N (pct)  record (pct)  FPI (pct)  combined (pct)", and
-  # the percentages are sometimes " ( 1.23)" and sometimes "(100.00)" -- two
-  # fields or one, depending on the value. Strip every parenthesised group
-  # first and the columns are fixed, which they are not if you index into the
-  # raw line. The Total line is skipped or every sum would be doubled.
-  read -r WS_BYTES WS_FPI WS_ROWS <<<"$(echo "$out" | awk '
-    /^Total/ { next }
-    /^[A-Za-z0-9_]+\// {
-      line = $0
-      gsub(/\([^)]*\)/, "", line)
-      sub(/^[ \t]+/, "", line)
-      n = split(line, f, /[ \t]+/)
-      if (n < 5) next
-      if (f[1] == "Heap/INSERT" || f[1] == "Heap/UPDATE" || f[1] == "Heap/HOT_UPDATE") rows += f[2]
-      fpi += f[4]; comb += f[5]
-    }
-    END { printf "%d %d %d", comb+0, fpi+0, rows+0 }')"
+  local out err attempt
+  WS_BYTES=0; WS_FPI=0; WS_ROWS=0; WS_ERR=""
+  for attempt in 1 2; do
+    err=$($PGBIN/pg_waldump -p $PGDATA/pg_wal --start="$1" --end="$2" --stats=record 2>&1 >/tmp/pgks_waldump.out)
+    out=$(cat /tmp/pgks_waldump.out)
+    # Each row is "Type  N (pct)  record (pct)  FPI (pct)  combined (pct)", and
+    # the percentages are sometimes " ( 1.23)" and sometimes "(100.00)" -- two
+    # fields or one, depending on the value. Strip every parenthesised group
+    # first and the columns are fixed, which they are not if you index into the
+    # raw line. The Total line is skipped or every sum would be doubled.
+    read -r WS_BYTES WS_FPI WS_ROWS <<<"$(echo "$out" | awk '
+      /^Total/ { next }
+      /^[A-Za-z0-9_]+\// {
+        line = $0
+        gsub(/\([^)]*\)/, "", line)
+        sub(/^[ \t]+/, "", line)
+        n = split(line, f, /[ \t]+/)
+        if (n < 5) next
+        if (f[1] == "Heap/INSERT" || f[1] == "Heap/UPDATE" || f[1] == "Heap/HOT_UPDATE") rows += f[2]
+        fpi += f[4]; comb += f[5]
+      }
+      END { printf "%d %d %d", comb+0, fpi+0, rows+0 }')"
+    [ "${WS_BYTES:-0}" -gt 0 ] && { WS_ERR=""; return 0; }
+    # A read that came back with nothing at all is a failed read, not a window
+    # in which nothing was written -- these windows always contain commits. It
+    # is worth one retry (a segment can be mid-recycle), and if it fails again
+    # the row must say so rather than print a dash that reads like a zero.
+    WS_ERR=$(echo "$err" | head -1)
+    sleep 1
+  done
+  WS_ERR="${WS_ERR:-pg_waldump returned no records}"
+  return 1
 }
+
 # After every write is acknowledged the data is already committed -- the durable
 # tier holds each ack until then -- so this is a quiescence check rather than a
 # drain: wait for the WAL to stop moving before reading its end position, so a
@@ -347,8 +361,12 @@ run_one() { # run_one <skew> <rate> <prefix>
     # a measured point. Mark it, because the row is then a max-rate row wearing
     # someone else's label.
     local mark=""
+    # A failed WAL read must not pass as a measurement: the row keeps its WAL
+    # total, which comes from pg_current_wal_lsn and is always trustworthy, and
+    # says plainly that the breakdown is missing.
+    [ -n "${WS_ERR:-}" ] && mark=" (waldump failed: $WS_ERR)"
     if [ "$rate" != "0" ]; then
-      mark=$(awk -v a="${achieved:-0}" -v r="$rate" 'BEGIN{ print (a < 0.8*r) ? " (not reached)" : "" }')
+      mark="$mark$(awk -v a="${achieved:-0}" -v r="$rate" 'BEGIN{ print (a < 0.8*r) ? " (not reached)" : "" }')"
     fi
     printf '%-8s %-7s %-6s %-11s %-10s %-9s %-7s %-10s %-8s %s%s\n' \
       "$skew" "$([ "$rate" = 0 ] && echo max || echo "$rate")" "$pass" \
