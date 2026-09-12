@@ -2287,12 +2287,32 @@ fn ensure_decode_slot(slot: &str) -> Result<(), String> {
     }))
 }
 
-/// How many change records one drain pass peeks at most. The server checks this
-/// limit only at transaction boundaries, so a batch always ends on a complete
-/// transaction and the LSN we advance to is never mid-transaction. Bounded at
-/// all because the batch is materialised in worker memory, and a backlog (the
-/// worker down for a while, or one bulk UPDATE) is otherwise unbounded.
-const DRAIN_MAX_CHANGES: i32 = 10_000;
+/// How much WAL one drain pass consumes at most.
+///
+/// A pass decodes a bounded *window* of WAL rather than a bounded number of
+/// changes, because the slot is advanced to the end of the window and that
+/// only works if the window is an LSN the caller chose. Bounded at all because
+/// the batch is materialised in worker memory, and a backlog (the worker down
+/// for a while, or one bulk UPDATE) is otherwise unbounded.
+///
+/// A transaction larger than this window is not a problem: the window simply
+/// does not reach its commit, nothing of it is decoded, the slot advances to
+/// the last commit that fits, and the next pass extends the window. Progress is
+/// guaranteed either way.
+const DRAIN_MAX_WAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Parse a `X/Y` LSN into the 64-bit position Postgres stores it as.
+fn lsn_parse(s: &str) -> Option<u64> {
+    let (hi, lo) = s.split_once('/')?;
+    let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
+    let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
+    Some((hi << 32) | lo)
+}
+
+/// Render a 64-bit position back into Postgres's `X/Y` LSN text.
+fn lsn_text(v: u64) -> String {
+    format!("{:X}/{:X}", v >> 32, v & 0xFFFF_FFFF)
+}
 
 /// What one drain pass did.
 #[derive(Default)]
@@ -2301,8 +2321,9 @@ struct Drain {
     reconciled: u64,
     /// Records the plugin emitted that `parse_change` could not read.
     unparsed: u64,
-    /// The batch came back at `DRAIN_MAX_CHANGES`, so more is probably pending
-    /// and the caller should come straight back instead of sleeping.
+    /// The pass stopped at its WAL window rather than at the end of the log, so
+    /// more is already pending and the caller should come straight back instead
+    /// of sleeping.
     full: bool,
 }
 
@@ -2339,46 +2360,84 @@ fn drain_invalidations(slot: &str) -> Drain {
         Some(v) => v,
         None => return Drain::default(),
     };
-    // Phase 1: peek. Non-destructive, so the slot stays put until phase 3.
-    // `lsn::text` because pg_lsn has no pgrx datum mapping and the value only
-    // ever travels back into pg_replication_slot_advance.
-    let (changes, unparsed, batch_end, rows) =
-        BackgroundWorker::transaction(AssertUnwindSafe(|| {
-            let mut out: Vec<(char, u32, Vec<u8>)> = Vec::new();
-            let mut bad = 0u64;
-            let mut end: Option<String> = None;
-            let mut rows = 0usize;
-            let _ = Spi::connect(|client| {
-                let t = client.select(
-                    "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
-                    None,
-                    Some(vec![
-                        (PgBuiltInOids::TEXTOID.oid(), slot.into_datum()),
-                        (PgBuiltInOids::INT4OID.oid(), DRAIN_MAX_CHANGES.into_datum()),
-                    ]),
-                )?;
-                for row in t {
-                    let lsn: String = row.get::<String>(1)?.unwrap_or_default();
-                    let data: String = row.get::<String>(2)?.unwrap_or_default();
-                    rows += 1;
-                    // Advance past every record the batch returned, parseable or
-                    // not: an unparseable one will never parse, so holding the
-                    // slot for it would stall the channel permanently.
-                    if !lsn.is_empty() {
-                        end = Some(lsn);
-                    }
-                    match parse_change(&data) {
-                        Some(c) => out.push(c),
-                        // Counted and logged rather than dropped in silence: a
-                        // plugin/format mismatch would otherwise degrade the
-                        // cache with no symptom but wrong answers.
-                        None => bad += 1,
-                    }
+    // Phase 1: pick the window, then peek it. Non-destructive, so the slot
+    // stays put until phase 3.
+    //
+    // The window is chosen FIRST and everything after is expressed in terms of
+    // it, because the slot has to be advanced to an LSN this code names. The
+    // obvious alternative -- decode a batch and advance to the last change's
+    // LSN -- does not work, and failed silently: a change's LSN lies before its
+    // own transaction's commit record, and `pg_replication_slot_advance` only
+    // ever moves `confirmed_flush_lsn` to a commit it has passed. Advancing to
+    // the last change of the last transaction therefore left the slot exactly
+    // where it was. Nothing errored. The same changes came back on the next
+    // poll, and the next, invalidating anything the cache had warmed in between
+    // -- so with decode on, the row cache could never hold an entry for longer
+    // than one poll interval, and the slot pinned WAL forever.
+    //
+    // `lsn::text` throughout because pg_lsn has no pgrx datum mapping, and the
+    // arithmetic (`lsn_parse`/`lsn_text`) is done here rather than in SQL
+    // because `pg_lsn + numeric` only exists from PostgreSQL 15.
+    let window = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::connect(|client| {
+            let t = client.select(
+                "SELECT confirmed_flush_lsn::text, restart_lsn::text, \
+                 pg_current_wal_lsn()::text FROM pg_replication_slots WHERE slot_name = $1",
+                None,
+                Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())]),
+            )?;
+            let mut out = None;
+            for row in t {
+                let confirmed = row.get::<String>(1)?.or(row.get::<String>(2)?);
+                let current = row.get::<String>(3)?;
+                out = confirmed.zip(current);
+            }
+            Ok::<_, pgrx::spi::Error>(out)
+        })
+        .ok()
+        .flatten()
+    }));
+    let (from, current) = match window.as_ref().and_then(|(c, n)| {
+        lsn_parse(c).zip(lsn_parse(n))
+    }) {
+        Some(v) => v,
+        // No slot row, or an LSN that did not parse: nothing safe to advance
+        // to, so do nothing this pass rather than guess.
+        None => return Drain::default(),
+    };
+    // Cap the pass at a window of WAL rather than at a number of changes, so the
+    // point the slot is advanced to is one this code picked and can name.
+    let target = current.min(from.saturating_add(DRAIN_MAX_WAL_BYTES));
+    let target_text = lsn_text(target);
+
+    let (changes, unparsed) = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        let mut out: Vec<(char, u32, Vec<u8>)> = Vec::new();
+        let mut bad = 0u64;
+        let _ = Spi::connect(|client| {
+            let t = client.select(
+                "SELECT data FROM pg_logical_slot_peek_changes($1, $2::pg_lsn, NULL)",
+                None,
+                Some(vec![
+                    (PgBuiltInOids::TEXTOID.oid(), slot.into_datum()),
+                    (PgBuiltInOids::TEXTOID.oid(), target_text.clone().into_datum()),
+                ]),
+            )?;
+            for row in t {
+                let data: String = row.get::<String>(1)?.unwrap_or_default();
+                match parse_change(&data) {
+                    Some(c) => out.push(c),
+                    // Counted and logged rather than dropped in silence: a
+                    // plugin/format mismatch would otherwise degrade the
+                    // cache with no symptom but wrong answers. The slot still
+                    // advances past it -- a record that will never parse would
+                    // otherwise stall the channel permanently.
+                    None => bad += 1,
                 }
-                Ok::<(), pgrx::spi::Error>(())
-            });
-            (out, bad, end, rows)
-        }));
+            }
+            Ok::<(), pgrx::spi::Error>(())
+        });
+        (out, bad)
+    }));
 
     // Phase 2: apply. Drop-only unless refill is enabled and the row still
     // exists. A failure here propagates and takes the worker with it, which is
@@ -2404,14 +2463,15 @@ fn drain_invalidations(slot: &str) -> Drain {
         reconciled += 1;
     }
 
-    // Phase 3: the batch is applied, so it is finally safe to consume it.
-    if let Some(upto) = batch_end {
-        advance_decode_slot(slot, &upto);
-    }
+    // Phase 3: everything committed at or before the window's end has been
+    // applied, so it is finally safe to consume up to it. `advance` stops at the
+    // last commit within the window, which is exactly what has been applied --
+    // it cannot skip a transaction whose changes this pass did not see.
+    advance_decode_slot(slot, &target_text);
     Drain {
         reconciled,
         unparsed,
-        full: rows >= DRAIN_MAX_CHANGES as usize,
+        full: target < current,
     }
 }
 
