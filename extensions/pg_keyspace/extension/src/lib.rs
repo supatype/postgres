@@ -47,6 +47,8 @@ mod pubsub_shm;
 mod repl;
 #[path = "../../core/src/aggr.rs"]
 mod aggr;
+#[path = "../../core/src/share.rs"]
+mod share;
 #[path = "../../core/src/server.rs"]
 mod server;
 
@@ -152,6 +154,8 @@ static GUC_ROWCACHE_DECODE_MS: GucSetting<i32> = GucSetting::<i32>::new(200);
 /// next read). Deleted rows are always dropped, never refilled.
 static GUC_ROWCACHE_REFILL: GucSetting<bool> = GucSetting::<bool>::new(false);
 static GUC_ROWCACHE_READTHROUGH: GucSetting<bool> = GucSetting::<bool>::new(false);
+/// Per-tenant share of each persistence ring (#43). On by default.
+static GUC_TENANT_RING_SHARE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
 /// values are raw heap-tuple bytes.
@@ -905,6 +909,21 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_bool_guc(
+        "pg_keyspace.tenant_ring_share",
+        "Give each tenant a share of the persistence ring rather than first come, first served",
+        "On (default) caps how many ring bytes one tenant may have in flight at \
+         once, to capacity/active-tenants, once a ring is more than half full. A \
+         tenant over its share waits for its own records to drain instead of \
+         taking space other tenants' writes need; below half full, and for \
+         connections with no tenant scope (unauthenticated, or an exempt service \
+         role), nothing is enforced. Off restores first come, first served, where \
+         one tenant writing hard enough to keep a ring full stalls every other \
+         tenant sharing it.",
+        &GUC_TENANT_RING_SHARE,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
         "pg_keyspace.rowcache_readthrough",
         "Populate the row cache on a miss instead of requiring rowcache_put",
         "Off (default) caches only what rowcache_put places, and a pk lookup for an \
@@ -1338,6 +1357,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
                 .map(|sh| unsafe { ring::Producer::attach(rbase.add(ring_index(w, sh) * stride)) })
                 .collect();
             worker.set_ring_producers(producers);
+            worker.set_tenant_ring_share(GUC_TENANT_RING_SHARE.get());
             // durable/replicated: hold each write's RESP OK until it commits.
             let sync_ack = matches!(ks_tier(), Tier::Durable | Tier::Replicated);
             worker.set_sync_ack(sync_ack);

@@ -16,6 +16,7 @@ use crate::crc16;
 use crate::pubsub;
 use crate::resp::{self, Parse};
 use crate::ring;
+use crate::share::{self, RingShare, TenantId};
 use crate::store::{now_micros, Lookup, Store, KIND_HASH, KIND_LIST, KIND_SET, KIND_ZSET};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Registry, Token};
@@ -265,8 +266,61 @@ fn shard_of(n: usize, key: &[u8]) -> usize {
     }
 }
 
+/// Enqueue one record on the ring its key shards to, waiting out a full ring
+/// for up to [`PUSH_DEADLINE`].
+///
+/// `who` is the tenant the record is charged to for the per-tenant share (#43);
+/// 0 for an unscoped or exempt connection, which is not accounted. The charge
+/// happens here rather than at the pre-flight because only a record that was
+/// actually pushed occupies ring bytes, and only after the push is its end
+/// position known.
+/// `(ring, tenant, in-flight bytes, times held back)` for the tenants this
+/// worker has ring accounting for (#43).
+///
+/// `only` restricts the answer to one tenant; 0 means every tenant. A scoped
+/// connection is given only its own row, because the whole point of the
+/// `{tenant}:` namespace is that one tenant cannot observe another — reporting
+/// a neighbour's write volume through INFO would be a hole in exactly the
+/// boundary this accounting exists to defend.
+///
+/// A free function rather than a method so callers can hold a mutable borrow of
+/// another of the server's fields (the reply buffer) at the same time.
+fn tenant_ring_usage(
+    shares: &[RingShare],
+    names: &HashMap<TenantId, String>,
+    only: TenantId,
+) -> Vec<(usize, String, u64, u64)> {
+    let mut out = Vec::new();
+    for (i, sh) in shares.iter().enumerate() {
+        for (id, bytes, held) in sh.snapshot() {
+            if only != 0 && id != only {
+                continue;
+            }
+            let name = names
+                .get(&id)
+                .map(|n| sanitize_label(n))
+                .unwrap_or_else(|| format!("x{id:016x}"));
+            out.push((i, name, bytes, held));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Reduce a tenant name to something that cannot break a line-oriented reply.
+/// Names come from the credential table, so they are not attacker-controlled,
+/// but an INFO section whose framing depends on that is a framing bug waiting
+/// for someone to create a tenant with a newline in it.
+fn sanitize_label(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
+}
+
 fn shard_push(
     producers: &[ring::Producer],
+    shares: &mut [RingShare],
+    who: TenantId,
     key: &[u8],
     val: &[u8],
     exp: i64,
@@ -278,13 +332,20 @@ fn shard_push(
     }
     let shard = shard_of(n, key);
     let p = &producers[shard];
+    let charge = |shares: &mut [RingShare]| {
+        if let Some(sh) = shares.get_mut(shard) {
+            sh.record(who, (ring::REC_HDR + key.len() + val.len()) as u64, p.tail());
+        }
+    };
     if let Some(seq) = p.push(key, val, exp, kind) {
+        charge(shares);
         return Some((shard, seq));
     }
     let deadline = Instant::now() + PUSH_DEADLINE;
     loop {
         std::thread::sleep(Duration::from_micros(50));
         if let Some(seq) = p.push(key, val, exp, kind) {
+            charge(shares);
             return Some((shard, seq));
         }
         if Instant::now() >= deadline {
@@ -438,6 +499,10 @@ struct Conn {
     authed: bool,
     role: String,
     tenant: String,
+    // The tenant's identity for per-tenant ring accounting (#43), computed once
+    // at AUTH so the write path is a field read. 0 means "not scoped":
+    // unauthenticated, or an exempt service role, both of which are unpoliced.
+    tenant_id: share::TenantId,
     exempt: bool,
     // durable sync-ack: the highest (ring, seq) per ring that this connection's
     // held replies are waiting on. While non-empty nothing is flushed, so every
@@ -509,6 +574,20 @@ pub struct Worker {
     // rings (sharded by key slot) and a dedicated persistence worker drains each
     // — the RESP path never touches SPI. Multiple rings scale durable writes.
     producers: Vec<ring::Producer>,
+    // Per-tenant in-flight accounting, one per ring (#43). Producer-local: the
+    // event loop is the only producer, so no shared state and no atomics are
+    // needed to keep it exact. Empty when persistence is off.
+    shares: Vec<RingShare>,
+    // Whether the per-tenant share is enforced (#43). On by default: it is
+    // inert without tenant scoping and inert below half a ring, so the cost of
+    // leaving it on is nothing until there is contention to resolve. The escape
+    // hatch exists because a fairness policy that cannot be turned off is one an
+    // operator cannot measure against.
+    tenant_share: bool,
+    // Tenant scope names by id, for the stats surface only -- the accounting
+    // itself is by id. Populated at AUTH, so it holds the tenants this worker
+    // has actually seen rather than every configured one.
+    tenant_names: HashMap<TenantId, String>,
     // when set, RESP AUTH is required and keys are ACL-checked + tenant-scoped.
     auth: Option<AuthConfig>,
     // durable tier: hold each write's RESP reply until its ring record commits.
@@ -577,6 +656,9 @@ impl Worker {
             conns: HashMap::new(),
             args: Vec::with_capacity(8),
             producers: Vec::new(),
+            shares: Vec::new(),
+            tenant_share: true,
+            tenant_names: HashMap::new(),
             auth: None,
             sync_ack: false,
             routing: None,
@@ -623,7 +705,19 @@ impl Worker {
     /// Enable persistence: writes are sharded by key slot across these rings,
     /// each drained by its own persistence worker.
     pub fn set_ring_producers(&mut self, producers: Vec<ring::Producer>) {
+        self.shares = (0..producers.len()).map(|_| RingShare::new()).collect();
         self.producers = producers;
+    }
+
+    /// Enforce (or stop enforcing) the per-tenant ring share.
+    pub fn set_tenant_ring_share(&mut self, on: bool) {
+        self.tenant_share = on;
+    }
+
+    /// `(ring, tenant, in-flight bytes, times held back)` for every tenant with
+    /// ring activity on this worker (#43).
+    pub fn tenant_ring_usage(&self) -> Vec<(usize, String, u64, u64)> {
+        tenant_ring_usage(&self.shares, &self.tenant_names, 0)
     }
 
     /// Serve only this worker's slot range, redirecting every other key with a
@@ -785,10 +879,22 @@ impl Worker {
     /// the current blob plus every argument byte: the new blob cannot exceed
     /// what is already stored plus what is being added. Over-estimating parks
     /// slightly early, which is the safe direction.
-    fn rings_have_room(&self, cmd: &[u8], args: &[Vec<u8>], key_idxs: &[usize]) -> bool {
+    fn rings_have_room(
+        &mut self,
+        who: TenantId,
+        cmd: &[u8],
+        args: &[Vec<u8>],
+        key_idxs: &[usize],
+    ) -> bool {
         let n = self.producers.len();
         if n == 0 {
             return true;
+        }
+        // Release what the persistence workers have drained before judging
+        // anyone's share, or a tenant would be held against bytes that left the
+        // ring some time ago.
+        for (p, sh) in self.producers.iter().zip(self.shares.iter_mut()) {
+            sh.reclaim(p.head());
         }
         let arg_bytes: usize = args.iter().map(|a| a.len()).sum();
         let aggregate = is_aggregate_write(cmd);
@@ -815,7 +921,27 @@ impl Worker {
             // so `has_room` could never be satisfied and the connection parked
             // forever with no error and no timeout.
             let val_bound = inline_bound.min(INLINE_MAX);
-            if !self.producers[shard_of(n, key)].has_room(key.len(), val_bound) {
+            let shard = shard_of(n, key);
+            if !self.producers[shard].has_room(key.len(), val_bound) {
+                return false;
+            }
+            // Per-tenant share (#43). Same answer as a full ring -- park and
+            // retry -- so this needs no new failure mode: an over-share tenant
+            // waits for its own records to drain while everyone else's writes
+            // go through. Inert below half a ring, and for connections with no
+            // tenant scope at all.
+            let p = &self.producers[shard];
+            let rec = (ring::REC_HDR + key.len() + val_bound) as u64;
+            let head = p.head();
+            // Recorded whether or not this write gets anywhere: a tenant a full
+            // ring is shutting out holds no bytes, and counting only occupancy
+            // made it invisible to its own share calculation -- which measured
+            // as no improvement at all.
+            self.shares[shard].note_attempt(who, head);
+            if self.tenant_share
+                && self.shares[shard].would_exceed(who, rec, p.used(), p.capacity(), head)
+            {
+                self.shares[shard].note_held(who);
                 return false;
             }
         }
@@ -953,6 +1079,7 @@ impl Worker {
                     authed: false,
                     role: String::new(),
                     tenant: String::new(),
+                    tenant_id: 0,
                     exempt: false,
                     ack: Vec::new(),
                     parked: false,
@@ -1322,6 +1449,9 @@ impl Worker {
         let batcher = self.batcher.clone();
         let tier = self.tier;
         let persist_on = !self.producers.is_empty();
+        // The tenant every record this command stages is charged to (#43).
+        // Read before the `out` borrow below, which takes `self.conns` mutably.
+        let who: TenantId = self.conns.get(&fd).map_or(0, |c| c.tenant_id);
         let sync_ack = self.sync_ack;
         // Tenant scope for SCAN/KEYS (None for unauthed/exempt): keys are stored
         // as `{tenant}:{key}`, so a scoped connection only sees — and only reports
@@ -1351,7 +1481,7 @@ impl Worker {
         // other connection on the worker while it waits. Parking blocks only the
         // connection whose write cannot fit.
         if persist_on && is_write_cmd(&cmd) {
-            if !self.rings_have_room(&cmd, args, &key_idxs) {
+            if !self.rings_have_room(who, &cmd, args, &key_idxs) {
                 // Park: nothing mutated, nothing replied. `process` leaves the
                 // command in `rbuf` and retries it once the ring drains.
                 if let Some(c) = self.conns.get_mut(&fd) {
@@ -1604,7 +1734,8 @@ impl Worker {
                         if persist_on {
                             // propagate the delete so it does not resurrect on
                             // crash recovery (key is already tenant-scoped in eff)
-                            if let Some(sa) = shard_push(&self.producers, a, b"", DELETE_TOMBSTONE, b's')
+                            if let Some(sa) =
+                                shard_push(&self.producers, &mut self.shares, who, a, b"", DELETE_TOMBSTONE, b's')
                             {
                                 acks.push(sa);
                             }
@@ -2289,6 +2420,20 @@ impl Worker {
                      # Cluster\r\ncluster_enabled:{cluster_enabled}\r\n\
                      # Keyspace\r\ndb0:keys={keys},expires=0,avg_ttl=0\r\n"
                 );
+                // Per-tenant persistence-ring usage (#43). Worker-local by
+                // nature: this worker owns the producer end of its rings, so
+                // this is what THIS worker has in flight, which is also the
+                // scope the fairness decision is made at.
+                let mut body = body;
+                let rows = tenant_ring_usage(&self.shares, &self.tenant_names, who);
+                if !rows.is_empty() {
+                    body.push_str("# Tenants\r\n");
+                    for (ring, name, bytes, held) in rows {
+                        body.push_str(&format!(
+                            "tenant_{name}_ring{ring}:inflight_bytes={bytes},held={held}\r\n"
+                        ));
+                    }
+                }
                 resp::bulk(out, body.as_bytes());
             }
             // ---- cluster topology discovery ----
@@ -2468,7 +2613,7 @@ impl Worker {
                     store.del(k);
                     if persist_on {
                         if let Some(sa) =
-                            shard_push(&self.producers, k, b"", DELETE_TOMBSTONE, b's')
+                            shard_push(&self.producers, &mut self.shares, who, k, b"", DELETE_TOMBSTONE, b's')
                         {
                             acks.push(sa);
                         }
@@ -4251,6 +4396,8 @@ impl Worker {
                 Some(version) => {
                     let r = shard_push(
                         &self.producers,
+                        &mut self.shares,
+                        who,
                         &k,
                         &version.to_le_bytes(),
                         e,
@@ -4266,7 +4413,7 @@ impl Worker {
                 }
                 // Small value, a tombstone, or a key that vanished under us:
                 // copy it into the ring as before.
-                None => shard_push(&self.producers, &k, &v, e, kind),
+                None => shard_push(&self.producers, &mut self.shares, who, &k, &v, e, kind),
             };
             match staged {
                 Some(sa) => acks.push(sa),
@@ -4456,9 +4603,22 @@ impl Worker {
             R::Ok(role, tenant, exempt) => {
                 c.authed = true;
                 c.role = role;
+                // Exempt roles are unscoped, so they have no tenant to charge
+                // ring bytes to and are not policed -- the same carve-out the
+                // key prefix already makes for them.
+                c.tenant_id = if exempt || tenant.is_empty() {
+                    0
+                } else {
+                    share::tenant_id(&tenant)
+                };
+                let id = c.tenant_id;
                 c.tenant = tenant;
                 c.exempt = exempt;
                 resp::simple(&mut c.wbuf, "OK");
+                if id != 0 {
+                    let name = self.conns[&fd].tenant.clone();
+                    self.tenant_names.insert(id, name);
+                }
             }
         }
     }
@@ -4520,10 +4680,19 @@ impl Worker {
                             return;
                         }
                         A::Ok(role, tenant, exempt) => {
+                            let id = if exempt || tenant.is_empty() {
+                                0
+                            } else {
+                                share::tenant_id(&tenant)
+                            };
+                            if id != 0 {
+                                self.tenant_names.insert(id, tenant.clone());
+                            }
                             let c = self.conns.get_mut(&fd).unwrap();
                             c.authed = true;
                             c.role = role;
                             c.tenant = tenant;
+                            c.tenant_id = id;
                             c.exempt = exempt;
                         }
                         A::NoCfg => {} // no auth configured: HELLO AUTH is a no-op OK
