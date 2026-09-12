@@ -103,12 +103,26 @@ wait_rowcache_quiet() {
   [ "$step" -lt 2 ] && step=2
   local tries=$(( budget / step ))
   [ "$tries" -lt 3 ] && tries=3
+  local put=""
   for _ in $(seq 1 "$tries"); do
-    psql_ "SELECT supacache.rowcache_put('$tbl', $pk)" >/dev/null
+    put=$(psql_ "SELECT supacache.rowcache_put('$tbl', $pk)" | tr -d '[:space:]')
     sleep "$step"
     [ -n "$(psql_ "SELECT supacache.rowcache_cached_has_external('$tbl', ${pk}::bigint)")" ] && { echo 1; return; }
   done
-  echo 0
+  # Say WHY rather than just reporting 0. This has failed intermittently in CI
+  # (roughly one run in three) and is not reproducible on demand -- a full local
+  # suite run passes it. An unexplained 0 has already cost two fixes built on
+  # inference, so the next occurrence names its own cause instead.
+  #
+  # Non-invasive on purpose: reports the slot's position rather than peeking it,
+  # since peeking a slot the invalidation worker holds would disturb the thing
+  # being diagnosed.
+  echo "0 [gave up after ${budget}s in ${step}s steps;" \
+       "registered_cols=$(psql_ "SELECT coalesce(supacache.rowcache_registration('$tbl')::text,'NULL')" | tr -d '[:space:]')" \
+       "last_put=${put:-EMPTY}" \
+       "entries=$(psql_ "SELECT coalesce(sum(entries),0)::text FROM supacache.rowcache_stats()" | tr -d '[:space:]')" \
+       "coherent=$(psql_ "SELECT coherent FROM supacache.rowcache_coherence()" | tr -d '[:space:]')" \
+       "slot=$(psql_ "SELECT confirmed_flush_lsn||' of '||pg_current_wal_lsn() FROM pg_replication_slots WHERE plugin='supacache_keys' LIMIT 1" | tr -d '[:space:]')]"
 }
 
 echo "=== build + install the extension ==="
@@ -1934,7 +1948,14 @@ echo "########## AJ. read-through warms the row cache on a miss (#10) ##########
 psql_ "DROP TABLE IF EXISTS public.rt CASCADE" >/dev/null 2>&1
 psql_ "CREATE TABLE public.rt(id bigint primary key, v text)" >/dev/null
 psql_ "INSERT INTO public.rt VALUES (1,'one'),(2,'two'),(3,'three'),(4,'canary')" >/dev/null
-psql_ "SELECT supacache.rowcache_register('public.rt', 1)" >/dev/null
+# Checked, not discarded. Everything below depends on it: rowcache_put refuses an
+# unregistered table, so a silent failure here would make the canary permanently
+# uncacheable and the quiesce wait below would burn its whole budget reporting
+# nothing but 0 -- which is exactly the shape of the intermittent failure this
+# section has shown in CI. The post-restart registration was already asserted;
+# this one was not, for no reason.
+chk "the table is registered before anything depends on it" "t" \
+    "$(psql_ "SELECT supacache.rowcache_register('public.rt', 1)")"
 chk "the invalidation worker is up, so the cache is served at all" "1" "$(wait_coherent 30)"
 chk "and it has caught up with this table, so the cache can hold a row" "1" \
     "$(wait_rowcache_quiet public.rt 4)"
