@@ -2544,6 +2544,9 @@ struct RcScanState {
     // custom_private; POD pointer+len so it is safe inside this palloc0 struct.
     pk_ptr: *const u8,
     pk_len: usize,
+    // pk column attnum, from the planner. Needed to resolve the column on a
+    // cache miss without consulting the (evictable) registration entry.
+    pk_attnum: i16,
     done: bool,
 }
 
@@ -2706,7 +2709,20 @@ unsafe extern "C" fn rc_pathlist_hook(
         false,
         false,
     );
+    // The pk attnum travels with the plan for the same reason the pk bytes do:
+    // everything execution needs must survive the cache entry it came from.
+    let attc = pg_sys::makeConst(
+        pg_sys::INT2OID,
+        -1,
+        pg_sys::InvalidOid,
+        2,
+        pg_sys::Datum::from(pk_attnum as i16),
+        false,
+        true,
+    );
     (*cpath).custom_private = pg_sys::lappend(std::ptr::null_mut(), pkc as *mut core::ffi::c_void);
+    (*cpath).custom_private =
+        pg_sys::lappend((*cpath).custom_private, attc as *mut core::ffi::c_void);
     pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
 }
 
@@ -2751,6 +2767,12 @@ unsafe extern "C" fn rc_create_state(cscan: *mut pg_sys::CustomScan) -> *mut pg_
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
     (*st).pk_ptr = buf;
     (*st).pk_len = n;
+    let attc = pg_sys::list_nth((*cscan).custom_private, 1) as *mut pg_sys::Const;
+    (*st).pk_attnum = if attc.is_null() || (*attc).constisnull {
+        0
+    } else {
+        (*attc).constvalue.value() as i16
+    };
     (*st).done = false;
     st as *mut pg_sys::Node
 }
@@ -2789,9 +2811,58 @@ unsafe extern "C" fn rc_access(ss: *mut pg_sys::ScanState) -> *mut pg_sys::Tuple
         None => return pg_sys::ExecClearTuple(slot),
     };
     let pk = std::slice::from_raw_parts((*st).pk_ptr, (*st).pk_len);
-    let bytes = match view.get(&rc_key(relid, pk)) {
+    // A miss here is NOT end of scan. Whether to use the cache is decided at
+    // plan time, but the lookup happens now, and anything that removes the entry
+    // in between -- an eviction, an invalidation, a flush -- would otherwise turn
+    // a correct query into an empty result with no error. A cached plan makes
+    // that window unbounded: the plan outlives the entry, and row-cache activity
+    // does not invalidate plans. Measured, a prepared statement returned zero
+    // rows for a row sitting in the heap the whole time (#85).
+    //
+    // So a miss falls back to reading the row, and costs a fetch rather than an
+    // answer. The read runs with the row-cache substitution bypassed (the guard
+    // inside `fetch_row_and_pk`) so it cannot recurse into this node, and
+    // read-only so it observes the running query's snapshot rather than taking a
+    // fresh one mid-scan.
+    //
+    // Deliberately not repopulating the cache here: that is read-through warming
+    // (#10), and doing it as a side effect of a miss would let one scan of
+    // evicted rows churn the whole cache.
+    let fallback;
+    let bytes: &[u8] = match view.get(&rc_key(relid, pk)) {
         Lookup::Hit(b) => b,
-        Lookup::Miss => return pg_sys::ExecClearTuple(slot),
+        Lookup::Miss => {
+            // Resolved from the attnum the planner carried, not from the
+            // registration entry: that entry is an ordinary cache entry and a
+            // busy cache evicts it, which is exactly the situation a miss means
+            // we are in.
+            let meta = match rowcache_meta_for_attnum((*rel).rd_id, (*st).pk_attnum) {
+                Some(m) => m,
+                None => return pg_sys::ExecClearTuple(slot),
+            };
+            let lit = String::from_utf8_lossy(pk).into_owned();
+            let where_sql = format!("{} = $1::{}", quote_ident(&meta.col), meta.typename);
+            let arg = match lit.into_datum() {
+                Some(d) => d,
+                None => return pg_sys::ExecClearTuple(slot),
+            };
+            match fetch_row_and_pk(
+                &meta.rel_q,
+                &meta.col,
+                &where_sql,
+                pg_sys::TEXTOID,
+                arg,
+                true,
+            ) {
+                // Genuinely absent: the row does not exist, so no rows is the
+                // right answer and matches what an index scan would return.
+                None => return pg_sys::ExecClearTuple(slot),
+                Some((raw, _)) => {
+                    fallback = raw;
+                    &fallback[..]
+                }
+            }
+        }
     };
     // Copy the cached tuple bytes into an aligned palloc buffer, wrap as a
     // HeapTuple, deform into the (virtual) scan slot, and store.
@@ -2882,6 +2953,7 @@ unsafe fn fetch_row_and_pk(
     where_sql: &str,
     argtype: pg_sys::Oid,
     argdatum: pg_sys::Datum,
+    read_only: bool,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     let _bypass = BypassGuard::new();
     let query = format!("SELECT * FROM {rel_q} WHERE {where_sql}");
@@ -2892,15 +2964,20 @@ unsafe fn fetch_row_and_pk(
     }
     let mut argtypes = [argtype];
     let mut values = [argdatum];
-    // read_only = false: take a fresh snapshot so a refill sees the row as of
-    // now (the just-committed change), not the worker transaction's start snapshot.
+    // A refill passes read_only = false so it takes a fresh snapshot and sees the
+    // row as of now -- the just-committed change -- rather than as of the worker
+    // transaction's start.
+    //
+    // A read served from inside a running query passes true, and must: taking a
+    // new snapshot mid-scan would let one leaf of a query see a row as of a
+    // later moment than the rest of it, which no index scan would ever do.
     let rc = pg_sys::SPI_execute_with_args(
         q.as_ptr(),
         1,
         argtypes.as_mut_ptr(),
         values.as_mut_ptr(),
         std::ptr::null(),
-        false,
+        read_only,
         1,
     );
     let out = if rc == pg_sys::SPI_OK_SELECT as i32 && pg_sys::SPI_processed >= 1 {
@@ -2971,7 +3048,7 @@ unsafe fn rowcache_refill_locked(relid: pg_sys::Oid, pk_lookup: &[u8]) -> Refill
         Some(d) => d,
         None => return Refill::Skipped,
     };
-    match fetch_row_and_pk(&meta.rel_q, &meta.col, &where_sql, pg_sys::TEXTOID, arg) {
+    match fetch_row_and_pk(&meta.rel_q, &meta.col, &where_sql, pg_sys::TEXTOID, arg, false) {
         Some((raw, canon)) if !canon.is_empty() => {
             view.set(&rc_key(relid.as_u32(), &canon), &raw, 0);
             Refill::Stored
@@ -2995,6 +3072,17 @@ unsafe fn rowcache_reg_meta(relid: pg_sys::Oid) -> Option<RegMeta> {
         Lookup::Hit(b) if b.len() >= 2 => i16::from_le_bytes([b[0], b[1]]),
         _ => return None,
     };
+    rowcache_meta_for_attnum(relid, attnum)
+}
+
+/// The catalogue half of `rowcache_reg_meta`, for a pk column already known.
+///
+/// Split out because the registration entry lives in the row cache and is
+/// evictable like any other entry, so a busy cache can lose it. Execution must
+/// not depend on that: the planner knew the attnum when it chose this scan, and
+/// carries it in `custom_private`, so the column is resolved from the catalogues
+/// here rather than looked up in a cache that may since have dropped it.
+unsafe fn rowcache_meta_for_attnum(relid: pg_sys::Oid, attnum: i16) -> Option<RegMeta> {
     let attname = pg_sys::get_attname(relid, attnum, false);
     if attname.is_null() {
         return None;
@@ -3457,7 +3545,7 @@ mod supacache {
             // Bind the pk value with its own type: `col = $1` (an implicit cast
             // covers e.g. int4 literal vs int8 column).
             let where_sql = format!("{} = $1", quote_ident(&meta.col));
-            match fetch_row_and_pk(&meta.rel_q, &meta.col, &where_sql, pk.oid(), pk.datum()) {
+            match fetch_row_and_pk(&meta.rel_q, &meta.col, &where_sql, pk.oid(), pk.datum(), false) {
                 Some((raw, canon)) if !canon.is_empty() => {
                     if let Some(view) = rowcache_view() {
                         return view.set(&rc_key(relid.as_u32(), &canon), &raw, 0);
