@@ -197,12 +197,30 @@ Redis-compatible (`bench/run_big{hash,list,zset}.sh`, `core/examples/bench_*`):
   dedicated persist workers), so reads stay unaffected: a write flood's read tail
   is cut from 170 ms → 5 ms. The ring **drains** into `supacache.kv` at ~107 k/s
   per worker, scaling to 145 k/s across 4 (`bench/run_persist_scaleout.sh`).
-  Read that as the capacity of the persistence machinery, not as a rate a client
-  can obtain durable acknowledgements at: on the `durable` and `replicated`
-  tiers a connection is not read again until its write commits, which caps each
-  connection at roughly one write per `persist_window_ms` — about 90/s at the
-  default, so a ten-connection pool sees ~900 writes/s. See
-  [#78](https://github.com/supatype/postgres/issues/78); `relaxed` and
+  Read that as the capacity of the persistence machinery. What a *client* can
+  obtain durable acknowledgements at depends on whether it pipelines, because a
+  durable reply is held until its record commits:
+
+  | connections | pipeline depth | durable writes/s | avg latency |
+  |---:|---:|---:|---:|
+  | 1 | 1 | 92 | 10.9 ms |
+  | 1 | 16 | 1 468 | 10.9 ms |
+  | 10 | 1 | 917 | 10.8 ms |
+  | 10 | 16 | **14 650** | 10.7 ms |
+
+  A client that waits for each reply before sending the next is capped at about
+  one write per `persist_window_ms` — 92/s at the default, and ~900/s across a
+  ten-connection pool. A client that pipelines is not: commands keep being read
+  and applied while replies are held, so ten connections reach **14 650/s**, and
+  even a single pipelined connection beats the whole non-pipelined pool.
+
+  Latency is flat at ~10.8 ms throughout, which is the persist window: pipelining
+  buys throughput without paying for it in latency.
+
+  That cap used to apply to every durable connection regardless of pipelining —
+  a pipelining client stalled exactly like a synchronous one. Fixed in
+  [#81](https://github.com/supatype/postgres/pull/81), closing
+  [#78](https://github.com/supatype/postgres/issues/78). `relaxed` and
   `ephemeral` are unaffected and take over 350 k/s on a single connection.
 - **Crash recovery:** after `kill -9`, keys rebuild from `supacache.kv` at
   ~3.5 µs/key; every acked durable write survives. Measured against key count by
@@ -260,11 +278,14 @@ latency, worst interval 21 668 tps.
 Two limits on these figures worth stating:
 
 - **The rate sweep could not be exercised.** The harness sweeps offered write
-  rates, but no rate above ~700/s was reachable on this host, for the reason in
-  [#78](https://github.com/supatype/postgres/issues/78) — so every rate row is
+  rates, but no rate above ~700/s was reachable when it was run, because every
+  durable connection then stalled on each reply
+  ([#78](https://github.com/supatype/postgres/issues/78), since fixed in
+  [#81](https://github.com/supatype/postgres/pull/81)) — so every rate row is
   really a max-rate row and the harness marks them "(not reached)". Since window
   occupancy is what drives dedup, the dedup column above is a lower bound: a
-  deployment that can fill its persist windows will dedupe more than this.
+  deployment that can fill its persist windows will dedupe more than this, and
+  a re-run on a build that pipelines should now reach the higher rates.
 - **The statistics views cannot be used to measure any of it.** The persist
   worker never flushes its pending statistics, so `pg_stat_user_tables` reports
   zero rows written for the `supacache` tables for the entire life of a running
