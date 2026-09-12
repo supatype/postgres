@@ -1785,18 +1785,39 @@ fn load_auth_config() -> Option<AuthConfig> {
     }))
 }
 
+/// How often recovery reports progress. A large keyspace takes minutes, and the
+/// RESP port is not served until recovery finishes, so silence for the whole of
+/// it is indistinguishable from a hang — which is how it has been read before.
+const RECOVER_LOG_EVERY: i64 = 100_000;
+
+/// Evictions summed across a store's partitions.
+fn total_evictions(store: &Store) -> u64 {
+    (0..store.num_partitions())
+        .map(|p| store.stats(p).evictions)
+        .sum()
+}
+
 /// Load live keys from `supacache.kv` into shmem at startup (crash recovery).
 /// Expired rows are skipped. Returns the number of keys restored.
 fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
     use std::panic::AssertUnwindSafe;
     let now = store::now_micros();
+    let t0 = std::time::Instant::now();
     // Recover only the slot range this worker serves. `supacache.kv.slot` is the
     // key's CRC16 slot, written on every persist, so a key comes back into the
     // same segment the RESP path and the SQL surface will look for it in. A
     // single-worker cluster owns everything, so it keeps the unfiltered scan.
     let (lo, hi) = crc16::slot_range(w, nworkers);
     let sharded = nworkers > 1;
-    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+    // A too-small keyspace announces itself here as eviction, so take the delta
+    // rather than the absolute: a relaunched worker recovers into a segment that
+    // may already carry its predecessor's counts.
+    let evicted_before = total_evictions(store);
+    log!(
+        "pg_keyspace worker {w}: recovering slots {lo}..{hi} from supacache.kv \
+         (no RESP traffic is served until this finishes)"
+    );
+    let recovered = BackgroundWorker::transaction(AssertUnwindSafe(|| {
         Spi::connect(|client| {
             let mut cnt = 0i64;
             // no-TTL keys from kv, then non-expired TTL keys from kv_ttl (latest
@@ -1833,6 +1854,13 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
                     let ttl = if e > 0 { e - now } else { 0 };
                     store.set_typed(&k, &v, ttl, kind);
                     cnt += 1;
+                    if cnt % RECOVER_LOG_EVERY == 0 {
+                        log!(
+                            "pg_keyspace worker {w}: recovery in progress, \
+                             {cnt} keys in {:?}",
+                            t0.elapsed()
+                        );
+                    }
                 }
             }
             let tup = if sharded {
@@ -1871,12 +1899,32 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
                 if let (Some(k), Some(v)) = (k, v) {
                     store.set_typed(&k, &v, (e - now).max(1), kind);
                     cnt += 1;
+                    if cnt % RECOVER_LOG_EVERY == 0 {
+                        log!(
+                            "pg_keyspace worker {w}: recovery in progress, \
+                             {cnt} keys in {:?}",
+                            t0.elapsed()
+                        );
+                    }
                 }
             }
             Ok::<i64, pgrx::spi::Error>(cnt)
         })
         .unwrap_or(0)
-    }))
+    }));
+    // Recovery evicts as it loads when the persisted set does not fit, and the
+    // cache then comes back quietly partial: every lookup still answers, just
+    // some of them with a miss for a key that is durably stored. Say so.
+    let evicted = total_evictions(store).saturating_sub(evicted_before);
+    if evicted > 0 {
+        warning!(
+            "pg_keyspace worker {w}: recovery evicted {evicted} key(s) while loading — \
+             the persisted set for slots {lo}..{hi} does not fit in pg_keyspace.keys \
+             ({}), so the cache has come back partial",
+            GUC_KEYS.get()
+        );
+    }
+    recovered
 }
 
 /// Apply a drained batch in one transaction. Deduplicated by key
