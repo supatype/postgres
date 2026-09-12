@@ -26,7 +26,12 @@ PORT=${PGKS_PG_PORT:-5466}
 RESP=${PGKS_RESP_PORT:-6436}
 PROFILE=${PGKS_BUILD_PROFILE:-release}
 # Sized so the whole persisted set fits: eviction during load would make the
-# timing a measurement of a partial cache rather than of recovery.
+# timing a measurement of a partial cache rather than of recovery. The size is
+# the SAME for every run, taken from the largest count in the list, because peak
+# RSS is the point of the exercise: sizing the segment per run would make the
+# baseline a small segment and every later row a bigger one, and the difference
+# would then be mostly the allocation rather than the load. RSS counts pages
+# touched, not reserved, so an oversized segment costs the small runs nothing.
 VAL_BYTES=${PGKS_BENCH_VAL_BYTES:-64}
 KEY_COUNTS=${PGKS_BENCH_KEYS:-"0 100000 1000000"}
 SKIP_BUILD=${PGKS_BENCH_SKIP_BUILD:-0}
@@ -57,16 +62,21 @@ if [ "$SKIP_BUILD" != "1" ]; then
   echo "installed ($PROFILE)"
 fi
 
-printf '\n%-12s  %-10s  %-14s  %-12s  %s\n' "keys" "recovered" "recovery time" "peak RSS" "RSS over baseline"
-printf -- '---------------------------------------------------------------------------------\n'
+# One sizing for every run, from the largest count asked for.
+MAXN=0
+for N in $KEY_COUNTS; do [ "$N" -gt "$MAXN" ] && MAXN=$N; done
+KEYS=$(( MAXN + (MAXN / 5) + 1024 ))
+echo "segment sized for $KEYS keys in every run (largest count $MAXN, plus 20%)"
+
+printf '\n%-12s  %-10s  %-14s  %-10s  %-10s  %s\n' \
+  "keys" "recovered" "recovery time" "us/key" "peak RSS" "RSS over baseline"
+printf -- '--------------------------------------------------------------------------------------------\n'
 
 BASE_RSS=""
 for N in $KEY_COUNTS; do
   kill_stragglers
   rm -rf $PGDATA; mkdir -p $PGDATA; chown postgres:postgres $PGDATA
   su postgres -c "$PGBIN/initdb -D $PGDATA -U postgres" >/dev/null 2>&1
-  # 20% headroom over the row count so nothing is evicted while loading.
-  KEYS=$(( N + (N / 5) + 1024 ))
   {
     echo "shared_preload_libraries = 'pg_keyspace'"
     echo "pg_keyspace.port = $RESP"
@@ -110,9 +120,18 @@ for N in $KEY_COUNTS; do
   RSS_MB=$(( ${RSS_KB:-0} / 1024 ))
   if [ "$N" -eq 0 ]; then BASE_RSS=$RSS_MB; DELTA="baseline";
   else DELTA="$(( RSS_MB - ${BASE_RSS:-0} )) MB"; fi
+  # Per-key cost, so a superlinear load shows up as a rising column rather than
+  # having to be divided out of the wall times by hand.
+  US_PER_KEY="-"
+  if [ "$N" -gt 0 ]; then
+    NS=$(echo "$TOOK" | awk '{ v=$0; sub(/[a-z]+$/,"",v);
+        if ($0 ~ /ms$/) print v*1000000; else if ($0 ~ /us$/) print v*1000;
+        else if ($0 ~ /ns$/) print v; else print v*1000000000 }')
+    US_PER_KEY=$(awk -v ns="$NS" -v n="$N" 'BEGIN{ if (n>0) printf "%.2f", ns/1000/n; else print "-" }')
+  fi
 
-  printf '%-12s  %-10s  %-14s  %-12s  %s\n' \
-    "$N" "${GOT:-?}" "${TOOK:-?}" "${RSS_MB} MB" "$DELTA"
+  printf '%-12s  %-10s  %-14s  %-10s  %-10s  %s\n' \
+    "$N" "${GOT:-?}" "${TOOK:-?}" "$US_PER_KEY" "${RSS_MB} MB" "$DELTA"
 done
 
 kill_stragglers
