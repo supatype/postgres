@@ -605,11 +605,16 @@ persistence worker `s` drains shard `s` of every slot worker's ring set.
 ### Mode B — transparent PostgREST row cache
 
 ```sql
-SELECT supacache.rowcache_register('public.orders', 1);  -- pk = attnum 1 (int/uuid/text)
+SELECT supacache.rowcache_register('public.orders');      -- the whole primary key, any arity
 SELECT supacache.rowcache_put('public.orders', 42);       -- warm one row
 EXPLAIN SELECT * FROM public.orders WHERE id = 42;
 --  Custom Scan (pg_keyspace_rowcache) on orders
 ```
+
+The one-argument form takes no column because there is nothing to choose: the key
+is whatever `pg_index` says it is, single-column or composite. `rowcache_register(tbl, attnum)`
+still exists and is still single-column only. `rowcache_registration(tbl)` reports
+which columns a table is registered with, in key order.
 
 The scan serves the **raw** cached row at the leaf; the relation's RLS quals and
 mask `CASE` expressions re-apply above it, so a role that couldn't see the row (or
@@ -622,7 +627,14 @@ automatic coherence:
 wal_level = logical
 pg_keyspace.rowcache_decode = on     # keys-only decode worker drops changed keys
 pg_keyspace.rowcache_refill = on     # (optional) re-cache a changed hot key instead of dropping
+pg_keyspace.rowcache_readthrough = on  # (optional) warm on a miss, instead of only via rowcache_put
 ```
+
+`rowcache_readthrough` is what removes the manual warming step: a primary-key
+lookup that misses caches the row it just read. It is off by default and is
+ignored unless `rowcache_decode` is on — a row warmed automatically that nothing
+is watching would be served stale indefinitely, so the two are deliberately
+coupled.
 
 #### What the row cache guarantees, and what it does not
 
@@ -809,6 +821,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.rowcache_mb` | 64 | Mode B row-cache segment size (never RESP-addressable) |
 | `pg_keyspace.rowcache_decode` | `off` | keys-only Mode B invalidation worker (needs `wal_level=logical`) |
 | `pg_keyspace.rowcache_refill` | `off` | on: re-cache a changed hot key; off: drop-only (lazy) |
+| `pg_keyspace.rowcache_readthrough` | `off` | on: a pk lookup that misses caches the row it read (ignored unless `rowcache_decode` is on) |
 | `pg_keyspace.tenant_ring_share` | `on` | give each tenant a share of the persistence ring instead of first come, first served |
 | `pg_keyspace.tenant_scoped_eviction` | `on` | evict a tenant's own cold keys before another tenant's |
 | `pg_keyspace.tenant_ops_per_sec` | 0 | commands per second one tenant may issue (0 = no limit) |
@@ -1002,8 +1015,15 @@ Scoping for this version — the extension works; these are the edges to know:
   is a restart.
 - **Pub/sub is cross-worker within one process** (the scale-out daemon), not yet
   cross-*process* for N in-PG background workers.
-- **Mode B caches single-column primary keys** (composite keys are refused); the
-  cache is warmed manually (`rowcache_put`) though invalidation is automatic.
+- **Mode B read-through is opt-in and needs the decode worker.**
+  `pg_keyspace.rowcache_readthrough` is off by default and does nothing unless
+  `rowcache_decode` is also on — warming a row the cluster cannot invalidate
+  would serve it stale forever, so read-through refuses to warm what nothing is
+  watching. With it off, the cache holds only what `rowcache_put` places.
+  Composite primary keys are supported, but **all-or-nothing at plan time**: a
+  query must pin every key column to a constant to be served from the cache, and
+  a partial key takes the ordinary index path (it asks for a set, and one cached
+  row is not one).
 - **Sorted-set scores match Valkey 8's text, with one exception.** Older Redis
   used `%.17g`; Valkey 8 uses the shortest representation that round-trips, and
   so does this, including its thresholds for printing an integral score as an
