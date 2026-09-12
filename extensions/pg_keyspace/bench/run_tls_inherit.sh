@@ -48,10 +48,17 @@ del_conf() { sed -i "/^$1 /d" $PGDATA/postgresql.conf; }
 # Does a plaintext RESP client get a reply? Plaintext against a TLS listener
 # does not fail fast on every stack, so bound the wait.
 resp_plain() { timeout 5 redis-cli -h 127.0.0.1 -p $RESP PING 2>&1 | tr -d '[:space:]'; }
-# ... and a TLS one? --insecure because these are self-signed: this asks
-# whether the port speaks TLS, not whether a CA vouches for it. Identity is
-# checked separately, by fingerprint, which is the stronger question anyway.
-resp_tls() { timeout 5 redis-cli --tls --insecure -h 127.0.0.1 -p $RESP PING 2>&1 | tr -d '[:space:]'; }
+# ... and a TLS one? Spoken straight down an openssl tunnel rather than through
+# `redis-cli --tls`, because redis-tools is not built with TLS everywhere and a
+# harness that cannot run on the CI runner is a harness that rots. RESP PING is
+# four bytes and a CRLF, so there is nothing a client library adds here. No cert
+# validation: these are self-signed, and this asks whether the port speaks TLS
+# at all. *Which* certificate it speaks it with is checked separately, by
+# fingerprint, which is the stronger question anyway.
+resp_tls() {
+  printf 'PING\r\n' | timeout 5 openssl s_client -connect 127.0.0.1:$RESP -quiet 2>/dev/null \
+    | tr -d '[:space:]' | sed 's/^+//'
+}
 # SHA-256 fingerprint of the certificate a port actually serves.
 fp_served() { timeout 5 openssl s_client -connect 127.0.0.1:$1 ${2:-} </dev/null 2>/dev/null \
   | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//'; }
