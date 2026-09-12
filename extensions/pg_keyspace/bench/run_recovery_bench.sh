@@ -46,10 +46,15 @@ set_conf() {
 }
 # Workers outlive a killed postmaster and keep the ports, which makes the next
 # cluster look alive while answering nothing. Clear them before starting.
+# Matched on the process name rather than a substring of the whole command line:
+# this script's own path contains "pg_keyspace", so a looser pattern makes the
+# harness kill itself the moment it is invoked by its full path.
 kill_stragglers() {
-  ps -eo pid,args | grep -E "pg_keyspace|postgres -D $PGDATA" \
-    | grep -v -E "grep|eval|snapshot|claude" | awk '{print $1}' \
-    | while read -r p; do kill -9 "$p" 2>/dev/null; done
+  ps -eo pid,args --no-headers | awk -v pgdata="$PGDATA" '
+    { pid = $1; $1 = ""; cmd = substr($0, 2) }
+    cmd ~ /^postgres: pg_keyspace/            { print pid; next }
+    cmd ~ /(^|\/)postgres / && index(cmd, pgdata) { print pid }
+  ' | while read -r p; do [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null; done
   sleep 2
 }
 
