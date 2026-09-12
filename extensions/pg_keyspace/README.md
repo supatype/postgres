@@ -194,9 +194,16 @@ Redis-compatible (`bench/run_big{hash,list,zset}.sh`, `core/examples/bench_*`):
 | replicated | ~1.67 ms | **fsync + standby ack** (real sync rep) |
 
 - Durable writes are **off the event loop** (a shared-memory ring drained by
-  dedicated persist workers): ~107 k/s sustained per worker, scaling to **145 k/s**
-  across 4 (`bench/run_persist_scaleout.sh`), while reads stay unaffected (write
-  flood tail cut from 170 ms → 5 ms).
+  dedicated persist workers), so reads stay unaffected: a write flood's read tail
+  is cut from 170 ms → 5 ms. The ring **drains** into `supacache.kv` at ~107 k/s
+  per worker, scaling to 145 k/s across 4 (`bench/run_persist_scaleout.sh`).
+  Read that as the capacity of the persistence machinery, not as a rate a client
+  can obtain durable acknowledgements at: on the `durable` and `replicated`
+  tiers a connection is not read again until its write commits, which caps each
+  connection at roughly one write per `persist_window_ms` — about 90/s at the
+  default, so a ten-connection pool sees ~900 writes/s. See
+  [#78](https://github.com/supatype/postgres/issues/78); `relaxed` and
+  `ephemeral` are unaffected and take over 350 k/s on a single connection.
 - **Crash recovery:** after `kill -9`, keys rebuild from `supacache.kv` at
   ~3.5 µs/key; every acked durable write survives. Measured against key count by
   `bench/run_recovery_bench.sh` — the per-key time holds to 1M, but peak memory
@@ -204,6 +211,66 @@ Redis-compatible (`bench/run_big{hash,list,zset}.sh`, `core/examples/bench_*`):
   [the table](#recovery-cost-against-key-count) before sizing one.
 - **TTL expiry** is an O(1) partition `DROP` (3.2 ms) vs an O(n) `DELETE`
   (141 ms for 100 k rows) — no vacuum churn.
+
+#### What a durable write costs in WAL and storage
+
+Operations per second says nothing about what the durable tiers cost on disk.
+Reproduce with `bench/run_wal_amplification.sh`, which measures WAL bytes per
+logical cache write across key skew and reads the row counts out of the WAL with
+`pg_waldump` rather than the statistics views (see the note at the end of this
+section for why).
+
+200 k writes per pass, 128-byte values, 20 k keyspace, one worker, one persist
+worker, `persist_window_ms = 10`, `full_page_writes = on`, release build,
+4-vCPU container, PG16.
+
+| key skew | pass | WAL/write | FPI share | row versions | dedup |
+|---|---|---:|---:|---:|---:|
+| uniform | cold | 225 B | 12% | 199 919 | 1.0× |
+| uniform | warm | 220 B | 11% | 199 959 | 1.0× |
+| Zipfian (s=1) | cold | 211 B | 13% | 190 750 | 1.0× |
+| Zipfian (s=1) | warm | 208 B | 13% | 190 793 | 1.0× |
+| single hot key | cold | 23 B | 0% | 25 008 | 8.0× |
+| single hot key | warm | 23 B | 0% | 25 005 | 8.0× |
+
+**Cold is the pass straight after a `CHECKPOINT`, warm the pass straight after
+that.** Every configuration is measured twice because the first touch of a page
+after a checkpoint carries a full-page image; a real deployment sits between the
+two rows and moves with checkpoint frequency, so neither is "the" number. Each
+configuration primes its whole keyspace first, unmeasured, so both measured
+passes are pure overwrites rather than one insert pass and one overwrite pass.
+
+**Skew is what moves the answer, and it moves it by an order of magnitude.** The
+persist worker collapses a window's writes to the last one per key before the
+statement runs, so a hot key rewritten many times in one window costs one row
+version. A single hot key costs 23 B/write against uniform's 225 B — 8× fewer row
+versions for the same client traffic. Ordinary skew does not get you this: over a
+20 k keyspace even a Zipfian distribution dedupes only 1.0×, because at the rate a
+client can actually issue durable writes each 10 ms window holds too few writes to
+collide. Budget with the uniform row unless you know you have genuinely hot keys.
+
+**Overwrites do not bloat the tables.** 400 k overwrites of 20 k rows grew the
+whole `supacache` schema by 0.3 MB: cache overwrites are HOT updates, which
+opportunistic page pruning reclaims without waiting for a vacuum.
+
+**Normal SQL is not starved by the flood.** With the row cache registered and
+`pgbench` reading a cached table throughout, SQL held 24 415 tps at 0.15 ms mean
+latency, worst interval 21 668 tps.
+
+Two limits on these figures worth stating:
+
+- **The rate sweep could not be exercised.** The harness sweeps offered write
+  rates, but no rate above ~700/s was reachable on this host, for the reason in
+  [#78](https://github.com/supatype/postgres/issues/78) — so every rate row is
+  really a max-rate row and the harness marks them "(not reached)". Since window
+  occupancy is what drives dedup, the dedup column above is a lower bound: a
+  deployment that can fill its persist windows will dedupe more than this.
+- **The statistics views cannot be used to measure any of it.** The persist
+  worker never flushes its pending statistics, so `pg_stat_user_tables` reports
+  zero rows written for the `supacache` tables for the entire life of a running
+  cluster ([#77](https://github.com/supatype/postgres/issues/77)). That is also
+  why autovacuum never fires on them, and why this benchmark reads the WAL
+  instead.
 
 #### Recovery cost against key count
 
