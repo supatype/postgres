@@ -1280,6 +1280,95 @@ chk "the denied read still went through the cache path" "1" \
     "$(as_tenant ten_alpha "EXPLAIN (COSTS OFF) SELECT secret FROM public.rls_rows WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
 
 echo ""
+echo "########## AB. the row cache's coherence window, asserted (#39) ##########"
+# The row cache is eventually coherent, not immediately: a committed change is
+# visible to the cache only once the invalidation worker drains the decode slot,
+# which is pg_keyspace.rowcache_decode_ms away at worst. Nothing has ever
+# asserted that bound, so "eventually" has been a claim rather than a measured
+# property, and the DELETE case — where the window serves a row that no longer
+# exists, which is worse than serving a stale value — was never exercised.
+#
+# Every assertion below is a CONVERGENCE assertion with a budget, never an
+# immediate-coherence one. Asserting that a read straight after COMMIT is stale
+# would be asserting a race: the worker is free to have drained already, and the
+# test would fail on the runs where the cache did better than its guarantee.
+DECODE_MS=$(psql_ "SHOW pg_keyspace.rowcache_decode_ms" | tr -d '[:space:]')
+# Defaulted rather than trusted: an empty SHOW would turn the arithmetic below
+# into a bash error mid-section rather than a failed assertion.
+case "$DECODE_MS" in ''|*[!0-9]*) DECODE_MS=4000 ;; esac
+# Generous against a loaded runner, but still several poll intervals, so a
+# genuinely broken drain fails rather than hangs.
+CONVERGE_BUDGET=${PGKS_CONVERGE_BUDGET:-25}
+echo "  (decode interval $DECODE_MS ms, convergence budget ${CONVERGE_BUDGET}s)"
+
+# Wait until `$2` is what the cached read returns, or the budget runs out.
+# Echoes how long it took so a regression in the bound is visible in the log
+# even when the assertion still passes.
+converge() { # converge <sql> <want>
+  local waited=0
+  while [ "$waited" -lt "$CONVERGE_BUDGET" ]; do
+    [ "$(psql_ "$1")" = "$2" ] && { echo "$waited"; return 0; }
+    sleep 1; waited=$((waited+1))
+  done
+  echo "$waited"; return 1
+}
+
+psql_ "DROP TABLE IF EXISTS public.cc CASCADE" >/dev/null 2>&1
+psql_ "CREATE TABLE public.cc(id bigint primary key, v text)" >/dev/null
+psql_ "INSERT INTO public.cc VALUES (1,'one'),(2,'two'),(3,'three'),(4,'four')" >/dev/null
+psql_ "SELECT supacache.rowcache_register('public.cc', 1)" >/dev/null
+# Same reason as section AA: let the worker consume the setup writes before
+# caching, or it invalidates the rows these cases are about.
+sleep 8
+for k in 1 2 3 4; do psql_ "SELECT supacache.rowcache_put('public.cc', $k)" >/dev/null; done
+chk "the rows under test are actually served from the cache" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.cc WHERE id=1" | grep -c 'pg_keyspace_rowcache')"
+
+# --- UPDATE then read -------------------------------------------------------
+psql_ "UPDATE public.cc SET v='one_v2' WHERE id=1" >/dev/null
+T=$(converge "SELECT v FROM public.cc WHERE id=1" "one_v2")
+chk "an UPDATE reaches the cache within the budget (took ${T}s)" "1" \
+    "$([ "$(psql_ "SELECT v FROM public.cc WHERE id=1")" = "one_v2" ] && echo 1 || echo 0)"
+
+# --- DELETE then read: the window serves a row that no longer exists ---------
+psql_ "DELETE FROM public.cc WHERE id=2" >/dev/null
+T=$(converge "SELECT count(*) FROM public.cc WHERE id=2" "0")
+chk "a DELETE stops the cache serving the removed row (took ${T}s)" "0" \
+    "$(psql_ "SELECT count(*) FROM public.cc WHERE id=2")"
+
+# --- ROLLBACK must not change what is served --------------------------------
+psql_ "BEGIN; UPDATE public.cc SET v='rolled_back' WHERE id=3; ROLLBACK" >/dev/null
+sleep $(( (DECODE_MS / 1000) + 4 ))
+chk "a ROLLBACK leaves the cached row alone" "three" \
+    "$(psql_ "SELECT v FROM public.cc WHERE id=3")"
+
+# --- two writers: the last commit is the one that survives -------------------
+psql_ "UPDATE public.cc SET v='four_a' WHERE id=4" >/dev/null
+psql_ "UPDATE public.cc SET v='four_b' WHERE id=4" >/dev/null
+T=$(converge "SELECT v FROM public.cc WHERE id=4" "four_b")
+chk "back-to-back UPDATEs converge on the last one (took ${T}s)" "four_b" \
+    "$(psql_ "SELECT v FROM public.cc WHERE id=4")"
+
+# --- INSERT: a row that was never cached must not be a phantom --------------
+psql_ "INSERT INTO public.cc VALUES (5,'five')" >/dev/null
+chk "a row inserted after caching reads correctly" "five" \
+    "$(psql_ "SELECT v FROM public.cc WHERE id=5")"
+chk "and it is served from the heap, not the cache" "0" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.cc WHERE id=5" | grep -c 'pg_keyspace_rowcache')"
+
+# --- the window itself ------------------------------------------------------
+# A read taken immediately after COMMIT may legitimately be either value. What
+# it must never be is anything else — a torn read, an empty result, or the value
+# of a different row.
+psql_ "UPDATE public.cc SET v='one_v3' WHERE id=1" >/dev/null
+IMM=$(psql_ "SELECT v FROM public.cc WHERE id=1")
+if [ "$IMM" = "one_v2" ] || [ "$IMM" = "one_v3" ]; then IMM_OK=1; else IMM_OK=0; fi
+chk "a read inside the window returns one of the two committed values (got '$IMM')" "1" "$IMM_OK"
+T=$(converge "SELECT v FROM public.cc WHERE id=1" "one_v3")
+chk "and the window closes within the budget (took ${T}s)" "one_v3" \
+    "$(psql_ "SELECT v FROM public.cc WHERE id=1")"
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
