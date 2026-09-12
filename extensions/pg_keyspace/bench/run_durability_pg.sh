@@ -1197,6 +1197,89 @@ start_pg; wait_ready; sleep 2
 chk "the cluster is healthy again at the original size" "1" "$(psql_ "SELECT 1")"
 
 echo ""
+echo "########## AA. the row cache never crosses a tenant boundary (#39) ##########"
+# Two things, neither of which runs in CI today.
+#
+# The RLS invariant itself. The CustomScan serves the RAW pre-policy row at the
+# leaf and relies on the relation's own restriction clauses being re-applied
+# above it, so a regression there is a cross-tenant read rather than a wrong
+# answer. bench/run_security.sh proves it, but that harness needs a hand-built
+# cluster and is wired into no workflow, so nothing checks it automatically.
+#
+# And the half of the cache key run_security.sh cannot reach. The key is
+# (relid, pk_bytes), and its two tables use disjoint pk values — 1,2 against
+# 10,11 — so a bug that ignored relid entirely would still pass there. A
+# single-column primary key cannot hold one value twice, so the only way to put
+# the same pk on two tenants is two tables, which is also how multi-tenant
+# schemas are usually shaped.
+psql_ "DROP TABLE IF EXISTS public.rls_rows, public.ten_a, public.ten_b, public.ten_c CASCADE" >/dev/null 2>&1
+psql_ "CREATE ROLE ten_alpha LOGIN" >/dev/null 2>&1
+psql_ "CREATE ROLE ten_beta LOGIN"  >/dev/null 2>&1
+# Connect AS the tenant rather than SET ROLE inside the superuser session: psql
+# prints the "SET" command tag ahead of the rows, which lands in the captured
+# output and makes an empty result compare as "SET" rather than "". It is also
+# closer to what a tenant actually does.
+as_tenant() { PGOPTIONS="$PGOPTS" $PGBIN/psql -h /tmp -p $PORT -U "$1" -d postgres -tAc "$2" 2>&1; }
+psql_ "CREATE TABLE public.rls_rows(id bigint primary key, tenant name, secret text)" >/dev/null
+psql_ "INSERT INTO public.rls_rows VALUES (1,'ten_alpha','alpha-secret'),(2,'ten_beta','beta-secret')" >/dev/null
+psql_ "ALTER TABLE public.rls_rows ENABLE ROW LEVEL SECURITY" >/dev/null
+psql_ "ALTER TABLE public.rls_rows FORCE ROW LEVEL SECURITY" >/dev/null
+psql_ "CREATE POLICY rls_own ON public.rls_rows FOR SELECT USING (tenant = current_user)" >/dev/null
+psql_ "GRANT SELECT ON public.rls_rows TO ten_alpha, ten_beta" >/dev/null
+# Same pk values in two tables; and a text pk whose canonical bytes are the same
+# as a bigint pk's, since the canonical form is the type's output text.
+psql_ "CREATE TABLE public.ten_a(id bigint primary key, v text)" >/dev/null
+psql_ "CREATE TABLE public.ten_b(id bigint primary key, v text)" >/dev/null
+psql_ "CREATE TABLE public.ten_c(id text   primary key, v text)" >/dev/null
+psql_ "INSERT INTO public.ten_a VALUES (1,'alpha-one'),(2,'alpha-two')" >/dev/null
+psql_ "INSERT INTO public.ten_b VALUES (1,'beta-one'),(2,'beta-two')" >/dev/null
+psql_ "INSERT INTO public.ten_c VALUES ('1','gamma-one')" >/dev/null
+for t in rls_rows ten_a ten_b ten_c; do
+  psql_ "SELECT supacache.rowcache_register('public.$t', 1)" >/dev/null
+done
+# The invalidation worker is live from section Y. Let it consume the decode
+# records for the setup writes above before caching anything, or it drops the
+# rows these assertions are about and they all fall back to index scans.
+sleep 8
+psql_ "SELECT supacache.rowcache_put('public.rls_rows', 1)" >/dev/null
+psql_ "SELECT supacache.rowcache_put('public.rls_rows', 2)" >/dev/null
+psql_ "SELECT supacache.rowcache_put('public.ten_a', 1)" >/dev/null
+psql_ "SELECT supacache.rowcache_put('public.ten_a', 2)" >/dev/null
+psql_ "SELECT supacache.rowcache_put('public.ten_b', 1)" >/dev/null
+psql_ "SELECT supacache.rowcache_put('public.ten_b', 2)" >/dev/null
+psql_ "SELECT supacache.rowcache_put('public.ten_c', '1')" >/dev/null
+
+# Everything below is worthless if the cache path is not the one being taken:
+# an index scan returns the right answers too, and the section would pass while
+# testing nothing.
+chk "a cached lookup takes the Custom Scan" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.ten_a WHERE id=1" | grep -c 'pg_keyspace_rowcache')"
+chk "so does the other table at the same pk" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.ten_b WHERE id=1" | grep -c 'pg_keyspace_rowcache')"
+
+# The relid half of the key: identical pk bytes, different relations.
+chk "pk 1 serves its own table's row"           "alpha-one" "$(psql_ "SELECT v FROM public.ten_a WHERE id=1")"
+chk "pk 1 in the other table serves the other"  "beta-one"  "$(psql_ "SELECT v FROM public.ten_b WHERE id=1")"
+chk "pk 2 serves its own table's row"           "alpha-two" "$(psql_ "SELECT v FROM public.ten_a WHERE id=2")"
+chk "pk 2 in the other table serves the other"  "beta-two"  "$(psql_ "SELECT v FROM public.ten_b WHERE id=2")"
+chk "a text pk with the same bytes as an integer pk does not collide" "gamma-one" \
+    "$(psql_ "SELECT v FROM public.ten_c WHERE id='1'")"
+
+# RLS re-applied above the cached leaf.
+chk "a tenant reads its own cached row" "alpha-secret" \
+    "$(as_tenant ten_alpha "SELECT secret FROM public.rls_rows WHERE id=1")"
+chk "the other tenant reads its own cached row" "beta-secret" \
+    "$(as_tenant ten_beta "SELECT secret FROM public.rls_rows WHERE id=2")"
+chk "a tenant is denied the other's cached row" "" \
+    "$(as_tenant ten_alpha "SELECT secret FROM public.rls_rows WHERE id=2")"
+chk "and the denial is mutual" "" \
+    "$(as_tenant ten_beta "SELECT secret FROM public.rls_rows WHERE id=1")"
+# The denial has to come from the policy rather than from the cache having
+# missed, so prove the denied read still goes through the cache path.
+chk "the denied read still went through the cache path" "1" \
+    "$(as_tenant ten_alpha "EXPLAIN (COSTS OFF) SELECT secret FROM public.rls_rows WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
