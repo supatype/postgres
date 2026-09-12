@@ -198,9 +198,49 @@ Redis-compatible (`bench/run_big{hash,list,zset}.sh`, `core/examples/bench_*`):
   across 4 (`bench/run_persist_scaleout.sh`), while reads stay unaffected (write
   flood tail cut from 170 ms → 5 ms).
 - **Crash recovery:** after `kill -9`, keys rebuild from `supacache.kv` at
-  ~3.5 µs/key; every acked durable write survives.
+  ~3.5 µs/key; every acked durable write survives. Measured against key count by
+  `bench/run_recovery_bench.sh` — the per-key time holds to 1M, but peak memory
+  is the constraint that decides how large a keyspace can be restarted, so see
+  [the table](#recovery-cost-against-key-count) before sizing one.
 - **TTL expiry** is an O(1) partition `DROP` (3.2 ms) vs an O(n) `DELETE`
   (141 ms for 100 k rows) — no vacuum churn.
+
+#### Recovery cost against key count
+
+Recovery loads a worker's whole slot range into the segment before its RESP port
+opens, so what it costs is a startup outage and a memory spike. Reproduce with
+`bench/run_recovery_bench.sh`; rows are written straight into `supacache.kv`,
+since recovery reads that table and populating it through RESP would be hours of
+sequential durable acks.
+
+| keys | recovery time | µs/key | peak RSS | over baseline |
+|------|---------------|--------|----------|---------------|
+| 0 | 3.96 ms | – | 22 MB | baseline |
+| 10 k | 48.5 ms | 4.85 | 43 MB | 21 MB |
+| 100 k | 470 ms | 4.70 | 93 MB | 71 MB |
+| 1 M | 6.70 s | 6.70 | 595 MB | 573 MB |
+
+Single run, **debug build**, 64-byte values, one worker, segment sized for 1.2M
+keys throughout so peak RSS is comparable across rows. Debug costs roughly twice
+release, so the 1M row is about 3.4 µs/key release-equivalent — the ~3.5 µs/key
+figure above holds at 1M, which is as far as it has been checked.
+
+Two things the table says that the per-key figure alone does not:
+
+- **Time per key is flat to 100k and rises at 1M** (4.85, 4.70, 6.70). Extrapolate
+  the headline figure past 1M with that in mind.
+- **Memory is the binding constraint, and it is not simply per-key.** The jump
+  from 10k to 100k costs 3.4× the memory for 10× the keys, because the bucket
+  array is sized for the whole segment and even a small load hashes across all of
+  it; from 100k to 1M it costs 8.1×, approaching linear. At 1M the 573 MB is
+  around three times what the segment's own entries, buckets and slab arena
+  should need for this key and value size, so something transient still scales
+  with key count even though the load now streams through a cursor. Worth
+  understanding before trusting a 10M extrapolation, which this shape would put
+  near 6 GB.
+
+10M and beyond are not measured here; they need a machine with the memory to
+hold the answer.
 
 ### Mode B row cache (masked-read cost, `bench/run_maskcost.sh`)
 
