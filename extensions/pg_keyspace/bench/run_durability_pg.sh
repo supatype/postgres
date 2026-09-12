@@ -1071,9 +1071,14 @@ if [ "$PLUGIN_OK" = "1" ]; then
   # Long enough that the drain lands inside the window this section controls
   # rather than racing it.
   set_conf "pg_keyspace.rowcache_decode_ms" "4000"
-  # Applies to the worker's own SPI. Every psql_ here overrides it per session
-  # through PGOPTIONS, so only the refill is affected.
-  set_conf "statement_timeout" "3s"
+  # lock_timeout, NOT statement_timeout. statement_timeout is armed in
+  # start_xact_command(), which is the main query loop; a background worker's SPI
+  # never goes through it, so the setting has no effect there and the refill just
+  # waits out the lock (which is what the first version of this section did).
+  # lock_timeout is armed by the lock manager itself in ProcSleep, so it applies
+  # to any lock wait however the query was started. Every psql_ here overrides it
+  # per session through PGOPTIONS, so only the worker's refill is affected.
+  set_conf "lock_timeout" "2s"
   [ "$OPL" = "1" ] && set_conf "output_plugin_libraries" "'supacache_keys'"
   start_pg; wait_ready; sleep 3
 
@@ -1094,6 +1099,11 @@ if [ "$PLUGIN_OK" = "1" ]; then
 
   # Change every cached row, then make the apply impossible before the worker
   # next wakes. The lock outlives several drain attempts.
+  # Decoding does not take a relation lock — a peek returns normally while
+  # ACCESS EXCLUSIVE is held — so phase 1 always completes here and it is
+  # specifically the apply that fails. That is what makes the next assertion
+  # decisive rather than vacuous: the changes really were read before they were
+  # lost.
   psql_ "UPDATE public.inv66 SET v='v2'" >/dev/null
   ( psql_ "BEGIN; LOCK TABLE public.inv66 IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(20); COMMIT" >/dev/null 2>&1 ) &
   LOCKER=$!
