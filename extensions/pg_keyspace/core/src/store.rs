@@ -21,6 +21,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // values handed to the persistence worker by reference instead of being copied
 // through the ring. The layout is not compatible with v2.
 const MAGIC: u64 = 0x70_67_6b_73_5f_76_33_00; // "pgks_v3\0"
+/// Layout version inside a given MAGIC. Bumped when the meaning of the header's
+/// own fields changes; MAGIC is bumped when the partition layout does.
+const VERSION: u32 = 1;
 
 // Size classes for the slab allocator ("size-classed, 32B..8KB").
 const CLASS_SIZES: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
@@ -283,6 +286,15 @@ impl Store {
         let total = cfg.total_bytes();
         let shmem = Shmem::attach(name, total)?;
         let base = shmem.base();
+        // Refuse a segment laid out differently from the way we are about to
+        // index into it. Mapping it anyway does not fail — it just reads the
+        // wrong offsets, quietly, forever.
+        unsafe { Store::check_header(base, cfg) }.map_err(|why| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("pg_keyspace segment '{name}': {why}"),
+            )
+        })?;
         Ok(Store::from_parts(Backing::Posix(shmem), base, cfg))
     }
 
@@ -321,12 +333,87 @@ impl Store {
         unsafe {
             let h = self.base as *mut SegHeader;
             (*h).magic = MAGIC;
-            (*h).version = 1;
+            (*h).version = VERSION;
             (*h).num_partitions = self.num_partitions;
             (*h).partition_bytes = self.partition_bytes as u64;
             (*h).buckets_per_part = self.buckets;
             (*h).entries_per_part = self.entries;
             (*h).data_bytes_per_part = self.data_bytes;
+        }
+    }
+
+    /// Compare the header an existing segment carries against the layout this
+    /// process is about to read it with.
+    ///
+    /// The header has been written since the first version and never read back.
+    /// That is safe only while every process mapping the segment agrees on the
+    /// layout by construction — true inside Postgres, which recreates the
+    /// segment on every start from Postmaster-level GUCs, and not true of a
+    /// segment that outlives the process which created it. Getting it wrong is
+    /// silent rather than loud: the offsets simply land in the wrong places and
+    /// lookups return plausible garbage for the life of the process.
+    ///
+    /// Reports every field that disagrees rather than stopping at the first, so
+    /// an operator correcting sizing sees the whole story at once.
+    ///
+    /// # Safety
+    /// `base` must point at a readable region of at least
+    /// `size_of::<SegHeader>()` bytes.
+    pub unsafe fn check_header(base: *const u8, cfg: &Config) -> Result<(), String> {
+        let h = &*(base as *const SegHeader);
+        if h.magic != MAGIC {
+            return Err(format!(
+                "not a pg_keyspace segment: magic {:#018x}, expected {:#018x} \
+                 (a stale segment of the same name, or one written by a build \
+                 with a different layout)",
+                h.magic, MAGIC
+            ));
+        }
+        if h.version != VERSION {
+            return Err(format!(
+                "segment layout version {}, this build understands {}",
+                h.version, VERSION
+            ));
+        }
+        let fields: [(&str, u64, u64); 5] = [
+            (
+                "partitions",
+                h.num_partitions as u64,
+                cfg.num_partitions as u64,
+            ),
+            (
+                "partition bytes",
+                h.partition_bytes,
+                cfg.partition_bytes() as u64,
+            ),
+            (
+                "buckets per partition",
+                h.buckets_per_part as u64,
+                cfg.buckets_per_part as u64,
+            ),
+            (
+                "entries per partition",
+                h.entries_per_part as u64,
+                cfg.entries_per_part as u64,
+            ),
+            (
+                "data bytes per partition",
+                h.data_bytes_per_part,
+                cfg.data_bytes_per_part,
+            ),
+        ];
+        let bad: Vec<String> = fields
+            .iter()
+            .filter(|(_, found, want)| found != want)
+            .map(|(what, found, want)| format!("{what} {found}, expected {want}"))
+            .collect();
+        if bad.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "segment layout is not the one this process expects: {}",
+                bad.join("; ")
+            ))
         }
     }
 
@@ -1290,6 +1377,51 @@ mod tests {
     fn store(name: &str) -> Store {
         let cfg = Config::for_capacity(2, 10_000, 128);
         Store::create(name, &cfg).unwrap()
+    }
+
+    #[test]
+    fn header_check_accepts_the_segment_it_wrote() {
+        let cfg = Config::for_capacity(2, 10_000, 128);
+        let s = Store::create("t_hdr_ok", &cfg).unwrap();
+        assert!(unsafe { Store::check_header(s.base, &cfg) }.is_ok());
+    }
+
+    #[test]
+    fn header_check_reports_every_field_that_disagrees() {
+        let cfg = Config::for_capacity(2, 10_000, 128);
+        let s = Store::create("t_hdr_layout", &cfg).unwrap();
+        // Same partition count, different sizing: exactly the shape of a daemon
+        // restarted against a live segment with different capacity flags.
+        let other = Config::for_capacity(2, 5_000, 128);
+        let why = unsafe { Store::check_header(s.base, &other) }.unwrap_err();
+        assert!(why.contains("entries per partition"), "{why}");
+        assert!(why.contains("buckets per partition"), "{why}");
+        assert!(why.contains("partition bytes"), "{why}");
+    }
+
+    #[test]
+    fn header_check_rejects_memory_that_is_not_a_segment() {
+        let zeros = vec![0u8; std::mem::size_of::<SegHeader>()];
+        let cfg = Config::for_capacity(2, 10_000, 128);
+        let why = unsafe { Store::check_header(zeros.as_ptr(), &cfg) }.unwrap_err();
+        assert!(why.contains("not a pg_keyspace segment"), "{why}");
+    }
+
+    #[test]
+    fn attach_takes_a_matching_segment_and_refuses_a_mismatched_one() {
+        let cfg = Config::for_capacity(2, 10_000, 128);
+        let _owner = Store::create("t_attach_chk", &cfg).unwrap();
+        // The legitimate path still works — this is also the only coverage
+        // Store::attach has, since nothing in the tree calls it yet.
+        assert!(Store::attach("t_attach_chk", &cfg).is_ok());
+        // A smaller layout maps cleanly because it fits inside the segment, so
+        // the header is the only thing standing between it and silent garbage.
+        let other = Config::for_capacity(2, 5_000, 128);
+        let e = match Store::attach("t_attach_chk", &other) {
+            Ok(_) => panic!("attached a segment laid out for a different capacity"),
+            Err(e) => e,
+        };
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

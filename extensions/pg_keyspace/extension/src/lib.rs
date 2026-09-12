@@ -957,6 +957,15 @@ extern "C" fn ks_shmem_startup() {
             for w in 0..nworkers {
                 let _view = Store::from_raw(ptr.add(w * size), &cfg, true);
             }
+        } else {
+            // Attaching to a segment this process did not lay out. Reading it
+            // with the wrong geometry does not fail, it just lands on the wrong
+            // offsets for the life of the process, so refuse instead.
+            for w in 0..nworkers {
+                if let Err(why) = Store::check_header(ptr.add(w * size), &cfg) {
+                    error!("pg_keyspace: shared segment for worker {w} is unusable: {why}");
+                }
+            }
         }
         SEG_BASE.store(ptr, Ordering::Release);
 
@@ -982,7 +991,13 @@ extern "C" fn ks_shmem_startup() {
         let mut rc_found = false;
         let rcptr = pg_sys::ShmemInitStruct(ROWCACHE_NAME.as_ptr(), rc_bytes, &mut rc_found) as *mut u8;
         if !rcptr.is_null() {
-            let _ = Store::from_raw(rcptr, &rc_cfg, !rc_found);
+            if rc_found {
+                if let Err(why) = Store::check_header(rcptr, &rc_cfg) {
+                    error!("pg_keyspace: row-cache segment is unusable: {why}");
+                }
+            } else {
+                let _ = Store::from_raw(rcptr, &rc_cfg, true);
+            }
             ROWCACHE_BASE.store(rcptr, Ordering::Release);
         }
         // Worker liveness table. Zeroed means "never claimed", which is what
@@ -1054,6 +1069,12 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         return;
     }
     let cfg = ks_config();
+    // Checked once here, at the point this worker takes up the segment, rather
+    // than in the per-query views built over the same base.
+    if let Err(why) = unsafe { Store::check_header(base, &cfg) } {
+        log!("pg_keyspace worker {w}: shared segment is unusable: {why}; exiting");
+        return;
+    }
     let store = Arc::new(unsafe { Store::from_raw(base, &cfg, false) });
     // Persistence and recovery are per slot worker: this worker owns a disjoint
     // slot range (crc16::slot_range), its own segment, and its own ring set, so
