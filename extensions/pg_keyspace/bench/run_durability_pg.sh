@@ -1598,6 +1598,112 @@ chk "replies come back in command order, and reads see the writes ahead of them"
     "$(timeout 60 python3 /tmp/pgks_order.py $RESP 2>&1 | tail -1)"
 
 echo ""
+echo "########## AF. one connection cannot monopolise the worker (#83) ##########"
+# Two failures, found together. process() drained a connection's whole read
+# buffer before yielding, so a deep pipeline was served to completion while
+# everyone else waited -- an unrelated connection went from 91586 operations in
+# five seconds to one operation in eight. And a parked connection was
+# re-executing the command it parked on, because `parked` was checked only after
+# dispatch: SET is idempotent so that merely desynchronised a pipelining client,
+# but INCR or LPUSH would have corrupted the value.
+#
+# Both need a ring small enough to be full, which is what makes a connection
+# park at all, so this section reconfigures and puts the cluster back after.
+stop_pg; sleep 1
+set_conf "pg_keyspace.ring_mb" "1"
+start_pg; wait_ready; sleep 3
+chk "the cluster came back on a small ring" "1" "$(psql_ "SELECT 1")"
+
+# --- the reply stream must have exactly one reply per command ---------------
+# Counted in bytes rather than by a client-side counter: "+OK" is five bytes, so
+# a duplicated reply is arithmetic rather than a judgement call. This is the
+# assertion that caught the double-execute; the latency one below would not have.
+cat > /tmp/pgks_replycount.py <<'PYEOF'
+import socket, sys, time
+port = int(sys.argv[1]); N = int(sys.argv[2])
+s = socket.create_connection(('127.0.0.1', port))
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+val = b'v' * 1024
+out = bytearray()
+for i in range(N):
+    k = b'rc:%d' % i
+    out += b'*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n' % (len(k), k, len(val), val)
+s.sendall(out)
+buf = b''
+s.settimeout(30)
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline and len(buf) < 5 * N:
+    try:
+        d = s.recv(1 << 16)
+    except OSError:
+        break
+    if not d:
+        break
+    buf += d
+# Give any surplus reply a chance to show up rather than declaring victory the
+# instant the expected count is reached.
+time.sleep(0.5)
+s.setblocking(False)
+try:
+    while True:
+        more = s.recv(1 << 16)
+        if not more:
+            break
+        buf += more
+except OSError:
+    pass
+print(len(buf) - 5 * N)
+PYEOF
+RC_N=${PGKS_RC_N:-50000}
+RC_DELTA=$(timeout 300 python3 /tmp/pgks_replycount.py $RESP $RC_N 2>&1 | tail -1)
+chk "exactly one reply per command, with the ring full throughout ($RC_N cmds, delta ${RC_DELTA}B)" "0" "$RC_DELTA"
+
+# --- an unrelated connection keeps being served -----------------------------
+cat > /tmp/pgks_victim.py <<'PYEOF'
+import socket, sys, time
+port = int(sys.argv[1]); secs = float(sys.argv[2])
+s = socket.create_connection(('127.0.0.1', port))
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+lat = []; t_end = time.monotonic() + secs; i = 0
+s.settimeout(30)
+while time.monotonic() < t_end:
+    i += 1
+    k = b'victim:%d' % i
+    t0 = time.monotonic()
+    try:
+        s.sendall(b'*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$2\r\nvv\r\n' % (len(k), k))
+        r = s.recv(64)
+    except OSError:
+        break
+    lat.append((time.monotonic() - t0) * 1000)
+    if not r:
+        break
+lat.sort()
+n = len(lat)
+print('%d %.1f' % (n, lat[-1] if n else 999999))
+PYEOF
+# Flood on one connection while a second does ordinary sequential writes.
+seq 1 60000 | awk '{print "SET flood:"$1" "sprintf("%01024d", $1)}' > /tmp/pgks_flood.txt
+(timeout 180 redis-cli -p $RESP --pipe < /tmp/pgks_flood.txt >/dev/null 2>&1) &
+FLOOD_PID=$!
+sleep 1
+read -r VIC_OPS VIC_MAX <<<"$(timeout 120 python3 /tmp/pgks_victim.py $RESP 8 2>&1 | tail -1)"
+wait $FLOOD_PID 2>/dev/null
+echo "  (victim managed ${VIC_OPS:-0} ops, worst ${VIC_MAX:-?}ms, while another connection flooded)"
+# Budgets are deliberately loose: the point is to catch a connection being
+# frozen out, not to pin a latency number on a shared CI runner. Unfixed, this
+# was 1 op and 9860ms.
+chk "an unrelated connection is still served during a flood (${VIC_OPS:-0} ops)" "1" \
+    "$([ "${VIC_OPS:-0}" -ge 20 ] && echo 1 || echo 0)"
+chk "and its worst round trip stays bounded (${VIC_MAX:-?}ms)" "1" \
+    "$(awk -v m="${VIC_MAX:-999999}" 'BEGIN{print (m < 2000) ? 1 : 0}')"
+
+stop_pg; sleep 1
+set_conf "pg_keyspace.ring_mb" "8"
+start_pg; wait_ready; sleep 2
+chk "the cluster is healthy again at the original ring size" "1" "$(psql_ "SELECT 1")"
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
