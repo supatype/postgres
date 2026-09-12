@@ -21,6 +21,7 @@ use pgrx::{AnyElement, FromDatum, IntoDatum, PgBuiltInOids, PgOid};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pgrx::pg_module_magic!();
@@ -40,6 +41,8 @@ mod batcher;
 mod ring;
 #[path = "../../core/src/pubsub.rs"]
 mod pubsub;
+#[path = "../../core/src/pubsub_shm.rs"]
+mod pubsub_shm;
 #[path = "../../core/src/repl.rs"]
 mod repl;
 #[path = "../../core/src/aggr.rs"]
@@ -57,6 +60,8 @@ const RING_NAME: &CStr = c"pg_keyspace_ring";
 // Mode B row cache lives in its OWN segment — never RESP-addressable (Mode A
 // and Mode B "must not share a code path").
 const ROWCACHE_NAME: &CStr = c"pg_keyspace_rowcache";
+// Cross-process pub/sub routing table and inboxes.
+const PUBSUB_NAME: &CStr = c"pg_keyspace_pubsub";
 
 // Base address of the Postgres shared-memory segment, published by the startup
 // hook and inherited by every forked backend. Each context rebuilds a cheap
@@ -66,6 +71,13 @@ static SEG_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static RING_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // Base of the Mode B row-cache segment (read by the planner-hook custom scan).
 static ROWCACHE_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+// Base of the cross-process pub/sub segment.
+static PUBSUB_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+// The bus itself, built by the postmaster in the shmem startup hook so that the
+// wake descriptors it opens are inherited by every worker that forks from it.
+// Built after the fork, each worker would hold private descriptors and wake
+// nobody, which is indistinguishable from having no subscribers.
+static BUS: OnceLock<Arc<pubsub::Bus>> = OnceLock::new();
 
 // GUCs (fixed at postmaster start; the segment is sized from them).
 static GUC_PORT: GucSetting<i32> = GucSetting::<i32>::new(6380);
@@ -87,6 +99,8 @@ static GUC_DATABASE: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"postgres"));
 static GUC_PERSIST_WINDOW_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static GUC_RING_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
+static GUC_PUBSUB_ROUTES: GucSetting<i32> = GucSetting::<i32>::new(4096);
+static GUC_PUBSUB_RING_KB: GucSetting<i32> = GucSetting::<i32>::new(256);
 static GUC_PERSIST_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 // TTL by partition drop: time-bucket width and sweep interval.
 static GUC_TTL_BUCKET_SECS: GucSetting<i32> = GucSetting::<i32>::new(10);
@@ -238,6 +252,15 @@ fn ring_index(w: usize, shard: usize) -> usize {
 /// Bytes for one ring (header + power-of-two capacity).
 fn ring_stride() -> usize {
     ring::bytes_for((GUC_RING_MB.get().max(1) as usize) * 1024 * 1024)
+}
+
+/// Shared bytes for the cross-process pub/sub bus.
+fn pubsub_bytes() -> usize {
+    pubsub_shm::bytes_for(
+        worker_count(),
+        GUC_PUBSUB_ROUTES.get().max(16) as usize,
+        (GUC_PUBSUB_RING_KB.get().max(4) as usize) * 1024,
+    )
 }
 /// Total shared memory for all rings, laid out contiguously.
 fn ring_total_bytes() -> usize {
@@ -467,6 +490,26 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_int_guc(
+        "pg_keyspace.pubsub_routes",
+        "Distinct pub/sub channels and patterns the shared routing table holds",
+        "Subscriptions beyond this are refused and counted in pubsub_stats().",
+        &GUC_PUBSUB_ROUTES,
+        16,
+        1_048_576,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.pubsub_ring_kb",
+        "Queue per ordered worker pair for cross-worker pub/sub, in KB",
+        "A publish to a worker whose queue is full is dropped and counted.",
+        &GUC_PUBSUB_RING_KB,
+        4,
+        65_536,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
         "pg_keyspace.ring_mb",
         "Size of each RESP->persistence ring buffer, in MB",
         "Absorbs write bursts so the RESP path never blocks on persistence.",
@@ -669,6 +712,7 @@ extern "C" fn ks_shmem_request() {
         pg_sys::RequestAddinShmemSpace(worker_count() * ks_config().total_bytes());
         pg_sys::RequestAddinShmemSpace(ring_total_bytes());
         pg_sys::RequestAddinShmemSpace(rowcache_config().total_bytes());
+        pg_sys::RequestAddinShmemSpace(pubsub_bytes());
     }
 }
 
@@ -721,6 +765,24 @@ extern "C" fn ks_shmem_startup() {
             let _ = Store::from_raw(rcptr, &rc_cfg, !rc_found);
             ROWCACHE_BASE.store(rcptr, Ordering::Release);
         }
+        // Cross-process pub/sub. Only the creator builds the Bus: it is the
+        // postmaster, and its wake descriptors are what every worker inherits.
+        let ps_bytes = pubsub_bytes();
+        let mut ps_found = false;
+        let psptr = pg_sys::ShmemInitStruct(PUBSUB_NAME.as_ptr(), ps_bytes, &mut ps_found) as *mut u8;
+        if !psptr.is_null() {
+            if !ps_found {
+                let bus = pubsub::Bus::new_shared(
+                    psptr,
+                    worker_count(),
+                    GUC_PUBSUB_ROUTES.get().max(16) as usize,
+                    (GUC_PUBSUB_RING_KB.get().max(4) as usize) * 1024,
+                );
+                let _ = BUS.set(Arc::new(bus));
+            }
+            PUBSUB_BASE.store(psptr, Ordering::Release);
+        }
+
         log!(
             "pg_keyspace: shmem ready (store {} bytes, {} rings x {} bytes, rowcache {} bytes, found={})",
             size,
@@ -776,6 +838,16 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         }
     };
     worker.set_max_value_bytes(GUC_MAX_VALUE_BYTES.get().max(1024) as usize);
+    // Cross-worker pub/sub. Without this a SUBSCRIBE here never sees a PUBLISH
+    // on another worker, and the publisher's reply counts only its own local
+    // subscribers, so neither side can tell the message was lost.
+    if let Some(bus) = BUS.get() {
+        worker.set_bus(bus.clone(), w);
+    } else if worker_count() > 1 {
+        log!(
+            "pg_keyspace worker {w}: WARNING no shared pub/sub bus; PUBLISH and              SUBSCRIBE reach only clients connected to this worker"
+        );
+    }
 
     // TLS: if a cert+key are configured, wrap the RESP wire in TLS. If TLS
     // was requested but the files fail to load, FAIL CLOSED — park rather than
@@ -2625,6 +2697,46 @@ mod supacache {
                 u += unresolved as i64;
             }
             rows.push((p, d, b, c_, (p - c_).max(0), e, u));
+        }
+        TableIterator::new(rows)
+    }
+
+    /// Health of the cross-worker pub/sub bus.
+    ///
+    /// Every column counts a message that was not delivered, which is the part
+    /// pub/sub cannot report for itself: PUBLISH answers with a subscriber
+    /// count, and a message dropped on the way to another worker still leaves
+    /// that count looking plausible to the client that sent it.
+    ///
+    /// `dropped` is a publish that did not fit in the target worker's queue.
+    /// Dropping is deliberate, since blocking a publisher on a worker that is
+    /// not draining would turn one stalled subscriber into a stalled keyspace,
+    /// but a number climbing here means subscribers are missing messages and
+    /// `pg_keyspace.pubsub_ring_kb` is too small for the burst.
+    ///
+    /// `route_full` is a subscription refused because the routing table was
+    /// full: raise `pg_keyspace.pubsub_routes`. Those clients are subscribed as
+    /// far as they know and will receive nothing.
+    ///
+    /// `name_too_long` is a channel or pattern longer than the table stores.
+    /// Such a subscription is refused rather than truncated, because truncating
+    /// would merge two channels into one and cross their traffic.
+    #[pg_extern(stable, parallel_safe)]
+    fn pubsub_stats() -> TableIterator<
+        'static,
+        (
+            name!(dropped, i64),
+            name!(route_full, i64),
+            name!(name_too_long, i64),
+        ),
+    > {
+        let base = PUBSUB_BASE.load(Ordering::Acquire);
+        let mut rows = Vec::new();
+        if !base.is_null() {
+            if let Some(bus) = unsafe { pubsub_shm::ShmBus::attach(base) } {
+                let (d, r, n) = bus.stats();
+                rows.push((d as i64, r as i64, n as i64));
+            }
         }
         TableIterator::new(rows)
     }
