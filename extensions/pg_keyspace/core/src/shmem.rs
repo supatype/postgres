@@ -72,6 +72,26 @@ impl Shmem {
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // A segment shorter than `len` maps without complaint and then
+            // SIGBUSes on the first touch past its end, which surfaces as a
+            // process dying with no diagnosis. Check the size while we still
+            // hold the descriptor and can say what was actually there.
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut st) != 0 {
+                let e = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(e);
+            }
+            if (st.st_size as u64) < len as u64 {
+                libc::close(fd);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "shared segment '/{name}' is {} bytes, need {len}",
+                        st.st_size
+                    ),
+                ));
+            }
             let ptr = libc::mmap(
                 std::ptr::null_mut(),
                 len,
