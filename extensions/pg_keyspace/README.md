@@ -198,30 +198,38 @@ Redis-compatible (`bench/run_big{hash,list,zset}.sh`, `core/examples/bench_*`):
   is cut from 170 ms → 5 ms. The ring **drains** into `supacache.kv` at ~107 k/s
   per worker, scaling to 145 k/s across 4 (`bench/run_persist_scaleout.sh`).
   Read that as the capacity of the persistence machinery. What a *client* can
-  obtain durable acknowledgements at depends on whether it pipelines, because a
-  durable reply is held until its record commits:
+  obtain durable acknowledgements at depends on **how deeply it pipelines**,
+  because a durable reply is held until its record commits while commands keep
+  being read and applied.
 
-  | connections | pipeline depth | durable writes/s | avg latency |
-  |---:|---:|---:|---:|
-  | 1 | 1 | 92 | 10.9 ms |
-  | 1 | 16 | 1 468 | 10.9 ms |
-  | 10 | 1 | 917 | 10.8 ms |
-  | 10 | 16 | **14 650** | 10.7 ms |
+  Durable tier, 256-byte values, default `ring_mb` and `persist_window_ms = 10`,
+  pipelining as deeply as the connection allows:
 
-  A client that waits for each reply before sending the next is capped at about
-  one write per `persist_window_ms` — 92/s at the default, and ~900/s across a
-  ten-connection pool. A client that pipelines is not: commands keep being read
-  and applied while replies are held, so ten connections reach **14 650/s**, and
-  even a single pipelined connection beats the whole non-pipelined pool.
+  | connections | durable writes/s |
+  |---:|---:|
+  | 1 | **23 327** |
+  | 2 | **34 550** |
+  | 8 | **49 989** |
 
-  Latency is flat at ~10.8 ms throughout, which is the persist window: pipelining
-  buys throughput without paying for it in latency.
+  One connection is enough to reach tens of thousands of durable writes a
+  second; the ceiling is the persistence machinery, not the connection handler
+  ([#81](https://github.com/supatype/postgres/pull/81) measured 34 581/s on one
+  connection and 91 237/s at 32 on a quieter box).
 
-  That cap used to apply to every durable connection regardless of pipelining —
-  a pipelining client stalled exactly like a synchronous one. Fixed in
-  [#81](https://github.com/supatype/postgres/pull/81), closing
-  [#78](https://github.com/supatype/postgres/issues/78). `relaxed` and
-  `ephemeral` are unaffected and take over 350 k/s on a single connection.
+  **Pipeline depth is the variable that matters**, and a shallow pipeline hides
+  all of this. A sync-ack reply is held for up to one persist window, so a client
+  with at most *N* writes in flight is capped near *N* per window whatever the
+  server can do — at the default 10 ms window that is ~92/s waiting for each
+  reply, ~1 500/s at depth 16, ~15 000/s for ten connections at depth 16. Those
+  are properties of the client, not of the tier: benchmark with a depth that
+  actually fills a window, or you will measure your own `-P` flag.
+
+  Before [#81](https://github.com/supatype/postgres/pull/81) (closing
+  [#78](https://github.com/supatype/postgres/issues/78)) none of that was
+  available: a sync-ack connection stopped being read the moment one write was
+  in flight, so depth was pinned at 1 and even a deeply pipelining client got
+  ~90/s. `relaxed` and `ephemeral` are unaffected and take over 350 k/s on a
+  single connection.
 - **Crash recovery:** after `kill -9`, keys rebuild from `supacache.kv` at
   ~3.5 µs/key; every acked durable write survives. Measured against key count by
   `bench/run_recovery_bench.sh` — the per-key time holds to 1M, but peak memory
