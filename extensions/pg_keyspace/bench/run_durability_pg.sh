@@ -30,6 +30,16 @@ PROFILE=${PGKS_BUILD_PROFILE:-release}
 # held until its record commits, so an unbounded call hangs the whole suite
 # when anything goes wrong: an earlier run sat on one SET for over two hours.
 RCLI_TIMEOUT=${PGKS_RCLI_TIMEOUT:-20}
+# The same applies to the SQL side, and for a while it did not. A DROP
+# TABLESPACE that waits on a procsignal barrier no backend will acknowledge
+# waits forever, and an unbounded psql turned that into a suite that sat there
+# for thirty-six minutes looking slow rather than broken. Every statement now
+# has a ceiling, so a hang surfaces as a failed assertion naming the statement.
+# Generous, because some of these are legitimately slow: recovery of a large
+# keyspace, a base backup, a tablespace move.
+PSQL_TIMEOUT=${PGKS_PSQL_TIMEOUT:-120s}
+PSQL_LOCK_TIMEOUT=${PGKS_PSQL_LOCK_TIMEOUT:-60s}
+PGOPTS="-c statement_timeout=$PSQL_TIMEOUT -c lock_timeout=$PSQL_LOCK_TIMEOUT"
 # Topology under test. The multi-worker section below deliberately uses an
 # uneven split (3 does not divide 16384) because the slot-range arithmetic is
 # where off-by-one errors live.
@@ -45,7 +55,11 @@ chk_contains() {
   if echo "$3" | grep -qF "$2"; then echo "PASS  $1"; pass=$((pass+1));
   else echo "FAIL  $1"; echo "        wanted: [$2]"; fail=$((fail+1)); fi
 }
-psql_() { $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tAc "$1" 2>&1; }
+# grep -c prints "0" and still exits non-zero when it matches nothing, so
+# `grep -c ... || echo 0` emits TWO zeros and every comparison against it fails
+# with a confusing "expected [0], actual [0 0]". Count through this instead.
+countlog() { grep -ci "$1" "$2" 2>/dev/null | head -1 || true; }
+psql_() { PGOPTIONS="$PGOPTS" $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tAc "$1" 2>&1; }
 rcli()  { timeout "$RCLI_TIMEOUT" redis-cli -p $RESP "$@" 2>&1; }
 # Large values must come from stdin: a megabyte as an argv element exceeds
 # ARG_MAX. redis-cli -x appends stdin as the final argument.
@@ -522,6 +536,506 @@ if [ "${AFTER_S:-0}" -ge "${BEFORE_S:-0}" ]; then
   echo "PASS  nothing durable was lost across the outage"; pass=$((pass+1))
 else
   echo "FAIL  rows lost across the terminate ($BEFORE_S -> $AFTER_S)"; fail=$((fail+1)); fi
+
+
+echo ""
+echo "########## T. replicated tier with a standby that goes away ##########"
+# J asserts the tier refuses to start with no standby configured. This is the
+# other half, and the one that matters in production: a standby that exists,
+# and then stops.
+#
+# The promise of the replicated tier is that a successful reply means the write
+# reached a synchronous standby. The only two honest behaviours when the standby
+# is gone are to hold the reply or to refuse it. Quietly degrading to local
+# commit would keep answering OK while the promise is no longer true, and
+# nothing downstream could tell.
+SBDATA=${PGKS_STANDBY_DATA:-/tmp/pgks-standby}
+SBPORT=$((PORT + 10))
+# -k /tmp to match start_pg: without it the standby puts its socket in the
+# build default and every psql -h /tmp against it fails, which looks exactly
+# like a standby that never started.
+sb_start() { su postgres -c "$PGBIN/pg_ctl -D $SBDATA -l $SBDATA/log -o \"-p $SBPORT -k /tmp\" -w start" >/dev/null 2>&1; }
+sb_stop()  { su postgres -c "$PGBIN/pg_ctl -D $SBDATA -m fast -w stop" >/dev/null 2>&1; }
+
+stop_pg; sleep 1
+set_conf "wal_level" "replica"
+set_conf "max_wal_senders" "10"
+set_conf "pg_keyspace.durability" "'durable'"
+start_pg; wait_ready; sleep 2
+
+rm -rf $SBDATA
+timeout 180 su postgres -c "$PGBIN/pg_basebackup -h /tmp -p $PORT -U postgres -D $SBDATA -X stream -c fast -R" >/tmp/basebackup.log 2>&1
+if [ ! -f "$SBDATA/postgresql.conf" ]; then
+  echo "FAIL  could not take a base backup for the standby"; fail=$((fail+1))
+  tail -5 /tmp/basebackup.log
+else
+  # The standby must not run the extension: its workers would fight for the RESP
+  # port and the persistence worker would try to INSERT on a read-only server.
+  # This section is about replication, not about running two keyspaces.
+  sed -i "/shared_preload_libraries/d" $SBDATA/postgresql.conf
+  {
+    echo "port = $SBPORT"
+    echo "hot_standby = on"
+  } >> $SBDATA/postgresql.conf
+  # application_name is what synchronous_standby_names matches on, and
+  # pg_basebackup -R does not put one in primary_conninfo. Last setting in
+  # postgresql.auto.conf wins, so this overrides what -R wrote.
+  echo "primary_conninfo = 'host=/tmp port=$PORT user=postgres application_name=standby1'" >> $SBDATA/postgresql.auto.conf
+  sb_start
+  SB_UP=0
+  for _ in $(seq 1 30); do
+    if $PGBIN/psql -h /tmp -p $SBPORT -U postgres -d postgres -tAc "SELECT 1" 2>/dev/null | grep -q "^1$"; then
+      SB_UP=1; break
+    fi
+    sleep 1
+  done
+  chk "the standby is streaming" "1" "$SB_UP"
+
+  # Now switch the primary to the replicated tier, with the standby named.
+  stop_pg; sleep 1
+  set_conf "synchronous_standby_names" "'standby1'"
+  set_conf "pg_keyspace.durability" "'replicated'"
+  start_pg; wait_ready; sleep 5
+
+  # J's refusal must NOT fire now: the condition it names is satisfied.
+  RECENT=$(tail -60 $PGDATA/log)
+  if echo "$RECENT" | grep -q "REFUSING to start"; then
+    echo "FAIL  refused the replicated tier despite a configured standby"; fail=$((fail+1))
+  else
+    echo "PASS  the replicated tier starts once a standby is configured"; pass=$((pass+1))
+  fi
+  chk "replication_status reports the promise is honoured" "t" \
+      "$(psql_ "SELECT honoured FROM supacache.replication_status()")"
+  chk "the standby is registered as synchronous" "sync" \
+      "$(psql_ "SELECT sync_state FROM pg_stat_replication WHERE application_name='standby1'")"
+
+  # A write with the standby up must complete.
+  chk "a replicated write completes with the standby up" "OK" \
+      "$(timeout 20 redis-cli -p $RESP SET rep:k1 v1 2>&1)"
+  chk "and it reached the table" "v1" \
+      "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='rep:k1'::bytea")"
+
+  # Take the standby away. remote_apply cannot be satisfied, so the commit
+  # blocks; the ack must be held rather than given.
+  sb_stop; sleep 2
+  BEFORE_T=$(psql_ "SELECT count(*) FROM supacache.kv")
+  OUT=$(timeout 8 redis-cli -p $RESP SET rep:k2 v2 2>&1); RC=$?
+  echo "  SET with the standby stopped -> [$OUT] (rc=$RC)"
+  if [ "$RC" -ne 0 ] || [ -z "$OUT" ]; then
+    echo "PASS  the ack was held rather than degrading to a local commit"; pass=$((pass+1))
+  else
+    echo "FAIL  acked [$OUT] while no standby could have received it"; fail=$((fail+1)); fi
+  chk "nothing reached the table for it" "0" \
+      "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='rep:k2'::bytea")"
+  chk "the write already durable is still readable" "v1" \
+      "$(timeout 10 redis-cli -p $RESP GET rep:k1 2>&1)"
+
+  # Bring it back: the held record must commit rather than having been dropped.
+  sb_start
+  for _ in $(seq 1 60); do
+    [ "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='rep:k2'::bytea")" = "1" ] && break
+    sleep 1
+  done
+  chk "the held record commits once the standby returns" "1" \
+      "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='rep:k2'::bytea")"
+  chk "with the right value" "v2" \
+      "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='rep:k2'::bytea")"
+  AFTER_T=$(psql_ "SELECT count(*) FROM supacache.kv")
+  if [ "${AFTER_T:-0}" -ge "${BEFORE_T:-0}" ]; then
+    echo "PASS  nothing durable was lost while the standby was away"; pass=$((pass+1))
+  else
+    echo "FAIL  rows lost across the standby outage ($BEFORE_T -> $AFTER_T)"; fail=$((fail+1)); fi
+
+  # The promise can also be withdrawn by a reload rather than by a failure:
+  # synchronous_standby_names is sighup context. Clearing it must fail closed,
+  # not silently downgrade every subsequent write to a local commit.
+  psql_ "ALTER SYSTEM SET synchronous_standby_names = ''" >/dev/null 2>&1
+  psql_ "SELECT pg_reload_conf()" >/dev/null 2>&1
+  sleep 2
+  chk "replication_status reports the promise is no longer honoured" "f" \
+      "$(psql_ "SELECT honoured FROM supacache.replication_status()")"
+  psql_ "ALTER SYSTEM RESET synchronous_standby_names" >/dev/null 2>&1
+  psql_ "SELECT pg_reload_conf()" >/dev/null 2>&1
+
+  sb_stop
+fi
+
+stop_pg; sleep 1
+set_conf "pg_keyspace.durability" "'durable'"
+set_conf "synchronous_standby_names" "''"
+start_pg; wait_ready; sleep 2
+
+echo ""
+echo "########## U. the durable table's filesystem fills up ##########"
+# The one row of the failure matrix that needs a real full filesystem rather
+# than a rejected statement: ENOSPC arrives from the storage layer, mid
+# transaction, not from the planner. A small tmpfs holding supacache.kv is the
+# closest thing to it that can be arranged repeatably.
+#
+# Mounting one needs CAP_SYS_ADMIN, which a container may not have, so this
+# section skips rather than fails when it cannot arrange the conditions. A
+# skipped section says so; it does not quietly pass.
+SMALL=${PGKS_SMALL_MOUNT:-/tmp/pgks-small}
+mkdir -p $SMALL
+# Big enough that moving the existing table onto it succeeds, small enough
+# that the filler below fills it in a reasonable number of steps.
+if ! mount -t tmpfs -o size=32m tmpfs $SMALL 2>/dev/null; then
+  echo "  SKIP  cannot mount a tmpfs here (needs CAP_SYS_ADMIN); disk-full not exercised"
+else
+  chown postgres:postgres $SMALL
+  chmod 700 $SMALL
+  psql_ "DROP TABLESPACE IF EXISTS pgks_small" >/dev/null 2>&1
+  TS=$(psql_ "CREATE TABLESPACE pgks_small LOCATION '$SMALL'" 2>&1)
+  # Emptied before the move, not after: the table arrives here carrying every
+  # earlier section's data, which both risks not fitting on a deliberately small
+  # filesystem and, more importantly, leaves reusable free space behind. See the
+  # note below the move for why that free space defeats the whole section.
+  psql_ "TRUNCATE supacache.kv" >/dev/null 2>&1
+  # supacache.kv is PARTITION BY HASH, so the parent has no storage of its own.
+  # ALTER TABLE on it sets the default tablespace for FUTURE partitions and
+  # moves nothing, succeeding silently while every row stays where it was. Four
+  # earlier versions of this section did exactly that and then "tested" a full
+  # filesystem the data was never on.
+  psql_ "DO \$\$ DECLARE p regclass; BEGIN FOR p IN SELECT inhrelid::regclass FROM pg_inherits WHERE inhparent = 'supacache.kv'::regclass LOOP EXECUTE format('ALTER TABLE %s SET TABLESPACE pgks_small', p); END LOOP; END \$\$" >/dev/null 2>&1
+  MOVED=$(psql_ "ALTER TABLE supacache.kv SET TABLESPACE pgks_small" 2>&1)
+  # Assert the precondition instead of assuming it. This is the check whose
+  # absence let the section pass while exercising nothing.
+  STRAY=$(psql_ "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace WHERE i.inhparent = 'supacache.kv'::regclass AND coalesce(t.spcname,'pg_default') <> 'pgks_small'")
+  if [ "${STRAY:-1}" != "0" ]; then
+    echo "FAIL  $STRAY partition(s) of supacache.kv are not on the small tablespace;"
+    echo "        the section would be filling a filesystem the data is not on"
+    fail=$((fail+1))
+    psql_ "DROP TABLESPACE IF EXISTS pgks_small" >/dev/null 2>&1
+    umount $SMALL 2>/dev/null
+  elif echo "$MOVED" | grep -qi "error"; then
+    echo "  SKIP  could not move supacache.kv onto the small tablespace [$MOVED]"
+    umount $SMALL 2>/dev/null
+  else
+    echo "PASS  every supacache.kv partition is on the small filesystem"; pass=$((pass+1))
+    # Start from an empty table. By the time this section runs, supacache.kv
+    # carries the deletes and overwrites of every section before it, and a TOAST
+    # table with reusable free space absorbs a megabyte without extending a
+    # single file. A full filesystem does not stop a write that never needed to
+    # allocate, so with that history in place the section tests nothing: two
+    # earlier versions of it were fooled exactly that way, one of them while
+    # reporting PASS.
+    #
+    # TRUNCATE rather than VACUUM FULL, because compacting still leaves the rows
+    # occupying the filesystem and can still leave slack. This section needs a
+    # relation with nowhere to put anything.
+    BEFORE_U=$(psql_ "SELECT count(*) FROM supacache.kv")
+    chk "a write still works before it fills" "OK"         "$(timeout 20 redis-cli -p $RESP SET du:ok v1 2>&1)"
+
+    # Fill the filesystem directly rather than by generating traffic. Trying to
+    # fill it through the RESP path makes the test depend on arena size, TOAST
+    # compression and eviction, none of which is what is under test here; an
+    # earlier version of this section quietly failed to fill anything at all.
+    # STORAGE EXTERNAL keeps the filler out of line and uncompressed, so a
+    # megabyte of payload costs a megabyte of disk.
+    psql_ "CREATE TABLE supacache.du_filler(b bytea) TABLESPACE pgks_small" >/dev/null 2>&1
+    psql_ "ALTER TABLE supacache.du_filler ALTER COLUMN b SET STORAGE EXTERNAL" >/dev/null 2>&1
+    # Two stages, because "full" is not one thing. A filesystem that cannot take
+    # another megabyte will still take another 8 kB page, and an earlier version
+    # of this stopped at the first stage: the filesystem was full, a 1 MB insert
+    # failed, and the durable write under test then succeeded anyway because a
+    # fifty-byte row fitted in the space that was left.
+    FULL=0
+    for i in $(seq 1 80); do
+      ERR=$(psql_ "INSERT INTO supacache.du_filler SELECT repeat('x', 1000000)::bytea")
+      case "$ERR" in
+        *"o space left"*) FULL=1; echo "  no room for another MB after ${i} MB of filler"; break ;;
+      esac
+    done
+    FINE=0
+    if [ "$FULL" -eq 1 ]; then
+      for j in $(seq 1 400); do
+        ERR=$(psql_ "INSERT INTO supacache.du_filler SELECT repeat('y', 7000)::bytea")
+        case "$ERR" in
+          *"o space left"*) FINE=1; echo "  and no room for another page after $j more"; break ;;
+        esac
+      done
+    fi
+    chk "the filesystem is full to the byte" "1" "$FINE"
+
+    if [ "$FINE" -eq 1 ]; then
+      # The invariant. A durable write that cannot be stored must not be acked,
+      # and nothing already durable may be lost.
+      # A megabyte, not a short string: a small value can land in free space
+      # inside an existing page and commit even on a full filesystem, which
+      # proves nothing. This one has to allocate.
+      head -c 700000 /dev/urandom | base64 | head -c 1000000 > /tmp/nospace.txt
+      OUT=$(timeout 10 redis-cli -p $RESP -x SET du:nospace < /tmp/nospace.txt 2>&1); RC=$?
+      echo "  SET with the filesystem full -> [$OUT] (rc=$RC)"
+      if [ "$RC" -ne 0 ] || [ -z "$OUT" ] || [ "$OUT" != "OK" ]; then
+        echo "PASS  the write was not acked while it could not be stored"; pass=$((pass+1))
+      else
+        echo "FAIL  acked [$OUT] with no space to store it"; fail=$((fail+1)); fi
+      chk "nothing reached the table for it" "0"           "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='du:nospace'::bytea")"
+      chk "the value written before it filled is still durable" "v1"           "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='du:ok'::bytea")"
+      chk "no panics from the storage error" "0"           "$(countlog panicked $PGDATA/log)"
+      ERRC=$(psql_ "SELECT failed_batches FROM supacache.ring_stats()")
+      if [ "${ERRC:-0}" -gt 0 ]; then
+        echo "PASS  the storage failure is countable, not just loggable ($ERRC)"; pass=$((pass+1))
+      else
+        echo "FAIL  the filesystem filled and failed_batches still reads $ERRC"; fail=$((fail+1)); fi
+
+      # Free the space: the retained record must commit on its own, with no
+      # restart and no intervention beyond making room.
+      psql_ "DROP TABLE supacache.du_filler" >/dev/null 2>&1
+      for _ in $(seq 1 40); do
+        [ "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='du:nospace'::bytea")" = "1" ] && break
+        sleep 1
+      done
+      chk "the held record commits once space is freed" "1"           "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='du:nospace'::bytea")"
+      chk "with the right value" "$(wc -c < /tmp/nospace.txt)"           "$(psql_ "SELECT length(val) FROM supacache.kv WHERE key='du:nospace'::bytea")"
+      AFTER_U=$(psql_ "SELECT count(*) FROM supacache.kv")
+      if [ "${AFTER_U:-0}" -ge "${BEFORE_U:-0}" ]; then
+        echo "PASS  nothing durable was lost across the outage"; pass=$((pass+1))
+      else
+        echo "FAIL  rows lost while the disk was full ($BEFORE_U -> $AFTER_U)"; fail=$((fail+1)); fi
+    fi
+    psql_ "DROP TABLE IF EXISTS supacache.du_filler" >/dev/null 2>&1
+
+    # Put it back before anything else runs, and time the drop.
+    #
+    # This is a regression test for a defect the section found by hanging on it
+    # for eleven minutes. DROP TABLESPACE emits a procsignal barrier and waits
+    # for every backend to acknowledge it. A backend acknowledges from inside
+    # CHECK_FOR_INTERRUPTS, which these workers never reached: the RESP worker
+    # sits in a mio poll, the persistence worker in a drain loop, the expiry
+    # worker in a sleep. None of them ever answered, so the drop waited forever
+    # with no error and nothing in the log naming the culprit.
+    #
+    # The timeout is what keeps a recurrence a failed assertion rather than a
+    # wedged suite.
+    psql_ "DELETE FROM supacache.kv WHERE key LIKE 'du:%'::bytea" >/dev/null 2>&1
+    psql_ "ALTER TABLE supacache.kv SET TABLESPACE pg_default" >/dev/null 2>&1
+    psql_ "DO \$\$ DECLARE p regclass; BEGIN FOR p IN SELECT inhrelid::regclass FROM pg_inherits WHERE inhparent = 'supacache.kv'::regclass LOOP EXECUTE format('ALTER TABLE %s SET TABLESPACE pg_default', p); END LOOP; END \$\$" >/dev/null 2>&1
+    T0=$(date +%s)
+    PGOPTIONS='-c statement_timeout=45s' $PGBIN/psql -h /tmp -p $PORT -U postgres       -d postgres -tAc "DROP TABLESPACE IF EXISTS pgks_small" >/tmp/dropts.txt 2>&1
+    ELAPSED=$(( $(date +%s) - T0 ))
+    if grep -qi "timeout\|cancel" /tmp/dropts.txt; then
+      echo "FAIL  DROP TABLESPACE never completed (${ELAPSED}s): a worker is not"
+      echo "        acknowledging procsignal barriers"
+      fail=$((fail+1))
+    else
+      echo "PASS  DROP TABLESPACE completed in ${ELAPSED}s, so barriers are acknowledged"
+      pass=$((pass+1))
+    fi
+    umount $SMALL 2>/dev/null
+  fi
+fi
+
+
+echo ""
+echo "########## V. a serialization failure on the persistence transaction ##########"
+# The issue filed this as needing a test hook. It does not. The persistence
+# worker sets only `SET LOCAL synchronous_commit` and never an isolation level,
+# so default_transaction_isolation applies to its transaction, and a genuine
+# 40001 can be produced from outside with nothing compiled in.
+stop_pg; sleep 1
+set_conf "default_transaction_isolation" "'serializable'"
+start_pg; wait_ready; sleep 3
+
+psql_ "SELECT 1" >/dev/null 2>&1
+BEFORE_V=$(psql_ "SELECT count(*) FROM supacache.kv")
+# Contend for the whole table from another session while writes are flowing.
+# A serializable reader that then writes creates the read-write dependency SSI
+# refuses, and either side can be the one it cancels.
+for r in 1 2 3 4 5 6; do
+  (
+    timeout 60 env PGOPTIONS="$PGOPTS" $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tAq >/dev/null 2>&1 <<SQL
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+-- Read the very row the persistence worker is about to write, then write it.
+-- That read-write pair against a concurrent writer of the same row is the
+-- dangerous structure SSI refuses; reading the whole table and writing some
+-- other key, as an earlier version did, gives it no cycle to find.
+SELECT version FROM supacache.kv WHERE key = ('ser:k$r')::bytea;
+SELECT pg_sleep(0.5);
+INSERT INTO supacache.kv (tenant,key,slot,kind,val,expires_at,version)
+VALUES ('', ('ser:k$r')::bytea, 1, 's', 'contended'::bytea, 0, 1)
+ON CONFLICT (tenant,key) DO UPDATE SET version = supacache.kv.version + 1;
+COMMIT;
+SQL
+  ) &
+  sleep 0.2
+  timeout 10 redis-cli -p $RESP SET "ser:k$r" "v$r" >/dev/null 2>&1
+  wait
+done
+sleep 3
+
+SERR=$(grep -ci "could not serialize" $PGDATA/log 2>/dev/null || true)
+if [ "${SERR:-0}" -gt 0 ]; then
+  echo "PASS  a real serialization failure was produced ($SERR in the log)"; pass=$((pass+1))
+else
+  echo "FAIL  no serialization failure occurred, so nothing was exercised"; fail=$((fail+1))
+fi
+# Whichever side SSI cancelled, the invariant is the same: a write that was
+# acked is durable, and the worker is still draining afterwards.
+ALL_OK=1
+for r in 1 2 3 4 5 6; do
+  GOT=$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key=('ser:k$r')::bytea")
+  [ "$GOT" = "v$r" ] || ALL_OK=0
+done
+chk "every acked write survived the serialization failures" "1" "$ALL_OK"
+chk "no panics from the retry path" "0" "$(countlog panicked $PGDATA/log)"
+chk "persistence is still draining afterwards" "OK" "$(timeout 20 redis-cli -p $RESP SET ser:after v 2>&1)"
+chk "and it committed" "1" "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='ser:after'::bytea")"
+AFTER_V=$(psql_ "SELECT count(*) FROM supacache.kv")
+if [ "${AFTER_V:-0}" -ge "${BEFORE_V:-0}" ]; then
+  echo "PASS  nothing durable was lost across the serialization failures"; pass=$((pass+1))
+else
+  echo "FAIL  rows lost ($BEFORE_V -> $AFTER_V)"; fail=$((fail+1)); fi
+
+stop_pg; sleep 1
+set_conf "default_transaction_isolation" "'read committed'"
+start_pg; wait_ready; sleep 2
+
+echo ""
+echo "########## W. a deadlock involving the persistence transaction ##########"
+# Also filed as needing a hook, and also not needing one. The persistence batch
+# locks the keys it is writing; another session can hold one of them and then
+# reach for another the batch already holds, which is a deadlock by
+# construction rather than by luck.
+#
+# It is the least deterministic row in the matrix, because it depends on the
+# batch containing both keys and on the order it takes their locks. The loop
+# below retries, and the section says plainly whether it managed to produce one
+# rather than passing on the strength of having tried.
+psql_ "DELETE FROM supacache.kv WHERE key LIKE 'dl:%'::bytea" >/dev/null 2>&1
+timeout 20 redis-cli -p $RESP SET dl:a seed >/dev/null 2>&1
+timeout 20 redis-cli -p $RESP SET dl:b seed >/dev/null 2>&1
+sleep 2
+BEFORE_W=$(psql_ "SELECT count(*) FROM supacache.kv")
+DEADLOCKED=0
+for attempt in 1 2 3 4 5; do
+  # Hold dl:a, then reach for dl:b once the batch is in flight holding it.
+  (
+    timeout 60 env PGOPTIONS="$PGOPTS" $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tAq >/dev/null 2>&1 <<SQL
+BEGIN;
+UPDATE supacache.kv SET version = version + 1 WHERE key = 'dl:a'::bytea;
+SELECT pg_sleep(0.6);
+UPDATE supacache.kv SET version = version + 1 WHERE key = 'dl:b'::bytea;
+COMMIT;
+SQL
+  ) &
+  HOLDER=$!
+  sleep 0.2
+  # Written b first so the batch takes b's lock before it waits on a.
+  timeout 15 redis-cli -p $RESP SET dl:b "w$attempt" >/dev/null 2>&1 &
+  timeout 15 redis-cli -p $RESP SET dl:a "w$attempt" >/dev/null 2>&1 &
+  wait $HOLDER 2>/dev/null || true
+  wait 2>/dev/null || true
+  if [ "$(countlog 'deadlock detected' $PGDATA/log)" -gt 0 ]; then
+    DEADLOCKED=1; echo "  produced a deadlock on attempt $attempt"; break
+  fi
+  sleep 1
+done
+
+if [ "$DEADLOCKED" -eq 1 ]; then
+  echo "PASS  a real deadlock was produced against the persistence transaction"; pass=$((pass+1))
+  sleep 4
+  chk "no panics from the deadlock" "0" "$(countlog panicked $PGDATA/log)"
+  chk "persistence is still draining afterwards" "OK" "$(timeout 20 redis-cli -p $RESP SET dl:after v 2>&1)"
+  chk "and it committed" "1" "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='dl:after'::bytea")"
+  AFTER_W=$(psql_ "SELECT count(*) FROM supacache.kv")
+  if [ "${AFTER_W:-0}" -ge "${BEFORE_W:-0}" ]; then
+    echo "PASS  nothing durable was lost across the deadlock"; pass=$((pass+1))
+  else
+    echo "FAIL  rows lost across the deadlock ($BEFORE_W -> $AFTER_W)"; fail=$((fail+1)); fi
+else
+  # Reported, not swallowed. A row that cannot be provoked here is a row this
+  # harness does not cover, and saying so is the point.
+  echo "  NOT PRODUCED  no deadlock in 5 attempts; this row is not exercised on this run"
+fi
+
+echo ""
+echo "########## X. the WAL filesystem fills up ##########"
+# The row where Postgres takes itself down. A WAL write that cannot complete is
+# a PANIC, not an ERROR, because there is no way to continue correctly without
+# it. So this is not "does the extension handle an error" but "does anything
+# acked survive the server killing itself", which is the same invariant every
+# other row asserts, under the harshest way of losing the server.
+#
+# Needs the same CAP_SYS_ADMIN as the disk-full row, and skips out loud without it.
+WALMNT=$PGDATA/pg_wal
+WALBAK=${PGKS_WAL_BACKUP:-/tmp/pgks-walbak}
+stop_pg; sleep 1
+rm -rf $WALBAK; mkdir -p $WALBAK
+cp -a $WALMNT/. $WALBAK/ 2>/dev/null
+if ! mount -t tmpfs -o size=96m tmpfs $WALMNT 2>/dev/null; then
+  echo "  SKIP  cannot mount a tmpfs here (needs CAP_SYS_ADMIN); WAL exhaustion not exercised"
+  start_pg; wait_ready; sleep 2
+else
+  cp -a $WALBAK/. $WALMNT/ 2>/dev/null
+  chown -R postgres:postgres $WALMNT
+  chmod 700 $WALMNT
+  start_pg; wait_ready; sleep 3
+
+  # The write whose survival is the whole point of the section.
+  chk "a durable write is acked before the WAL fills" "OK" \
+      "$(timeout 20 redis-cli -p $RESP SET wal:keep v1 2>&1)"
+  sleep 2
+  chk "and it is durable" "v1" \
+      "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='wal:keep'::bytea")"
+
+  # Burn WAL until the filesystem holding it cannot take another byte.
+  psql_ "CREATE TABLE IF NOT EXISTS supacache.wal_filler(b bytea)" >/dev/null 2>&1
+  psql_ "ALTER TABLE supacache.wal_filler ALTER COLUMN b SET STORAGE EXTERNAL" >/dev/null 2>&1
+  DOWN=0
+  for i in $(seq 1 150); do
+    psql_ "INSERT INTO supacache.wal_filler SELECT repeat('w', 1000000)::bytea" >/dev/null 2>&1
+    if ! psql_ "SELECT 1" 2>/dev/null | grep -q "^1$"; then
+      DOWN=1; echo "  the server stopped answering after ${i} MB of WAL churn"; break
+    fi
+  done
+
+  if [ "$DOWN" -eq 0 ]; then
+    echo "  NOT PRODUCED  the WAL filesystem did not fill within the budget"
+  else
+    if grep -qi "PANIC" $PGDATA/log 2>/dev/null; then
+      echo "PASS  Postgres PANICked on the WAL write rather than continuing"; pass=$((pass+1))
+    else
+      echo "FAIL  the server went down without a PANIC in the log"; fail=$((fail+1)); fi
+    chk_contains "the cause is recorded as a storage failure" "No space left" "$(tail -200 $PGDATA/log)"
+
+    # The realistic recovery: give the WAL filesystem more room. Nothing can be
+    # freed from inside, because freeing WAL needs a checkpoint, and a
+    # checkpoint needs to write WAL.
+    mount -o remount,size=512m $WALMNT 2>/dev/null
+    start_pg
+    UP=0
+    for _ in $(seq 1 90); do
+      psql_ "SELECT 1" 2>/dev/null | grep -q "^1$" && { UP=1; break; }
+      sleep 1
+    done
+    chk "the cluster comes back once the WAL filesystem has room" "1" "$UP"
+    if [ "$UP" = "1" ]; then
+      chk "the write acked before the PANIC survived it" "v1" \
+          "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='wal:keep'::bytea")"
+      chk "and is served again from shared memory" "v1" \
+          "$(timeout 20 redis-cli -p $RESP GET wal:keep 2>&1)"
+      chk "persistence resumed" "OK" "$(timeout 25 redis-cli -p $RESP SET wal:after v2 2>&1)"
+    fi
+  fi
+
+  # Put the real WAL directory back, or nothing after this point would start.
+  psql_ "DROP TABLE IF EXISTS supacache.wal_filler" >/dev/null 2>&1
+  stop_pg; sleep 1
+  # The WAL the cluster needs now lives on the tmpfs. Unmounting exposes the
+  # copies taken before the mount, which are stale by a PANIC, a recovery and
+  # everything since, so the cluster would not start on them. Carry the live
+  # segments across the unmount instead of stranding them.
+  WALNOW=${PGKS_WAL_NOW:-/tmp/pgks-walnow}
+  rm -rf $WALNOW; mkdir -p $WALNOW
+  cp -a $WALMNT/. $WALNOW/ 2>/dev/null
+  umount $WALMNT 2>/dev/null || umount -l $WALMNT 2>/dev/null
+  rm -rf $WALMNT/* $WALMNT/.[!.]* 2>/dev/null
+  cp -a $WALNOW/. $WALMNT/ 2>/dev/null
+  chown -R postgres:postgres $WALMNT 2>/dev/null
+  start_pg; wait_ready; sleep 2
+  chk "the cluster is healthy on its real WAL directory" "1" "$(psql_ "SELECT 1")"
+fi
 
 echo ""
 echo "================================================"

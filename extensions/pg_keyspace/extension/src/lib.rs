@@ -356,6 +356,32 @@ fn health_claim(i: usize) -> bool {
     true
 }
 
+/// Acknowledge any pending procsignal barrier.
+///
+/// Postgres emits a barrier for operations that need every backend to let go of
+/// something before they can proceed, DROP TABLESPACE being the common one, and
+/// then waits for all of them to acknowledge it. A backend acknowledges from
+/// inside CHECK_FOR_INTERRUPTS, which a normal backend reaches constantly while
+/// executing a query.
+///
+/// These workers never execute a query on their own behalf. The RESP worker
+/// sits in a mio poll, the persistence worker in a drain loop and the expiry
+/// worker in a sleep, so none of them passed through the interrupt machinery at
+/// all and none of them ever acknowledged. The result was that DROP TABLESPACE
+/// hung for as long as pg_keyspace was loaded, with no error and nothing in the
+/// log to say which backend had not answered.
+///
+/// Only the barrier is processed here, not the full interrupt path: these loops
+/// handle their own SIGTERM and unwinding them from an arbitrary point would
+/// abandon a connection's parked write.
+fn absorb_procsignal_barrier() {
+    unsafe {
+        if pg_sys::ProcSignalBarrierPending != 0 {
+            pg_sys::ProcessProcSignalBarrier();
+        }
+    }
+}
+
 /// Whether a recorded owner is still running. Signal 0 checks for the process
 /// without sending anything.
 fn pid_alive(pid: u32) -> bool {
@@ -1261,6 +1287,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             // worker looking half-stale to everyone else. The scan itself walks
             // every slot, so it is rate-limited.
             health_beat(w);
+            absorb_procsignal_barrier();
             if last_watch.elapsed() >= Duration::from_secs(5) {
                 last_watch = std::time::Instant::now();
                 health_watchdog();
@@ -1390,6 +1417,7 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
     let mut last_watch = std::time::Instant::now();
     while !BackgroundWorker::sigterm_received() {
         health_beat(health);
+        absorb_procsignal_barrier();
         if last_watch.elapsed() >= Duration::from_secs(5) {
             last_watch = std::time::Instant::now();
             health_watchdog();
@@ -2028,6 +2056,7 @@ pub extern "C" fn pg_keyspace_expiry_main(_arg: pg_sys::Datum) {
     }
     while !BackgroundWorker::sigterm_received() {
         health_beat(expiry_slot);
+        absorb_procsignal_barrier();
         health_watchdog();
         let now_bucket = store::now_micros() / ttl_bucket_us();
         let dropped = drop_expired_partitions(now_bucket);
