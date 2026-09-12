@@ -11,6 +11,10 @@ target/
 
 # C build objects
 *.o
+# LLVM bitcode, emitted alongside the .o by PGXS on a JIT-enabled build. The
+# durability suite builds the keys-only output plugin, so anyone who runs it
+# gets these.
+*.bc
 
 # Redis runtime dump artifact (written by a redis-server during benches)
 dump.rdb
