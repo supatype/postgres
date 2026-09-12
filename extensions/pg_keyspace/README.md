@@ -663,6 +663,15 @@ Scoping for this version — the extension works; these are the edges to know:
   slew is harmless. On-disk reclamation also lags expiry by up to
   `ttl_bucket_secs + ttl_sweep_secs` (about 15 s at defaults), though reads
   filter on `expires_at` so nothing expired is ever served.
+- **`pg_terminate_backend` on a pg_keyspace worker is survivable, but only
+  because of the watchdog.** Terminating a background worker calls
+  `TerminateBackgroundWorker`, which deregisters it in the postmaster rather
+  than restarting it, so neither `bgw_restart_time` nor the worker count GUCs
+  bring it back. Every pg_keyspace worker therefore beats a heartbeat in shared
+  memory and relaunches any peer whose heartbeat goes stale, controlled by
+  `pg_keyspace.watchdog_secs` (default 30, 0 disables). Set it to 0 if you need
+  a worker to stay stopped.
+
 - **There are no per-tenant quotas.** Keys and channels are force-scoped to
   `{tenant}:`, which is an isolation boundary, not an accounting one: one tenant
   can evict another's hot data or fill the persistence ring.

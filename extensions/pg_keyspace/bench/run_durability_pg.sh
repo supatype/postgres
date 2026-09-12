@@ -397,6 +397,30 @@ chk "no pub/sub messages dropped" "0" "$(psql_ "SELECT dropped FROM supacache.pu
 chk "no subscriptions refused for table space" "0" "$(psql_ "SELECT route_full FROM supacache.pubsub_stats()")"
 chk "no subscriptions refused for name length" "0" "$(psql_ "SELECT name_too_long FROM supacache.pubsub_stats()")"
 
+echo "########## R. Mode B row cache under multiple RESP workers ##########"
+# Issue #8 lists the row cache as single-worker alongside persistence. Reading
+# the code that looks wrong: the cache lives in its own segment and is reached
+# from a Postgres backend through the planner hook and CustomScan, never from a
+# RESP worker, so the RESP worker count should not touch it. The cluster is
+# already running three of them here, so assert it rather than reason about it.
+psql_ "DROP TABLE IF EXISTS public.rc_mw" >/dev/null 2>&1
+psql_ "CREATE TABLE public.rc_mw(id bigint primary key, v text)" >/dev/null 2>&1
+psql_ "INSERT INTO public.rc_mw VALUES (1,'one'),(2,'two')" >/dev/null 2>&1
+chk "register a table while $MW_WORKERS RESP workers run" "t"     "$(psql_ "SELECT supacache.rowcache_register('public.rc_mw', 1)")"
+chk "the cache was populated" "t" "$(psql_ "SELECT entries > 0 FROM supacache.rowcache_stats()")"
+
+RC_H0=$(psql_ "SELECT hits FROM supacache.rowcache_stats()")
+chk "a cached row reads back correctly"        "one" "$(psql_ "SELECT v FROM public.rc_mw WHERE id = 1")"
+chk "a second cached row reads back correctly" "two" "$(psql_ "SELECT v FROM public.rc_mw WHERE id = 2")"
+RC_H1=$(psql_ "SELECT hits FROM supacache.rowcache_stats()")
+# The values above would also be right if the cache were bypassed entirely and
+# the rows came off the heap, so the hit counter is what shows the substitution
+# actually happened with several RESP workers running.
+if [ "${RC_H1:-0}" -gt "${RC_H0:-0}" ]; then
+  echo "PASS  the scan was served from the cache (hits $RC_H0 -> $RC_H1)"; pass=$((pass+1))
+else
+  echo "FAIL  no cache hit recorded (hits $RC_H0 -> $RC_H1)"; fail=$((fail+1)); fi
+
 stop_pg; sleep 1
 set_conf "pg_keyspace.workers" "1"
 set_conf "pg_keyspace.persist_workers" "1"
@@ -439,6 +463,65 @@ if [ "$AFTER_P" -ge "$BEFORE_P" ]; then
   echo "PASS  nothing already durable was lost across the outage"; pass=$((pass+1))
 else
   echo "FAIL  rows lost across the outage ($BEFORE_P -> $AFTER_P)"; fail=$((fail+1)); fi
+
+echo ""
+echo "########## S. a worker terminated out from under the cluster comes back ##########"
+# A third failure class, distinct from both above. L rejects the statement and P
+# removes the relation; here the worker's own session is terminated.
+#
+# What Postgres does with that is not what "restart_time = 2s" suggests.
+# pg_terminate_backend on a background worker calls TerminateBackgroundWorker,
+# which makes the postmaster DEREGISTER it rather than restart it, whatever
+# bgw_restart_time says. Persistence would then stop for the life of the
+# cluster, and because a durable write holds its ack rather than failing, the
+# only outward sign is that writes stop completing.
+#
+# The watchdog exists for exactly this: every worker beats a heartbeat and every
+# worker scans for gaps, so as long as one survives the rest are relaunched.
+set_conf "pg_keyspace.watchdog_secs" "10"
+stop_pg; sleep 1; start_pg; wait_ready; sleep 4
+
+BEFORE_S=$(psql_ "SELECT count(*) FROM supacache.kv")
+rcli SET fi:conn v1 >/dev/null 2>&1
+sleep 2
+chk "the write before the drop is durable" "v1"     "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='fi:conn'::bytea")"
+
+SPID=$(ps -eo pid,args | grep "[p]ersistence worker" | awk '{print $1}' | head -1)
+if [ -z "$SPID" ]; then
+  echo "FAIL  no persistence worker to terminate"; fail=$((fail+1))
+else
+  echo "  terminating the session of persistence worker pid $SPID"
+  psql_ "SELECT pg_terminate_backend($SPID)" >/dev/null 2>&1
+  sleep 3
+  chk "the cluster stayed up (this is not a crash)" "1" "$(psql_ "SELECT 1")"
+
+  # Postgres will not bring it back. The watchdog must, within its window.
+  BACK=0; NEWPID=""
+  for _ in $(seq 1 60); do
+    NEWPID=$(ps -eo pid,args | grep "[p]ersistence worker" | awk '{print $1}' | head -1)
+    if [ -n "$NEWPID" ] && [ "$NEWPID" != "$SPID" ]; then BACK=1; break; fi
+    sleep 1
+  done
+  chk "the watchdog relaunched the deregistered worker" "1" "$BACK"
+  [ "$BACK" = "1" ] && echo "  came back as pid $NEWPID (was $SPID)"
+  chk_contains "the relaunch is in the log, not silent" "watchdog" "$(cat $PGDATA/log 2>/dev/null | tail -80)"
+
+  # The real test: a durable write must complete again with no restart.
+  OUT=$(timeout 20 redis-cli -p $RESP SET fi:conn2 v2 2>&1)
+  chk "a durable write completes again without restarting the cluster" "OK" "$OUT"
+  chk "and it reached the table" "v2"       "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='fi:conn2'::bytea")"
+  chk "persistence caught up" "0" "$(psql_ "SELECT lag FROM supacache.ring_stats()")"
+
+  # Exactly one worker per shard: a second one draining the same ring would
+  # corrupt it, since the rings are single-consumer.
+  chk "exactly one persistence worker is draining the shard" "1"       "$(ps -eo args | grep -c '[p]ersistence worker')"
+fi
+
+AFTER_S=$(psql_ "SELECT count(*) FROM supacache.kv")
+if [ "${AFTER_S:-0}" -ge "${BEFORE_S:-0}" ]; then
+  echo "PASS  nothing durable was lost across the outage"; pass=$((pass+1))
+else
+  echo "FAIL  rows lost across the terminate ($BEFORE_S -> $AFTER_S)"; fail=$((fail+1)); fi
 
 echo ""
 echo "================================================"
