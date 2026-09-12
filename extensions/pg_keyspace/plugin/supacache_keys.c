@@ -42,6 +42,18 @@ static void cb_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 static void cb_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
                       Relation relation, ReorderBufferChange *change);
 
+/*
+ * A reorder-buffer change's tuple, as a HeapTuple, across server versions.
+ *
+ * PG17 removed ReorderBufferTupleBuf and stores HeapTuples directly; earlier
+ * versions hand back the wrapper, with the HeapTupleData inside it.
+ */
+#if PG_VERSION_NUM >= 170000
+#define RBTUP(x) (x)
+#else
+#define RBTUP(x) ((x) != NULL ? &((x)->tuple) : NULL)
+#endif
+
 void
 _PG_output_plugin_init(OutputPluginCallbacks *cb)
 {
@@ -87,21 +99,30 @@ cb_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
     int         i;
     char        action;
 
-    /* The tuple that carries the replica-identity key for this change. */
+    /* The tuple that carries the replica-identity key for this change.
+     *
+     * PG17 removed ReorderBufferTupleBuf and made these fields plain HeapTuples;
+     * PG16 and earlier wrap the tuple, with the HeapTupleData inside it. Reading
+     * the wrapper as a HeapTuple does not fail loudly -- heap_getattr walks
+     * whatever the pointer lands on -- so on PG16 this segfaulted the decoding
+     * backend, and with the invalidation worker enabled that became a crash loop
+     * the cluster never recovered from (#90).
+     */
     switch (change->action)
     {
         case REORDER_BUFFER_CHANGE_INSERT:
-            keytuple = change->data.tp.newtuple;
+            keytuple = RBTUP(change->data.tp.newtuple);
             action = 'I';
             break;
         case REORDER_BUFFER_CHANGE_UPDATE:
             /* old-key is present only when the key changed; else it's in new */
-            keytuple = change->data.tp.oldtuple ? change->data.tp.oldtuple
-                                                : change->data.tp.newtuple;
+            keytuple = change->data.tp.oldtuple
+                           ? RBTUP(change->data.tp.oldtuple)
+                           : RBTUP(change->data.tp.newtuple);
             action = 'U';
             break;
         case REORDER_BUFFER_CHANGE_DELETE:
-            keytuple = change->data.tp.oldtuple;
+            keytuple = RBTUP(change->data.tp.oldtuple);
             action = 'D';
             break;
         default:
