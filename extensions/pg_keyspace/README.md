@@ -244,6 +244,51 @@ Redis-compatible (`bench/run_big{hash,list,zset}.sh`, `core/examples/bench_*`):
 - **TTL expiry** is an O(1) partition `DROP` (3.2 ms) vs an O(n) `DELETE`
   (141 ms for 100 k rows) — no vacuum churn.
 
+#### Tuning durable throughput: which knob actually moves it
+
+The durable tiers commit through `supacache.kv`, so their ceiling is Postgres
+commit throughput. Two settings look like they should raise it. Only one does.
+
+Durable tier, 6 deeply-pipelined connections, distinct keys, 256-byte values,
+3 reps of 8 s per cell, 4-vCPU container, PG16 — **median durable writes/s**:
+
+| `persist_window_ms` | `persist_workers = 1` | `persist_workers = 4` |
+|---:|---:|---:|
+| 10 | 42 810 * | 49 768 |
+| 25 | **59 923** | 48 223 |
+| 50 | **64 290** | 47 536 |
+| 100 | 62 780 | 58 591 |
+
+\* two valid reps rather than three in that cell.
+
+**`persist_window_ms` is the knob.** Going from the default 10 ms to 25 ms buys
+roughly 40%, 25 → 50 ms a few percent more, and past 50 ms the curve is flat —
+by then the window is no longer what any write is waiting on. What a wider
+window costs is exactly the window: a durable ack is held up to that much
+longer, and `relaxed`'s loss bound grows by the same amount. The default stays
+at 10 ms because it favours latency; **25–50 ms is the range worth trying if
+durable write throughput is the constraint.**
+
+**More `persist_workers` does not raise the ceiling.** At a well-chosen window
+four workers are no better than one and usually worse, with a much wider spread
+(one cell ran 64 023, 48 223, 47 488 across its three reps). That is the
+expected result rather than a surprising one: `persist_workers` multiplies ring
+and drain capacity, and the ring is not the bottleneck — commit is. Four
+workers commit the same rows through four transactions instead of one, so the
+batching gets worse before the parallelism pays. It helps in one place only, at
+a 10 ms window, where a single worker's window *is* the constraint. Raise
+`persist_workers` to add ring capacity under a write flood
+([per-tenant fairness](#per-tenant-fairness) and `ring_mb` are the relevant
+knobs there), not to chase throughput.
+
+The third option often suggested — a WAL-bypass fast log with its own fsync for
+the non-replicated `durable` tier — is deliberately **not** implemented. It
+would break the property the tier exists to provide: that a durable ack means
+the row is already committed in `supacache.kv`, visible to SQL, and recovered by
+Postgres's own crash recovery rather than by a second recovery path of ours.
+That is a trade worth making only against a measured need this benchmark does
+not show.
+
 #### What a durable write costs in WAL and storage
 
 Operations per second says nothing about what the durable tiers cost on disk.
@@ -624,9 +669,41 @@ redis-cli --tls --user alice -a s3cret -p 6381 GET session:1   # NOAUTH without 
 
 Secrets are stored as salted SHA-256 and verified in constant time. Keys and
 pub/sub channels are force-scoped to `{tenant}:` for non-exempt roles, so one
-tenant cannot address or subscribe to another's. Point `tls_cert_file` /
-`tls_key_file` at a PEM cert+key to serve TLS (rotate by swapping the files and
-`SELECT pg_reload_conf()` — no restart).
+tenant cannot address or subscribe to another's.
+
+For TLS, either point `tls_cert_file` / `tls_key_file` at a PEM cert+key, or
+**reuse the certificate the cluster already serves**:
+
+```conf
+ssl = on                                  # the cluster's own TLS, as usual
+ssl_cert_file = 'server.crt'
+ssl_key_file  = 'server.key'
+pg_keyspace.tls_use_postgres_cert = on    # RESP serves that same certificate
+```
+
+Whichever way, rotation is in place: swap the files and `SELECT
+pg_reload_conf()` — no restart, and existing connections keep the cert they
+started on. Inheriting means there is no second certificate to obtain or renew,
+so a `cert-manager` or ACME renewal that already covers the Postgres port
+covers the RESP port with it.
+
+Three things about `tls_use_postgres_cert` are deliberate:
+
+- **It is off by default**, and stays off after an upgrade. Turning it on
+  implicitly would encrypt a port that plaintext clients are already connected
+  to, and break all of them at the next restart. Opting in is the operator
+  saying the libpq cert is the cert they want here.
+- **`ssl_cert_file` is resolved against the data directory**, the way Postgres
+  resolves it — its default is the bare name `server.crt`.
+- **It fails closed.** With the flag on and `ssl = off` there is no certificate
+  to inherit, so the worker refuses to serve rather than quietly falling back to
+  plaintext, and the log says so. An explicit `pg_keyspace.tls_cert_file` always
+  wins over the inherited one, so enabling the flag cannot take over a
+  deployment that configured its own cert.
+
+All four behaviours are checked against the wire — including by fingerprint,
+that the RESP port and Postgres serve the same certificate — by
+`bench/run_tls_inherit.sh`.
 
 ### Per-tenant fairness
 
@@ -728,6 +805,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.ttl_bucket_secs` | 10 | TTL time-bucket width (range-partitioned `supacache.kv_ttl`) |
 | `pg_keyspace.require_mask` | `off` | `off` (default) runs standalone; `on` fails closed unless `supatype_mask` is loaded + outermost — set by the Supatype platform |
 | `pg_keyspace.tls_cert_file` / `tls_key_file` | *(empty)* | PEM cert + key → serve RESP over TLS |
+| `pg_keyspace.tls_use_postgres_cert` | `off` | with those unset, serve RESP with the cluster's `ssl_cert_file`/`ssl_key_file` (needs `ssl = on`) |
 | `pg_keyspace.rowcache_mb` | 64 | Mode B row-cache segment size (never RESP-addressable) |
 | `pg_keyspace.rowcache_decode` | `off` | keys-only Mode B invalidation worker (needs `wal_level=logical`) |
 | `pg_keyspace.rowcache_refill` | `off` | on: re-cache a changed hot key; off: drop-only (lazy) |
@@ -935,9 +1013,21 @@ Scoping for this version — the extension works; these are the edges to know:
   implementation it formats through is not always optimal; matching those byte
   for byte would mean emitting digits that parse back to a different double, so
   this prints the correctly rounded shortest form instead.
-- TLS is bring-your-own-cert (in-place rotation on `SIGHUP`; no managed CA). The
-  durable/replicated tiers are correct but not throughput-optimised — they
-  serialize on the Postgres WAL by design.
+- **TLS certificates come from the operator, not from a CA integration.**
+  Either supply them directly (`tls_cert_file`/`tls_key_file`) or set
+  `tls_use_postgres_cert` to reuse the cluster's — the latter means whatever
+  already renews the Postgres certificate renews this one too. There is no ACME
+  client in the extension itself, which is the right place for it not to be: a
+  background worker inside Postgres is a poor place to be answering HTTP-01
+  challenges, and the deployments that want automated certs already terminate
+  or renew at a gateway.
+- **The durable/replicated tiers serialize on the Postgres WAL by design**, so
+  their ceiling is commit throughput rather than anything in the cache. That is
+  a correctness choice, not an unoptimised path: a durable ack means the row is
+  committed in `supacache.kv`. `persist_window_ms` is the setting that moves the
+  number and `persist_workers` is not — see
+  [tuning durable throughput](#tuning-durable-throughput-which-knob-actually-moves-it)
+  for the measured curve.
 - **TTL expiry is wall-clock, not monotonic.** Expiry compares against
   `CLOCK_REALTIME`, so a system clock *step* moves every key's deadline; NTP
   slew is harmless. On-disk reclamation also lags expiry by up to

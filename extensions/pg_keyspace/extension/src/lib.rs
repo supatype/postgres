@@ -133,6 +133,14 @@ static GUC_TLS_CERT: GucSetting<Option<&'static CStr>> =
 static GUC_TLS_KEY: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(None);
 
+/// Reuse the cluster's own TLS material for the RESP port instead of a
+/// second, separately-managed cert. Off by default, and deliberately so:
+/// turning it on implicitly would encrypt a port that every existing
+/// plaintext client is already talking to, breaking them all at the next
+/// restart. Opting in is the operator saying "the cert I already rotate for
+/// libpq is the cert I want here".
+static GUC_TLS_USE_PG_CERT: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Mode B: enable the keys-only logical-decoding invalidation worker,
 /// which consumes a replication slot (output plugin `supacache_keys`) and drops
 /// changed rows from the row cache so it stays coherent with committed writes.
@@ -636,6 +644,120 @@ fn sync_standby_configured() -> bool {
     }
 }
 
+/// Read a Postgres GUC as a trimmed, non-empty string.
+fn pg_setting(name: &CStr) -> Option<String> {
+    unsafe {
+        let s = pg_sys::GetConfigOption(name.as_ptr(), true, false);
+        if s.is_null() {
+            return None;
+        }
+        let v = CStr::from_ptr(s).to_string_lossy().trim().to_string();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+}
+
+/// Resolve a Postgres file setting the way the server itself does: an
+/// absolute path is used as-is, a relative one is relative to the data
+/// directory. `ssl_cert_file` defaults to the bare name `server.crt`, so
+/// inheriting it without this would look for the cert in whatever directory
+/// the worker happens to have started in.
+fn resolve_in_datadir(p: &str) -> String {
+    if p.starts_with('/') {
+        return p.to_string();
+    }
+    match pg_setting(c"data_directory") {
+        Some(d) => format!("{}/{}", d.trim_end_matches('/'), p),
+        None => p.to_string(),
+    }
+}
+
+/// What the RESP listener should do about TLS.
+enum TlsChoice {
+    /// Nothing configured: serve the RESP wire in the clear.
+    Plaintext,
+    /// Serve TLS from these files. `from` names the settings they came from,
+    /// so the log line says which knob produced the cert in use.
+    Serve {
+        cert: String,
+        key: String,
+        from: &'static str,
+    },
+    /// TLS was asked for but cannot be honoured; the string says why.
+    Refuse(String),
+}
+
+/// Decide where the RESP port's certificate comes from.
+///
+/// `pg_keyspace.tls_cert_file`/`tls_key_file` win whenever they are set — an
+/// explicit cert for the RESP port is always the more specific instruction.
+/// With neither set and `pg_keyspace.tls_use_postgres_cert` on, fall back to
+/// the cluster's own `ssl_cert_file`/`ssl_key_file`: the certificate the
+/// operator already supplies and renews for `libpq`, reused here so there is
+/// no second cert to manage or rotate.
+///
+/// `ssl = on` is required for that fallback rather than merely preferred.
+/// `ssl_cert_file` has a non-empty *default* (`server.crt`), so its value says
+/// nothing about whether the operator actually configured TLS; `ssl` is the
+/// setting that does. And since the fallback only runs when the operator
+/// opted in, a cluster with `ssl = off` is a contradiction to report, not a
+/// reason to quietly serve plaintext.
+fn tls_choice() -> TlsChoice {
+    let explicit = |g: &GucSetting<Option<&'static CStr>>| {
+        g.get()
+            .and_then(|c| c.to_str().ok().map(str::to_string))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    match (explicit(&GUC_TLS_CERT), explicit(&GUC_TLS_KEY)) {
+        (Some(cert), Some(key)) => {
+            return TlsChoice::Serve {
+                cert,
+                key,
+                from: "pg_keyspace.tls_cert_file/tls_key_file",
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return TlsChoice::Refuse(
+                "set BOTH pg_keyspace.tls_cert_file and pg_keyspace.tls_key_file, or neither"
+                    .to_string(),
+            )
+        }
+    }
+
+    if !GUC_TLS_USE_PG_CERT.get() {
+        return TlsChoice::Plaintext;
+    }
+
+    if pg_setting(c"ssl").as_deref() != Some("on") {
+        return TlsChoice::Refuse(
+            "pg_keyspace.tls_use_postgres_cert is on but the cluster has ssl = off, so there \
+             is no Postgres certificate to inherit. Set ssl = on (and ssl_cert_file / \
+             ssl_key_file), or give pg_keyspace its own cert with \
+             pg_keyspace.tls_cert_file/tls_key_file"
+                .to_string(),
+        );
+    }
+    match (
+        pg_setting(c"ssl_cert_file"),
+        pg_setting(c"ssl_key_file"),
+    ) {
+        (Some(cert), Some(key)) => TlsChoice::Serve {
+            cert: resolve_in_datadir(&cert),
+            key: resolve_in_datadir(&key),
+            from: "ssl_cert_file/ssl_key_file",
+        },
+        _ => TlsChoice::Refuse(
+            "pg_keyspace.tls_use_postgres_cert is on but ssl_cert_file/ssl_key_file are empty"
+                .to_string(),
+        ),
+    }
+}
+
 /// Human-readable reason the `replicated` tier cannot be honoured, if any.
 fn check_sync_standby() -> Result<(), String> {
     if !sync_standby_configured() {
@@ -907,6 +1029,18 @@ pub extern "C" fn _PG_init() {
         "PEM private-key file for RESP TLS; set with tls_cert_file to enable TLS",
         "",
         &GUC_TLS_KEY,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
+        "pg_keyspace.tls_use_postgres_cert",
+        "Serve RESP TLS with the cluster's own ssl_cert_file/ssl_key_file",
+        "Off (default): the RESP port is plaintext unless pg_keyspace.tls_cert_file and \
+         tls_key_file are set. On: with those unset, inherit the certificate Postgres \
+         already serves libpq with, so there is no second cert to supply or rotate. \
+         Requires ssl = on. Left off by default because enabling TLS implicitly would \
+         break every plaintext RESP client at the next restart.",
+        &GUC_TLS_USE_PG_CERT,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -1285,27 +1419,24 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     // TLS: if a cert+key are configured, wrap the RESP wire in TLS. If TLS
     // was requested but the files fail to load, FAIL CLOSED — park rather than
     // fall back to plaintext on an operator who asked for encryption.
-    let tls_cert = GUC_TLS_CERT.get().and_then(|c| c.to_str().ok().map(str::to_string));
-    let tls_key = GUC_TLS_KEY.get().and_then(|c| c.to_str().ok().map(str::to_string));
-    match (tls_cert.as_deref().filter(|s| !s.is_empty()), tls_key.as_deref().filter(|s| !s.is_empty())) {
-        (Some(cert), Some(key)) => match server::load_tls_config(cert, key) {
+    match tls_choice() {
+        TlsChoice::Serve { cert, key, from } => match server::load_tls_config(&cert, &key) {
             Ok(cfg) => {
                 worker.set_tls_config(cfg);
-                log!("pg_keyspace worker: RESP TLS enabled (cert '{cert}')");
+                log!("pg_keyspace worker: RESP TLS enabled (cert '{cert}' from {from})");
             }
             Err(e) => {
                 log!("pg_keyspace worker: REFUSING to start — TLS requested but cert/key \
-                      failed to load ({e}); fix pg_keyspace.tls_cert_file/tls_key_file");
+                      failed to load ({e}); fix {from}");
                 while !BackgroundWorker::sigterm_received() {
                     std::thread::sleep(Duration::from_secs(1));
                 }
                 return;
             }
         },
-        (None, None) => {}
-        _ => {
-            log!("pg_keyspace worker: REFUSING to start — set BOTH pg_keyspace.tls_cert_file \
-                  and pg_keyspace.tls_key_file, or neither");
+        TlsChoice::Plaintext => {}
+        TlsChoice::Refuse(why) => {
+            log!("pg_keyspace worker: REFUSING to start — {why}");
             while !BackgroundWorker::sigterm_received() {
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -1510,22 +1641,31 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
                     auth: Some(cfg),
                     tls: None,
                 };
-                if let (Some(cert), Some(key)) = (
-                    GUC_TLS_CERT.get().and_then(|c| c.to_str().ok().map(str::to_string)).filter(|s| !s.is_empty()),
-                    GUC_TLS_KEY.get().and_then(|c| c.to_str().ok().map(str::to_string)).filter(|s| !s.is_empty()),
-                ) {
-                    match server::load_tls_config(&cert, &key) {
-                        Ok(c) => {
-                            reload.tls = Some(Some(c));
-                            log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} creds) + TLS cert");
+                match tls_choice() {
+                    TlsChoice::Serve { cert, key, .. } => {
+                        match server::load_tls_config(&cert, &key) {
+                            Ok(c) => {
+                                reload.tls = Some(Some(c));
+                                log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} creds) + TLS cert");
+                            }
+                            Err(e) => log!(
+                                "pg_keyspace worker: SIGHUP — reloaded auth ({n} creds); TLS cert \
+                                 reload FAILED ({e}), keeping the current cert"
+                            ),
                         }
-                        Err(e) => log!(
-                            "pg_keyspace worker: SIGHUP — reloaded auth ({n} creds); TLS cert \
-                             reload FAILED ({e}), keeping the current cert"
-                        ),
                     }
-                } else {
-                    log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} credentials)");
+                    // Both arms keep the running cert. The GUCs behind this
+                    // choice are `postmaster`-context, so a reload cannot
+                    // legitimately turn TLS off underneath live connections —
+                    // and dropping to plaintext is never the safe reading of
+                    // an ambiguous reload anyway.
+                    TlsChoice::Plaintext => {
+                        log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} credentials)");
+                    }
+                    TlsChoice::Refuse(why) => log!(
+                        "pg_keyspace worker: SIGHUP — reloaded auth ({n} creds); TLS cert \
+                         reload SKIPPED ({why}), keeping the current cert"
+                    ),
                 }
                 return server::Tick::Reload(reload);
             }
