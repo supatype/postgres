@@ -1038,6 +1038,109 @@ else
 fi
 
 echo ""
+echo "########## Y. an interrupted invalidation apply loses nothing (#66) ##########"
+# The Mode B invalidation worker peeks the decode slot, applies what it read, and
+# only then advances the slot. It used to consume first and apply second, so
+# anything that interrupted the apply lost those invalidations permanently: the
+# slot had already moved past them, nothing replayed them, and the row cache went
+# on serving the pre-change values. Nothing was logged either, because from the
+# worker's own point of view nothing had failed.
+#
+# What makes that observable — rather than masked by a restart wiping the cache —
+# is that a worker which ERRORs exits with code 1, and the postmaster does not
+# treat code 1 as a crash: the cluster stays up and shared memory, row cache
+# included, survives. So hold ACCESS EXCLUSIVE on the cached table and the
+# refill's own SELECT times out, failing the apply with the cache live underneath
+# it. Needs wal_level=logical and the keys-only output plugin.
+PLUGIN_OK=1
+make -C "$SCRIPT_DIR/../plugin" PG_CONFIG=$PGBIN/pg_config install >/tmp/pgks_plugin.log 2>&1 || PLUGIN_OK=0
+chk "the supacache_keys output plugin builds and installs" "1" "$PLUGIN_OK"
+
+# Some builds gate output plugins behind an allowlist GUC. Setting a parameter
+# the server does not know would stop it starting at all, so ask first.
+OPL=$(psql_ "SELECT count(*) FROM pg_settings WHERE name='output_plugin_libraries'")
+
+if [ "$PLUGIN_OK" = "1" ]; then
+  stop_pg; sleep 1
+  set_conf "wal_level" "logical"
+  set_conf "max_replication_slots" "10"
+  set_conf "pg_keyspace.workers" "1"
+  set_conf "pg_keyspace.persist_workers" "1"
+  set_conf "pg_keyspace.rowcache_decode" "on"
+  set_conf "pg_keyspace.rowcache_refill" "on"
+  # Long enough that the drain lands inside the window this section controls
+  # rather than racing it.
+  set_conf "pg_keyspace.rowcache_decode_ms" "4000"
+  # lock_timeout, NOT statement_timeout. statement_timeout is armed in
+  # start_xact_command(), which is the main query loop; a background worker's SPI
+  # never goes through it, so the setting has no effect there and the refill just
+  # waits out the lock (which is what the first version of this section did).
+  # lock_timeout is armed by the lock manager itself in ProcSleep, so it applies
+  # to any lock wait however the query was started. Every psql_ here overrides it
+  # per session through PGOPTIONS, so only the worker's refill is affected.
+  set_conf "lock_timeout" "2s"
+  [ "$OPL" = "1" ] && set_conf "output_plugin_libraries" "'supacache_keys'"
+  start_pg; wait_ready; sleep 3
+
+  psql_ "DROP TABLE IF EXISTS public.inv66 CASCADE" >/dev/null
+  psql_ "CREATE TABLE public.inv66(id int primary key, v text)" >/dev/null
+  psql_ "INSERT INTO public.inv66 SELECT g, 'v1' FROM generate_series(1,200) g" >/dev/null
+  psql_ "SELECT supacache.rowcache_register('public.inv66', 1)" >/dev/null
+  # Let the worker consume the setup INSERTs' own decode records before caching,
+  # or they would invalidate the rows we just cached.
+  sleep 6
+  psql_ "SELECT supacache.rowcache_put('public.inv66', g) FROM generate_series(1,200) g" >/dev/null
+  chk "the row cache is serving cached rows" "1" \
+      "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.inv66 WHERE id=1" | grep -c 'pg_keyspace_rowcache')"
+
+  PMT0=$(psql_ "SELECT pg_postmaster_start_time()")
+  LSN0=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='supacache_rowcache'")
+  LOG0=$(wc -l < $PGDATA/log)
+
+  # Change every cached row, then make the apply impossible before the worker
+  # next wakes. The lock outlives several drain attempts.
+  # Decoding does not take a relation lock — a peek returns normally while
+  # ACCESS EXCLUSIVE is held — so phase 1 always completes here and it is
+  # specifically the apply that fails. That is what makes the next assertion
+  # decisive rather than vacuous: the changes really were read before they were
+  # lost.
+  psql_ "UPDATE public.inv66 SET v='v2'" >/dev/null
+  ( psql_ "BEGIN; LOCK TABLE public.inv66 IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(20); COMMIT" >/dev/null 2>&1 ) &
+  LOCKER=$!
+  sleep 22
+  wait $LOCKER 2>/dev/null
+
+  ERRS=$(tail -n +$((LOG0+1)) $PGDATA/log | grep -c "rowcache invalidation worker.*exit code 1" || true)
+  PMT1=$(psql_ "SELECT pg_postmaster_start_time()")
+  LSN1=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='supacache_rowcache'")
+
+  chk "the apply failed while the lock was held" "1" "$([ "${ERRS:-0}" -ge 1 ] && echo 1 || echo 0)"
+  chk "the cluster stayed up, so the row cache survived the failure" "$PMT0" "$PMT1"
+  # The assertion this section exists for. Consuming before applying moved the
+  # slot here, and those invalidations were never seen again.
+  chk "the slot did not advance past changes that were never applied" "$LSN0" "$LSN1"
+
+  # With the lock gone the same batch is re-read and applied. Both terminal
+  # actions are idempotent, so the replay converges rather than double-applying.
+  SAMPLE="SELECT v FROM public.inv66 WHERE id=1 UNION ALL SELECT v FROM public.inv66 WHERE id=37 \
+UNION ALL SELECT v FROM public.inv66 WHERE id=99 UNION ALL SELECT v FROM public.inv66 WHERE id=150 \
+UNION ALL SELECT v FROM public.inv66 WHERE id=200"
+  STALE=""
+  for _ in $(seq 1 20); do
+    STALE=$(psql_ "SELECT count(*) FROM ($SAMPLE) s WHERE v <> 'v2'")
+    [ "$STALE" = "0" ] && break
+    sleep 2
+  done
+  chk "the cache is coherent once the apply can run again" "0" "$STALE"
+
+  # And the slot must move once a batch really has been applied, or the fix
+  # would trade lost invalidations for unbounded WAL retention.
+  LSN2=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='supacache_rowcache'")
+  chk "the slot advances once the batch is applied" "1" \
+      "$(psql_ "SELECT ('$LSN2'::pg_lsn > '$LSN0'::pg_lsn)::int")"
+fi
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
