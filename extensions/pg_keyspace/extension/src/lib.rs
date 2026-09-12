@@ -249,6 +249,33 @@ unsafe fn canon_pk(typoid: pg_sys::Oid, datum: pg_sys::Datum) -> Vec<u8> {
     bytes
 }
 
+/// Join canonical pk parts into the one key a composite-keyed row is cached under.
+///
+/// NUL is the separator, and it is safe as one rather than merely unlikely: each
+/// part is the output of a type's output function, which Postgres returns as a
+/// C string, so no part can contain a NUL byte. A single-column key is therefore
+/// byte-identical to the part itself, which is what it has always been.
+///
+/// Every side that builds a cache key goes through here -- the planner, the
+/// executor's miss fallback, the invalidation refill and the SQL surface -- so
+/// there is one definition of "the key for this row" rather than four that have
+/// to be kept in step.
+fn compose_pk(parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(parts.iter().map(|p| p.len() + 1).sum());
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// Split a composed key back into its parts. Inverse of [`compose_pk`].
+fn split_pk(key: &[u8]) -> Vec<Vec<u8>> {
+    key.split(|b| *b == 0).map(|p| p.to_vec()).collect()
+}
+
 /// Lowercase-hex encode (the decode plugin emits the pk this way, so an
 /// arbitrary-byte canonical pk survives the whitespace-delimited line format).
 fn hex_encode(b: &[u8]) -> String {
@@ -2303,12 +2330,21 @@ pub extern "C" fn pg_keyspace_expiry_main(_arg: pg_sys::Datum) {
 /// Parse one `supacache_keys` line: `<action> <relid> <hexpk>` -> (action,
 /// relid, canonical pk bytes). action is 'I' (insert), 'U' (update) or 'D'
 /// (delete); the pk is hex of the type's output-function text (see `rc_key`).
+/// `ACTION RELID HEXPART [HEXPART ...]` -- one hex token per primary-key column,
+/// in ascending attnum order, which is the order the plugin emits them and the
+/// order the registration stores its attnums in.
 fn parse_change(line: &str) -> Option<(char, u32, Vec<u8>)> {
     let mut it = line.split_whitespace();
     let action = it.next()?.chars().next()?;
     let relid: u32 = it.next()?.parse().ok()?;
-    let pk = hex_decode(it.next()?)?;
-    Some((action, relid, pk))
+    let mut parts = Vec::new();
+    for tok in it {
+        parts.push(hex_decode(tok)?);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some((action, relid, compose_pk(&parts)))
 }
 
 /// Create the keys-only replication slot if it does not exist yet. Requires
@@ -2719,10 +2755,24 @@ struct RcScanState {
     // custom_private; POD pointer+len so it is safe inside this palloc0 struct.
     pk_ptr: *const u8,
     pk_len: usize,
-    // pk column attnum, from the planner. Needed to resolve the column on a
-    // cache miss without consulting the (evictable) registration entry.
-    pk_attnum: i16,
+    // pk column attnums, from the planner, packed little-endian. Needed to
+    // resolve the columns on a cache miss without consulting the (evictable)
+    // registration entry. A pointer+len rather than a Vec because this struct is
+    // palloc0'd and must stay POD.
+    att_ptr: *const u8,
+    att_len: usize,
     done: bool,
+}
+
+/// The pk attnums the planner carried into this scan.
+unsafe fn rc_state_attnums(st: *mut RcScanState) -> Vec<i16> {
+    if (*st).att_ptr.is_null() || (*st).att_len < 2 {
+        return Vec::new();
+    }
+    std::slice::from_raw_parts((*st).att_ptr, (*st).att_len)
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect()
 }
 
 fn rowcache_planner_init() {
@@ -2749,6 +2799,25 @@ fn rc_reg_key(relid: u32) -> [u8; 5] {
 /// cross-type `=` operators over a plain Var are within the value-preserving
 /// integer family — so this cannot produce a wrong (incoherent) key; at worst a
 /// non-matching literal misses the cache and falls back to the index path.
+/// The canonical key for this scan, or None if the query does not pin *every*
+/// primary-key column to a constant.
+///
+/// All-or-nothing is the correctness rule for a composite key, not a
+/// conservatism: matching a query that constrains only some of the key columns
+/// to a row cached under the whole key would serve one row where the query asks
+/// for a set. That is an incoherence, not a miss, and it is the reason composite
+/// keys were refused outright rather than half-supported.
+unsafe fn find_pk_parts(rel: *mut pg_sys::RelOptInfo, attnums: &[i16]) -> Option<Vec<u8>> {
+    if attnums.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(attnums.len());
+    for &a in attnums {
+        parts.push(find_pk_bytes(rel, a)?);
+    }
+    Some(compose_pk(&parts))
+}
+
 unsafe fn find_pk_bytes(rel: *mut pg_sys::RelOptInfo, attnum: i16) -> Option<Vec<u8>> {
     let cell = (*(*rel).baserestrictinfo).elements;
     let n = (*(*rel).baserestrictinfo).length;
@@ -2851,12 +2920,11 @@ unsafe extern "C" fn rc_pathlist_hook(
         Some(v) => v,
         None => return,
     };
-    let reg = match view.get(&rc_reg_key(relid_u32)) {
-        Lookup::Hit(b) if b.len() >= 2 => [b[0], b[1]],
-        _ => return,
+    let pk_attnums = match reg_attnums(relid_u32) {
+        Some(a) => a,
+        None => return,
     };
-    let pk_attnum = i16::from_le_bytes(reg);
-    let pk = match find_pk_bytes(rel, pk_attnum) {
+    let pk = match find_pk_parts(rel, &pk_attnums) {
         Some(v) => v,
         None => return,
     };
@@ -2898,16 +2966,23 @@ unsafe extern "C" fn rc_pathlist_hook(
         false,
         false,
     );
-    // The pk attnum travels with the plan for the same reason the pk bytes do:
+    // The pk attnums travel with the plan for the same reason the pk bytes do:
     // everything execution needs must survive the cache entry it came from.
+    // Packed little-endian as a bytea rather than a single int2, so a composite
+    // key carries all of its columns.
+    let att_bytes: Vec<u8> = pk_attnums.iter().flat_map(|a| a.to_le_bytes()).collect();
+    let att_datum = match att_bytes.into_datum() {
+        Some(d) => d,
+        None => return,
+    };
     let attc = pg_sys::makeConst(
-        pg_sys::INT2OID,
+        pg_sys::BYTEAOID,
         -1,
         pg_sys::InvalidOid,
-        2,
-        pg_sys::Datum::from(pk_attnum as i16),
+        -1,
+        att_datum,
         false,
-        true,
+        false,
     );
     (*cpath).custom_private = pg_sys::lappend(std::ptr::null_mut(), pkc as *mut core::ffi::c_void);
     (*cpath).custom_private =
@@ -2957,11 +3032,16 @@ unsafe extern "C" fn rc_create_state(cscan: *mut pg_sys::CustomScan) -> *mut pg_
     (*st).pk_ptr = buf;
     (*st).pk_len = n;
     let attc = pg_sys::list_nth((*cscan).custom_private, 1) as *mut pg_sys::Const;
-    (*st).pk_attnum = if attc.is_null() || (*attc).constisnull {
-        0
+    let atts: Vec<u8> = if attc.is_null() || (*attc).constisnull {
+        Vec::new()
     } else {
-        (*attc).constvalue.value() as i16
+        Vec::<u8>::from_datum((*attc).constvalue, false).unwrap_or_default()
     };
+    let an = atts.len();
+    let abuf = pg_sys::palloc(an.max(1)) as *mut u8;
+    std::ptr::copy_nonoverlapping(atts.as_ptr(), abuf, an);
+    (*st).att_ptr = abuf;
+    (*st).att_len = an;
     (*st).done = false;
     st as *mut pg_sys::Node
 }
@@ -3030,24 +3110,16 @@ unsafe extern "C" fn rc_access(ss: *mut pg_sys::ScanState) -> *mut pg_sys::Tuple
             // registration entry: that entry is an ordinary cache entry and a
             // busy cache evicts it, which is exactly the situation a miss means
             // we are in.
-            let meta = match rowcache_meta_for_attnum((*rel).rd_id, (*st).pk_attnum) {
+            let attnums = rc_state_attnums(st);
+            let meta = match rowcache_meta_for_attnums((*rel).rd_id, &attnums) {
                 Some(m) => m,
                 None => return pg_sys::ExecClearTuple(slot),
             };
-            let lit = String::from_utf8_lossy(pk).into_owned();
-            let where_sql = format!("{} = $1::{}", quote_ident(&meta.col), meta.typename);
-            let arg = match lit.into_datum() {
-                Some(d) => d,
-                None => return pg_sys::ExecClearTuple(slot),
-            };
-            match fetch_row_and_pk(
-                &meta.rel_q,
-                &meta.col,
-                &where_sql,
-                pg_sys::TEXTOID,
-                arg,
-                true,
-            ) {
+            let parts = split_pk(pk);
+            if parts.len() != meta.cols.len() {
+                return pg_sys::ExecClearTuple(slot);
+            }
+            match fetch_row_and_pk(&meta, &parts, true) {
                 // Genuinely absent: the row does not exist, so no rows is the
                 // right answer and matches what an index scan would return.
                 None => return pg_sys::ExecClearTuple(slot),
@@ -3149,22 +3221,40 @@ extern "C" {
 /// row's canonical pk (not the lookup literal) makes put and the WAL decode path
 /// agree even when the caller passes a non-canonical literal.
 unsafe fn fetch_row_and_pk(
-    rel_q: &str,
-    col: &str,
-    where_sql: &str,
-    argtype: pg_sys::Oid,
-    argdatum: pg_sys::Datum,
+    meta: &RegMeta,
+    args: &[Vec<u8>],
     read_only: bool,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
+    if args.len() != meta.cols.len() {
+        return None;
+    }
     let _bypass = BypassGuard::new();
+    let rel_q = &meta.rel_q;
+    let where_sql = meta.where_sql();
     let query = format!("SELECT * FROM {rel_q} WHERE {where_sql}");
     let q = std::ffi::CString::new(query).ok()?;
-    let col_c = std::ffi::CString::new(col).ok()?;
+    let col_cs: Vec<std::ffi::CString> = meta
+        .cols
+        .iter()
+        .map(|c| std::ffi::CString::new(c.as_str()))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    // Every pk part binds as text and is cast to the column type in SQL. That is
+    // what the decode worker has always had to do -- WAL decode only ever yields
+    // canonical text -- and unifying on it means one query shape serves the
+    // worker, the executor's miss fallback and the SQL surface, instead of three
+    // that could drift apart on a composite key.
+    //
+    // Built before SPI_connect so the datums live in the caller's context rather
+    // than the SPI one, which is freed by SPI_finish before they are read back.
+    let mut argtypes: Vec<pg_sys::Oid> = vec![pg_sys::TEXTOID; args.len()];
+    let mut values: Vec<pg_sys::Datum> = Vec::with_capacity(args.len());
+    for a in args {
+        values.push(String::from_utf8_lossy(a).into_owned().into_datum()?);
+    }
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
         return None;
     }
-    let mut argtypes = [argtype];
-    let mut values = [argdatum];
     // A refill passes read_only = false so it takes a fresh snapshot and sees the
     // row as of now -- the just-committed change -- rather than as of the worker
     // transaction's start.
@@ -3174,7 +3264,7 @@ unsafe fn fetch_row_and_pk(
     // later moment than the rest of it, which no index scan would ever do.
     let rc = pg_sys::SPI_execute_with_args(
         q.as_ptr(),
-        1,
+        args.len() as i32,
         argtypes.as_mut_ptr(),
         values.as_mut_ptr(),
         std::ptr::null(),
@@ -3204,13 +3294,30 @@ unsafe fn fetch_row_and_pk(
         if flat != tup {
             pg_sys::heap_freetuple(flat);
         }
-        // canonical pk of the fetched row (from the original tuple — pk columns
-        // are never external, and the pk value is identical either way)
-        let fno = pg_sys::SPI_fnumber(tupdesc, col_c.as_ptr());
-        let mut isnull = false;
-        let d = pg_sys::SPI_getbinval(tup, tupdesc, fno, &mut isnull);
-        let coltyp = pg_sys::SPI_gettypeid(tupdesc, fno);
-        let canon = if isnull { Vec::new() } else { canon_pk(coltyp, d) };
+        // Canonical pk of the fetched row, composed from every pk column in the
+        // same order the key was built in (from the original tuple -- pk columns
+        // are never external, and the value is identical either way).
+        //
+        // Recomputed from the row rather than echoed back from the lookup
+        // arguments, so the entry is keyed by what the row actually holds. A
+        // lookup that matched through a cast ('01' finding a bigint 1) still
+        // caches under the row's own canonical form.
+        let mut parts = Vec::with_capacity(col_cs.len());
+        let mut any_null = false;
+        for col_c in &col_cs {
+            let fno = pg_sys::SPI_fnumber(tupdesc, col_c.as_ptr());
+            let mut isnull = false;
+            let d = pg_sys::SPI_getbinval(tup, tupdesc, fno, &mut isnull);
+            let coltyp = pg_sys::SPI_gettypeid(tupdesc, fno);
+            if isnull {
+                any_null = true;
+                break;
+            }
+            parts.push(canon_pk(coltyp, d));
+        }
+        // A NULL pk column cannot identify a row; report it the way an absent
+        // canonical pk has always been reported, so callers treat it as "gone".
+        let canon = if any_null { Vec::new() } else { compose_pk(&parts) };
         Some((buf, canon))
     } else {
         None
@@ -3241,15 +3348,13 @@ unsafe fn rowcache_refill_locked(relid: pg_sys::Oid, pk_lookup: &[u8]) -> Refill
         Some(m) => m,
         None => return Refill::Skipped,
     };
-    // The WAL decode emits the pk in canonical text form; bind it as text and
-    // cast to the column type in SQL so the pk index is still usable.
-    let lit = String::from_utf8_lossy(pk_lookup).into_owned();
-    let where_sql = format!("{} = $1::{}", quote_ident(&meta.col), meta.typename);
-    let arg = match lit.into_datum() {
-        Some(d) => d,
-        None => return Refill::Skipped,
-    };
-    match fetch_row_and_pk(&meta.rel_q, &meta.col, &where_sql, pg_sys::TEXTOID, arg, false) {
+    // The WAL decode emits each pk part in canonical text form, joined by
+    // `compose_pk`; split it back into one argument per pk column.
+    let parts = split_pk(pk_lookup);
+    if parts.len() != meta.cols.len() {
+        return Refill::Skipped;
+    }
+    match fetch_row_and_pk(&meta, &parts, false) {
         Some((raw, canon)) if !canon.is_empty() => {
             view.set(&rc_key(relid.as_u32(), &canon), &raw, 0);
             Refill::Stored
@@ -3262,18 +3367,50 @@ unsafe fn rowcache_refill_locked(relid: pg_sys::Oid, pk_lookup: &[u8]) -> Refill
 /// name (SQL-castable), and the relation's `regclass` text — resolved from the
 /// stored attnum. `None` if the relation is not registered / not resolvable.
 struct RegMeta {
-    col: String,
-    typename: String,
+    /// pk column names, ascending by attnum -- the same order the decode plugin
+    /// emits its parts in, and the order `compose_pk` joins them in.
+    cols: Vec<String>,
+    /// SQL-castable type name per column, positionally matching `cols`.
+    typenames: Vec<String>,
     rel_q: String,
 }
 
-unsafe fn rowcache_reg_meta(relid: pg_sys::Oid) -> Option<RegMeta> {
+impl RegMeta {
+    /// `c1 = $1::t1 AND c2 = $2::t2 ...`
+    ///
+    /// Every part binds as text and casts in SQL, which is what lets one code
+    /// path serve the decode worker (which only ever has canonical text), the
+    /// executor's miss fallback and the SQL surface alike. The cast keeps the
+    /// primary-key index usable.
+    fn where_sql(&self) -> String {
+        self.cols
+            .iter()
+            .zip(self.typenames.iter())
+            .enumerate()
+            .map(|(i, (c, t))| format!("{} = ${}::{}", quote_ident(c), i + 1, t))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+}
+
+/// The pk attnums a relation is registered with, ascending. The entry is simply
+/// the attnums packed little-endian, so a single-column registration is the two
+/// bytes it has always been.
+fn reg_attnums(relid: u32) -> Option<Vec<i16>> {
     let view = rowcache_view()?;
-    let attnum = match view.get(&rc_reg_key(relid.as_u32())) {
-        Lookup::Hit(b) if b.len() >= 2 => i16::from_le_bytes([b[0], b[1]]),
-        _ => return None,
-    };
-    rowcache_meta_for_attnum(relid, attnum)
+    match view.get(&rc_reg_key(relid)) {
+        Lookup::Hit(b) if b.len() >= 2 && b.len() % 2 == 0 => Some(
+            b.chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+unsafe fn rowcache_reg_meta(relid: pg_sys::Oid) -> Option<RegMeta> {
+    let attnums = reg_attnums(relid.as_u32())?;
+    rowcache_meta_for_attnums(relid, &attnums)
 }
 
 /// The catalogue half of `rowcache_reg_meta`, for a pk column already known.
@@ -3283,26 +3420,33 @@ unsafe fn rowcache_reg_meta(relid: pg_sys::Oid) -> Option<RegMeta> {
 /// not depend on that: the planner knew the attnum when it chose this scan, and
 /// carries it in `custom_private`, so the column is resolved from the catalogues
 /// here rather than looked up in a cache that may since have dropped it.
-unsafe fn rowcache_meta_for_attnum(relid: pg_sys::Oid, attnum: i16) -> Option<RegMeta> {
-    let attname = pg_sys::get_attname(relid, attnum, false);
-    if attname.is_null() {
+unsafe fn rowcache_meta_for_attnums(relid: pg_sys::Oid, attnums: &[i16]) -> Option<RegMeta> {
+    if attnums.is_empty() {
         return None;
     }
-    let col = CStr::from_ptr(attname).to_string_lossy().into_owned();
-    let coltypid = pg_sys::get_atttype(relid, attnum);
-    if coltypid == pg_sys::InvalidOid {
-        return None;
+    let mut cols = Vec::with_capacity(attnums.len());
+    let mut typenames = Vec::with_capacity(attnums.len());
+    for &attnum in attnums {
+        let attname = pg_sys::get_attname(relid, attnum, false);
+        if attname.is_null() {
+            return None;
+        }
+        cols.push(CStr::from_ptr(attname).to_string_lossy().into_owned());
+        let coltypid = pg_sys::get_atttype(relid, attnum);
+        if coltypid == pg_sys::InvalidOid {
+            return None;
+        }
+        let tn = pg_sys::format_type_be(coltypid);
+        typenames.push(CStr::from_ptr(tn).to_string_lossy().into_owned());
+        pg_sys::pfree(tn as *mut c_void);
     }
-    let tn = pg_sys::format_type_be(coltypid);
-    let typename = CStr::from_ptr(tn).to_string_lossy().into_owned();
-    pg_sys::pfree(tn as *mut c_void);
     let rel_q = Spi::get_one_with_args::<String>(
         "SELECT $1::regclass::text",
         vec![(PgBuiltInOids::OIDOID.oid(), relid.into_datum())],
     )
     .ok()
     .flatten()?;
-    Some(RegMeta { col, typename, rel_q })
+    Some(RegMeta { cols, typenames, rel_q })
 }
 
 // ---- the SQL surface: in-backend shared-memory reads/writes ---------
@@ -3679,12 +3823,16 @@ mod supacache {
             Ok(Some(o)) => o,
             _ => return false,
         };
-        // Guard: the registered column must be a SINGLE-column primary key. The
-        // cache keys a row by this one column and the keys-only decode plugin
-        // only emits single-column identity keys — registering one column of a
-        // composite key would let the planner match a query on that column alone
-        // to the wrong cached row (an incoherence, not just a miss). Any pk type
-        // is allowed (int, uuid, text, …); only the arity is constrained.
+        // Guard: the named column must be the table's ENTIRE primary key.
+        // Registering one column of a composite key would let the planner match
+        // a query constraining that column alone to a row cached under the whole
+        // key -- serving one row where the query asks for a set, which is an
+        // incoherence rather than a miss.
+        //
+        // Composite keys are supported, but not through this entry point: there
+        // is no sensible single `pk_attnum` for them, so they go through the
+        // one-argument `rowcache_register(tbl)`, which takes the key from the
+        // catalogue. Any pk type is allowed (int, uuid, text, …).
         let ok_pk = Spi::get_one_with_args::<bool>(
             "SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = $1 \
                AND i.indisprimary AND i.indnkeyatts = 1 AND i.indkey[0] = $2)",
@@ -3699,17 +3847,82 @@ mod supacache {
         if !ok_pk {
             return false; // not a single-column primary key on that attnum
         }
+        rowcache_store_registration(relid, &[pk_attnum as i16])
+    }
+
+    /// Register a table's whole primary key, whatever its arity — the general
+    /// form of `rowcache_register`, and the only one that can register a
+    /// composite key.
+    ///
+    /// Takes no attnum because there is nothing for the caller to choose: the
+    /// key is whatever `pg_index` says it is. The two-argument form remains for
+    /// callers that want to state the column explicitly, and still refuses
+    /// anything but a single-column key.
+    #[pg_extern(name = "rowcache_register")]
+    fn rowcache_register_pk(tbl: &str) -> bool {
+        let relid = match Spi::get_one_with_args::<pg_sys::Oid>(
+            "SELECT $1::regclass::oid",
+            vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
+        ) {
+            Ok(Some(o)) => o,
+            _ => return false,
+        };
+        // Ascending attnum order, which is what the decode plugin emits its key
+        // parts in. Index-column order would not do: a primary key declared
+        // (b, a) has indkey [b, a] but attnums [a, b], and the plugin reads its
+        // columns out of a bitmapset, which is inherently ascending. Sorting
+        // here is what lets neither side describe its ordering to the other.
+        let attnums: Vec<i16> = match Spi::get_one_with_args::<Vec<i16>>(
+            "SELECT array_agg(k ORDER BY k)::smallint[] \
+             FROM pg_index i, unnest(i.indkey[0:i.indnkeyatts-1]) k \
+             WHERE i.indrelid = $1 AND i.indisprimary AND k > 0",
+            vec![(PgBuiltInOids::OIDOID.oid(), relid.into_datum())],
+        ) {
+            Ok(Some(v)) if !v.is_empty() => v,
+            _ => return false, // no primary key, or one over a system column
+        };
+        rowcache_store_registration(relid, &attnums)
+    }
+
+    /// Store a registration: the pk attnums packed little-endian, ascending.
+    ///
+    /// Pinned, because a registration is configuration, not cache content.
+    /// Stored as an ordinary entry it competed with the cached rows for the same
+    /// arena, so a busy cache evicted it and `rc_pathlist_hook` then stopped
+    /// substituting for the table -- caching silently turned itself off under
+    /// exactly the load it exists to serve (#87).
+    fn rowcache_store_registration(relid: pg_sys::Oid, attnums: &[i16]) -> bool {
+        if attnums.is_empty() {
+            return false;
+        }
         let view = match rowcache_view() {
             Some(v) => v,
             None => return false,
         };
-        let attn = (pk_attnum as i16).to_le_bytes();
-        // Pinned: a registration is configuration, not cache content. Stored as
-        // an ordinary entry it competed with the cached rows for the same arena,
-        // so a busy cache evicted it and rc_pathlist_hook then stopped
-        // substituting for the table -- caching silently turned itself off under
-        // exactly the load it exists to serve (#87).
-        view.set_pinned(&rc_reg_key(relid.as_u32()), &attn)
+        let packed: Vec<u8> = attnums.iter().flat_map(|a| a.to_le_bytes()).collect();
+        view.set_pinned(&rc_reg_key(relid.as_u32()), &packed)
+    }
+
+    /// Which pk columns a table is registered with, ascending by attnum. Empty
+    /// if it is not registered.
+    #[pg_extern]
+    fn rowcache_registration(tbl: &str) -> Vec<String> {
+        let relid = match Spi::get_one_with_args::<pg_sys::Oid>(
+            "SELECT $1::regclass::oid",
+            vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
+        ) {
+            Ok(Some(o)) => o,
+            _ => return Vec::new(),
+        };
+        let attnums = match reg_attnums(relid.as_u32()) {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        unsafe {
+            rowcache_meta_for_attnums(relid, &attnums)
+                .map(|m| m.cols)
+                .unwrap_or_default()
+        }
     }
 
     /// Drop a relation's registration; the planner stops substituting for it.
@@ -3748,10 +3961,13 @@ mod supacache {
                 Some(m) => m,
                 None => return false,
             };
-            // Bind the pk value with its own type: `col = $1` (an implicit cast
-            // covers e.g. int4 literal vs int8 column).
-            let where_sql = format!("{} = $1", quote_ident(&meta.col));
-            match fetch_row_and_pk(&meta.rel_q, &meta.col, &where_sql, pk.oid(), pk.datum(), false) {
+            // Single-column form: canonicalise the caller's value the same way
+            // every other side does, then take the one shared lookup path.
+            if meta.cols.len() != 1 {
+                return false; // composite key: use rowcache_put_pk
+            }
+            let canon = canon_pk(pk.oid(), pk.datum());
+            match fetch_row_and_pk(&meta, std::slice::from_ref(&canon), false) {
                 Some((raw, canon)) if !canon.is_empty() => {
                     if let Some(view) = rowcache_view() {
                         return view.set(&rc_key(relid.as_u32(), &canon), &raw, 0);
@@ -3760,6 +3976,70 @@ mod supacache {
                 }
                 _ => false,
             }
+        }
+    }
+
+    /// `rowcache_put` for a composite primary key.
+    ///
+    /// Parts are the canonical text of each pk column, in ascending attnum
+    /// order — the same order `rowcache_registration` reports. Text rather than
+    /// a typed value because a composite key has several types and SQL has no
+    /// heterogeneous array; each part is cast to its column's type in the
+    /// lookup, exactly as the decode worker's parts are.
+    #[pg_extern]
+    fn rowcache_put_pk(tbl: &str, pk: Vec<Option<String>>) -> bool {
+        let relid = match Spi::get_one_with_args::<pg_sys::Oid>(
+            "SELECT $1::regclass::oid",
+            vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
+        ) {
+            Ok(Some(o)) => o,
+            _ => return false,
+        };
+        let parts: Vec<Vec<u8>> = pk
+            .into_iter()
+            .map(|p| p.unwrap_or_default().into_bytes())
+            .collect();
+        unsafe {
+            let meta = match rowcache_reg_meta(relid) {
+                Some(m) => m,
+                None => return false,
+            };
+            if parts.len() != meta.cols.len() {
+                return false;
+            }
+            match fetch_row_and_pk(&meta, &parts, false) {
+                Some((raw, canon)) if !canon.is_empty() => rowcache_view()
+                    .map(|v| v.set(&rc_key(relid.as_u32(), &canon), &raw, 0))
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
+    }
+
+    /// `rowcache_cached_has_external` for a composite primary key, taking the
+    /// same canonical-text parts as `rowcache_put_pk`. NULL when not cached.
+    #[pg_extern]
+    fn rowcache_cached_pk_has_external(tbl: &str, pk: Vec<Option<String>>) -> Option<bool> {
+        let relid = Spi::get_one_with_args::<pg_sys::Oid>(
+            "SELECT $1::regclass::oid",
+            vec![(PgBuiltInOids::TEXTOID.oid(), tbl.into_datum())],
+        )
+        .ok()
+        .flatten()?;
+        let parts: Vec<Vec<u8>> = pk
+            .into_iter()
+            .map(|p| p.unwrap_or_default().into_bytes())
+            .collect();
+        let view = rowcache_view()?;
+        match view.get(&rc_key(relid.as_u32(), &compose_pk(&parts))) {
+            Lookup::Hit(bytes)
+                if bytes.len() >= std::mem::size_of::<pg_sys::HeapTupleHeaderData>() =>
+            {
+                let hdr = bytes.as_ptr() as *const pg_sys::HeapTupleHeaderData;
+                let infomask = unsafe { (*hdr).t_infomask };
+                Some(infomask & pg_sys::HEAP_HASEXTERNAL as u16 != 0)
+            }
+            _ => None,
         }
     }
 

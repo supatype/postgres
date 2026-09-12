@@ -98,6 +98,9 @@ cb_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
     char       *canon;
     int         i;
     char        action;
+    StringInfoData parts;
+    int         bmsiter;
+    int         nparts = 0;
 
     /* The tuple that carries the replica-identity key for this change.
      *
@@ -131,35 +134,68 @@ cb_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
     if (keytuple == NULL)
         return;
 
-    /* The replica-identity key columns — the ONLY columns we ever read. */
+    /* The replica-identity key columns — the ONLY columns we ever read.
+     *
+     * Emitted in ASCENDING ATTNUM order, which is the order bms_next_member
+     * walks. That ordering is load-bearing for a composite key: the planner
+     * composes its lookup key from the attnums the registration stores, also
+     * ascending, so the two sides agree without either having to describe its
+     * ordering to the other. Index-column order would NOT work -- a primary key
+     * declared (b, a) has indkey [b, a] but attnums [a, b] -- so neither side
+     * may use it.
+     */
     idattrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_IDENTITY_KEY);
-    if (bms_num_members(idattrs) != 1)
+    if (bms_is_empty(idattrs))
     {
         bms_free(idattrs);
-        return;                 /* cache only supports a single-column pk */
+        return;                 /* no replica identity: nothing to key a row by */
     }
-    attno = bms_singleton_member(idattrs) + FirstLowInvalidHeapAttributeNumber;
-    bms_free(idattrs);
-    if (attno <= 0)
-        return;
-
     tupdesc = RelationGetDescr(relation);
-    att = TupleDescAttr(tupdesc, attno - 1);
 
-    d = heap_getattr(keytuple, attno, tupdesc, &isnull);
-    if (isnull)
+    initStringInfo(&parts);
+    bmsiter = -1;
+    while ((bmsiter = bms_next_member(idattrs, bmsiter)) >= 0)
+    {
+        attno = bmsiter + FirstLowInvalidHeapAttributeNumber;
+        if (attno <= 0)
+        {
+            /* a system column in the identity: not something we can key by */
+            nparts = -1;
+            break;
+        }
+        att = TupleDescAttr(tupdesc, attno - 1);
+        d = heap_getattr(keytuple, attno, tupdesc, &isnull);
+        if (isnull)
+        {
+            /* a NULL key column cannot identify a row */
+            nparts = -1;
+            break;
+        }
+
+        /* Canonical pk part = the column type's output-function text —
+         * identical to what the planner hook and rowcache_put/refill compute,
+         * so all sides agree. */
+        getTypeOutputInfo(att->atttypid, &outoid, &isvarlena);
+        canon = OidOutputFunctionCall(outoid, d);
+        if (nparts > 0)
+            appendStringInfoChar(&parts, ' ');
+        /* hex-encode each part so spaces/newlines/etc. survive the line format,
+         * and so the parts stay separable by whitespace however they print */
+        for (i = 0; canon[i] != '\0'; i++)
+            appendStringInfo(&parts, "%02x", (unsigned char) canon[i]);
+        pfree(canon);
+        nparts++;
+    }
+    bms_free(idattrs);
+    if (nparts <= 0)
+    {
+        pfree(parts.data);
         return;
-
-    /* Canonical pk = the column type's output-function text — identical to what
-     * the planner hook and rowcache_put/refill compute, so all sides agree. */
-    getTypeOutputInfo(att->atttypid, &outoid, &isvarlena);
-    canon = OidOutputFunctionCall(outoid, d);
+    }
 
     OutputPluginPrepareWrite(ctx, true);
-    appendStringInfo(ctx->out, "%c %u ", action, RelationGetRelid(relation));
-    /* hex-encode the canonical text so spaces/newlines/etc. survive the line */
-    for (i = 0; canon[i] != '\0'; i++)
-        appendStringInfo(ctx->out, "%02x", (unsigned char) canon[i]);
+    appendStringInfo(ctx->out, "%c %u %s", action, RelationGetRelid(relation),
+                     parts.data);
     OutputPluginWrite(ctx, true);
-    pfree(canon);
+    pfree(parts.data);
 }
