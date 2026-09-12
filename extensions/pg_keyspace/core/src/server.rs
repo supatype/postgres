@@ -200,6 +200,26 @@ pub const PUSH_DEADLINE: Duration = Duration::from_secs(2);
 /// thing to bound.
 pub const MAX_HELD_REPLY_BYTES: usize = 1 << 20;
 
+/// How many commands one connection may be served in a single event-loop pass.
+///
+/// `process` used to drain a connection's whole read buffer before yielding, so
+/// a client pipelining deeply was served to completion while every other
+/// connection on the worker waited. Measured, that took an unrelated connection
+/// from 91 586 operations in five seconds to one operation in eight. The budget
+/// bounds the damage: past it the connection is marked backlogged and revisited
+/// on the next pass, so service is interleaved rather than first-come.
+///
+/// Large enough that an ordinary pipelined batch still completes in one or two
+/// passes, small enough that a flood cannot monopolise the loop.
+pub const MAX_COMMANDS_PER_PASS: usize = 256;
+
+/// How long the loop may sleep while a connection is parked on a full ring.
+///
+/// Short enough that the connection resumes promptly once the persist worker
+/// frees space, long enough that waiting is a sleep rather than a spin. A zero
+/// timeout here starves the very worker whose progress the park is waiting for.
+pub const PARKED_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
 /// Reply for a write the store could not hold. Redis uses this exact text when
 /// memory pressure prevents a write, and clients special-case it, so reusing it
 /// means an existing client library handles the condition it already knows.
@@ -436,6 +456,10 @@ struct Conn {
     // is replied while this is set, which is what keeps the shared-memory
     // store and `supacache.kv` from diverging under overload.
     parked: bool,
+    // Served up to MAX_COMMANDS_PER_PASS this pass and still has complete
+    // commands buffered. Revisited next pass rather than being drained now, so
+    // one busy connection cannot starve the others.
+    backlogged: bool,
     // When set, this connection is TLS: ciphertext on the socket, plaintext in
     // rbuf/wbuf. `wpos` then counts wbuf bytes already fed to the TLS writer.
     tls: Option<Box<rustls::ServerConnection>>,
@@ -655,6 +679,20 @@ impl Worker {
                 }
                 Tick::Continue => {}
             }
+            // Work that no readability event will announce must not wait on the
+            // poll at all; a park, which waits on the persist worker rather than
+            // on this loop, gets a short bounded wait so the retry is prompt
+            // without spinning.
+            let timeout = if self.has_runnable_work() {
+                Some(Duration::from_millis(0))
+            } else if self.has_parked_work() {
+                Some(match timeout {
+                    Some(t) => t.min(PARKED_RETRY_INTERVAL),
+                    None => PARKED_RETRY_INTERVAL,
+                })
+            } else {
+                timeout
+            };
             if let Err(e) = self.poll.poll(&mut events, timeout) {
                 // A signal (e.g. SIGTERM/SIGHUP in the bgworker) interrupts the
                 // wait; loop so `tick` observes it, exactly as with epoll_wait+EINTR.
@@ -714,8 +752,11 @@ impl Worker {
             // then retry anything parked waiting for ring space to free up.
             if self.sync_ack {
                 self.resolve_acks();
-                self.resume_parked();
             }
+            // Both run on every tier now: `relaxed` parks on a full ring too,
+            // and any tier can have a connection that hit its per-pass budget.
+            self.resume_parked();
+            self.resume_backlogged();
         }
     }
 
@@ -804,6 +845,49 @@ impl Worker {
         }
     }
 
+    /// Continue connections that hit their per-pass command budget with work
+    /// still buffered.
+    ///
+    /// Needed because those bytes are already off the socket: the poller will
+    /// not report the connection readable again, so nothing else would ever come
+    /// back to it. One budget's worth is served per pass, which is what
+    /// interleaves a deep pipeline with everyone else's traffic instead of
+    /// running it to completion first.
+    fn resume_backlogged(&mut self) {
+        let ready: Vec<RawFd> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.backlogged && !c.parked)
+            .map(|(fd, _)| *fd)
+            .collect();
+        for fd in ready {
+            self.process(fd);
+            if self.conns.contains_key(&fd) {
+                self.flush(fd);
+            }
+        }
+    }
+
+    /// True while some connection has work this loop can actually make progress
+    /// on right now: bytes already read off its socket that no poll event will
+    /// announce.
+    ///
+    /// Deliberately NOT true for a parked connection. Parked means waiting on
+    /// the persist worker to free ring space, which this loop cannot hurry;
+    /// treating it as runnable turns the retry into a busy spin that burns the
+    /// core the persist worker and every other connection need. Measured, that
+    /// spin was worth a 1.3 s tail on an unrelated connection. Parked
+    /// connections get a short bounded wait instead, via `poll_timeout`.
+    fn has_runnable_work(&self) -> bool {
+        self.conns.values().any(|c| c.backlogged)
+    }
+
+    /// True while a connection is parked on a full ring, so the loop should
+    /// come back promptly to retry rather than sleeping out its full timeout.
+    fn has_parked_work(&self) -> bool {
+        self.conns.values().any(|c| c.parked)
+    }
+
     /// Send the held reply for any connection whose durable write(s) have now
     /// committed, then resume reading that connection.
     fn resolve_acks(&mut self) {
@@ -872,6 +956,7 @@ impl Worker {
                     exempt: false,
                     ack: Vec::new(),
                     parked: false,
+                    backlogged: false,
                     tls,
                     subs: HashSet::new(),
                     psubs: HashSet::new(),
@@ -989,6 +1074,22 @@ impl Worker {
     }
 
     fn process(&mut self, fd: RawFd) {
+        // A parked connection is waiting on the persist worker for ring space,
+        // and `resume_parked` owns waking it. Dispatching here anyway
+        // re-executes the command it is parked on -- the pre-flight may well
+        // pass this time, so it applies, pushes a record and replies -- and then
+        // the stale `parked` flag breaks out without consuming it, so
+        // `resume_parked` executes it AGAIN. Measured: one extra ring record and
+        // one extra +OK per 100k commands against a full ring. SET is idempotent
+        // so it only duplicates a reply, which already desynchronises a
+        // pipelining client; INCR and LPUSH would corrupt the value.
+        //
+        // Latent before the pre-flight covered every tier: `parked` was only
+        // ever set on a sync-ack tier, where it needed the same guard and did
+        // not have it.
+        if self.conns.get(&fd).map(|c| c.parked).unwrap_or(true) {
+            return;
+        }
         // A pending durable reply no longer stops the connection being read.
         // Replies are appended to `wbuf` in command order and `flush` holds the
         // whole buffer until every outstanding ack commits, so order is
@@ -1007,6 +1108,12 @@ impl Worker {
             return;
         }
         let mut consumed_total = 0usize;
+        // Being serviced now; set again below only if the budget runs out with
+        // work still buffered.
+        if let Some(c) = self.conns.get_mut(&fd) {
+            c.backlogged = false;
+        }
+        let mut dispatched = 0usize;
         // Copied out before the borrows below: `self.args` is taken mutably
         // inside the block, so `self.max_value_bytes` cannot also be read there.
         let max_value_bytes = self.max_value_bytes;
@@ -1042,6 +1149,7 @@ impl Worker {
                         break;
                     }
                     consumed_total += consumed;
+                    dispatched += 1;
                     let stop = self
                         .conns
                         .get(&fd)
@@ -1049,6 +1157,16 @@ impl Worker {
                         .unwrap_or(true);
                     if stop {
                         break; // connection closing, or its held replies are capped
+                    }
+                    // Yield the loop to the other connections. Anything still in
+                    // `rbuf` is served on the next pass; `resume_backlogged`
+                    // guarantees there is one without waiting for readability,
+                    // since the bytes have already been read off the socket.
+                    if dispatched >= MAX_COMMANDS_PER_PASS {
+                        if let Some(c) = self.conns.get_mut(&fd) {
+                            c.backlogged = true;
+                        }
+                        break;
                     }
                 }
             }
@@ -1227,7 +1345,12 @@ impl Worker {
         // The check is sound without a lock because there is one producer per
         // ring (this event loop) and the consumer only frees space, so room
         // seen here still exists at push time.
-        if sync_ack && persist_on && is_write_cmd(&cmd) {
+        // Every persisted tier, not only the sync-ack ones. Without this a
+        // `relaxed` write met a full ring inside `push_with_backpressure`, which
+        // sleeps on the event loop for up to PUSH_DEADLINE and stalls every
+        // other connection on the worker while it waits. Parking blocks only the
+        // connection whose write cannot fit.
+        if persist_on && is_write_cmd(&cmd) {
             if !self.rings_have_room(&cmd, args, &key_idxs) {
                 // Park: nothing mutated, nothing replied. `process` leaves the
                 // command in `rbuf` and retries it once the ring drains.
