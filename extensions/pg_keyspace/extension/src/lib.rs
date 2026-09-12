@@ -2128,42 +2128,104 @@ fn ensure_decode_slot(slot: &str) -> Result<(), String> {
     }))
 }
 
-/// Drain all pending changes from the slot and apply them to the row cache.
-/// Returns the number of cache entries touched (dropped or refilled).
+/// How many change records one drain pass peeks at most. The server checks this
+/// limit only at transaction boundaries, so a batch always ends on a complete
+/// transaction and the LSN we advance to is never mid-transaction. Bounded at
+/// all because the batch is materialised in worker memory, and a backlog (the
+/// worker down for a while, or one bulk UPDATE) is otherwise unbounded.
+const DRAIN_MAX_CHANGES: i32 = 10_000;
+
+/// What one drain pass did.
+#[derive(Default)]
+struct Drain {
+    /// Cache entries touched (dropped or refilled).
+    reconciled: u64,
+    /// Records the plugin emitted that `parse_change` could not read.
+    unparsed: u64,
+    /// The batch came back at `DRAIN_MAX_CHANGES`, so more is probably pending
+    /// and the caller should come straight back instead of sleeping.
+    full: bool,
+}
+
+/// Drain pending changes from the slot and apply them to the row cache.
 ///
-/// Two phases so refill's per-row SPI does not nest inside the get_changes SPI:
-/// phase 1 pulls the change list (advancing the slot) in one transaction; phase 2
-/// applies each change. Only *hot* keys (currently cached) are touched — a change
-/// to an uncached row is ignored, so the cache never fills with cold rows.
-fn drain_invalidations(slot: &str) -> u64 {
+/// Three phases, and the order is the point. Phase 1 *peeks* the change list in
+/// one transaction; phase 2 applies each change (a transaction per refill, so
+/// that SPI does not nest inside the peek's); phase 3 advances the slot past the
+/// batch phase 2 just applied.
+///
+/// Peek-apply-advance rather than get-apply because `pg_logical_slot_get_changes`
+/// *consumes*: it advances the slot when the calling transaction commits, which
+/// is before a single change has been applied. A worker that died in that window
+/// lost those invalidations permanently and then served the stale rows forever,
+/// with nothing logged and nothing to notice — it came back healthy, just behind
+/// reality (#66).
+///
+/// Delivery is therefore at-least-once, which is safe here because both terminal
+/// actions are idempotent: dropping an absent key is a no-op, and a refill
+/// re-reads whatever the heap holds now. Replaying a batch converges on the same
+/// cache state as applying it once.
+///
+/// The deliberate trade: a change that cannot be applied at all now blocks the
+/// channel — the slot stops advancing and WAL accumulates — instead of being
+/// consumed and forgotten. A stalled slot is loud, bounded by
+/// `max_slot_wal_keep_size` and recoverable; a cache that quietly disagrees with
+/// the heap is none of those things.
+///
+/// Only *hot* keys (currently cached) are touched — a change to an uncached row
+/// is ignored, so the cache never fills with cold rows.
+fn drain_invalidations(slot: &str) -> Drain {
     use std::panic::AssertUnwindSafe;
     let view = match rowcache_view() {
         Some(v) => v,
-        None => return 0,
+        None => return Drain::default(),
     };
-    // Phase 1: pull the change list.
-    let changes: Vec<(char, u32, Vec<u8>)> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
-        let mut out = Vec::new();
-        let _ = Spi::connect(|client| {
-            let t = client.select(
-                "SELECT data FROM pg_logical_slot_get_changes($1, NULL, NULL)",
-                None,
-                Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())]),
-            )?;
-            for row in t {
-                let data: String = row.get::<String>(1)?.unwrap_or_default();
-                if let Some(c) = parse_change(&data) {
-                    out.push(c);
+    // Phase 1: peek. Non-destructive, so the slot stays put until phase 3.
+    // `lsn::text` because pg_lsn has no pgrx datum mapping and the value only
+    // ever travels back into pg_replication_slot_advance.
+    let (changes, unparsed, batch_end, rows) =
+        BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            let mut out: Vec<(char, u32, Vec<u8>)> = Vec::new();
+            let mut bad = 0u64;
+            let mut end: Option<String> = None;
+            let mut rows = 0usize;
+            let _ = Spi::connect(|client| {
+                let t = client.select(
+                    "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
+                    None,
+                    Some(vec![
+                        (PgBuiltInOids::TEXTOID.oid(), slot.into_datum()),
+                        (PgBuiltInOids::INT4OID.oid(), DRAIN_MAX_CHANGES.into_datum()),
+                    ]),
+                )?;
+                for row in t {
+                    let lsn: String = row.get::<String>(1)?.unwrap_or_default();
+                    let data: String = row.get::<String>(2)?.unwrap_or_default();
+                    rows += 1;
+                    // Advance past every record the batch returned, parseable or
+                    // not: an unparseable one will never parse, so holding the
+                    // slot for it would stall the channel permanently.
+                    if !lsn.is_empty() {
+                        end = Some(lsn);
+                    }
+                    match parse_change(&data) {
+                        Some(c) => out.push(c),
+                        // Counted and logged rather than dropped in silence: a
+                        // plugin/format mismatch would otherwise degrade the
+                        // cache with no symptom but wrong answers.
+                        None => bad += 1,
+                    }
                 }
-            }
-            Ok::<(), pgrx::spi::Error>(())
-        });
-        out
-    }));
+                Ok::<(), pgrx::spi::Error>(())
+            });
+            (out, bad, end, rows)
+        }));
 
-    // Phase 2: apply. Drop-only unless refill is enabled and the row still exists.
+    // Phase 2: apply. Drop-only unless refill is enabled and the row still
+    // exists. A failure here propagates and takes the worker with it, which is
+    // the safe direction: the slot has not moved, so the batch replays.
     let refill = GUC_ROWCACHE_REFILL.get();
-    let mut n = 0u64;
+    let mut reconciled = 0u64;
     for (action, relid, pk) in changes {
         let key = rc_key(relid, &pk);
         if !matches!(view.get(&key), Lookup::Hit(_)) {
@@ -2180,9 +2242,48 @@ fn drain_invalidations(slot: &str) -> u64 {
         } else {
             view.del(&key);
         }
-        n += 1;
+        reconciled += 1;
     }
-    n
+
+    // Phase 3: the batch is applied, so it is finally safe to consume it.
+    if let Some(upto) = batch_end {
+        advance_decode_slot(slot, &upto);
+    }
+    Drain {
+        reconciled,
+        unparsed,
+        full: rows >= DRAIN_MAX_CHANGES as usize,
+    }
+}
+
+/// Consume everything up to `upto` on the decode slot, releasing its WAL.
+///
+/// Run through the READ-ONLY SPI path for the same reason slot creation is: this
+/// is not a heap write, and the read-write path would assign the transaction an
+/// xid. A failure is logged and otherwise ignored — the slot simply stays where
+/// it is and the batch replays harmlessly on the next pass — but it is worth
+/// logging, because a slot that never advances retains WAL until
+/// `max_slot_wal_keep_size` invalidates it.
+fn advance_decode_slot(slot: &str, upto: &str) {
+    use std::panic::AssertUnwindSafe;
+    let res: Result<(), String> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT pg_replication_slot_advance($1, $2::pg_lsn)",
+                    None,
+                    Some(vec![
+                        (PgBuiltInOids::TEXTOID.oid(), slot.into_datum()),
+                        (PgBuiltInOids::TEXTOID.oid(), upto.into_datum()),
+                    ]),
+                )
+                .map(|_| ())
+        })
+        .map_err(|e| e.to_string())
+    }));
+    if let Err(why) = res {
+        log!("pg_keyspace invalidation: cannot advance slot '{slot}' to {upto}: {why}");
+    }
 }
 
 #[no_mangle]
@@ -2210,9 +2311,26 @@ pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
     let poll = Duration::from_millis(GUC_ROWCACHE_DECODE_MS.get().max(10) as u64);
     log!("pg_keyspace invalidation: draining slot '{slot}' every {poll:?} (keys-only)");
     while !BackgroundWorker::sigterm_received() {
-        let n = drain_invalidations(&slot);
-        if n > 0 {
-            log!("pg_keyspace invalidation: reconciled {n} changed row-cache entr(ies)");
+        let d = drain_invalidations(&slot);
+        if d.reconciled > 0 {
+            log!(
+                "pg_keyspace invalidation: reconciled {} changed row-cache entr(ies)",
+                d.reconciled
+            );
+        }
+        if d.unparsed > 0 {
+            log!(
+                "pg_keyspace invalidation: skipped {} unreadable change record(s) on slot \
+                 '{slot}' (supacache_keys output format mismatch?)",
+                d.unparsed
+            );
+        }
+        // A batch that came back full means more is already waiting: come
+        // straight back for it rather than letting a backlog drain one poll
+        // interval at a time. Each pass does a batch of real work, so this is
+        // not a spin, and sigterm is still checked between passes.
+        if d.full {
+            continue;
         }
         std::thread::sleep(poll);
     }
