@@ -224,6 +224,12 @@ Redis-compatible (`bench/run_big{hash,list,zset}.sh`, `core/examples/bench_*`):
   are properties of the client, not of the tier: benchmark with a depth that
   actually fills a window, or you will measure your own `-P` flag.
 
+  Use **distinct keys** too. `redis-benchmark -t set` writes one key over and
+  over unless `-r` is given, and same-key writes collapse within a persist
+  window — it reports 174 k/s here and leaves `supacache.kv` holding a single
+  row. The table above writes distinct keys, so it is the rate at which
+  *different* rows reach Postgres.
+
   Before [#81](https://github.com/supatype/postgres/pull/81) (closing
   [#78](https://github.com/supatype/postgres/issues/78)) none of that was
   available: a sync-ack connection stopped being read the moment one write was
