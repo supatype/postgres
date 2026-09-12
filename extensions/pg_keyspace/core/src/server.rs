@@ -1074,6 +1074,22 @@ impl Worker {
     }
 
     fn process(&mut self, fd: RawFd) {
+        // A parked connection is waiting on the persist worker for ring space,
+        // and `resume_parked` owns waking it. Dispatching here anyway
+        // re-executes the command it is parked on -- the pre-flight may well
+        // pass this time, so it applies, pushes a record and replies -- and then
+        // the stale `parked` flag breaks out without consuming it, so
+        // `resume_parked` executes it AGAIN. Measured: one extra ring record and
+        // one extra +OK per 100k commands against a full ring. SET is idempotent
+        // so it only duplicates a reply, which already desynchronises a
+        // pipelining client; INCR and LPUSH would corrupt the value.
+        //
+        // Latent before the pre-flight covered every tier: `parked` was only
+        // ever set on a sync-ack tier, where it needed the same guard and did
+        // not have it.
+        if self.conns.get(&fd).map(|c| c.parked).unwrap_or(true) {
+            return;
+        }
         // A pending durable reply no longer stops the connection being read.
         // Replies are appended to `wbuf` in command order and `flush` holds the
         // whole buffer until every outstanding ack commits, so order is
