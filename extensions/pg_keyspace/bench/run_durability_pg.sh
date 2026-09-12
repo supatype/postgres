@@ -1846,17 +1846,25 @@ chk "the row is served from the cache while invalidation is healthy" "1" \
     "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.fc WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
 chk "and reads correctly" "two" "$(psql_ "SELECT v FROM public.fc WHERE id=2")"
 
-# Stop the invalidation worker without touching anything else. SIGKILL rather
-# than a clean shutdown: a worker that is killed cannot flush, disable itself, or
-# leave any note, which is precisely the case the heartbeat exists for.
+# Stop the invalidation worker without killing it. SIGKILL would be wrong here:
+# a bgworker with shared-memory access that dies by signal takes the postmaster
+# into a crash cycle, which restarts the cluster, zeroes the segment and brings
+# the worker straight back -- the assertion would pass for the wrong reason, or
+# race. SIGSTOP leaves it alive and simply not beating, which is also the more
+# insidious real failure: a worker that exists but is making no progress.
+#
+# A watchdog relaunch during the pause is harmless and expected: the replacement
+# calls health_claim, finds the predecessor still running, and exits.
+stop_pg_reload() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA reload" >/dev/null 2>&1; }
+AI_WATCHDOG_WAS=$(psql_ "SHOW pg_keyspace.watchdog_secs" | tr -d '[:space:]')
+set_conf "pg_keyspace.watchdog_secs" "10"
+stop_pg_reload; sleep 1
 INVAL_PID=$(ps -eo pid,args --no-headers | awk '/pg_keyspace: rowcache invalidation worker/ && !/awk/ {print $1}' | head -1)
 chk "the invalidation worker was running to begin with" "1" \
     "$([ -n "$INVAL_PID" ] && echo 1 || echo 0)"
-[ -n "$INVAL_PID" ] && kill -9 "$INVAL_PID" 2>/dev/null
-# Wait out the staleness window rather than guessing: the heartbeat has to age
-# past pg_keyspace.watchdog_secs before a reader distrusts it.
+[ -n "$INVAL_PID" ] && kill -STOP "$INVAL_PID" 2>/dev/null
 STALE_MS=$(psql_ "SELECT stale_after_ms FROM supacache.rowcache_coherence()")
-STALE_WAIT=$(( ${STALE_MS:-30000} / 1000 + 15 ))
+STALE_WAIT=$(( ${STALE_MS:-10000} / 1000 + 20 ))
 GONE=0
 for _ in $(seq 1 $STALE_WAIT); do
   [ "$(psql_ "SELECT coherent FROM supacache.rowcache_coherence()")" = "f" ] && { GONE=1; break; }
@@ -1869,9 +1877,14 @@ chk "a fresh plan stops using the cache" "0" \
     "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.fc WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
 chk "and the row still reads correctly from the heap" "two" \
     "$(psql_ "SELECT v FROM public.fc WHERE id=2")"
-# It must recover on its own: the watchdog relaunches the worker, it beats again,
-# and the cache becomes usable without operator action.
-chk "coherence returns once the worker is back" "1" "$(wait_coherent 90)"
+# It must recover on its own once the worker is beating again, with no operator
+# action and no flush to undo.
+[ -n "$INVAL_PID" ] && kill -CONT "$INVAL_PID" 2>/dev/null
+chk "coherence returns once the worker beats again" "1" "$(wait_coherent 60)"
+chk "and the cache is served again" "1" \
+    "$(psql_ "SELECT supacache.rowcache_put('public.fc', 2)" >/dev/null; psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.fc WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
+set_conf "pg_keyspace.watchdog_secs" "${AI_WATCHDOG_WAS:-30}"
+stop_pg_reload
 
 echo ""
 echo "================================================"
