@@ -1785,6 +1785,13 @@ fn load_auth_config() -> Option<AuthConfig> {
     }))
 }
 
+/// Rows per cursor fetch during recovery. The point is that worker memory stays
+/// flat regardless of key count, so this bounds a batch at roughly this many
+/// row widths. Deliberately modest rather than maximal: a row can carry a value
+/// of several megabytes, and recovery is already about 3.5us per key, so the
+/// extra round trips disappear into the noise while the memory ceiling does not.
+const RECOVER_BATCH: i64 = 1_000;
+
 /// How often recovery reports progress. A large keyspace takes minutes, and the
 /// RESP port is not served until recovery finishes, so silence for the whole of
 /// it is indistinguishable from a hang — which is how it has been read before.
@@ -1822,54 +1829,64 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
             let mut cnt = 0i64;
             // no-TTL keys from kv, then non-expired TTL keys from kv_ttl (latest
             // expiry per key wins, so a re-SET into a newer bucket takes effect).
-            let tup = if sharded {
-                client.select(
+            // Through a cursor rather than one unbounded SELECT: SPI materialises
+            // a whole result set in the worker, so the old form's peak memory
+            // scaled with the persisted key count on top of the segment itself.
+            // Fetching keeps the query plan and access path identical — only the
+            // delivery changes.
+            let mut cur = if sharded {
+                client.try_open_cursor(
                     "SELECT key, val, expires_at, kind::text FROM supacache.kv \
                      WHERE slot >= $1 AND slot < $2",
-                    None,
                     Some(vec![
                         (PgOid::BuiltIn(PgBuiltInOids::INT4OID), (lo as i32).into_datum()),
                         (PgOid::BuiltIn(PgBuiltInOids::INT4OID), (hi as i32).into_datum()),
                     ]),
                 )?
             } else {
-                client.select(
+                client.try_open_cursor(
                     "SELECT key, val, expires_at, kind::text FROM supacache.kv",
-                    None,
                     None,
                 )?
             };
-            for row in tup {
-                let k: Option<Vec<u8>> = row.get(1)?;
-                let v: Option<Vec<u8>> = row.get(2)?;
-                let e: i64 = row.get::<i64>(3)?.unwrap_or(0);
-                let kind = row
-                    .get::<String>(4)?
-                    .and_then(|s| s.bytes().next())
-                    .unwrap_or(b's') as u32;
-                if let (Some(k), Some(v)) = (k, v) {
-                    if e > 0 && e <= now {
-                        continue; // already expired
-                    }
-                    let ttl = if e > 0 { e - now } else { 0 };
-                    store.set_typed(&k, &v, ttl, kind);
-                    cnt += 1;
-                    if cnt % RECOVER_LOG_EVERY == 0 {
-                        log!(
-                            "pg_keyspace worker {w}: recovery in progress, \
-                             {cnt} keys in {:?}",
-                            t0.elapsed()
-                        );
+            loop {
+                let tup = cur.fetch(RECOVER_BATCH as _)?;
+                if tup.is_empty() {
+                    break;
+                }
+                for row in tup {
+                    let k: Option<Vec<u8>> = row.get(1)?;
+                    let v: Option<Vec<u8>> = row.get(2)?;
+                    let e: i64 = row.get::<i64>(3)?.unwrap_or(0);
+                    let kind = row
+                        .get::<String>(4)?
+                        .and_then(|s| s.bytes().next())
+                        .unwrap_or(b's') as u32;
+                    if let (Some(k), Some(v)) = (k, v) {
+                        if e > 0 && e <= now {
+                            continue; // already expired
+                        }
+                        let ttl = if e > 0 { e - now } else { 0 };
+                        store.set_typed(&k, &v, ttl, kind);
+                        cnt += 1;
+                        if cnt % RECOVER_LOG_EVERY == 0 {
+                            log!(
+                                "pg_keyspace worker {w}: recovery in progress, \
+                                 {cnt} keys in {:?}",
+                                t0.elapsed()
+                            );
+                        }
                     }
                 }
             }
-            let tup = if sharded {
-                client.select(
+            // The DISTINCT ON sort happens server side either way; the cursor
+            // only stops its whole output landing in the worker at once.
+            let mut cur = if sharded {
+                client.try_open_cursor(
                     "SELECT DISTINCT ON (key) key, val, expires_at, kind::text \
                      FROM supacache.kv_ttl \
                      WHERE expires_at > $1 AND slot >= $2 AND slot < $3 \
                      ORDER BY key, expires_at DESC",
-                    None,
                     Some(vec![
                         (PgOid::BuiltIn(PgBuiltInOids::INT8OID), now.into_datum()),
                         (PgOid::BuiltIn(PgBuiltInOids::INT4OID), (lo as i32).into_datum()),
@@ -1877,34 +1894,39 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
                     ]),
                 )?
             } else {
-                client.select(
+                client.try_open_cursor(
                     "SELECT DISTINCT ON (key) key, val, expires_at, kind::text \
                      FROM supacache.kv_ttl \
                      WHERE expires_at > $1 ORDER BY key, expires_at DESC",
-                    None,
                     Some(vec![(
                         PgOid::BuiltIn(PgBuiltInOids::INT8OID),
                         now.into_datum(),
                     )]),
                 )?
             };
-            for row in tup {
-                let k: Option<Vec<u8>> = row.get(1)?;
-                let v: Option<Vec<u8>> = row.get(2)?;
-                let e: i64 = row.get::<i64>(3)?.unwrap_or(0);
-                let kind = row
-                    .get::<String>(4)?
-                    .and_then(|s| s.bytes().next())
-                    .unwrap_or(b's') as u32;
-                if let (Some(k), Some(v)) = (k, v) {
-                    store.set_typed(&k, &v, (e - now).max(1), kind);
-                    cnt += 1;
-                    if cnt % RECOVER_LOG_EVERY == 0 {
-                        log!(
-                            "pg_keyspace worker {w}: recovery in progress, \
-                             {cnt} keys in {:?}",
-                            t0.elapsed()
-                        );
+            loop {
+                let tup = cur.fetch(RECOVER_BATCH as _)?;
+                if tup.is_empty() {
+                    break;
+                }
+                for row in tup {
+                    let k: Option<Vec<u8>> = row.get(1)?;
+                    let v: Option<Vec<u8>> = row.get(2)?;
+                    let e: i64 = row.get::<i64>(3)?.unwrap_or(0);
+                    let kind = row
+                        .get::<String>(4)?
+                        .and_then(|s| s.bytes().next())
+                        .unwrap_or(b's') as u32;
+                    if let (Some(k), Some(v)) = (k, v) {
+                        store.set_typed(&k, &v, (e - now).max(1), kind);
+                        cnt += 1;
+                        if cnt % RECOVER_LOG_EVERY == 0 {
+                            log!(
+                                "pg_keyspace worker {w}: recovery in progress, \
+                                 {cnt} keys in {:?}",
+                                t0.elapsed()
+                            );
+                        }
                     }
                 }
             }
