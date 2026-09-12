@@ -1477,6 +1477,9 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
                     c.note_commit();
                 }
                 commit_rings(&consumers, &slices);
+                // Outside the transaction bulk_upsert just committed, so the
+                // pending entries are complete and publishable.
+                flush_worker_stats();
                 backoff = Duration::from_millis(0);
             }
             Err(e) => {
@@ -1498,7 +1501,10 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
     let tcount: usize = tslices.iter().map(|(n, _)| n).sum();
     if !tail.is_empty() {
         match bulk_upsert(tail, sync_commit, ttl_bucket_us()) {
-            Ok(()) => commit_rings(&consumers, &tslices),
+            Ok(()) => {
+                commit_rings(&consumers, &tslices);
+                flush_worker_stats();
+            }
             Err(e) => log!(
                 "pg_keyspace persist {idx}: final batch of {tcount} record(s) FAILED                  to persist ({e}); they remain in the rings for the next start"
             ),
@@ -1510,6 +1516,23 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
     // stale is correct for both: on a real shutdown the segment is destroyed
     // anyway, and a postmaster that is shutting down refuses new registrations.
     log!("pg_keyspace persist {idx}: shutting down");
+}
+
+/// Publish this worker's pending table statistics to shared memory.
+///
+/// A background worker never runs the backend main loop, which is what normally
+/// calls `pgstat_report_stat` after each command. Without this the persist
+/// worker's row counts accumulate in process-local pending entries and reach
+/// `pg_stat_user_tables` only when the shutdown hook flushes them as the worker
+/// exits — so a running cluster reports zero inserts, zero updates and zero dead
+/// tuples on the supacache tables no matter how much it has written, and
+/// autovacuum, whose thresholds are computed from exactly those counters, never
+/// sees the churn. Restart such a cluster and every write appears at once.
+///
+/// Must be called outside a transaction: the pending entries are flushed at
+/// transaction end and `pgstat_report_stat` asserts it is not inside one.
+fn flush_worker_stats() {
+    unsafe { pg_sys::pgstat_report_stat(true) };
 }
 
 /// Read from every ring this worker owns without consuming anything, appending
