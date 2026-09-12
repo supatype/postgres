@@ -1516,6 +1516,88 @@ echo "  (n_tup_ins + n_tup_upd: $STAT_BEFORE -> $STAT_AFTER over $(( ${KV_STAT_A
 # delta above establishes.
 
 echo ""
+echo "########## AE. a durable connection pipelines instead of stalling (#78) ##########"
+# A sync-ack tier used to stop reading a connection the moment one of its writes
+# was waiting to commit, so pipeline depth was fixed at 1 and each connection
+# got one durable write per persist window -- about 90/s at the default 10 ms.
+# Reading on is safe because replies are appended to wbuf in command order and
+# flush holds the whole buffer until every outstanding ack commits.
+#
+# Three things have to hold, and throughput is the least important of them:
+# every acked write must still be durable, replies must still arrive in command
+# order, and a read behind a write in the same pipeline must see that write.
+PIPE_N=${PGKS_PIPE_N:-2000}
+KV_PIPE_BEFORE=$(psql_ "SELECT count(*) FROM supacache.kv")
+seq 1 $PIPE_N | awk '{print "SET pipek:"$1" v"$1}' > /tmp/pgks_pipe.txt
+T_PIPE0=$(date +%s.%N)
+PIPE_OUT=$(timeout 120 redis-cli -p $RESP --pipe < /tmp/pgks_pipe.txt 2>&1)
+T_PIPE1=$(date +%s.%N)
+PIPE_SECS=$(awk -v a="$T_PIPE0" -v b="$T_PIPE1" 'BEGIN{printf "%.1f", b-a}')
+chk "every pipelined write was replied to" "1" \
+    "$(echo "$PIPE_OUT" | grep -c "replies: $PIPE_N")"
+chk "and none of them errored" "1" \
+    "$(echo "$PIPE_OUT" | grep -c 'errors: 0')"
+# The whole point: at one write per persist window this would take PIPE_N/90
+# seconds. The budget is generous against a loaded runner and still nowhere
+# near that, so it fails on a regression rather than on a slow day.
+PIPE_BUDGET=${PGKS_PIPE_BUDGET:-10}
+chk "the pipeline did not serialise on the persist window (took ${PIPE_SECS}s, budget ${PIPE_BUDGET}s)" "1" \
+    "$(awk -v t="$PIPE_SECS" -v b="$PIPE_BUDGET" 'BEGIN{print (t < b) ? 1 : 0}')"
+sleep 2
+KV_PIPE_AFTER=$(psql_ "SELECT count(*) FROM supacache.kv")
+# Throughput is worthless if the acks were lying. Every one of those writes was
+# acknowledged on the durable tier, so every one must be in the table.
+chk "and every acked write is actually in supacache.kv" "1" \
+    "$([ "$(( ${KV_PIPE_AFTER:-0} - ${KV_PIPE_BEFORE:-0} ))" -ge "$PIPE_N" ] && echo 1 || echo 0)"
+
+# Ordering, and read-your-writes within one pipeline. Interleaves SET and GET on
+# the same key so the reply stream is only correct if replies come back in
+# command order AND each read saw the write immediately before it. A reordering
+# bug shows up as a mismatched reply rather than as a slow test.
+cat > /tmp/pgks_order.py <<'PYEOF'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.create_connection(('127.0.0.1', port))
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+N = 500
+out = bytearray()
+want = []
+for i in range(N):
+    # The key length is computed, not written by hand: an $N that disagrees with
+    # the key is a protocol error, and it fails as "out of order" rather than as
+    # the malformed request it actually is.
+    k = b'ordk:%03d' % (i % 1000)
+    v = b'v%d' % i
+    out += b'*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n' % (len(k), k, len(v), v)
+    want.append(b'+OK')
+    out += b'*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n' % (len(k), k)
+    want.append(b'$%d\r\n%s' % (len(v), v))
+s.sendall(out)
+expect = b''.join(w + b'\r\n' for w in want)
+buf = b''
+s.settimeout(30)
+while len(buf) < len(expect):
+    try:
+        d = s.recv(1 << 16)
+    except OSError:
+        break
+    if not d:
+        break
+    buf += d
+if buf == expect:
+    print('OK')
+else:
+    # Say where it diverged: a reordering shows as a reply appearing early, a
+    # protocol error as an "-ERR" in the stream, and a short read as a length.
+    n = min(len(buf), len(expect))
+    at = next((i for i in range(n) if buf[i] != expect[i]), n)
+    print('MISMATCH at byte %d of %d: wanted %r, got %r'
+          % (at, len(expect), expect[at:at + 40], buf[at:at + 40]))
+PYEOF
+chk "replies come back in command order, and reads see the writes ahead of them" "OK" \
+    "$(timeout 60 python3 /tmp/pgks_order.py $RESP 2>&1 | tail -1)"
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
