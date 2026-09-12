@@ -67,6 +67,16 @@ rcli_x() { local f="$1"; shift; timeout "$RCLI_TIMEOUT" redis-cli -p $RESP -x "$
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
 stop_pg()  { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop" >/dev/null 2>&1; }
 wait_ready() { for _ in $(seq 1 30); do psql_ "SELECT 1" | grep -q "^1$" && return 0; sleep 1; done; return 1; }
+# The row cache is only served while its invalidation worker is beating (#39),
+# so anything asserting the cache is used has to wait for that rather than sleep
+# a guessed amount. Returns 1 if it became coherent, 0 if it never did.
+wait_coherent() {
+  for _ in $(seq 1 "${1:-30}"); do
+    [ "$(psql_ "SELECT coherent FROM supacache.rowcache_coherence()")" = "t" ] && { echo 1; return; }
+    sleep 1
+  done
+  echo 0
+}
 
 echo "=== build + install the extension ==="
 cd "$EXT_DIR"
@@ -1718,6 +1728,9 @@ echo "########## AG. a cached plan never returns fewer rows than the heap has (#
 stop_pg; sleep 1
 set_conf "pg_keyspace.rowcache_mb" "1"
 start_pg; wait_ready; sleep 2
+# Invalidation is on by this point in the suite, and the cache is not served
+# until its worker beats, so wait for that instead of assuming two seconds did it.
+chk "the invalidation worker is up, so the cache is served at all" "1" "$(wait_coherent 30)"
 psql_ "DROP TABLE IF EXISTS public.ev CASCADE" >/dev/null 2>&1
 psql_ "CREATE TABLE public.ev(id bigint primary key, v text)" >/dev/null
 psql_ "INSERT INTO public.ev SELECT g, repeat('x', 900)||g FROM generate_series(1,4000) g" >/dev/null
@@ -1777,6 +1790,7 @@ echo "########## AH. a busy cache does not un-register its own tables (#87) ####
 stop_pg; sleep 1
 set_conf "pg_keyspace.rowcache_mb" "1"
 start_pg; wait_ready; sleep 2
+chk "the invalidation worker is up, so the cache is served at all" "1" "$(wait_coherent 30)"
 psql_ "DROP TABLE IF EXISTS public.rp CASCADE" >/dev/null 2>&1
 psql_ "CREATE TABLE public.rp(id bigint primary key, v text)" >/dev/null
 psql_ "INSERT INTO public.rp SELECT g, repeat('x',900)||g FROM generate_series(1,4000) g" >/dev/null
@@ -1807,6 +1821,70 @@ stop_pg; sleep 1
 set_conf "pg_keyspace.rowcache_mb" "64"
 start_pg; wait_ready; sleep 2
 chk "the cluster is healthy again at the original row-cache size" "1" "$(psql_ "SELECT 1")"
+
+echo ""
+echo "########## AI. the row cache fails closed when nothing is invalidating it (#39) ##########"
+# The row cache holds raw pre-policy rows and is only as correct as the worker
+# that invalidates them. If that worker stops, entries go stale with no bound and
+# nothing says so -- #39's "serves stale rows indefinitely with no alarm".
+#
+# Reads now refuse a cache whose invalidation is configured but not running, at
+# plan time and again at execution time, because a plan outlives the condition.
+# With the heap fallback from #85 in place that costs a fetch rather than an
+# answer, which is what makes failing closed safe to do at all.
+chk "coherence is reported, and true while the worker is beating" "t" \
+    "$(psql_ "SELECT coherent FROM supacache.rowcache_coherence()")"
+psql_ "DROP TABLE IF EXISTS public.fc CASCADE" >/dev/null 2>&1
+psql_ "CREATE TABLE public.fc(id bigint primary key, v text)" >/dev/null
+psql_ "INSERT INTO public.fc VALUES (1,'one'),(2,'two')" >/dev/null
+psql_ "SELECT supacache.rowcache_register('public.fc', 1)" >/dev/null
+sleep 6
+psql_ "SELECT supacache.rowcache_put('public.fc', 2)" >/dev/null
+# Without this the section proves nothing: a cache that was never used cannot be
+# observed to stop being used.
+chk "the row is served from the cache while invalidation is healthy" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.fc WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
+chk "and reads correctly" "two" "$(psql_ "SELECT v FROM public.fc WHERE id=2")"
+
+# Stop the invalidation worker without killing it. SIGKILL would be wrong here:
+# a bgworker with shared-memory access that dies by signal takes the postmaster
+# into a crash cycle, which restarts the cluster, zeroes the segment and brings
+# the worker straight back -- the assertion would pass for the wrong reason, or
+# race. SIGSTOP leaves it alive and simply not beating, which is also the more
+# insidious real failure: a worker that exists but is making no progress.
+#
+# A watchdog relaunch during the pause is harmless and expected: the replacement
+# calls health_claim, finds the predecessor still running, and exits.
+stop_pg_reload() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA reload" >/dev/null 2>&1; }
+AI_WATCHDOG_WAS=$(psql_ "SHOW pg_keyspace.watchdog_secs" | tr -d '[:space:]')
+set_conf "pg_keyspace.watchdog_secs" "10"
+stop_pg_reload; sleep 1
+INVAL_PID=$(ps -eo pid,args --no-headers | awk '/pg_keyspace: rowcache invalidation worker/ && !/awk/ {print $1}' | head -1)
+chk "the invalidation worker was running to begin with" "1" \
+    "$([ -n "$INVAL_PID" ] && echo 1 || echo 0)"
+[ -n "$INVAL_PID" ] && kill -STOP "$INVAL_PID" 2>/dev/null
+STALE_MS=$(psql_ "SELECT stale_after_ms FROM supacache.rowcache_coherence()")
+STALE_WAIT=$(( ${STALE_MS:-10000} / 1000 + 20 ))
+GONE=0
+for _ in $(seq 1 $STALE_WAIT); do
+  [ "$(psql_ "SELECT coherent FROM supacache.rowcache_coherence()")" = "f" ] && { GONE=1; break; }
+  sleep 1
+done
+chk "coherence goes false once the worker stops beating (within ${STALE_WAIT}s)" "1" "$GONE"
+# The point of all of it: the cache is no longer served, and the answer is still
+# right because the read falls through to the heap (#85).
+chk "a fresh plan stops using the cache" "0" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.fc WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
+chk "and the row still reads correctly from the heap" "two" \
+    "$(psql_ "SELECT v FROM public.fc WHERE id=2")"
+# It must recover on its own once the worker is beating again, with no operator
+# action and no flush to undo.
+[ -n "$INVAL_PID" ] && kill -CONT "$INVAL_PID" 2>/dev/null
+chk "coherence returns once the worker beats again" "1" "$(wait_coherent 60)"
+chk "and the cache is served again" "1" \
+    "$(psql_ "SELECT supacache.rowcache_put('public.fc', 2)" >/dev/null; psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.fc WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
+set_conf "pg_keyspace.watchdog_secs" "${AI_WATCHDOG_WAS:-30}"
+stop_pg_reload
 
 echo ""
 echo "================================================"

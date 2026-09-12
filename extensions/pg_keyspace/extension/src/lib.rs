@@ -167,6 +167,33 @@ fn rowcache_config() -> Config {
     }
 }
 
+/// Whether the row cache's coherence can be trusted right now.
+///
+/// The cache holds raw pre-policy rows and is only as correct as the worker that
+/// invalidates them. If that worker is not running, entries go stale with no
+/// bound and nothing says so: #39 called this out as the case where the cache
+/// "serves stale rows indefinitely with no alarm".
+///
+/// Fail closed, but only against the configuration that asked for automatic
+/// coherence. With `pg_keyspace.rowcache_decode = off` there is no invalidation
+/// worker by design -- the cache is warmed and managed by hand -- and refusing
+/// to serve it would break a deliberate choice rather than protect anyone.
+///
+/// A slot that has never beaten reads as not coherent, so the window between a
+/// cluster starting and the worker's first beat is closed rather than open.
+fn rowcache_coherent() -> bool {
+    if !GUC_ROWCACHE_DECODE.get() {
+        return true; // manual coherence, operator's choice
+    }
+    match health_slot(health_invalidation_slot()) {
+        None => true, // no health table at all: nothing to judge against
+        Some(sl) => {
+            let last = sl.last_seen_us.load(Ordering::Acquire);
+            last != 0 && store::now_micros().saturating_sub(last) < health_stale_us()
+        }
+    }
+}
+
 /// A row-cache Store view over the Mode B segment (any backend).
 fn rowcache_view() -> Option<Store> {
     let base = ROWCACHE_BASE.load(Ordering::Acquire);
@@ -285,13 +312,18 @@ struct WorkerSlot {
 const HEALTH_STRIDE: usize = 64;
 
 /// Slots are laid out RESP workers, then persistence shards, then the expiry
-/// worker, so an index maps back to exactly what to relaunch.
+/// worker, then the row-cache invalidation worker, so an index maps back to
+/// exactly what to relaunch.
 fn health_slot_count() -> usize {
-    worker_count() + persist_shards() + 1
+    worker_count() + persist_shards() + 2
 }
 
 fn health_expiry_slot() -> usize {
     worker_count() + persist_shards()
+}
+
+fn health_invalidation_slot() -> usize {
+    worker_count() + persist_shards() + 1
 }
 
 fn health_bytes() -> usize {
@@ -409,8 +441,15 @@ fn health_watchdog() {
     let stale = health_stale_us();
     let nworkers = worker_count();
     for i in 0..health_slot_count() {
-        // Workers that are not supposed to be running are not gaps.
-        if !persisted && i >= nworkers {
+        // Workers that are not supposed to be running are not gaps. The
+        // invalidation worker does not follow the persistence tiers -- Mode B
+        // runs on an ephemeral cluster too -- so it is gated on its own GUC
+        // rather than on `persisted`.
+        if i == health_invalidation_slot() {
+            if !GUC_ROWCACHE_DECODE.get() {
+                continue;
+            }
+        } else if !persisted && i >= nworkers {
             continue;
         }
         let sl = match health_slot(i) {
@@ -444,8 +483,14 @@ fn health_relaunch(i: usize, nworkers: usize) {
     } else if i < health_expiry_slot() {
         let sh = i - nworkers;
         (format!("pg_keyspace: persistence worker {sh}"), "pg_keyspace_persist_main", sh as i32)
-    } else {
+    } else if i == health_expiry_slot() {
         ("pg_keyspace: expiry worker".to_string(), "pg_keyspace_expiry_main", 0)
+    } else {
+        (
+            "pg_keyspace: rowcache invalidation worker".to_string(),
+            "pg_keyspace_invalidation_main",
+            0,
+        )
     };
     log!("pg_keyspace watchdog: '{name}' has not beaten in {}s; relaunching it", GUC_WATCHDOG_SECS.get());
     let built = BackgroundWorkerBuilder::new(&name)
@@ -2423,8 +2468,17 @@ pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
         return;
     }
     let poll = Duration::from_millis(GUC_ROWCACHE_DECODE_MS.get().max(10) as u64);
+    // The heartbeat is what lets a reader tell "coherent" from "nobody has been
+    // invalidating anything for a while". Claimed the same way the other workers
+    // claim theirs, so two invalidation workers cannot both drain one slot.
+    let health = health_invalidation_slot();
+    if !health_claim(health) {
+        log!("pg_keyspace invalidation: another invalidation worker is live; exiting");
+        return;
+    }
     log!("pg_keyspace invalidation: draining slot '{slot}' every {poll:?} (keys-only)");
     while !BackgroundWorker::sigterm_received() {
+        health_beat(health);
         let d = drain_invalidations(&slot);
         if d.reconciled > 0 {
             log!(
@@ -2645,6 +2699,11 @@ unsafe extern "C" fn rc_pathlist_hook(
     if RC_BYPASS.load(Ordering::SeqCst) {
         return;
     }
+    // Invalidation asked for but not running: leave the ordinary index path in
+    // place rather than substitute a cache nothing is keeping current.
+    if !rowcache_coherent() {
+        return;
+    }
     if (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL
         || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
     {
@@ -2828,10 +2887,15 @@ unsafe extern "C" fn rc_access(ss: *mut pg_sys::ScanState) -> *mut pg_sys::Tuple
     // Deliberately not repopulating the cache here: that is read-through warming
     // (#10), and doing it as a side effect of a miss would let one scan of
     // evicted rows churn the whole cache.
+    // Checked here as well as at plan time, because a plan outlives the
+    // condition: a statement planned while invalidation was healthy would go on
+    // serving cached rows through a worker outage otherwise. `rc_access` runs
+    // once per scan, so this costs one clock read per scan rather than per row.
+    let trusted = rowcache_coherent();
     let fallback;
     let bytes: &[u8] = match view.get(&rc_key(relid, pk)) {
-        Lookup::Hit(b) => b,
-        Lookup::Miss => {
+        Lookup::Hit(b) if trusted => b,
+        _ => {
             // Resolved from the attnum the planner carried, not from the
             // registration entry: that entry is an ordinary cache entry and a
             // busy cache evicts it, which is exactly the situation a miss means
@@ -3585,6 +3649,45 @@ mod supacache {
             }
             _ => None,
         }
+    }
+
+    /// Whether the row cache is currently trusted, and how stale its
+    /// invalidation worker's heartbeat is.
+    ///
+    /// The point of #39 was that a stopped invalidation worker left the cache
+    /// serving stale rows "indefinitely with no alarm". Reads now fail closed on
+    /// their own, but an operator still needs to be able to see it, and a test
+    /// needs to be able to wait for the worker to come up rather than sleep and
+    /// hope.
+    ///
+    /// `coherent` is false while invalidation is configured but not beating;
+    /// `beat_age_ms` is NULL when it has never beaten (nothing has started yet)
+    /// and when invalidation is switched off, where there is nothing to beat.
+    #[pg_extern]
+    fn rowcache_coherence() -> TableIterator<
+        'static,
+        (
+            name!(coherent, bool),
+            name!(decode_enabled, bool),
+            name!(beat_age_ms, Option<i64>),
+            name!(stale_after_ms, i64),
+        ),
+    > {
+        let decode = GUC_ROWCACHE_DECODE.get();
+        let age = health_slot(health_invalidation_slot()).and_then(|sl| {
+            let last = sl.last_seen_us.load(Ordering::Acquire);
+            if last == 0 {
+                None
+            } else {
+                Some(store::now_micros().saturating_sub(last) / 1000)
+            }
+        });
+        TableIterator::once((
+            rowcache_coherent(),
+            decode,
+            age,
+            health_stale_us() / 1000,
+        ))
     }
 
     /// Row-cache occupancy: entries (registrations + rows), bytes used/cap.
