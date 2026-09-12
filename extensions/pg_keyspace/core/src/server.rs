@@ -187,6 +187,19 @@ fn write_command_entry(out: &mut Vec<u8>, c: &CmdSpec) {
 /// `resolve_acks` defers replies, is the proper fix and is not done here.
 pub const PUSH_DEADLINE: Duration = Duration::from_secs(2);
 
+/// How many bytes of held reply a single connection may accumulate while its
+/// durable writes are still committing.
+///
+/// A sync-ack tier holds a connection's replies until the records behind them
+/// commit, so a pipelining client can queue replies faster than the persist
+/// worker retires them. This caps that queue: past it the connection stops
+/// being read until an ack resolves, which is the same backpressure that used
+/// to apply at the very first outstanding write. At roughly five bytes per
+/// `+OK` this is a deep pipeline, and for reads — where the bytes actually
+/// are — it bounds memory rather than command count, which is the useful
+/// thing to bound.
+pub const MAX_HELD_REPLY_BYTES: usize = 1 << 20;
+
 /// Reply for a write the store could not hold. Redis uses this exact text when
 /// memory pressure prevents a write, and clients special-case it, so reusing it
 /// means an existing client library handles the condition it already knows.
@@ -406,8 +419,16 @@ struct Conn {
     role: String,
     tenant: String,
     exempt: bool,
-    // durable sync-ack: (ring, seq) the connection's reply is waiting on. While
-    // non-empty the reply is held (not flushed) and no further commands are read.
+    // durable sync-ack: the highest (ring, seq) per ring that this connection's
+    // held replies are waiting on. While non-empty nothing is flushed, so every
+    // reply behind it stays behind it and command order is preserved by `wbuf`
+    // alone. Commands ARE still read and applied meanwhile, up to
+    // `MAX_HELD_REPLY_BYTES` of held reply — that is what lets a pipelined
+    // client put more than one write into a single persist window.
+    //
+    // One entry per ring, holding the highest sequence seen, because a ring
+    // commits in order: waiting for the newest record on a ring implies every
+    // earlier one on it has committed too.
     ack: Vec<(usize, u64)>,
     // Backpressure park: the persistence ring had no room for this command's
     // record, so the command was NOT applied and NOT consumed from `rbuf`. It
@@ -436,6 +457,16 @@ struct Conn {
     // OPTIN / OPTOUT modes) or matched by prefix at write time (BCAST); an
     // `invalidate` push is then sent to this connection or its REDIRECT target.
     track: Tracking,
+}
+
+impl Conn {
+    /// Bytes already written into this connection's reply buffer but not yet
+    /// sent. While a durable ack is outstanding `flush` holds all of it, so this
+    /// is how far ahead of its commits a pipelining client has been allowed to
+    /// run.
+    fn held_reply_bytes(&self) -> usize {
+        self.wbuf.len().saturating_sub(self.wpos)
+    }
 }
 
 pub struct Worker {
@@ -684,6 +715,22 @@ impl Worker {
             if self.sync_ack {
                 self.resolve_acks();
                 self.resume_parked();
+            }
+        }
+    }
+
+    /// Fold this command's acks into the connection's, keeping the highest
+    /// sequence per ring.
+    ///
+    /// Replacing rather than merging was safe only while a connection could
+    /// have one write in flight. With a pipeline it loses waits: a first write
+    /// on ring 0 and a second on ring 1 would leave only ring 1's sequence, and
+    /// the first write's reply would flush before its record committed.
+    fn merge_acks(dst: &mut Vec<(usize, u64)>, src: Vec<(usize, u64)>) {
+        for (shard, seq) in src {
+            match dst.iter_mut().find(|(sh, _)| *sh == shard) {
+                Some(slot) => slot.1 = slot.1.max(seq),
+                None => dst.push((shard, seq)),
             }
         }
     }
@@ -942,10 +989,21 @@ impl Worker {
     }
 
     fn process(&mut self, fd: RawFd) {
-        // Do not read more commands while a durable reply is still pending — the
-        // reply must land before the next command's, and this backpressures the
-        // connection to its own commit rate.
-        if self.conns.get(&fd).map(|c| !c.ack.is_empty()).unwrap_or(true) {
+        // A pending durable reply no longer stops the connection being read.
+        // Replies are appended to `wbuf` in command order and `flush` holds the
+        // whole buffer until every outstanding ack commits, so order is
+        // preserved without stalling: what used to be one write per persist
+        // window per connection can now fill a window.
+        //
+        // The stall is kept only as a memory bound. Past MAX_HELD_REPLY_BYTES of
+        // held reply the connection waits for an ack to resolve, and
+        // `resolve_acks` resumes it.
+        if self
+            .conns
+            .get(&fd)
+            .map(|c| c.held_reply_bytes() >= MAX_HELD_REPLY_BYTES)
+            .unwrap_or(true)
+        {
             return;
         }
         let mut consumed_total = 0usize;
@@ -987,10 +1045,10 @@ impl Worker {
                     let stop = self
                         .conns
                         .get(&fd)
-                        .map(|c| c.closing || !c.ack.is_empty())
+                        .map(|c| c.closing || c.held_reply_bytes() >= MAX_HELD_REPLY_BYTES)
                         .unwrap_or(true);
                     if stop {
-                        break; // durable reply pending or connection closing
+                        break; // connection closing, or its held replies are capped
                     }
                 }
             }
@@ -4113,10 +4171,16 @@ impl Worker {
                 &mut c.wbuf,
                 "ERR persistence backlog full: write applied in memory but NOT durable",
             );
-            c.ack.clear();
+            // Deliberately not clearing `c.ack`: any entry there belongs to an
+            // EARLIER command in this pipeline whose reply is still held, and
+            // dropping it would flush that reply before its record committed.
+            // This command simply contributes no wait — its reply is an error,
+            // which promises nothing, and `wbuf` still keeps it behind the
+            // replies of the commands before it.
         } else if sync_ack && !acks.is_empty() {
-            // Durable tier: hold this command's reply until its record(s) commit.
-            self.conns.get_mut(&fd).unwrap().ack = acks;
+            // Durable tier: hold this command's reply until its record(s) commit,
+            // alongside whatever earlier commands in the pipeline are waiting on.
+            Self::merge_acks(&mut self.conns.get_mut(&fd).unwrap().ack, acks);
         }
 
         // ---- server-assisted client-side caching (CLIENT TRACKING) ----
