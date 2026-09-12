@@ -2544,6 +2544,9 @@ struct RcScanState {
     // custom_private; POD pointer+len so it is safe inside this palloc0 struct.
     pk_ptr: *const u8,
     pk_len: usize,
+    // pk column attnum, from the planner. Needed to resolve the column on a
+    // cache miss without consulting the (evictable) registration entry.
+    pk_attnum: i16,
     done: bool,
 }
 
@@ -2706,7 +2709,20 @@ unsafe extern "C" fn rc_pathlist_hook(
         false,
         false,
     );
+    // The pk attnum travels with the plan for the same reason the pk bytes do:
+    // everything execution needs must survive the cache entry it came from.
+    let attc = pg_sys::makeConst(
+        pg_sys::INT2OID,
+        -1,
+        pg_sys::InvalidOid,
+        2,
+        pg_sys::Datum::from(pk_attnum as i16),
+        false,
+        true,
+    );
     (*cpath).custom_private = pg_sys::lappend(std::ptr::null_mut(), pkc as *mut core::ffi::c_void);
+    (*cpath).custom_private =
+        pg_sys::lappend((*cpath).custom_private, attc as *mut core::ffi::c_void);
     pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
 }
 
@@ -2751,6 +2767,12 @@ unsafe extern "C" fn rc_create_state(cscan: *mut pg_sys::CustomScan) -> *mut pg_
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
     (*st).pk_ptr = buf;
     (*st).pk_len = n;
+    let attc = pg_sys::list_nth((*cscan).custom_private, 1) as *mut pg_sys::Const;
+    (*st).pk_attnum = if attc.is_null() || (*attc).constisnull {
+        0
+    } else {
+        (*attc).constvalue.value() as i16
+    };
     (*st).done = false;
     st as *mut pg_sys::Node
 }
@@ -2810,7 +2832,11 @@ unsafe extern "C" fn rc_access(ss: *mut pg_sys::ScanState) -> *mut pg_sys::Tuple
     let bytes: &[u8] = match view.get(&rc_key(relid, pk)) {
         Lookup::Hit(b) => b,
         Lookup::Miss => {
-            let meta = match rowcache_reg_meta((*rel).rd_id) {
+            // Resolved from the attnum the planner carried, not from the
+            // registration entry: that entry is an ordinary cache entry and a
+            // busy cache evicts it, which is exactly the situation a miss means
+            // we are in.
+            let meta = match rowcache_meta_for_attnum((*rel).rd_id, (*st).pk_attnum) {
                 Some(m) => m,
                 None => return pg_sys::ExecClearTuple(slot),
             };
@@ -3046,6 +3072,17 @@ unsafe fn rowcache_reg_meta(relid: pg_sys::Oid) -> Option<RegMeta> {
         Lookup::Hit(b) if b.len() >= 2 => i16::from_le_bytes([b[0], b[1]]),
         _ => return None,
     };
+    rowcache_meta_for_attnum(relid, attnum)
+}
+
+/// The catalogue half of `rowcache_reg_meta`, for a pk column already known.
+///
+/// Split out because the registration entry lives in the row cache and is
+/// evictable like any other entry, so a busy cache can lose it. Execution must
+/// not depend on that: the planner knew the attnum when it chose this scan, and
+/// carries it in `custom_private`, so the column is resolved from the catalogues
+/// here rather than looked up in a cache that may since have dropped it.
+unsafe fn rowcache_meta_for_attnum(relid: pg_sys::Oid, attnum: i16) -> Option<RegMeta> {
     let attname = pg_sys::get_attname(relid, attnum, false);
     if attname.is_null() {
         return None;
