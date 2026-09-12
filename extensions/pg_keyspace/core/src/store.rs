@@ -252,17 +252,6 @@ enum Backing {
     Raw,
 }
 
-/// Whether eviction prefers a victim from the same tenant as the key being
-/// inserted (#43). Process-local and on by default: it is an eviction
-/// heuristic rather than a protocol, so processes attached to the same segment
-/// need not agree, and CLOCK is already approximate.
-static SCOPED_EVICTION: AtomicBool = AtomicBool::new(true);
-
-/// Turn tenant-scoped eviction off (or back on) for this process.
-pub fn set_scoped_eviction(on: bool) {
-    SCOPED_EVICTION.store(on, Ordering::Relaxed);
-}
-
 /// How many entries the scoped look-ahead inspects before giving up and letting
 /// the ordinary sweep decide.
 ///
@@ -282,6 +271,13 @@ const SCOPED_EVICT_PROBE: u32 = 64;
 /// this is the tenant boundary rather than a guess at one. A key with no `:` --
 /// an unscoped or exempt deployment -- has no scope and is evicted exactly as
 /// before.
+///
+/// Only meaningful for the RESP keyspace, whose keys are client-supplied byte
+/// strings. It is nonsense for a segment holding binary keys, which is why
+/// scoping is enabled per [`Store`] rather than globally: a row-cache key is
+/// `relid_le_bytes ++ pk`, and one table in every 256 has a relid whose low
+/// byte is 0x3a, so its rows would all appear to belong to a one-byte ":"
+/// tenant.
 #[inline]
 fn tenant_scope(key: &[u8]) -> Option<&[u8]> {
     key.iter().position(|b| *b == b':').map(|i| &key[..=i])
@@ -300,6 +296,11 @@ pub struct Store {
     data_bytes: u64,
     partition_bytes: usize,
     header_bytes: usize,
+    /// Whether eviction prefers a victim from the same tenant as the key being
+    /// inserted (#43). Off unless the caller turns it on, because it is only
+    /// meaningful for a segment whose keys are the tenant-scoped RESP keyspace
+    /// -- see [`tenant_scope`].
+    scoped_eviction: bool,
 }
 
 // A partition is written by exactly one worker; SQL-surface readers in other
@@ -369,7 +370,17 @@ impl Store {
             data_bytes: cfg.data_bytes_per_part,
             partition_bytes: cfg.partition_bytes(),
             header_bytes: align_up(std::mem::size_of::<SegHeader>(), 64),
+            scoped_eviction: false,
         }
+    }
+
+    /// Prefer a victim from the inserting key's tenant when evicting (#43).
+    ///
+    /// Set this only on a segment holding the tenant-scoped RESP keyspace. On
+    /// one holding binary keys -- the row cache -- `:` is just a byte that
+    /// turns up, and the preference would group unrelated rows together.
+    pub fn set_scoped_eviction(&mut self, on: bool) {
+        self.scoped_eviction = on;
     }
 
     fn init_header(&self) {
@@ -1284,7 +1295,7 @@ impl Store {
     /// own still falls through to the ordinary sweep, so a small or new tenant
     /// is never starved of the arena by this.
     unsafe fn evict_one(&self, p: u32, prefer: Option<&[u8]>) -> bool {
-        if SCOPED_EVICTION.load(Ordering::Relaxed) {
+        if self.scoped_eviction {
             if let Some(scope) = prefer {
                 if self.evict_scoped(p, scope) {
                     return true;
@@ -1705,18 +1716,10 @@ mod tests {
         assert!(matches!(s.get(b"key4999"), Lookup::Hit(_)));
     }
 
-    /// `set_scoped_eviction` is process-global, and the test harness runs these
-    /// in parallel threads of one process, so a test that toggles it has to hold
-    /// this for as long as it depends on the value. Without it these pass alone
-    /// and fail in the suite, which is worse than failing outright.
-    static EVICTION_POLICY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// The case #43 describes: "a cold-key flood from one tenant simply evicts
     /// everyone else". The victim writes a small working set once, then the
     /// flood writes cold keys until the arena turns over many times.
     fn flood_survival(scoped: bool) -> usize {
-        let _guard = EVICTION_POLICY.lock().unwrap_or_else(|e| e.into_inner());
-        set_scoped_eviction(scoped);
         let cfg = Config {
             num_partitions: 1,
             buckets_per_part: 1024,
@@ -1724,14 +1727,14 @@ mod tests {
             data_bytes_per_part: 64 * 1024,
         };
         let name = if scoped { "t_eb_on" } else { "t_eb_off" };
-        let s = Store::create(name, &cfg).unwrap();
+        let mut s = Store::create(name, &cfg).unwrap();
+        s.set_scoped_eviction(scoped);
         for i in 0..40u32 {
             assert!(s.set(format!("victim:{i}").as_bytes(), b"0123456789abcdef", 0));
         }
         for i in 0..4000u32 {
             s.set(format!("flood:{i}").as_bytes(), b"0123456789abcdef", 0);
         }
-        set_scoped_eviction(true); // leave the default as we found it
         (0..40u32)
             .filter(|i| matches!(s.get(format!("victim:{i}").as_bytes()), Lookup::Hit(_)))
             .count()
@@ -1754,15 +1757,14 @@ mod tests {
         // The preference must not become a budget: a tenant that owns almost
         // none of the arena has no victim of its own, and must fall through to
         // the ordinary sweep rather than fail its write.
-        let _guard = EVICTION_POLICY.lock().unwrap_or_else(|e| e.into_inner());
-        set_scoped_eviction(true);
         let cfg = Config {
             num_partitions: 1,
             buckets_per_part: 1024,
             entries_per_part: 512,
             data_bytes_per_part: 64 * 1024,
         };
-        let s = Store::create("t_ev_small", &cfg).unwrap();
+        let mut s = Store::create("t_ev_small", &cfg).unwrap();
+        s.set_scoped_eviction(true);
         for i in 0..4000u32 {
             s.set(format!("big:{i}").as_bytes(), b"0123456789abcdef", 0);
         }
@@ -1780,20 +1782,44 @@ mod tests {
     fn a_key_with_no_tenant_scope_is_evicted_as_before() {
         // No ':' means no scope, so the ordinary sweep decides and behaviour is
         // exactly what it was.
-        let _guard = EVICTION_POLICY.lock().unwrap_or_else(|e| e.into_inner());
-        set_scoped_eviction(true);
         let cfg = Config {
             num_partitions: 1,
             buckets_per_part: 1024,
             entries_per_part: 512,
             data_bytes_per_part: 64 * 1024,
         };
-        let s = Store::create("t_ev_noscope", &cfg).unwrap();
+        let mut s = Store::create("t_ev_noscope", &cfg).unwrap();
+        s.set_scoped_eviction(true);
         for i in 0..5000u32 {
             assert!(s.set(format!("key{i}").as_bytes(), b"0123456789abcdef", 0), "set {i}");
         }
         assert!(s.stats(0).evictions > 0);
         assert!(matches!(s.get(b"key4999"), Lookup::Hit(_)));
+    }
+
+    #[test]
+    fn a_segment_with_binary_keys_is_never_scoped() {
+        // A row-cache key is `relid_le_bytes ++ pk`, and one relid in every 256
+        // has 0x3a as its low byte -- so `tenant_scope` finds a ":" that means
+        // nothing. Such a segment must simply never turn the preference on.
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 64 * 1024,
+        };
+        let s = Store::create("t_ev_binary", &cfg).unwrap();
+        assert!(!s.scoped_eviction, "off unless a caller opts in");
+        // 16186 = 0x3F3A: little-endian low byte is ':'.
+        let mut key = 16186u32.to_le_bytes().to_vec();
+        key.extend_from_slice(b"1");
+        assert_eq!(
+            tenant_scope(&key),
+            Some(&b":"[..]),
+            "which is exactly why this segment must not opt in"
+        );
+        assert!(s.set(&key, b"v", 0));
+        assert!(matches!(s.get(&key), Lookup::Hit(_)));
     }
 
     #[test]
