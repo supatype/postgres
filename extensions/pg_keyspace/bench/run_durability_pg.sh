@@ -1704,6 +1704,61 @@ start_pg; wait_ready; sleep 2
 chk "the cluster is healthy again at the original ring size" "1" "$(psql_ "SELECT 1")"
 
 echo ""
+echo "########## AG. a cached plan never returns fewer rows than the heap has (#85) ##########"
+# Whether to use the row cache is decided at PLAN time; the lookup happens at
+# EXECUTION time. rc_access treated a miss as end of scan, so anything that
+# removed the entry in between turned a correct query into an empty result. With
+# a cached plan the window is unbounded, because the plan outlives the entry and
+# row-cache activity does not invalidate plans.
+#
+# Eviction is used to remove the entry rather than an invalidation: it needs no
+# decode worker (so this runs wherever the suite does), and it is ordinary
+# operation for any working set larger than pg_keyspace.rowcache_mb rather than
+# a failure mode.
+stop_pg; sleep 1
+set_conf "pg_keyspace.rowcache_mb" "1"
+start_pg; wait_ready; sleep 2
+psql_ "DROP TABLE IF EXISTS public.ev CASCADE" >/dev/null 2>&1
+psql_ "CREATE TABLE public.ev(id bigint primary key, v text)" >/dev/null
+psql_ "INSERT INTO public.ev SELECT g, repeat('x', 900)||g FROM generate_series(1,4000) g" >/dev/null
+psql_ "SELECT supacache.rowcache_register('public.ev', 1)" >/dev/null
+psql_ "SELECT supacache.rowcache_put('public.ev', 2)" >/dev/null
+EV_HEAP=$(psql_ "SELECT length(v) FROM public.ev WHERE id=2")
+# Without this the section proves nothing: if the row were never cached, the
+# plan would be an ordinary index scan and the cached-plan path untested.
+chk "the row under test is served from the cache at plan time" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.ev WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
+
+# One session throughout: plan once while the row is cached, evict it, then reuse
+# the very same plan. force_generic_plan makes the reuse explicit; a prepared
+# statement reaches a generic plan on its own after five executions.
+#
+# The eviction range must name rows that actually exist: rowcache_put on a
+# missing row caches nothing, so a range past the end of the table evicts
+# nothing and the section passes without testing anything. The "really was
+# evicted" assertion below exists to catch exactly that, and did.
+# The last bare line of the session is the second EXECUTE's result.
+EV_AFTER=$(timeout 300 $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tA <<'SQL' 2>&1 | tail -1
+SET plan_cache_mode = force_generic_plan;
+PREPARE p AS SELECT length(v) FROM public.ev WHERE id = 2;
+EXECUTE p;
+SELECT count(*) FROM (SELECT supacache.rowcache_put('public.ev', g) FROM generate_series(100,3900) g) t;
+EXECUTE p;
+SQL
+)
+chk "a cached plan still returns the row after its cache entry is evicted (got '${EV_AFTER:-}')" "$EV_HEAP" "$EV_AFTER"
+# And the entry really was gone, or the assertion above passed without testing
+# anything: a fresh plan for the same row must now take the heap path.
+chk "and the entry really was evicted (a fresh plan no longer uses the cache)" "0" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.ev WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
+chk "the heap still agrees" "$EV_HEAP" "$(psql_ "SELECT length(v) FROM public.ev WHERE id=2")"
+
+stop_pg; sleep 1
+set_conf "pg_keyspace.rowcache_mb" "64"
+start_pg; wait_ready; sleep 2
+chk "the cluster is healthy again at the original row-cache size" "1" "$(psql_ "SELECT 1")"
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
