@@ -107,7 +107,19 @@ for N in $KEY_COUNTS; do
 
   LOG_MARK=$(wc -l < $PGDATA/log)
   stop_pg; sleep 1; start_pg; wait_ready || { echo "cluster did not come back for N=$N"; continue; }
-  sleep 3
+  # SQL starts accepting long before the worker has finished loading: recovery
+  # runs in the background worker, so wait_ready says nothing about it. Wait for
+  # the line the worker writes when it is done. A fixed sleep here read the log
+  # mid-load at 1M — no timing line to parse, and a peak RSS that was only
+  # whatever had been touched by then.
+  RECOVER_WAIT=${PGKS_BENCH_RECOVER_WAIT:-900}
+  DONE=0
+  for _ in $(seq 1 $RECOVER_WAIT); do
+    if tail -n +$((LOG_MARK+1)) $PGDATA/log | grep -q "recovered [0-9]* keys"; then DONE=1; break; fi
+    sleep 1
+  done
+  [ "$DONE" = "1" ] || echo "  (warning: no recovery completion line within ${RECOVER_WAIT}s for N=$N)"
+  sleep 1
 
   NEW=$(tail -n +$((LOG_MARK+1)) $PGDATA/log)
   # "recovered N keys (slots a..b) from supacache.kv in 11.09ms" — the worker
