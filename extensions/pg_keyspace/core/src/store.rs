@@ -15,7 +15,7 @@
 //! Not MVCC. No tuple headers. No vacuum. Entries are overwritten in place.
 
 use crate::shmem::Shmem;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // v3 widens Entry with `staged_seq` and PartMeta with `commit_watermark`, for
 // values handed to the persistence worker by reference instead of being copied
@@ -250,6 +250,41 @@ enum Backing {
     /// segment from `ShmemInitStruct`, mapped at the same address in every
     /// backend. The store only borrows it.
     Raw,
+}
+
+/// Whether eviction prefers a victim from the same tenant as the key being
+/// inserted (#43). Process-local and on by default: it is an eviction
+/// heuristic rather than a protocol, so processes attached to the same segment
+/// need not agree, and CLOCK is already approximate.
+static SCOPED_EVICTION: AtomicBool = AtomicBool::new(true);
+
+/// Turn tenant-scoped eviction off (or back on) for this process.
+pub fn set_scoped_eviction(on: bool) {
+    SCOPED_EVICTION.store(on, Ordering::Relaxed);
+}
+
+/// How many entries the scoped look-ahead inspects before giving up and letting
+/// the ordinary sweep decide.
+///
+/// Deliberately a small constant rather than a full revolution. A tenant that
+/// owns a large share of the arena -- which is exactly the tenant worth
+/// scoping eviction to -- will have a victim within a few dozen slots, while a
+/// tenant that owns almost nothing falls through immediately at a fixed, tiny
+/// cost. Sweeping a whole revolution looking for a tenant with no entries would
+/// add an O(entries) scan to every eviction for the tenants least responsible
+/// for the pressure.
+const SCOPED_EVICT_PROBE: u32 = 64;
+
+/// The tenant a key belongs to, for eviction purposes: everything up to and
+/// including the first `:`.
+///
+/// Keys are force-scoped to `{tenant}:` server-side for non-exempt roles, so
+/// this is the tenant boundary rather than a guess at one. A key with no `:` --
+/// an unscoped or exempt deployment -- has no scope and is evicted exactly as
+/// before.
+#[inline]
+fn tenant_scope(key: &[u8]) -> Option<&[u8]> {
+    key.iter().position(|b| *b == b':').map(|i| &key[..=i])
 }
 
 pub struct Store {
@@ -868,7 +903,7 @@ impl Store {
                 // even though the write failed, and a later read returned
                 // whatever had since been handed to another key. A failed
                 // overwrite must be a no-op, not a silent corruption.
-                let got = self.ensure_alloc(p, val.len());
+                let got = self.ensure_alloc(p, val.len(), tenant_scope(key));
                 let (voff, vcls) = match got {
                     Some(x) => x,
                     // Nothing to undo: the old value is still intact and
@@ -921,20 +956,20 @@ impl Store {
             match self.entry_alloc(p) {
                 Some(i) => break i,
                 None => {
-                    if !self.evict_one(p) {
+                    if !self.evict_one(p, tenant_scope(key)) {
                         return false;
                     }
                 }
             }
         };
-        let (koff, kcls) = match self.ensure_alloc(p, key.len()) {
+        let (koff, kcls) = match self.ensure_alloc(p, key.len(), tenant_scope(key)) {
             Some(x) => x,
             None => {
                 self.entry_free(p, idx);
                 return false;
             }
         };
-        let (voff, vcls) = match self.ensure_alloc(p, val.len()) {
+        let (voff, vcls) = match self.ensure_alloc(p, val.len(), tenant_scope(key)) {
             Some(x) => x,
             None => {
                 self.slab_free(p, koff, kcls);
@@ -995,7 +1030,7 @@ impl Store {
         }
     }
 
-    unsafe fn ensure_alloc(&self, p: u32, size: usize) -> Option<(u64, u32)> {
+    unsafe fn ensure_alloc(&self, p: u32, size: usize, prefer: Option<&[u8]>) -> Option<(u64, u32)> {
         // Refuse an allocation the arena could never satisfy, before evicting
         // anything. Without this, a single write too large for the arena evicts
         // the entire keyspace one entry at a time and then fails regardless:
@@ -1013,7 +1048,7 @@ impl Store {
             if let Some(x) = self.slab_alloc(p, size) {
                 return Some(x);
             }
-            if !self.evict_one(p) {
+            if !self.evict_one(p, prefer) {
                 return None;
             }
         }
@@ -1182,7 +1217,80 @@ impl Store {
 
     /// CLOCK sweep: clear ref bits until an unreferenced occupied entry is
     /// found, then evict it. Returns false only if the arena is empty.
-    unsafe fn evict_one(&self, p: u32) -> bool {
+    /// A bounded CLOCK sweep restricted to one tenant's own entries.
+    ///
+    /// Entries belonging to other tenants are stepped over without touching
+    /// their reference bits, so a flood cannot age another tenant's data merely
+    /// by looking for a victim. Within the tenant this is ordinary CLOCK: a
+    /// referenced entry gets its second chance and the first unreferenced one is
+    /// taken.
+    ///
+    /// Giving the tenant's own entries their second chance here rather than
+    /// skipping them is the whole mechanism. A reference bit is set on *write*,
+    /// so a flood's freshly written keys all look referenced; a version of this
+    /// that skipped them found nothing, every time, and fell through to the
+    /// global sweep -- which is the behaviour being fixed. A tenant competing
+    /// with itself is exactly who should be clearing its own reference bits.
+    unsafe fn evict_scoped(&self, p: u32, prefer: &[u8]) -> bool {
+        let meta = self.meta(p);
+        let bump = (*meta).entry_bump;
+        if bump == 0 {
+            return false;
+        }
+        let steps = SCOPED_EVICT_PROBE.min(bump);
+        for _ in 0..steps {
+            let idx = (*meta).clock_hand % bump;
+            (*meta).clock_hand = (idx + 1) % bump;
+            let e = self.entries_ptr(p).add(idx as usize);
+            if (*e).flags & FLAG_OCCUPIED == 0 {
+                continue;
+            }
+            // The same two the ordinary sweep must never take: a staged write
+            // whose only copy is here, and a pinned registration.
+            if (*e).staged_seq > (*meta).commit_watermark || (*e).flags & FLAG_PINNED != 0 {
+                continue;
+            }
+            let key = std::slice::from_raw_parts(
+                self.data_ptr(p).add((*e).key_off as usize),
+                (*e).key_len as usize,
+            );
+            if !key.starts_with(prefer) {
+                continue; // another tenant's: not ours to age or to take
+            }
+            if (*e).flags & FLAG_REF != 0 {
+                (*e).flags &= !FLAG_REF;
+                continue;
+            }
+            let (found, _) = self.probe(p, (*e).key_hash, key);
+            if let Some(b) = found {
+                self.remove_at(p, b, idx);
+                (*meta).evictions += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Free one entry, preferring a victim from `prefer`'s tenant if there is a
+    /// cold one close to hand (#43).
+    ///
+    /// Without the preference, one tenant writing cold keys hard enough to keep
+    /// the arena full simply evicts everyone else: CLOCK admits cold keys
+    /// unconditionally and takes whatever is unreferenced, which is every other
+    /// tenant's data as readily as its own. Preferring the inserting tenant's
+    /// own cold entries makes a flood recycle its own space.
+    ///
+    /// It is a preference, not a budget. A tenant with nothing evictable of its
+    /// own still falls through to the ordinary sweep, so a small or new tenant
+    /// is never starved of the arena by this.
+    unsafe fn evict_one(&self, p: u32, prefer: Option<&[u8]>) -> bool {
+        if SCOPED_EVICTION.load(Ordering::Relaxed) {
+            if let Some(scope) = prefer {
+                if self.evict_scoped(p, scope) {
+                    return true;
+                }
+            }
+        }
         let meta = self.meta(p);
         let bump = (*meta).entry_bump;
         if bump == 0 {
@@ -1595,6 +1703,104 @@ mod tests {
         assert!(st.evictions > 0, "expected evictions, got {}", st.evictions);
         // latest key must still be present
         assert!(matches!(s.get(b"key4999"), Lookup::Hit(_)));
+    }
+
+    /// `set_scoped_eviction` is process-global, and the test harness runs these
+    /// in parallel threads of one process, so a test that toggles it has to hold
+    /// this for as long as it depends on the value. Without it these pass alone
+    /// and fail in the suite, which is worse than failing outright.
+    static EVICTION_POLICY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The case #43 describes: "a cold-key flood from one tenant simply evicts
+    /// everyone else". The victim writes a small working set once, then the
+    /// flood writes cold keys until the arena turns over many times.
+    fn flood_survival(scoped: bool) -> usize {
+        let _guard = EVICTION_POLICY.lock().unwrap_or_else(|e| e.into_inner());
+        set_scoped_eviction(scoped);
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 64 * 1024,
+        };
+        let name = if scoped { "t_eb_on" } else { "t_eb_off" };
+        let s = Store::create(name, &cfg).unwrap();
+        for i in 0..40u32 {
+            assert!(s.set(format!("victim:{i}").as_bytes(), b"0123456789abcdef", 0));
+        }
+        for i in 0..4000u32 {
+            s.set(format!("flood:{i}").as_bytes(), b"0123456789abcdef", 0);
+        }
+        set_scoped_eviction(true); // leave the default as we found it
+        (0..40u32)
+            .filter(|i| matches!(s.get(format!("victim:{i}").as_bytes()), Lookup::Hit(_)))
+            .count()
+    }
+
+    #[test]
+    fn a_cold_flood_evicts_its_own_keys_before_another_tenants() {
+        let unscoped = flood_survival(false);
+        let scoped = flood_survival(true);
+        eprintln!("victim keys surviving a 4000-key cold flood: scoped={scoped}/40 unscoped={unscoped}/40");
+        assert!(
+            scoped > unscoped,
+            "scoped eviction should protect the victim tenant: \
+             {scoped} of 40 survived with it on, {unscoped} with it off"
+        );
+    }
+
+    #[test]
+    fn a_tenant_with_nothing_to_evict_still_gets_arena() {
+        // The preference must not become a budget: a tenant that owns almost
+        // none of the arena has no victim of its own, and must fall through to
+        // the ordinary sweep rather than fail its write.
+        let _guard = EVICTION_POLICY.lock().unwrap_or_else(|e| e.into_inner());
+        set_scoped_eviction(true);
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 64 * 1024,
+        };
+        let s = Store::create("t_ev_small", &cfg).unwrap();
+        for i in 0..4000u32 {
+            s.set(format!("big:{i}").as_bytes(), b"0123456789abcdef", 0);
+        }
+        // A brand-new tenant writing into a full arena owned entirely by another.
+        for i in 0..20u32 {
+            assert!(
+                s.set(format!("newcomer:{i}").as_bytes(), b"0123456789abcdef", 0),
+                "a tenant with no entries of its own must still be able to write"
+            );
+        }
+        assert!(matches!(s.get(b"newcomer:19"), Lookup::Hit(_)));
+    }
+
+    #[test]
+    fn a_key_with_no_tenant_scope_is_evicted_as_before() {
+        // No ':' means no scope, so the ordinary sweep decides and behaviour is
+        // exactly what it was.
+        let _guard = EVICTION_POLICY.lock().unwrap_or_else(|e| e.into_inner());
+        set_scoped_eviction(true);
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 64 * 1024,
+        };
+        let s = Store::create("t_ev_noscope", &cfg).unwrap();
+        for i in 0..5000u32 {
+            assert!(s.set(format!("key{i}").as_bytes(), b"0123456789abcdef", 0), "set {i}");
+        }
+        assert!(s.stats(0).evictions > 0);
+        assert!(matches!(s.get(b"key4999"), Lookup::Hit(_)));
+    }
+
+    #[test]
+    fn tenant_scope_is_the_prefix_through_the_first_colon() {
+        assert_eq!(tenant_scope(b"ta:user:1"), Some(&b"ta:"[..]));
+        assert_eq!(tenant_scope(b"ta:"), Some(&b"ta:"[..]));
+        assert_eq!(tenant_scope(b"nocolon"), None);
     }
 
     #[test]

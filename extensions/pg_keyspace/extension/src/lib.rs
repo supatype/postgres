@@ -156,6 +156,10 @@ static GUC_ROWCACHE_REFILL: GucSetting<bool> = GucSetting::<bool>::new(false);
 static GUC_ROWCACHE_READTHROUGH: GucSetting<bool> = GucSetting::<bool>::new(false);
 /// Per-tenant share of each persistence ring (#43). On by default.
 static GUC_TENANT_RING_SHARE: GucSetting<bool> = GucSetting::<bool>::new(true);
+/// Tenant-scoped row-cache eviction (#43). On by default.
+static GUC_TENANT_SCOPED_EVICTION: GucSetting<bool> = GucSetting::<bool>::new(true);
+/// Per-tenant command rate (#43). 0 = no limit, which is the default.
+static GUC_TENANT_OPS_PER_SEC: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 /// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
 /// values are raw heap-tuple bytes.
@@ -669,6 +673,11 @@ fn store_view_for(w: usize) -> Option<Store> {
     if base.is_null() {
         return None;
     }
+    // Eviction policy is process-local state in the core crate, and a backend
+    // that writes through the SQL surface evicts just as a worker does. Applied
+    // here rather than at load time because a Postmaster GUC is not settled when
+    // _PG_init runs; it is a relaxed store of a bool, next to a segment attach.
+    store::set_scoped_eviction(GUC_TENANT_SCOPED_EVICTION.get());
     Some(unsafe { Store::from_raw(base, &ks_config(), false) })
 }
 
@@ -678,6 +687,7 @@ fn store_view_for_worker(w: usize) -> Option<Store> {
     if base.is_null() {
         return None;
     }
+    store::set_scoped_eviction(GUC_TENANT_SCOPED_EVICTION.get());
     Some(unsafe { Store::from_raw(base, &ks_config(), false) })
 }
 
@@ -932,6 +942,37 @@ pub extern "C" fn _PG_init() {
         &GUC_ROWCACHE_DECODE_MS,
         10,
         60_000,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.tenant_ops_per_sec",
+        "Commands per second one tenant may issue (0 = no limit)",
+        "Bounds how much of a worker's event loop one tenant can ask for. The \
+         ring share bounds persistence and scoped eviction bounds cache memory, \
+         but neither sees a tenant issuing only reads: it stages no ring records \
+         and evicts nothing, and can still saturate the loop. A tenant may burst \
+         up to one second's worth and then proceeds at the rate. Over-rate \
+         commands are held and retried, not refused, so no client sees a new \
+         error. Connections with no tenant scope are never limited. 0 (default) \
+         disables it entirely, including the clock read.",
+        &GUC_TENANT_OPS_PER_SEC,
+        0,
+        10_000_000,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
+        "pg_keyspace.tenant_scoped_eviction",
+        "Evict a tenant's own cold keys before another tenant's",
+        "On (default) makes the cache's CLOCK sweep prefer a victim under the \
+         same `{tenant}:` prefix as the key being inserted, so a cold-key flood \
+         from one tenant recycles its own space instead of evicting everyone \
+         else's working set. It is a preference, not a budget: a tenant with \
+         nothing evictable of its own still falls through to the ordinary \
+         sweep, so a small or new tenant is never starved. Keys with no `:` -- \
+         an unscoped or exempt deployment -- are evicted exactly as before.",
+        &GUC_TENANT_SCOPED_EVICTION,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -1223,6 +1264,10 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         }
     };
     worker.set_max_value_bytes(GUC_MAX_VALUE_BYTES.get().max(1024) as usize);
+    worker.set_tenant_rate_limit(GUC_TENANT_OPS_PER_SEC.get().max(0) as u32);
+    // Eviction policy is process-local, so every process that evicts has to be
+    // told: this worker here, and each backend below in `store_view_for`.
+    store::set_scoped_eviction(GUC_TENANT_SCOPED_EVICTION.get());
     // Cross-worker pub/sub. Without this a SUBSCRIBE here never sees a PUBLISH
     // on another worker, and the publisher's reply counts only its own local
     // subscribers, so neither side can tell the message was lost.

@@ -593,25 +593,30 @@ tenant cannot address or subscribe to another's. Point `tls_cert_file` /
 `tls_key_file` at a PEM cert+key to serve TLS (rotate by swapping the files and
 `SELECT pg_reload_conf()` — no restart).
 
-### Per-tenant share of the persistence ring
+### Per-tenant fairness
 
 Writes cross from the RESP worker to Postgres through one shared ring per
 persist shard, FIFO. Without a share, a tenant writing hard enough to keep that
 ring full starves every other tenant on it: their writes meet a full ring and
-park. Measured with a 1 MiB ring, 1 KiB values and eight flooding connections,
-against a victim tenant on one connection doing ordinary sequential writes:
+park. Measured with a 1 MiB ring, 1 KiB values and eight flooding connections against
+a victim tenant doing ordinary sequential writes on four connections, three
+rounds of ten seconds each (`bench/run_tenant_fairness.sh`):
 
-| over 10s, durable tier | share off | share on |
+| durable tier | share off | share on |
 |---|---:|---:|
-| victim writes | 1 | **10** |
-| victim p50 | 32.7 ms | **17.5 ms** |
-| victim worst | 32.7 ms | 50.5 ms |
-| flood writes | 17 572 | 9 670 |
+| victim writes per round | 33, 32, 29 | **270, 270, 305** |
+| victim writes, total | 94 | **845** |
+| victim p50 | 363.8 ms | **12.6 ms** |
+| flood writes, total | 206 750 | 202 693 |
 
-The victim's gain is around tenfold and holds across runs (1 → 25, 4 → 38,
-1 → 10 on three). The flood's own throughput moves in both directions between
-runs and is noise at this sample size, so the honest claim is that capping it
-does not collapse it, not that it helps.
+**9×** the throughput and **29×** the median latency for the victim, with no
+overlap between the two distributions, and the flood is unaffected (−2%) —
+capping it costs it nothing measurable.
+
+The per-round numbers are given because one round is a sample, not a result: an
+earlier version of this measurement used a *single* victim connection, whose
+counts (0–38) were small enough that scheduling noise sometimes ranked the two
+configurations the wrong way round.
 
 `pg_keyspace.tenant_ring_share` is on by default, and is inert until there is
 something to be fair about:
@@ -630,11 +635,45 @@ it has bytes in flight — a tenant a full ring is shutting out holds nothing, a
 counting only occupancy makes the tenant that most needs the policy invisible to
 it.
 
-`INFO` reports a `# Tenants` section with in-flight bytes and how many writes
-have been held back, for the asking connection's own tenant (an unscoped or
-exempt connection sees every tenant). Measure it with
-`bench/run_tenant_fairness.sh`, which runs the same load with the share off and
-on and prints both.
+#### Cache memory
+
+The same shape of problem one layer up: a cold-key flood from one tenant simply
+evicted everyone else, because CLOCK admits cold keys unconditionally and takes
+whatever is unreferenced — another tenant's hot data as readily as its own.
+
+`pg_keyspace.tenant_scoped_eviction` (on by default) makes the sweep prefer a
+victim under the same `{tenant}:` prefix as the key being inserted, so a flood
+recycles its own space. A victim tenant's 200-key working set against a
+40 000-key cold flood, in-Postgres:
+
+| | scoped eviction off | on |
+|---|---:|---:|
+| victim keys surviving | 0 / 200 | **193 / 200** |
+
+It is a preference, not a budget: a tenant with nothing evictable of its own
+falls through to the ordinary sweep, so a small or new tenant is never starved,
+and the flooding tenant keeps its own recent keys. Keys with no `:` — an
+unscoped or exempt deployment — are evicted exactly as before.
+
+#### Request rate
+
+`pg_keyspace.tenant_ops_per_sec` (0 = off, the default) bounds how much of a
+worker's event loop one tenant may ask for. The other two axes do not see a
+tenant issuing only reads: it stages no ring records and evicts nothing, and can
+still saturate the loop.
+
+A tenant may burst up to one second's worth and then proceeds at the rate.
+Over-rate commands are **held and retried, not refused**, which is the same
+contract a full persistence ring already has — no client learns a new error and
+no command is lost.
+
+#### Seeing it
+
+`INFO` reports a `# Tenants` section with in-flight ring bytes, writes held back
+by the share, and commands held back by the rate limit, for the asking
+connection's own tenant (an unscoped or exempt connection sees every tenant).
+Measure all of it with `bench/run_tenant_fairness.sh`, which runs the same loads
+with each policy off and on and prints both.
 
 ### Configuration (GUCs)
 
@@ -658,6 +697,8 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.rowcache_decode` | `off` | keys-only Mode B invalidation worker (needs `wal_level=logical`) |
 | `pg_keyspace.rowcache_refill` | `off` | on: re-cache a changed hot key; off: drop-only (lazy) |
 | `pg_keyspace.tenant_ring_share` | `on` | give each tenant a share of the persistence ring instead of first come, first served |
+| `pg_keyspace.tenant_scoped_eviction` | `on` | evict a tenant's own cold keys before another tenant's |
+| `pg_keyspace.tenant_ops_per_sec` | 0 | commands per second one tenant may issue (0 = no limit) |
 
 ### Sizing
 
@@ -876,11 +917,14 @@ Scoping for this version — the extension works; these are the edges to know:
   `pg_keyspace.watchdog_secs` (default 30, 0 disables). Set it to 0 if you need
   a worker to stay stopped.
 
-- **Per-tenant quotas cover the persistence ring only.** Keys and channels are
-  force-scoped to `{tenant}:`, which is an isolation boundary; the only axis
-  that is also *accounted* is ring capacity (`pg_keyspace.tenant_ring_share`,
-  below). Cache memory, request rate and worker placement still have no
-  per-tenant budget, so one tenant can evict another's hot data.
+- **Per-tenant fairness covers the ring, cache memory and request rate; worker
+  placement is still unbalanced.** Keys and channels are force-scoped to
+  `{tenant}:`, and persistence capacity, cache eviction and command rate are now
+  accounted against that scope. What remains is placement: keys map to workers
+  by CRC16 slot, so a tenant with a hot key range concentrates on one worker
+  with no rebalancing. Cache memory is also a *preference* rather than a hard
+  budget — a tenant's flood evicts its own keys first, but nothing caps the
+  share of the arena it may hold.
 - Operational metrics are partial. `supacache.stats()`, `ring_stats()`,
   `rowcache_stats()` and `replication_status()` exist, and `ring_stats()` reports
   commit lag, failed batches and unresolved references; row cache invalidation

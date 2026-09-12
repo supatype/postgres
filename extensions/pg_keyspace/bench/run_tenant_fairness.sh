@@ -190,10 +190,18 @@ def flood_conn(idx):
 
 
 victim = {'ok': 0, 'lat': [], 'first': None}
+vlock = threading.Lock()
 
 
-def victim_conn():
-    """One write at a time, waiting for each reply. Latency is per write."""
+def victim_conn(idx):
+    """One write at a time per connection, waiting for each reply.
+
+    Several connections rather than one, because a single synchronous durable
+    writer completes so few writes in the window that scheduling noise dominates
+    the effect being measured -- an earlier version of this used one and produced
+    counts between 0 and 38 that sometimes ranked the two configurations the
+    wrong way round.
+    """
     s = socket.create_connection(('127.0.0.1', port))
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     s.settimeout(30)
@@ -202,7 +210,7 @@ def victim_conn():
     while time.time() < stop_at[0]:
         t0 = time.time()
         try:
-            s.sendall(resp('SET', 'v%d' % n, val))
+            s.sendall(resp('SET', 'v%d_%d' % (idx, n), val))
             buf = b''
             while b'\r\n' not in buf:
                 d = s.recv(4096)
@@ -221,18 +229,20 @@ def victim_conn():
         if done_at > stop_at[0]:
             break
         if buf.startswith(b'+OK'):
-            victim['ok'] += 1
-            victim['lat'].append(dt)
-            if victim['first'] is None:
-                victim['first'] = (time.time() - started) * 1000.0
+            with vlock:
+                victim['ok'] += 1
+                victim['lat'].append(dt)
+                if victim['first'] is None:
+                    victim['first'] = (done_at - started) * 1000.0
         n += 1
     s.close()
 
 
 started = time.time()
 stop_at[0] = started + secs
+victims = int(args.get('victims', '4'))
 threads = [threading.Thread(target=flood_conn, args=(i,)) for i in range(conns)]
-threads.append(threading.Thread(target=victim_conn))
+threads += [threading.Thread(target=victim_conn, args=(i,)) for i in range(victims)]
 for t in threads:
     t.start()
 for t in threads:
@@ -255,8 +265,25 @@ print('victim_ops=%d victim_first_ms=%.0f victim_p50=%.1f victim_p99=%.1f victim
          pct(0.50), pct(0.99), max(lat) if lat else 0.0, flood['ok']))
 PYEOF
 
+# One round is a sample, not a result: the victim's count is small enough that
+# scheduling noise can rank two configurations the wrong way round. Several
+# rounds are summed, and the per-round values are printed so a reader can see
+# the spread rather than take the total on trust.
+ROUNDS=${PGKS_FAIRNESS_ROUNDS:-3}
+VICTIM_CONNS=${PGKS_FAIRNESS_VICTIM_CONNS:-4}
 run_load() {
-  python3 $LOADER port=$RESP secs=$SECONDS_PER_RUN conns=$FLOOD_CONNS valsize=$VALSIZE 2>&1 | tail -1
+  local tv=0 tf=0 tp50=0 per=""
+  local r out v f p
+  for r in $(seq 1 $ROUNDS); do
+    out=$(python3 $LOADER port=$RESP secs=$SECONDS_PER_RUN conns=$FLOOD_CONNS \
+          valsize=$VALSIZE victims=$VICTIM_CONNS 2>&1 | tail -1)
+    v=$(echo "$out" | tr ' ' '\n' | grep '^victim_ops=' | cut -d= -f2)
+    f=$(echo "$out" | tr ' ' '\n' | grep '^flood_ops=' | cut -d= -f2)
+    p=$(echo "$out" | tr ' ' '\n' | grep '^victim_p50=' | cut -d= -f2)
+    tv=$((tv + ${v:-0})); tf=$((tf + ${f:-0})); per="$per ${v:-0}"
+    tp50=$p
+  done
+  echo "victim_ops=$tv victim_p50=$tp50 flood_ops=$tf victim_rounds=$per"
 }
 field() { echo "$1" | tr ' ' '\n' | grep "^$2=" | cut -d= -f2; }
 
@@ -268,6 +295,7 @@ start_pg; wait_ready; sleep 2
 chk "the share is off for this run" "off" "$(psql_ "SHOW pg_keyspace.tenant_ring_share")"
 OFF=$(run_load)
 echo "  $OFF"
+echo "  ($ROUNDS rounds of ${SECONDS_PER_RUN}s, $VICTIM_CONNS victim connections)"
 
 echo ""
 echo "########## per-tenant share (tenant_ring_share = on) ##########"
@@ -280,16 +308,13 @@ echo "  $ON"
 
 OFF_V=$(field "$OFF" victim_ops); ON_V=$(field "$ON" victim_ops)
 OFF_F=$(field "$OFF" flood_ops);  ON_F=$(field "$ON" flood_ops)
-OFF_MAX=$(field "$OFF" victim_max); ON_MAX=$(field "$ON" victim_max)
 OFF_P50=$(field "$OFF" victim_p50); ON_P50=$(field "$ON" victim_p50)
-OFF_1ST=$(field "$OFF" victim_first_ms); ON_1ST=$(field "$ON" victim_first_ms)
+
 echo ""
 echo "================================================"
 printf "%-22s %12s %12s\n" "" "share off" "share on"
 printf "%-22s %12s %12s\n" "victim writes" "${OFF_V:-0}" "${ON_V:-0}"
 printf "%-22s %12s %12s\n" "victim p50 (ms)" "${OFF_P50:-0}" "${ON_P50:-0}"
-printf "%-22s %12s %12s\n" "victim worst (ms)" "${OFF_MAX:-0}" "${ON_MAX:-0}"
-printf "%-22s %12s %12s\n" "first write at (ms)" "${OFF_1ST:--1}" "${ON_1ST:--1}"
 printf "%-22s %12s %12s\n" "flood writes" "${OFF_F:-0}" "${ON_F:-0}"
 echo "================================================"
 
@@ -310,6 +335,61 @@ chk "a tenant can see its own ring usage through INFO" "1" \
 # accounting for it must not become a way around it.
 chk "and cannot see another tenant's" "0" \
     "$(redis-cli -p $RESP --user victim -a pw2 --no-auth-warning INFO 2>/dev/null | grep -c '^tenant_ta')"
+
+echo ""
+echo "########## cache memory: a cold flood must not evict another tenant ##########"
+# The other axis #43 names: "a cold-key flood from one tenant simply evicts
+# everyone else. CLOCK eviction has no admission control, so cold keys are
+# admitted unconditionally and evict hot ones."
+#
+# The victim writes a small working set once and then stops. The flood writes
+# cold keys until the arena has turned over many times. The measurement is how
+# much of the victim's set is still there afterwards -- run once with
+# pg_keyspace.tenant_scoped_eviction off and once with it on.
+#
+# Ephemeral tier and a small keyspace, so this measures the cache arena rather
+# than the persistence ring the sections above measure.
+VICTIM_KEYS=${PGKS_FAIRNESS_VICTIM_KEYS:-200}
+FLOOD_KEYS=${PGKS_FAIRNESS_FLOOD_KEYS:-40000}
+
+evict_run() {
+  local scoped=$1
+  stop_pg; sleep 1
+  set_conf "pg_keyspace.tenant_scoped_eviction" "$scoped"
+  set_conf "pg_keyspace.durability" "'ephemeral'"
+  set_conf "pg_keyspace.keys" "2000"
+  set_conf "pg_keyspace.val_bytes" "256"
+  start_pg; wait_ready || { echo "NO START"; return 1; }
+  local i
+  for i in $(seq 1 $VICTIM_KEYS); do
+    redis-cli -p $RESP --user victim -a pw2 --no-auth-warning SET "w$i" "$(printf 'v%.0s' $(seq 1 64))" >/dev/null 2>&1
+  done
+  # One pipelined stream of cold keys from the other tenant.
+  { for i in $(seq 1 $FLOOD_KEYS); do echo "SET c$i vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"; done; } \
+    | redis-cli -p $RESP --user flood -a pw1 --no-auth-warning --pipe >/dev/null 2>&1
+  local survived=0
+  for i in $(seq 1 $VICTIM_KEYS); do
+    [ -n "$(redis-cli -p $RESP --user victim -a pw2 --no-auth-warning GET "w$i" 2>/dev/null)" ] \
+      && survived=$((survived+1))
+  done
+  echo "$survived"
+}
+
+EV_OFF=$(evict_run off)
+echo "  scoped eviction off: $EV_OFF/$VICTIM_KEYS of the victim's keys survived"
+EV_ON=$(evict_run on)
+echo "  scoped eviction on:  $EV_ON/$VICTIM_KEYS of the victim's keys survived"
+
+# Guard first: if the flood did not actually cause eviction there is nothing to
+# be fair about and both numbers are meaningless.
+chk "the flood evicted from the cache" "1" \
+    "$([ "$(psql_ "SELECT sum(evictions) > 0 FROM supacache.stats()")" = "t" ] && echo 1 || echo 0)"
+chk "scoped eviction protects the victim tenant (${EV_OFF:-0} -> ${EV_ON:-0} of $VICTIM_KEYS)" "1" \
+    "$([ "${EV_ON:-0}" -gt "${EV_OFF:-0}" ] && echo 1 || echo 0)"
+# And it must stay a preference rather than becoming a budget: the flooding
+# tenant's own recent keys are still there, so it was not simply shut out.
+chk "the flooding tenant still holds its own recent keys" "1" \
+    "$([ -n "$(redis-cli -p $RESP --user flood -a pw1 --no-auth-warning GET "c$FLOOD_KEYS" 2>/dev/null)" ] && echo 1 || echo 0)"
 
 stop_pg; rm -rf $PGDATA
 echo ""

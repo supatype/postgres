@@ -258,6 +258,86 @@ impl RingShare {
     }
 }
 
+/// Per-tenant request rate limiting (#43).
+///
+/// The third axis the issue names: "One event loop per worker, no scheduling,
+/// no rate limiting." The ring share bounds how much *persistence* one tenant
+/// can hold and scoped eviction bounds how much *cache* it can take, but
+/// neither bounds how much of the worker's time it can ask for -- a tenant
+/// issuing reads has no ring records and evicts nothing, and can still saturate
+/// the loop.
+///
+/// A token bucket per tenant, refilled continuously at `limit` tokens a second
+/// and capped at one second's worth, so a tenant may burst up to its per-second
+/// rate and then proceeds at it.
+///
+/// Off unless configured (`limit == 0`), and never applied to a connection with
+/// no tenant scope, which keeps the clock read off the hot path entirely for
+/// deployments that do not use it.
+#[derive(Default)]
+pub struct TenantRates {
+    limit: u32,
+    buckets: HashMap<TenantId, Bucket>,
+    throttled: HashMap<TenantId, u64>,
+}
+
+struct Bucket {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl TenantRates {
+    pub fn new() -> TenantRates {
+        TenantRates::default()
+    }
+
+    /// Commands per second per tenant; 0 disables.
+    pub fn set_limit(&mut self, ops: u32) {
+        self.limit = ops;
+    }
+
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// Take a token for `who`, or report that it is over its rate.
+    ///
+    /// The caller's response to `false` is to park the connection and retry,
+    /// which is the same thing a full persistence ring already does: the tenant
+    /// is slowed rather than told no, so no client learns a new error and no
+    /// command is lost.
+    pub fn allow(&mut self, who: TenantId) -> bool {
+        if self.limit == 0 || who == 0 {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let cap = self.limit as f64;
+        let b = self.buckets.entry(who).or_insert(Bucket { tokens: cap, last: now });
+        let elapsed = now.duration_since(b.last).as_secs_f64();
+        b.last = now;
+        b.tokens = (b.tokens + elapsed * cap).min(cap);
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
+            true
+        } else {
+            *self.throttled.entry(who).or_insert(0) += 1;
+            false
+        }
+    }
+
+    /// How many commands this tenant has been held back, for the stats surface.
+    pub fn throttled(&self, who: TenantId) -> u64 {
+        self.throttled.get(&who).copied().unwrap_or(0)
+    }
+
+    /// Every tenant that has been throttled at least once.
+    pub fn throttled_tenants(&self) -> Vec<(TenantId, u64)> {
+        let mut v: Vec<(TenantId, u64)> = self.throttled.iter().map(|(k, n)| (*k, *n)).collect();
+        v.sort_unstable();
+        v
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +476,60 @@ mod tests {
         s.note_held(a);
         s.note_held(a);
         assert_eq!(s.snapshot(), vec![(a, 0, 2)]);
+    }
+
+    #[test]
+    fn a_disabled_limiter_allows_everything() {
+        let mut r = TenantRates::new();
+        let a = tenant_id("a");
+        for _ in 0..10_000 {
+            assert!(r.allow(a));
+        }
+        assert_eq!(r.throttled(a), 0);
+    }
+
+    #[test]
+    fn an_unscoped_connection_is_never_limited() {
+        let mut r = TenantRates::new();
+        r.set_limit(1);
+        for _ in 0..1000 {
+            assert!(r.allow(0), "no tenant scope: not this policy's business");
+        }
+    }
+
+    #[test]
+    fn a_tenant_may_burst_its_rate_then_is_held() {
+        let mut r = TenantRates::new();
+        r.set_limit(100);
+        let a = tenant_id("a");
+        // A full bucket is one second's worth, so the first 100 go straight
+        // through -- a burst is allowed, a sustained overrate is not.
+        let allowed = (0..100).filter(|_| r.allow(a)).count();
+        assert_eq!(allowed, 100);
+        assert!(!r.allow(a), "the 101st in the same instant is over the rate");
+        assert!(r.throttled(a) >= 1);
+    }
+
+    #[test]
+    fn one_tenants_rate_does_not_touch_anothers() {
+        let mut r = TenantRates::new();
+        r.set_limit(10);
+        let (a, b) = (tenant_id("a"), tenant_id("b"));
+        for _ in 0..10 {
+            r.allow(a);
+        }
+        assert!(!r.allow(a), "a has spent its bucket");
+        assert!(r.allow(b), "b's bucket is its own");
+    }
+
+    #[test]
+    fn a_bucket_refills_over_time() {
+        let mut r = TenantRates::new();
+        r.set_limit(1000);
+        let a = tenant_id("a");
+        while r.allow(a) {}
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(r.allow(a), "20ms at 1000/s is ~20 tokens back");
     }
 
     #[test]
