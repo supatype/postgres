@@ -249,8 +249,31 @@ fn rowcache_view() -> Option<Store> {
 /// heap tuple), and by the `supacache_keys` decode plugin (from the WAL change),
 /// so all three agree for the same logical row regardless of the pk's type —
 /// int, uuid, text, etc. (Integers are still their decimal text, e.g. `1`.)
+/// Tag byte distinguishing the three kinds of row-cache key. Without it a row
+/// key whose leading bytes happened to match could collide with a registration
+/// key -- a latent hazard in the original `relid`-first scheme, and a real one
+/// once a database oid sits in front.
+const RC_TAG_ROW: u8 = 0x00;
+const RC_TAG_REG: u8 = 0xff;
+
+/// The database this backend is connected to, as row-cache key bytes.
+///
+/// The row-cache segment is cluster-wide shared memory and
+/// `shared_preload_libraries` installs the planner hook in *every* database, so
+/// a key without the database in it is ambiguous across databases. Relids are
+/// per-database and `CREATE DATABASE ... TEMPLATE` copies `pg_class` physically,
+/// so two cloned databases have *identical* relids -- which made the collision
+/// certain rather than unlikely in the per-project-database pattern, and served
+/// one database's rows to another (#117).
+#[inline]
+fn rc_db() -> [u8; 4] {
+    unsafe { pg_sys::MyDatabaseId.as_u32().to_le_bytes() }
+}
+
 fn rc_key(relid: u32, pk: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(4 + pk.len());
+    let mut k = Vec::with_capacity(9 + pk.len());
+    k.push(RC_TAG_ROW);
+    k.extend_from_slice(&rc_db());
     k.extend_from_slice(&relid.to_le_bytes());
     k.extend_from_slice(pk);
     k
@@ -3052,9 +3075,11 @@ fn rowcache_planner_init() {
     }
 }
 
-fn rc_reg_key(relid: u32) -> [u8; 5] {
-    let mut k = [0xffu8; 5];
-    k[1..].copy_from_slice(&relid.to_le_bytes());
+fn rc_reg_key(relid: u32) -> [u8; 9] {
+    let mut k = [0u8; 9];
+    k[0] = RC_TAG_REG;
+    k[1..5].copy_from_slice(&rc_db());
+    k[5..].copy_from_slice(&relid.to_le_bytes());
     k
 }
 
@@ -4315,6 +4340,43 @@ mod supacache {
             Some(v) => v,
             None => return false,
         };
+        // The row cache is single-database, and this is where that becomes
+        // visible (#118).
+        //
+        // Not a limitation of the catalogue but of logical decoding: the
+        // invalidation worker's slot is created in `pg_keyspace.database`, and a
+        // logical slot only ever decodes changes from the database it belongs
+        // to. A table registered anywhere else would be cached and then never
+        // invalidated -- stale indefinitely, with `rowcache_coherence()` still
+        // reporting healthy, because coherence describes the worker rather than
+        // your table.
+        //
+        // Before this check the failure was `relation "supacache.rowcache_reg"
+        // does not exist`, because the backing tables are created by the worker
+        // in its own database. Loud, but it named the symptom rather than the
+        // reason.
+        let want = GUC_DATABASE
+            .get()
+            .and_then(|c| c.to_str().ok().map(str::to_string))
+            .unwrap_or_else(|| "postgres".to_string());
+        // `::text` is load-bearing: current_database() returns `name`, and
+        // reading that as a String comes back empty, which compared unequal to
+        // every configured value and refused registration everywhere --
+        // including in the database that is supposed to allow it.
+        let here = Spi::get_one::<String>("SELECT current_database()::text")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if here.is_empty() || here != want {
+            warning!(
+                "pg_keyspace: the row cache is served only from the database named by \
+                 pg_keyspace.database ('{want}'), because the invalidation worker's logical \
+                 slot only decodes changes from that database. Registering from '{here}' \
+                 would cache rows that are never invalidated, so it is refused. Register from \
+                 '{want}', or point pg_keyspace.database at this database."
+            );
+            return false;
+        }
         // The catalogue first, and a failure here fails the call. Pinning
         // succeeds far more often than it survives: a segment reinitialisation
         // takes the pinned entry with it, and before #103 the caller was told

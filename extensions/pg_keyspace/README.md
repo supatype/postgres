@@ -626,6 +626,28 @@ is whatever `pg_index` says it is, single-column or composite. `rowcache_registe
 still exists and is still single-column only. `rowcache_registration(tbl)` reports
 which columns a table is registered with, in key order.
 
+**The row cache serves one database — the one named by `pg_keyspace.database`.**
+Not a choice but a consequence of logical decoding: the invalidation worker's
+replication slot belongs to that database, and a logical slot only ever decodes
+changes from the database it was created in. A table registered anywhere else
+would be cached and then *never invalidated* — stale indefinitely, while
+`rowcache_coherence()` still reported healthy, because coherence describes the
+worker rather than your table. `rowcache_register` therefore refuses from any
+other database and says so.
+
+Keys carry the database oid for the same reason. The segment is cluster-wide and
+`shared_preload_libraries` installs the planner hook in *every* database, so an
+unqualified `relid`-keyed entry was ambiguous across databases — and relids
+collide: `CREATE DATABASE ... TEMPLATE` copies `pg_class` physically, so cloned
+databases have **identical** relids, which made the collision certain in a
+per-project-database deployment rather than a remote possibility. Before
+[#117](https://github.com/supatype/postgres/issues/117) that served one
+database's rows to another, under a correct-looking `Custom Scan` plan, with no
+error — and RLS could not help, since it is re-applied above the cache and would
+evaluate the *querying* database's policies against the *other* database's row.
+Asserted by `bench/run_rowcache_database_scope.sh`, which clones two databases
+from one template precisely so their relids match.
+
 **Registrations are durable.** They are rows in `supacache.rowcache_reg`, recorded
 under the table's schema-qualified name, with the pinned shared-memory entry as a
 cache of that. Anything that reinitialises the row-cache segment — a watchdog
@@ -921,7 +943,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
 | `pg_keyspace.max_value_bytes` | 536870912 | largest value accepted from a client; matches Valkey/Redis `proto-max-bulk-len` |
 | `pg_keyspace.durability` | `ephemeral` | `ephemeral` \| `relaxed` \| `durable` \| `replicated` |
-| `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables |
+| `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables, **and the only database the row cache serves** |
 | `pg_keyspace.persist_workers` | 1 | persist workers/rings draining in parallel |
 | `pg_keyspace.ring_mb` | 64 | per-worker RESP→persist ring size (burst absorption) |
 | `pg_keyspace.ttl_bucket_secs` | 10 | TTL time-bucket width (range-partitioned `supacache.kv_ttl`) |
