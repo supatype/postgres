@@ -243,6 +243,13 @@ chk "persistence actually saw the durable writes" "t" \
     "$(Q "SELECT sum(pushed) > 0 FROM supacache.pg_stat_keyspace_persist")"
 chk "the total view exposes the deepest single ring" "0" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_persist_total WHERE worst_ring_backlog_bytes IS NULL")"
+# uncommitted_batches is a GAUGE of batches in flight, not a failure count: the
+# ring increments before attempting and decrements after committing. Asserting
+# it is >= 0 and present is all that is meaningful; asserting it is 0 would fail
+# on any run that happens to sample mid-batch, which is most of them.
+chk "uncommitted_batches is reported and non-negative" "0" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_persist
+          WHERE uncommitted_batches IS NULL OR uncommitted_batches < 0")"
 
 echo
 echo "########## 8. per-tenant arena occupancy ##########"
