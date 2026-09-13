@@ -282,6 +282,16 @@ jobs:
       # Correctness: a registration must survive a segment reinitialisation.
       # Its own cluster and ports, and it needs the C output plugin, which it
       # builds itself.
+      # Correctness across a database boundary: two databases cloned from one
+      # template (so their relids match) must never see each other's cached
+      # rows. Its own cluster and ports; builds the C output plugin itself.
+      - name: Row-cache database scoping
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_rowcache_database_scope.sh
+
       - name: Row-cache registration durability
         env:
           PGKS_BUILD_PROFILE: debug
