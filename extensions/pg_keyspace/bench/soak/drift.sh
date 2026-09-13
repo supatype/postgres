@@ -101,7 +101,12 @@ sample() {
 RSS_GROWTH_PCT=${RSS_GROWTH_PCT:-25}       # RSS, second half vs first half
 ENTRIES_GROWTH_PCT=${ENTRIES_GROWTH_PCT:-10}  # LIVE entries must plateau, not climb
 MAX_PERSIST_DROPPED=${MAX_PERSIST_DROPPED:-0}
-MAX_PERSIST_FAILED=${MAX_PERSIST_FAILED:-0}
+# A GAUGE of batches in flight, not a failure count -- the ring increments
+# before attempting and decrements after committing, so this oscillates at a
+# small number under load and a floor that never drains is the real signal.
+# Judged on the LAST sample, taken after the load has stopped, where anything
+# left is a batch that never committed.
+MAX_UNCOMMITTED_FINAL=${MAX_UNCOMMITTED_FINAL:-0}
 MAX_PERSIST_LAG=${MAX_PERSIST_LAG:-5000}   # median acked-but-uncommitted writes
 MAX_DECODE_LAG_SECS=${MAX_DECODE_LAG_SECS:-30}   # median, against measured WAL rate
 MAX_FINAL_DECODE_SECS=${MAX_FINAL_DECODE_SECS:-60} # last sample: it came back
@@ -161,8 +166,14 @@ judge() {
       # during cluster bootstrap -- before CREATE EXTENSION the supacache tables
       # do not exist yet and the first persist attempts fail. Judging the raw
       # total charged those two startup failures to the run.
+      # Dropped IS cumulative, so the delta over the sampled window is what the
+      # run is responsible for -- the final total also carries whatever happened
+      # during cluster bootstrap, before CREATE EXTENSION created the tables.
       printf "dropped %d\n",       drop[n] - drop[1]
-      printf "failed %d\n",        failed[n] - failed[1]
+      # Against the FIRST sample, taken before the load began: cluster bootstrap
+      # can leave increments uncancelled (a persist worker exits before
+      # CREATE EXTENSION has made its tables) and those belong to no run.
+      printf "uncommitted %d %d\n", median(failed), failed[n] - failed[1]
       printf "wal %d %d %d\n",     wal[1], wal[n], (ts[n]-ts[1] > 0 ? ts[n]-ts[1] : 1)
       inco=0; for(i=1;i<=n;i++) if (coh[i]!=1 && coh[i]!="") inco++
       printf "incoherent %d\n",    inco
@@ -170,15 +181,15 @@ judge() {
 
   local rss_pct rss_a rss_b ent_pct ent_a ent_b arena_a arena_b evi_a evi_b
   local lag_med lag_max lag_last dec_med dec_max dec_last
-  local dropped failed wal_a wal_b wal_secs incoh
+  local dropped unc_med unc_last wal_a wal_b wal_secs incoh
   read -r _ rss_pct rss_a rss_b   <<< "$(grep '^rss '       <<< "$verdicts")"
   read -r _ ent_pct ent_a ent_b   <<< "$(grep '^entries '   <<< "$verdicts")"
   read -r _ arena_a arena_b       <<< "$(grep '^arena '     <<< "$verdicts")"
   read -r _ evi_a evi_b           <<< "$(grep '^evictions ' <<< "$verdicts")"
   read -r _ lag_med lag_max lag_last  <<< "$(grep '^lag '        <<< "$verdicts")"
   read -r _ dec_med dec_max dec_last  <<< "$(grep '^decode '     <<< "$verdicts")"
-  read -r _ dropped                   <<< "$(grep '^dropped '    <<< "$verdicts")"
-  read -r _ failed                    <<< "$(grep '^failed '     <<< "$verdicts")"
+  read -r _ dropped                   <<< "$(grep '^dropped '     <<< "$verdicts")"
+  read -r _ unc_med unc_last          <<< "$(grep '^uncommitted ' <<< "$verdicts")"
   read -r _ wal_a wal_b wal_secs      <<< "$(grep '^wal '        <<< "$verdicts")"
   read -r _ incoh                     <<< "$(grep '^incoherent ' <<< "$verdicts")"
 
@@ -230,9 +241,14 @@ judge() {
   chk "no acknowledged write was dropped during the run (dropped=$dropped)" \
       "$([ "${dropped:-0}" -le "$MAX_PERSIST_DROPPED" ] && echo pass || echo fail)" \
       "$dropped dropped -- the ring overflowed and acks were discarded"
-  chk "no persistence batch failed during the run (failed=$failed)" \
-      "$([ "${failed:-0}" -le "$MAX_PERSIST_FAILED" ] && echo pass || echo fail)" \
-      "$failed failed batches"
+  # run_soak.sh keeps sampling for a drain window after the load stops, so the
+  # last sample is quiescent and in-flight batches have had time to commit.
+  # Anything still outstanding there never committed.
+  # Judging the MEDIAN instead -- or demanding zero at any sample -- fails on
+  # ordinary traffic, which is exactly what the first version of this check did.
+  chk "no batch was left uncommitted once drained (+${unc_last} vs baseline, median-under-load ${unc_med})" \
+      "$([ "${unc_last:-0}" -le "$MAX_UNCOMMITTED_FINAL" ] && echo pass || echo fail)" \
+      "${unc_last} batches never committed"
 
   # -1 is the sentinel for "no invalidation row", i.e. decoding is off. Judging
   # a decoder that is not running would be judging nothing.

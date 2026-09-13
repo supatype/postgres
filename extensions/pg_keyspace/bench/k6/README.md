@@ -74,3 +74,52 @@ the design rather than of the load:
 All at 2 000 writes/s of distinct keys, 256-byte values. A durable ack is held
 until its batch commits, so write latency tracks the persist window — which is
 the cost side of the throughput curve in the main README's tuning section.
+
+## `mixed.js` — the soak workload (#113)
+
+`soak.js` and `ladder.js` measure latency. `mixed.js` is shaped to **find
+things** instead, which is what #113 asks for: the k6 runs before it found no
+bugs, and a two-minute happy-path run that finds nothing is weak evidence.
+
+Driven by `bench/run_soak.sh`, which also runs pgbench against the Mode B row
+cache (a SQL path the redis client cannot reach), injects faults, and judges
+drift. Run it directly only to point load at a server somewhere else:
+
+```bash
+HOST=cache.internal PORT=6380 WORKERS=2 TENANTS=3 SECRET=... \
+  DURATION=4h PEAK=64 MAX_ERRORS=0 k6 run mixed.js
+```
+
+Four things it does that `soak.js` does not:
+
+**Every read verifies a checksum.** A value is a pure function of its key, so a
+reader needs no shared state to know what it should have got back. A cache
+confidently returning the *wrong* bytes fails the run; one that only checks for
+null cannot tell that from working. `run_soak.sh` then re-derives the same
+hash in SQL and checks every persisted row, closing the loop from client through
+the ring to the table.
+
+**Multi-tenant.** Each VU authenticates as one of several tenants, so keys are
+force-scoped server-side and the fairness paths are under real contention.
+
+**Workload variety, together.** Hot and cold key distributions, aggregates at
+size, TTL churn heavy enough to cycle partitions, and pub/sub concurrent with
+writes — the combination, which is what had never been exercised.
+
+**Writers and readers overlap** on the same keys, rather than seeding a corpus
+and then only reading it. A pre-seeded read-only corpus cannot expose a race.
+
+### Two traps specific to this script
+
+**The client is cluster-aware, and must be.** pg_keyspace shards across workers
+and answers `MOVED` for a key it does not own. A plain client does not follow
+that: against two workers, every operation failed and the run reported 0
+iterations while its checksum threshold passed vacuously. `WORKERS` builds the
+node list.
+
+**Not every command exists on the k6 client.** `publish` does not, and calling
+it threw instantly — so that scenario ran 5.1 *million* no-op iterations,
+inflating both the iteration count and the error count while publishing nothing.
+`sendCommand` is the way, and `setup()` now probes every operation the run uses
+before the run starts, so a missing method fails immediately instead of becoming
+four minutes of counterfeit load.

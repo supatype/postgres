@@ -62,6 +62,7 @@ const miss      = new Counter('unexpected_miss');
 const corrupt   = new Counter('checksum_mismatch');
 const verified  = new Counter('checksum_verified');
 const published = new Counter('pubsub_published');
+const oom       = new Counter('oom_refused');
 
 const n = {
   hot: new Counter('iters_hot'), cold: new Counter('iters_cold'),
@@ -94,12 +95,25 @@ function valueFor(key) {
 // would have buried a real protocol or connection failure among them.
 function isNil(e) { return String(e).indexOf('redis: nil') !== -1; }
 
+// `OOM command not allowed when used memory > 'maxmemory'` is the server
+// CORRECTLY refusing a write it has no room for -- the Redis-compatible reply,
+// not a failure. This soak deliberately undersizes the cache so eviction runs
+// for the whole run, and the aggregate scenario grows hashes far larger than
+// that cache, so refusals are the expected outcome and not a bug to fix.
+//
+// It gets its own counter for the same reason nil does: a metric that lumps
+// "the server said no, correctly" together with "something broke" cannot be
+// thresholded, and burying a real failure under 457 legitimate refusals is
+// exactly the kind of non-result #113 was filed about.
+function isOom(e) { return String(e).indexOf('OOM command not allowed') !== -1; }
+
 // An error count with no error text is a number nobody can act on. Log the
 // first few per VU, with the scenario that produced them, so an unexplained
 // floor of errors can be identified instead of budgeted around -- which is how
 // #130 was found and how the remainder after it was.
 let logged = 0;
 function noteErr(where, e) {
+  if (isOom(e)) { oom.add(1); return; }
   errs.add(1);
   if (logged < 3) { logged++; console.error(`op_error[${where}] ${e}`); }
 }
@@ -274,7 +288,7 @@ export function handleSummary(data) {
   L.push(`iterations: ${v('iterations','count')}   sustained: ${v('iterations','rate').toFixed(0)} ops/s`);
   L.push(`checksums verified: ${v('checksum_verified','count')}   MISMATCHES: ${v('checksum_mismatch','count')}`);
   const it = v('iterations','count') || 1;
-  L.push(`errors: ${v('op_errors','count')} (${(v('op_errors','count')*100/it).toFixed(3)}%, budget ${MAX_ERRORS})   misses: ${v('unexpected_miss','count')}   published: ${v('pubsub_published','count')}`);
+  L.push(`errors: ${v('op_errors','count')} (${(v('op_errors','count')*100/it).toFixed(3)}%, budget ${MAX_ERRORS})   misses: ${v('unexpected_miss','count')}   OOM-refused: ${v('oom_refused','count')}   published: ${v('pubsub_published','count')}`);
   L.push('');
   L.push('scenario      n           min      p50      p95      p99      max   (microseconds)');
   for (const s of ['hot','cold','write','ttl','aggr','pub']) {

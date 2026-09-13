@@ -212,9 +212,14 @@ LABEL="soak-${DURATION}" SUMMARY_JSON="$OUT/k6.json" \
 K6_RC=${PIPESTATUS[0]}
 
 wait $PGBENCH_PID 2>/dev/null
-kill $DRIFT_PID 2>/dev/null
+# Stop injecting first, then keep SAMPLING through a quiet drain window. The
+# last drift sample is then taken against an idle cluster, which is the only
+# condition under which "batches still uncommitted" means "never committed"
+# rather than "in flight" -- the persistence counter is a gauge, not a tally.
 [ -n "${FAULTS_PID:-}" ] && kill $FAULTS_PID 2>/dev/null
-sleep 3
+sleep "${DRAIN_SECS:-20}"
+kill $DRIFT_PID 2>/dev/null
+sleep 2
 
 echo
 echo "########## 2. the load actually ran ##########"
