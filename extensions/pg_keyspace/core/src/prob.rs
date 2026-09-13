@@ -3180,15 +3180,50 @@ mod tests {
 
     #[test]
     fn an_add_retries_when_the_key_lapses_inside_the_command() {
+        // WAIT for the lapse; do not race it.
+        //
+        // The 1us TTL below makes the key expire almost at once, but "almost at
+        // once" is not "before the next line", and the add behaves differently
+        // either side of that:
+        //
+        //   lapsed first  -> with_value_mut misses, the filter is RECREATED by
+        //                    bf_create/cf_create, which set ttl 0 -- so the key
+        //                    that survives the command has no deadline and the
+        //                    reads below find it. This is the retry the test is
+        //                    named for.
+        //   still alive   -> the item is added IN PLACE and the key keeps its
+        //                    original 1us deadline, so it expires again before
+        //                    the reads and they answer :0.
+        //
+        // Which branch runs was decided by how fast the machine got from one
+        // line to the next, so the test passed on Linux and failed on macOS with
+        // `left: ":0" right: ":1"`. Spinning until the key is actually gone
+        // makes the retry path certain, which is the path being tested.
+        fn await_lapse(s: &Store, key: &[u8]) {
+            for _ in 0..2000 {
+                if s.get_typed(key).is_none() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            panic!(
+                "key {:?} never lapsed, so this test would have exercised the \
+                 in-place path rather than the retry it is named for",
+                std::str::from_utf8(key).unwrap_or("?")
+            );
+        }
+
         let s = Store::create("t_prob_lapse", &cfg(1024 * 1024)).unwrap();
         let blob = new_blob(0.01, 100, 2, false).unwrap();
         assert!(s.set_typed(b"g", &blob, 1, KIND_BLOOM));
+        await_lapse(&s, b"g");
         assert!(matches!(add_item(&s, b"g", b"x", &Spec::default()), Add::Added));
         assert_eq!(run(&s, &["BF.EXISTS", "g", "x"]), ":1\r\n");
         assert_eq!(run(&s, &["BF.CARD", "g"]), ":1\r\n");
 
         let cblob = cf_new_blob(&cspec(1000)).unwrap();
         assert!(s.set_typed(b"c", &cblob, 1, KIND_CUCKOO));
+        await_lapse(&s, b"c");
         assert!(matches!(
             cf_add_item(&s, b"c", b"y", false, &CSpec::default()),
             Add::Added
