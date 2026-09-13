@@ -87,8 +87,16 @@ fi
 # From here on the allowlist (if this build has one) is in place, so truncate:
 # the guard below is about whether the worker crash-loops from now on, and the
 # first start before the setting was applied would otherwise count against it.
+#
+# Stop FIRST, then truncate. Truncating under a running server leaves a window
+# in which the still-running pre-allowlist worker -- which relaunches on a
+# five-second loop -- can append one more "may not be used as an output plugin"
+# line after the truncate, and the guard below then fails for a setup artefact
+# rather than a crash loop. That race is why this test was intermittent.
+stop_pg
 : > $PGDATA/log; chown postgres:postgres $PGDATA/log
-restart
+start_pg; wait_ready || { echo "NO START"; exit 1; }
+sleep 2
 chk "the invalidation worker is up" "1" "$(wait_coherent 30)"
 # Guard, because a dead worker makes everything below meaningless: the section
 # that matters asserts a registration survives a restart, and a worker stuck in
