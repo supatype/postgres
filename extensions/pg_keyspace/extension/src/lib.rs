@@ -4129,7 +4129,8 @@ mod supacache {
     /// The slot range and RESP port of every shared-nothing slot worker.
     ///
     /// This is the routing table a client must follow: worker `w` serves exactly
-    /// the keys whose CRC16 slot falls in `[slot_lo, slot_hi)`, on `port`. It is
+    /// the keys whose CRC16 slot falls in `slot_lo ..= slot_hi`, on `port` --
+    /// inclusive at both ends, the same convention `CLUSTER SLOTS` reports. It is
     /// also the mapping crash recovery uses to put each persisted key back into
     /// the segment that will serve it, so a client that shards by these ranges
     /// gets its data back after a restart, on the same worker.
@@ -4148,7 +4149,14 @@ mod supacache {
         let rows: Vec<(i32, i32, i32, i32)> = (0..n)
             .map(|w| {
                 let (lo, hi) = crc16::slot_range(w, n);
-                (w as i32, base + w as i32, lo as i32, hi as i32)
+                // INCLUSIVE, matching CLUSTER SLOTS / SHARDS / NODES, which all
+                // emit `hi - 1`. crc16::slot_range is half-open, and reporting
+                // it raw made adjacent workers overlap -- worker 0 ending at
+                // 4096 and worker 1 starting at 4096 -- so a client sharding
+                // from this table sent boundary slots to the wrong worker. The
+                // doc comment said `[slot_lo, slot_hi)`, but a table whose rows
+                // overlap is read, not read about (#121).
+                (w as i32, base + w as i32, lo as i32, hi as i32 - 1)
             })
             .collect();
         TableIterator::new(rows)
