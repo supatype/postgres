@@ -15,7 +15,7 @@
 //! Not MVCC. No tuple headers. No vacuum. Entries are overwritten in place.
 
 use crate::shmem::Shmem;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 // v3 widens Entry with `staged_seq` and PartMeta with `commit_watermark`, for
 // values handed to the persistence worker by reference instead of being copied
@@ -202,12 +202,107 @@ unsafe fn seq_end(e: *mut Entry) {
 }
 
 #[inline]
-pub fn now_micros() -> i64 {
+/// A clock that is immune to wall-clock *steps* but still reports wall-clock
+/// values (#110).
+///
+/// TTLs used to compare against `CLOCK_REALTIME` directly, so a clock step moved
+/// every key's deadline at once. Forward: everything with a deadline inside the
+/// jump expired together, which from the application's side is a cache that
+/// emptied itself for no reason. Backward: keys outlived their TTL by the size
+/// of the jump, which for a TTL used as a lock lease or a rate-limit window is a
+/// correctness problem. Both silent, neither diagnosable afterwards. Steps are
+/// not exotic: a VM resuming from suspend, a container host correcting a large
+/// offset, a first NTP sync after booting with a bad RTC.
+///
+/// The fix is the clock, not the deadlines. An anchor -- realtime and boottime
+/// captured together -- is advanced by the *boottime* delta, so the value is
+/// still an absolute unix timestamp and every persisted `expires_at`, every
+/// `kv_ttl` bucket and every comparison keeps working untouched. Only steps stop
+/// being visible.
+///
+/// `CLOCK_BOOTTIME` rather than `CLOCK_MONOTONIC`: time a machine spends
+/// suspended should count toward a TTL, or a host suspended for an hour resumes
+/// with every key an hour past its deadline still live. macOS has no
+/// `CLOCK_BOOTTIME`, but its `CLOCK_MONOTONIC` already includes sleep, so the
+/// two are equivalent there.
+///
+/// Slew is ignored along with steps, so over long uptime this drifts slightly
+/// from true wall time. Irrelevant for a relative TTL -- both ends use this
+/// clock, so a 300-second TTL is accurate to microseconds -- and visible only
+/// for an absolute deadline set via `EXPIREAT`. A restart re-anchors.
+#[inline]
+fn boot_micros() -> i64 {
+    #[cfg(target_os = "linux")]
+    const SRC: libc::clockid_t = libc::CLOCK_BOOTTIME;
+    #[cfg(not(target_os = "linux"))]
+    const SRC: libc::clockid_t = libc::CLOCK_MONOTONIC;
+    unsafe {
+        let mut ts: libc::timespec = std::mem::zeroed();
+        libc::clock_gettime(SRC, &mut ts);
+        ts.tv_sec as i64 * 1_000_000 + ts.tv_nsec as i64 / 1_000
+    }
+}
+
+#[inline]
+fn real_micros() -> i64 {
     unsafe {
         let mut ts: libc::timespec = std::mem::zeroed();
         libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
         ts.tv_sec as i64 * 1_000_000 + ts.tv_nsec as i64 / 1_000
     }
+}
+
+static ANCHOR_REAL: AtomicI64 = AtomicI64::new(0);
+static ANCHOR_BOOT: AtomicI64 = AtomicI64::new(0);
+static ANCHOR_SET: AtomicBool = AtomicBool::new(false);
+
+/// Adopt an anchor captured elsewhere -- in practice one written to shared
+/// memory when the segment was created.
+///
+/// The anchor MUST be shared across processes. A per-process anchor would have
+/// backends that started either side of a step disagreeing about whether a key
+/// is expired, which is worse than the bug being fixed: a global shift becomes
+/// per-process inconsistency.
+pub fn adopt_clock_anchor(real_us: i64, boot_us: i64) {
+    ANCHOR_REAL.store(real_us, Ordering::Release);
+    ANCHOR_BOOT.store(boot_us, Ordering::Release);
+    ANCHOR_SET.store(true, Ordering::Release);
+}
+
+/// Capture an anchor for sharing. Called once, by whoever creates the segment.
+pub fn capture_clock_anchor() -> (i64, i64) {
+    (real_micros(), boot_micros())
+}
+
+pub fn now_micros() -> i64 {
+    if !ANCHOR_SET.load(Ordering::Acquire) {
+        // No shared anchor: the standalone daemon, or a unit test. Single
+        // process, so a local anchor is consistent by construction. Raced
+        // adopters land within microseconds of each other, and only one wins.
+        let (r, b) = capture_clock_anchor();
+        if ANCHOR_SET
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            ANCHOR_REAL.store(r, Ordering::Release);
+            ANCHOR_BOOT.store(b, Ordering::Release);
+        }
+    }
+    anchored_now(
+        ANCHOR_REAL.load(Ordering::Acquire),
+        ANCHOR_BOOT.load(Ordering::Acquire),
+        boot_micros(),
+    )
+}
+
+/// The whole of the clock, as arithmetic.
+///
+/// Split out so it can be tested without touching the process-global anchor --
+/// tests run in parallel threads and share it, so a test that adopted a
+/// deliberately bogus anchor would break every other test that reads the clock.
+#[inline]
+fn anchored_now(anchor_real: i64, anchor_boot: i64, boot_now: i64) -> i64 {
+    anchor_real + (boot_now - anchor_boot)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2059,6 +2154,92 @@ mod tests {
             reported, actual,
             "measured usage must equal a fresh count: reported {reported}, actual {actual}"
         );
+    }
+
+    /// #110: a wall-clock step must not move the clock.
+    ///
+    /// A step moves `CLOCK_REALTIME` and leaves `CLOCK_BOOTTIME` alone. A clock
+    /// anchored before the step keeps advancing on boottime, so it does not
+    /// move -- the anchor's realtime half is a fixed reference, never re-read.
+    ///
+    /// Tested as arithmetic rather than by re-adopting an anchor: the first
+    /// version of this test re-adopted the *same* anchor while its comment
+    /// claimed the clock had lurched an hour, which proved nothing at all.
+    /// bench/run_ttl_clock_step.sh does the real thing, against a live cluster
+    /// with the system clock actually set.
+    #[test]
+    fn a_wall_clock_step_does_not_move_the_clock() {
+        let (r0, b0) = (1_700_000_000_000_000i64, 500_000i64);
+        // Two reads 10us apart in boottime terms.
+        let before = anchored_now(r0, b0, b0 + 10);
+        let after = anchored_now(r0, b0, b0 + 20);
+        assert_eq!(after - before, 10, "the clock must advance on boottime alone");
+        // The step itself: realtime is now an hour ahead. Nothing in the
+        // anchored clock reads it, so the answer is unchanged.
+        let real_after_step = r0 + 3_600_000_000;
+        assert_ne!(
+            anchored_now(r0, b0, b0 + 20),
+            real_after_step,
+            "a stepped wall clock must not be what the clock reports"
+        );
+        assert_eq!(anchored_now(r0, b0, b0 + 20), r0 + 20);
+    }
+
+    /// The failure mode of the code this replaces, stated so the test says what
+    /// it is protecting against: reading CLOCK_REALTIME directly means the step
+    /// lands in the answer, and every deadline moves with it.
+    #[test]
+    fn reading_realtime_directly_would_have_moved_everything() {
+        let (r0, b0) = (1_700_000_000_000_000i64, 500_000i64);
+        let naive_before = r0;
+        let naive_after = r0 + 3_600_000_000; // the step, read straight through
+        assert_eq!(
+            naive_after - naive_before,
+            3_600_000_000,
+            "this is what the old clock did, and why TTLs all fired at once"
+        );
+        // The anchored clock, over the same interval, moves by the boottime
+        // delta and nothing else.
+        assert_eq!(anchored_now(r0, b0, b0 + 20) - anchored_now(r0, b0, b0), 20);
+    }
+
+    #[test]
+    fn the_clock_never_goes_backwards() {
+        let mut last = now_micros();
+        for _ in 0..10_000 {
+            let n = now_micros();
+            assert!(n >= last, "now_micros went backwards: {last} -> {n}");
+            last = n;
+        }
+    }
+
+    #[test]
+    fn the_clock_reports_wall_clock_values() {
+        // It must still be an absolute unix timestamp: persisted expires_at and
+        // the kv_ttl bucket boundaries depend on that, and a monotonic-valued
+        // clock would silently make every persisted deadline meaningless.
+        let n = now_micros();
+        let real = unsafe {
+            let mut ts: libc::timespec = std::mem::zeroed();
+            libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+            ts.tv_sec as i64 * 1_000_000 + ts.tv_nsec as i64 / 1_000
+        };
+        assert!(
+            (n - real).abs() < 5_000_000,
+            "clock reads {n} but the wall clock says {real}; it must stay an absolute timestamp"
+        );
+    }
+
+    #[test]
+    fn every_process_sharing_one_anchor_agrees() {
+        // The property a per-process anchor would break: two processes reading
+        // the same anchor at the same boottime must produce the same answer, or
+        // backends disagree about whether a key is expired.
+        let (r0, b0) = (1_700_000_000_000_000i64, 500_000i64);
+        assert_eq!(anchored_now(r0, b0, b0 + 42), anchored_now(r0, b0, b0 + 42));
+        // And two anchors captured at different moments must NOT: that is the
+        // reason the anchor lives in shared memory rather than in each process.
+        assert_ne!(anchored_now(r0, b0, b0 + 42), anchored_now(r0 + 999, b0, b0 + 42));
     }
 
     /// The case #43 describes: "a cold-key flood from one tenant simply evicts

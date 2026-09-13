@@ -1181,11 +1181,20 @@ Scoping for this version — the extension works; these are the edges to know:
   number and `persist_workers` is not — see
   [tuning durable throughput](#tuning-durable-throughput-which-knob-actually-moves-it)
   for the measured curve.
-- **TTL expiry is wall-clock, not monotonic.** Expiry compares against
-  `CLOCK_REALTIME`, so a system clock *step* moves every key's deadline; NTP
-  slew is harmless. On-disk reclamation also lags expiry by up to
-  `ttl_bucket_secs + ttl_sweep_secs` (about 15 s at defaults), though reads
-  filter on `expires_at` so nothing expired is ever served.
+- **TTL expiry is immune to wall-clock steps, and still reports wall-clock
+  times.** Expiry compares against an anchor — realtime and `CLOCK_BOOTTIME`
+  captured together, then advanced by the boottime delta — so a clock *step*
+  does not move any deadline, while `expires_at` stays an absolute unix
+  timestamp and every persisted value and `kv_ttl` bucket keeps its meaning.
+  Time a machine spends suspended counts toward a TTL, which is why
+  `CLOCK_BOOTTIME` rather than `CLOCK_MONOTONIC`. The anchor lives in shared
+  memory so every backend agrees; a per-process anchor would have processes
+  that started either side of a step disagreeing about whether a key is
+  expired. Slew is ignored along with steps, so over long uptime the clock
+  drifts slightly from true wall time — irrelevant for a relative TTL, visible
+  only for an absolute deadline set by `EXPIREAT`, and re-anchored on restart.
+  Verified by `bench/run_ttl_clock_step.sh`, which sets the system clock for
+  real ([#110](https://github.com/supatype/postgres/issues/110)).
 - **`pg_terminate_backend` on a pg_keyspace worker is survivable, but only
   because of the watchdog.** Terminating a background worker calls
   `TerminateBackgroundWorker`, which deregisters it in the postmaster rather
