@@ -91,6 +91,35 @@ chk "BF.LOADCHUNK iterator 0"           "ERR not found" "$($K BF.LOADCHUNK lc 0 
 chk "BF.SCANDUMP iterator not numeric"  "Second argument must be numeric" "$($K BF.SCANDUMP b abc 2>&1)"
 chk "BF.SCANDUMP on a missing key"      "ERR not found" "$($K BF.SCANDUMP gone 0 2>&1)"
 chk "BF.RESERVE a subnormal error rate"  "ERR could not create filter" "$($K BF.RESERVE sub 5e-324 1 2>&1)"
+chk "BF.RESERVE a negative error rate"   "ERR error rate must be in the range (0.000000, 1.000000)" \
+                                        "$($K BF.RESERVE sub2 -1 100 2>&1)"
+chk "BF.INSERT a negative error rate"    "Bad error rate" "$($K BF.INSERT sub3 ERROR -1 ITEMS a 2>&1)"
+chk "BF.INSERT a zero error rate"        "Bad error rate" "$($K BF.INSERT sub4 ERROR 0 ITEMS a 2>&1)"
+chk "BF.RESERVE EXPANSION with no value" "ERR no expansion" "$($K BF.RESERVE sub5 0.01 100 X EXPANSION 2>&1)"
+chk "BF.INSERT CAPACITY with no value"   "ERR wrong number of arguments for 'bf.insert' command" \
+                                        "$($K BF.INSERT sub6 CAPACITY 2>&1)"
+chk "BF.LOADCHUNK of an empty chunk"     "ERR received bad data" "$($K BF.LOADCHUNK ez 1 "" 2>&1)"
+chk "an empty chunk created no key"      "0" "$($K EXISTS ez)"
+# option-token parity cases, pinned here and compared to Redis 8 below
+$K DEL o1 o2 o3 o4 o5 o6 o7 >/dev/null 2>&1
+chk "BF.RESERVE an unknown token"        "OK" "$($K BF.RESERVE o1 0.01 100 BOGUS 2>&1)"
+chk "BF.RESERVE two unknown tokens"      "OK" "$($K BF.RESERVE o2 0.01 100 BOGUS BOGUS 2>&1)"
+chk "BF.RESERVE NONSCALING twice"        "OK" "$($K BF.RESERVE o3 0.01 100 NONSCALING NONSCALING 2>&1)"
+chk "BF.RESERVE EXPANSION twice"         "ERR wrong number of arguments for 'bf.reserve' command" \
+                                        "$($K BF.RESERVE o4 0.01 100 EXPANSION 2 EXPANSION 3 2>&1)"
+chk "BF.RESERVE a trailing EXPANSION"    "OK" "$($K BF.RESERVE o5 0.01 100 EXPANSION 2 EXPANSION 2>&1)"
+chk "the first EXPANSION won"            "2" "$($K BF.INFO o5 EXPANSION)"
+chk "BF.INSERT CAPACITY twice"           "1" "$($K BF.INSERT o6 CAPACITY 200 CAPACITY 300 ITEMS x 2>&1)"
+chk "the last CAPACITY won"              "300" "$($K BF.INFO o6 CAPACITY)"
+chk "BF.INSERT EXPANSION twice"          "1" "$($K BF.INSERT o7 EXPANSION 2 EXPANSION 3 ITEMS x 2>&1)"
+chk "the last EXPANSION won"             "3" "$($K BF.INFO o7 EXPANSION)"
+$K DEL o1 o2 o3 o4 o5 o6 o7 ez sub2 sub3 sub4 sub5 sub6 >/dev/null 2>&1
+# a chain that keeps scaling is not capped at 32 sub-filters
+$K DEL mfx >/dev/null; $K BF.RESERVE mfx 0.01 1 EXPANSION 1 >/dev/null
+awk 'BEGIN{for(i=0;i<60;i++) printf "BF.ADD mfx f-%d\n", i}' | $K >/dev/null 2>&1
+chk "a scaling chain passes 32 filters"  "yes" "$(yn [ "$($K BF.INFO mfx FILTERS)" -gt 32 ])"
+chk "and answers no error at 60 adds"    "0" "$($K BF.ADD mfx f-0 2>&1 | grep -c ERR)"
+$K DEL mfx >/dev/null
 chk "BF.INSERT a subnormal error rate"   "ERR could not create filter" "$($K BF.INSERT sub ERROR 5e-324 ITEMS x 2>&1)"
 chk "BF.LOADCHUNK iterator not numeric" "ERR Second argument must be numeric" "$($K BF.LOADCHUNK b abc data 2>&1)"
 chk "BF.ADD wrong arity"                "ERR wrong number of arguments for 'bf.add' command" "$($K BF.ADD b 2>&1)"
@@ -263,6 +292,28 @@ else
     $1 BF.LOADCHUNK pstr 1 zz 2>&1
     $1 BF.RESERVE psub 5e-324 1 2>&1
     $1 BF.INSERT psub ERROR 5e-324 ITEMS x 2>&1
+    $1 BF.RESERVE psub -1 100 2>&1
+    $1 BF.INSERT psub ERROR -1 ITEMS a 2>&1
+    $1 BF.INSERT psub ERROR 0 ITEMS a 2>&1
+    $1 BF.INSERT psub ERROR 2 ITEMS a 2>&1
+    $1 BF.RESERVE psub 0.01 100 X EXPANSION 2>&1
+    $1 BF.INSERT psub CAPACITY 2>&1
+    $1 BF.LOADCHUNK pez 1 "" 2>&1
+    $1 EXISTS pez 2>&1
+    $1 BF.RESERVE po1 0.01 100 BOGUS 2>&1
+    $1 BF.RESERVE po2 0.01 100 BOGUS BOGUS 2>&1
+    $1 BF.RESERVE po3 0.01 100 NONSCALING NONSCALING 2>&1
+    $1 BF.RESERVE po4 0.01 100 EXPANSION 2 EXPANSION 3 2>&1
+    $1 BF.RESERVE po5 0.01 100 EXPANSION 2 EXPANSION 2>&1
+    $1 BF.INFO po5 EXPANSION 2>&1
+    $1 BF.RESERVE po6 0.01 100 X EXPANSION 3 2>&1
+    $1 BF.INFO po6 EXPANSION 2>&1
+    $1 BF.RESERVE po7 0.01 100 EXPANSION 3 X 2>&1
+    $1 BF.INFO po7 EXPANSION 2>&1
+    $1 BF.INSERT po8 CAPACITY 200 CAPACITY 300 ITEMS x 2>&1
+    $1 BF.INFO po8 CAPACITY 2>&1
+    $1 BF.INSERT po9 EXPANSION 2 EXPANSION 3 ITEMS x 2>&1
+    $1 BF.INFO po9 EXPANSION 2>&1
   }
   a=$(errs "$R8" | grep . | paste -sd'|'); b=$(errs "$K" | grep . | paste -sd'|')
   chk "error text parity"               "$a" "$b"
@@ -283,7 +334,9 @@ else
   expl() { $1 BF.RESERVE px 0.01 100 EXPANSION -1 2>&1; $1 BF.RESERVE px 0.01 100 EXPANSION 99999 2>&1; }
   chk "BF.RESERVE expansion range parity" "$(expl "$R8" | grep . | paste -sd'|')" "$(expl "$K" | grep . | paste -sd'|')"
   for R in "$K" "$R8"; do $R DEL px >/dev/null 2>&1; done
-  for R in "$K" "$R8"; do $R DEL pe pn pstr >/dev/null 2>&1; done
+  for R in "$K" "$R8"; do
+    $R DEL pe pn pstr pez po1 po2 po3 po4 po5 po6 po7 po8 po9 >/dev/null 2>&1
+  done
 
   # measured false-positive rate: 100k inserts, 100k misses, on each server
   N=100000

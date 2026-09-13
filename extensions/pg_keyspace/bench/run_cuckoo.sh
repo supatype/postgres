@@ -115,6 +115,32 @@ chk "CF.RESERVE three trailing tokens"  "ERR wrong number of arguments for 'cf.r
 $K DEL qpair >/dev/null
 chk "CF.RESERVE a token pair is ignored" "OK" "$($K CF.RESERVE qpair 1000 BOGUS 1 2>&1)"
 $K DEL qpair >/dev/null
+# an option keyword at the end of the argument list must not read past it.
+# Redis 8 reads on and answers a capacity or parse error here, so this is a
+# conformance check only; the daemon answers the arity error instead.
+chk "CF.RESERVE X BUCKETSIZE does not crash" "ERR wrong number of arguments for 'cf.reserve' command" \
+                                        "$($K CF.RESERVE qx 100 X BUCKETSIZE 2>&1)"
+chk "CF.RESERVE X MAXITERATIONS"        "ERR wrong number of arguments for 'cf.reserve' command" \
+                                        "$($K CF.RESERVE qx 100 X MAXITERATIONS 2>&1)"
+chk "CF.RESERVE X EXPANSION"            "ERR wrong number of arguments for 'cf.reserve' command" \
+                                        "$($K CF.RESERVE qx 100 X EXPANSION 2>&1)"
+chk "the daemon is still up"            "PONG" "$($K PING)"
+chk "no key was created"                "0" "$($K EXISTS qx)"
+chk "CF.INSERT CAPACITY with no value"  "ERR wrong number of arguments for 'cf.insert' command" \
+                                        "$($K CF.INSERT qx CAPACITY 2>&1)"
+chk "CF.LOADCHUNK of an empty chunk"    "Invalid header" "$($K CF.LOADCHUNK ecz 1 "" 2>&1)"
+chk "an empty chunk created no key"     "0" "$($K EXISTS ecz)"
+# duplicate option tokens: the first value wins, the way Redis 8 does it
+$K DEL d1 d2 d3 d4 >/dev/null 2>&1
+chk "CF.RESERVE BUCKETSIZE twice"       "OK" "$($K CF.RESERVE d1 1000 BUCKETSIZE 4 BUCKETSIZE 8 2>&1)"
+chk "the first BUCKETSIZE won"          "4" "$(cfi "$K" d1 'Bucket size')"
+chk "CF.RESERVE EXPANSION twice"        "OK" "$($K CF.RESERVE d2 1000 EXPANSION 2 EXPANSION 4 2>&1)"
+chk "the first EXPANSION won"           "2" "$(cfi "$K" d2 'Expansion rate')"
+chk "CF.RESERVE MAXITERATIONS twice"    "OK" "$($K CF.RESERVE d3 1000 MAXITERATIONS 5 MAXITERATIONS 9 2>&1)"
+chk "the first MAXITERATIONS won"       "5" "$(cfi "$K" d3 'Max iterations')"
+chk "CF.INSERT CAPACITY twice"          "1" "$($K CF.INSERT d4 CAPACITY 2000 CAPACITY 3000 ITEMS x 2>&1)"
+chk "the last CAPACITY won"             "2048" "$(cfi "$K" d4 'Number of buckets')"
+$K DEL d1 d2 d3 d4 ecz >/dev/null 2>&1
 chk "CF.INFO on a missing key"          "ERR not found" "$($K CF.INFO gone 2>&1)"
 chk "CF.INSERT NOCREATE on a missing key" "ERR not found" "$($K CF.INSERT gone NOCREATE ITEMS a 2>&1)"
 chk "CF.INSERTNX NOCREATE on a missing key" "ERR not found" "$($K CF.INSERTNX gone NOCREATE ITEMS a 2>&1)"
@@ -327,6 +353,19 @@ else
     $1 CF.RESERVE pe 100 EXPANSION 2>&1
     $1 CF.RESERVE pe 1000 BOGUS 2>&1
     $1 CF.RESERVE pe 1000 BOGUS 1 2 2>&1
+    $1 CF.INSERT pe CAPACITY 2>&1
+    $1 CF.LOADCHUNK pecz 1 "" 2>&1
+    $1 EXISTS pecz 2>&1
+    $1 CF.RESERVE pd1 1000 BUCKETSIZE 4 BUCKETSIZE 8 2>&1
+    cfi "$1" pd1 'Bucket size'
+    cfi "$1" pd1 'Number of buckets'
+    $1 CF.RESERVE pd2 1000 EXPANSION 2 EXPANSION 4 2>&1
+    cfi "$1" pd2 'Expansion rate'
+    $1 CF.RESERVE pd3 1000 MAXITERATIONS 5 MAXITERATIONS 9 2>&1
+    cfi "$1" pd3 'Max iterations'
+    $1 CF.INSERT pd4 CAPACITY 2000 CAPACITY 3000 ITEMS x 2>&1
+    cfi "$1" pd4 'Number of buckets'
+    cfi "$1" pd4 'Number of items inserted' 
     $1 CF.INSERT pe NOCREATE ITEMS a 2>&1
     $1 CF.INSERTNX pe NOCREATE ITEMS a 2>&1
     $1 CF.INSERT pe CAPACITY abc ITEMS a 2>&1
@@ -370,7 +409,9 @@ else
   }
   a=$(errs "$R8" | grep . | paste -sd'|'); b=$(errs "$K" | grep . | paste -sd'|')
   chk "error text parity"               "$a" "$b"
-  for R in "$K" "$R8"; do $R DEL pe pstr >/dev/null 2>&1; done
+  for R in "$K" "$R8"; do
+    $R DEL pe pstr pecz pd1 pd2 pd3 pd4 >/dev/null 2>&1
+  done
 
   # a full EXPANSION 0 filter answers the same way on both
   fulls() {

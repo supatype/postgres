@@ -35,6 +35,10 @@ items() { seq "$1" "$2" "$3" | sed 's/^/item:/'; }
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
 stop_pg()  { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop" >/dev/null 2>&1; }
 wait_ready() { for _ in $(seq 1 30); do psql_ "SELECT 1" | grep -q "^1$" && return 0; sleep 1; done; return 1; }
+# The run leaves the cluster up after the restart check. Stop it and drop the
+# data directory on every exit path, so the next CI step finds no postmaster.
+cleanup() { stop_pg; rm -rf "$PGDATA"; }
+trap cleanup EXIT
 wait_resp()  { for _ in $(seq 1 30); do rcli PING | grep -q PONG && return 0; sleep 1; done; return 1; }
 
 echo "=== build + install the extension ==="

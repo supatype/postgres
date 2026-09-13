@@ -15,7 +15,8 @@ const DEFAULT_CAPACITY: u64 = 100;
 const DEFAULT_ERROR: f64 = 0.01;
 const DEFAULT_EXPANSION: u32 = 2;
 const MAX_CAPACITY: u64 = 1 << 30;
-const MAX_FILTERS: usize = 32;
+const MAX_FILTERS: usize = 1024;
+const CF_MAX_FILTERS: usize = 32;
 const MAX_HASHES: u32 = 64;
 const MAX_BLOB_BYTES: usize = 512 * 1024 * 1024;
 const CHUNK_BYTES: usize = 16 * 1024 * 1024;
@@ -74,7 +75,7 @@ const CF_MAXITER_RANGE: &str = "MAXITERATIONS: value must be in the range [1, 65
 const CF_PARSE_EXPANSION: &str = "Couldn't parse EXPANSION";
 const CF_EXPANSION_RANGE: &str = "EXPANSION: value must be in the range [0, 32768]";
 const CF_FULL: &str = "Filter is full";
-const CF_MAX_EXPANSIONS: &str = "Maximum expansions reached";
+const MAX_EXPANSIONS: &str = "Maximum expansions reached";
 const CF_INVALID_POSITION: &str = "Invalid position";
 const CF_INVALID_HEADER: &str = "Invalid header";
 
@@ -180,7 +181,7 @@ fn rd_f64(b: &[u8], at: usize) -> Option<f64> {
 }
 
 fn chunk_bytes(max_bulk: usize) -> usize {
-    CHUNK_BYTES.min(max_bulk).max(1)
+    CHUNK_BYTES.min(max_bulk).max(C_HDR)
 }
 
 fn chunk_start(it: i64, len: usize) -> Option<usize> {
@@ -386,9 +387,6 @@ fn new_blob(error: f64, capacity: u64, expansion: u32, nonscaling: bool) -> Opti
 
 fn grown(blob: &[u8]) -> Option<Vec<u8>> {
     let f = parse(blob)?;
-    if f.subs.len() >= MAX_FILTERS {
-        return None;
-    }
     let last = f.subs.last()?;
     let capacity = last
         .capacity
@@ -428,7 +426,13 @@ fn add_in_place(blob: &mut [u8], item: &[u8]) -> Add {
         None => return Add::Bad,
     };
     if last.items >= last.capacity {
-        return if f.nonscaling() { Add::Full } else { Add::Grow };
+        if f.nonscaling() {
+            return Add::Full;
+        }
+        if f.subs.len() >= MAX_FILTERS {
+            return Add::MaxGrow;
+        }
+        return Add::Grow;
     }
     let bits = &mut blob[last.bitmap..last.bitmap + (last.bits / 8) as usize];
     for i in 0..last.hashes {
@@ -485,34 +489,45 @@ fn create(store: &Store, key: &[u8], spec: &Spec) -> bool {
     }
 }
 
-fn add_item(store: &Store, key: &[u8], item: &[u8]) -> Add {
-    match store.with_value_mut(key, |v| add_in_place(v, item)) {
-        None => Add::Bad,
-        Some(Add::Grow) => {
-            let (exp, blob) = match store.get_typed(key) {
-                Some((KIND_BLOOM, exp, v)) => (exp, v.to_vec()),
-                _ => return Add::Bad,
-            };
-            let mut next = match grown(&blob) {
-                Some(b) => b,
-                None => return Add::Oom,
-            };
-            let r = add_in_place(&mut next, item);
-            if r == Add::Bad {
-                return Add::Bad;
-            }
-            if !store.set_typed(key, &next, remaining_ttl(exp), KIND_BLOOM) {
+fn add_item(store: &Store, key: &[u8], item: &[u8], spec: &Spec) -> Add {
+    let first = match store.with_value_mut(key, |v| add_in_place(v, item)) {
+        Some(r) => Some(r),
+        None => {
+            if !create(store, key, spec) {
                 return Add::Oom;
             }
-            r
+            store.with_value_mut(key, |v| add_in_place(v, item))
         }
-        Some(other) => other,
+    };
+    let r = match first {
+        Some(r) => r,
+        None => return Add::Oom,
+    };
+    if r != Add::Grow {
+        return r;
     }
+    let (exp, blob) = match store.get_typed(key) {
+        Some((KIND_BLOOM, exp, v)) => (exp, v.to_vec()),
+        _ => return Add::Bad,
+    };
+    let mut next = match grown(&blob) {
+        Some(b) => b,
+        None => return Add::Oom,
+    };
+    let r = add_in_place(&mut next, item);
+    if r == Add::Bad {
+        return Add::Bad;
+    }
+    if !store.set_typed(key, &next, remaining_ttl(exp), KIND_BLOOM) {
+        return Add::Oom;
+    }
+    r
 }
 
 fn add_error(out: &mut Vec<u8>, r: &Add) -> bool {
     match r {
         Add::Full => resp::error(out, FILTER_FULL),
+        Add::MaxGrow => resp::error(out, MAX_EXPANSIONS),
         Add::Oom => resp::error(out, crate::server::OOM_ERR),
         Add::Bad => resp::error(out, BAD_DATA),
         _ => return false,
@@ -541,10 +556,17 @@ fn prepare(store: &Store, key: &[u8], spec: &Spec, nocreate: bool, out: &mut Vec
     }
 }
 
-fn add_many(store: &Store, key: &[u8], items: &[Vec<u8>], out: &mut Vec<u8>, resp3: bool) {
+fn add_many(
+    store: &Store,
+    key: &[u8],
+    items: &[Vec<u8>],
+    spec: &Spec,
+    out: &mut Vec<u8>,
+    resp3: bool,
+) {
     let mut results = Vec::with_capacity(items.len());
     for item in items {
-        let r = add_item(store, key, item);
+        let r = add_item(store, key, item, spec);
         let stop = matches!(r, Add::Full | Add::MaxGrow | Add::Oom | Add::Bad);
         results.push(r);
         if stop {
@@ -590,6 +612,13 @@ fn reserve(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
     let mut i = 4;
     while i < args.len() {
         if eq(&args[i], "EXPANSION") {
+            if saw_expansion {
+                if i + 1 < args.len() {
+                    return arity(out, cmd);
+                }
+                i += 1;
+                continue;
+            }
             if i + 1 >= args.len() {
                 return resp::error(out, NO_EXPANSION);
             }
@@ -635,7 +664,7 @@ fn add(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: bo
     if !prepare(store, &args[1], &Spec::default(), false, out) {
         return;
     }
-    let r = add_item(store, &args[1], &args[2]);
+    let r = add_item(store, &args[1], &args[2], &Spec::default());
     if !add_error(out, &r) {
         resp::boolean(out, r == Add::Added, resp3);
     }
@@ -648,7 +677,7 @@ fn madd(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: b
     if !prepare(store, &args[1], &Spec::default(), false, out) {
         return;
     }
-    add_many(store, &args[1], &args[2..], out, resp3);
+    add_many(store, &args[1], &args[2..], &Spec::default(), out, resp3);
 }
 
 fn insert(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: bool) {
@@ -682,8 +711,12 @@ fn insert(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3:
                 }
             } else if eq(&args[i], "ERROR") {
                 match arg_f64(&args[i + 1]) {
-                    Some(v) if v < MIN_ERROR => return resp::error(out, CANNOT_CREATE),
-                    Some(v) if v > 0.0 && v < 1.0 => spec.error = v,
+                    Some(v) if v > 0.0 && v < 1.0 => {
+                        if v < MIN_ERROR {
+                            return resp::error(out, CANNOT_CREATE);
+                        }
+                        spec.error = v;
+                    }
                     _ => return resp::error(out, INSERT_BAD_ERROR),
                 }
             } else {
@@ -707,7 +740,7 @@ fn insert(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3:
     if !prepare(store, &args[1], &spec, nocreate, out) {
         return;
     }
-    add_many(store, &args[1], items, out, resp3);
+    add_many(store, &args[1], items, &spec, out, resp3);
 }
 
 fn contains(store: &Store, key: &[u8], item: &[u8]) -> bool {
@@ -866,7 +899,7 @@ fn loadchunk(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
         return resp::error(out, BAD_DATA);
     }
     next.extend_from_slice(&args[3]);
-    if matches!(shape(&next), Shape::Bad) {
+    if next.len() < HDR || matches!(shape(&next), Shape::Bad) {
         return resp::error(out, BAD_DATA);
     }
     if store.set_typed(&args[1], &next, remaining_ttl(exp), KIND_BLOOM) {
@@ -917,7 +950,7 @@ fn cshape(blob: &[u8]) -> CShape {
         || maxiter > CF_MAX_MAXITER
         || expansion > CF_MAX_EXPANSION
         || filters == 0
-        || filters > MAX_FILTERS
+        || filters > CF_MAX_FILTERS
     {
         return CShape::Bad;
     }
@@ -1134,7 +1167,7 @@ fn cf_add_in_place(blob: &mut [u8], item: &[u8], nx: bool) -> Add {
         if c.expansion == 0 {
             return Add::Full;
         }
-        if c.subs.len() >= MAX_FILTERS {
+        if c.subs.len() >= CF_MAX_FILTERS {
             return Add::MaxGrow;
         }
         return Add::Grow;
@@ -1231,35 +1264,45 @@ fn cf_prepare(store: &Store, key: &[u8], spec: &CSpec, nocreate: bool, out: &mut
     }
 }
 
-fn cf_add_item(store: &Store, key: &[u8], item: &[u8], nx: bool) -> Add {
-    match store.with_value_mut(key, |v| cf_add_in_place(v, item, nx)) {
-        None => Add::Bad,
-        Some(Add::Grow) => {
-            let (exp, blob) = match store.get_typed(key) {
-                Some((KIND_CUCKOO, exp, v)) => (exp, v.to_vec()),
-                _ => return Add::Bad,
-            };
-            let mut next = match cf_grown(&blob) {
-                Some(b) => b,
-                None => return Add::Oom,
-            };
-            let r = cf_add_in_place(&mut next, item, nx);
-            if r == Add::Bad {
-                return Add::Bad;
-            }
-            if !store.set_typed(key, &next, remaining_ttl(exp), KIND_CUCKOO) {
+fn cf_add_item(store: &Store, key: &[u8], item: &[u8], nx: bool, spec: &CSpec) -> Add {
+    let first = match store.with_value_mut(key, |v| cf_add_in_place(v, item, nx)) {
+        Some(r) => Some(r),
+        None => {
+            if !cf_create(store, key, spec) {
                 return Add::Oom;
             }
-            r
+            store.with_value_mut(key, |v| cf_add_in_place(v, item, nx))
         }
-        Some(other) => other,
+    };
+    let r = match first {
+        Some(r) => r,
+        None => return Add::Oom,
+    };
+    if r != Add::Grow {
+        return r;
     }
+    let (exp, blob) = match store.get_typed(key) {
+        Some((KIND_CUCKOO, exp, v)) => (exp, v.to_vec()),
+        _ => return Add::Bad,
+    };
+    let mut next = match cf_grown(&blob) {
+        Some(b) => b,
+        None => return Add::Oom,
+    };
+    let r = cf_add_in_place(&mut next, item, nx);
+    if r == Add::Bad {
+        return Add::Bad;
+    }
+    if !store.set_typed(key, &next, remaining_ttl(exp), KIND_CUCKOO) {
+        return Add::Oom;
+    }
+    r
 }
 
 fn cf_add_error(out: &mut Vec<u8>, r: &Add) -> bool {
     match r {
         Add::Full => resp::error(out, CF_FULL),
-        Add::MaxGrow => resp::error(out, CF_MAX_EXPANSIONS),
+        Add::MaxGrow => resp::error(out, MAX_EXPANSIONS),
         Add::Oom => resp::error(out, crate::server::OOM_ERR),
         Add::Bad => resp::error(out, CF_INVALID_HEADER),
         _ => return false,
@@ -1267,19 +1310,24 @@ fn cf_add_error(out: &mut Vec<u8>, r: &Add) -> bool {
     true
 }
 
-fn cf_opts(args: &[Vec<u8>], from: usize, spec: &mut CSpec, out: &mut Vec<u8>) -> bool {
+fn cf_opts(cmd: &[u8], args: &[Vec<u8>], from: usize, spec: &mut CSpec, out: &mut Vec<u8>) -> bool {
+    let mut seen = [false; 3];
     let mut i = from;
     while i < args.len() {
-        let (text, range, lo, hi) = if eq(&args[i], "BUCKETSIZE") {
-            (CF_PARSE_BUCKETSIZE, CF_BUCKETSIZE_RANGE, 1, CF_MAX_BUCKET)
+        let (which, text, range, lo, hi) = if eq(&args[i], "BUCKETSIZE") {
+            (0usize, CF_PARSE_BUCKETSIZE, CF_BUCKETSIZE_RANGE, 1i64, CF_MAX_BUCKET as i64)
         } else if eq(&args[i], "MAXITERATIONS") {
-            (CF_PARSE_MAXITER, CF_MAXITER_RANGE, 1, CF_MAX_MAXITER)
+            (1, CF_PARSE_MAXITER, CF_MAXITER_RANGE, 1, CF_MAX_MAXITER as i64)
         } else if eq(&args[i], "EXPANSION") {
-            (CF_PARSE_EXPANSION, CF_EXPANSION_RANGE, 0, CF_MAX_EXPANSION)
+            (2, CF_PARSE_EXPANSION, CF_EXPANSION_RANGE, 0, CF_MAX_EXPANSION as i64)
         } else {
             i += 1;
             continue;
         };
+        if i + 1 >= args.len() {
+            arity(out, cmd);
+            return false;
+        }
         let v = match arg_i64(&args[i + 1]) {
             Some(v) => v,
             None => {
@@ -1287,16 +1335,17 @@ fn cf_opts(args: &[Vec<u8>], from: usize, spec: &mut CSpec, out: &mut Vec<u8>) -
                 return false;
             }
         };
-        if v < lo as i64 || v > hi as i64 {
+        if v < lo || v > hi {
             resp::error(out, range);
             return false;
         }
-        if eq(&args[i], "BUCKETSIZE") {
-            spec.bucket = v as u32;
-        } else if eq(&args[i], "MAXITERATIONS") {
-            spec.maxiter = v as u32;
-        } else {
-            spec.expansion = v as u32;
+        if !seen[which] {
+            seen[which] = true;
+            match which {
+                0 => spec.bucket = v as u32,
+                1 => spec.maxiter = v as u32,
+                _ => spec.expansion = v as u32,
+            }
         }
         i += 2;
     }
@@ -1315,7 +1364,7 @@ fn cf_reserve(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
         return arity(out, cmd);
     }
     let mut spec = CSpec::default();
-    if !cf_opts(args, 3, &mut spec, out) {
+    if !cf_opts(cmd, args, 3, &mut spec, out) {
         return;
     }
     if capacity < 2 * spec.bucket as i64 || capacity as u64 > MAX_CAPACITY {
@@ -1342,7 +1391,7 @@ fn cf_add(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3:
     if !cf_prepare(store, &args[1], &CSpec::default(), false, out) {
         return;
     }
-    let r = cf_add_item(store, &args[1], &args[2], nx);
+    let r = cf_add_item(store, &args[1], &args[2], nx, &CSpec::default());
     if !cf_add_error(out, &r) {
         resp::boolean(out, r == Add::Added, resp3);
     }
@@ -1392,7 +1441,7 @@ fn cf_insert(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, res
     }
     let mut results = Vec::with_capacity(items.len());
     for item in items {
-        let r = cf_add_item(store, &args[1], item, nx);
+        let r = cf_add_item(store, &args[1], item, nx, &spec);
         match r {
             Add::Added => results.push(1i64),
             Add::Present => results.push(0),
@@ -1557,7 +1606,7 @@ fn cf_loadchunk(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) 
         return resp::error(out, CF_INVALID_HEADER);
     }
     next.extend_from_slice(&args[3]);
-    if matches!(cshape(&next), CShape::Bad) {
+    if next.len() < C_HDR || matches!(cshape(&next), CShape::Bad) {
         return resp::error(out, CF_INVALID_HEADER);
     }
     if store.set_typed(&args[1], &next, remaining_ttl(exp), KIND_CUCKOO) {
@@ -2609,10 +2658,10 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(stopped, Some(format!("-{CF_MAX_EXPANSIONS}\r\n")));
+        assert_eq!(stopped, Some(format!("-{MAX_EXPANSIONS}\r\n")));
         assert_eq!(
             cf_parse(s.get_typed(b"m").unwrap().2).unwrap().subs.len(),
-            MAX_FILTERS
+            CF_MAX_FILTERS
         );
     }
 
@@ -2920,7 +2969,204 @@ mod tests {
         }
         assert_eq!(total, blob_len);
         assert!(chunks > 1);
-        assert_eq!(chunk_bytes(0), 1);
+        assert_eq!(chunk_bytes(0), C_HDR);
         assert_eq!(chunk_bytes(usize::MAX), CHUNK_BYTES);
+    }
+
+    #[test]
+    fn an_option_keyword_with_no_value_never_reads_past_the_arguments() {
+        let s = Store::create("t_prob_bounds", &cfg(1024 * 1024)).unwrap();
+        let cf = "-ERR wrong number of arguments for 'cf.reserve' command\r\n";
+        assert_eq!(run(&s, &["CF.RESERVE", "k", "100", "X", "BUCKETSIZE"]), cf);
+        assert_eq!(run(&s, &["CF.RESERVE", "k", "100", "X", "MAXITERATIONS"]), cf);
+        assert_eq!(run(&s, &["CF.RESERVE", "k", "100", "X", "EXPANSION"]), cf);
+        assert_eq!(run(&s, &["CF.RESERVE", "k", "100", "A", "B", "C", "BUCKETSIZE"]), cf);
+        assert!(s.get_typed(b"k").is_none());
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "k", "0.01", "100", "X", "EXPANSION"]),
+            format!("-{NO_EXPANSION}\r\n")
+        );
+        assert_eq!(
+            run(&s, &["BF.INSERT", "k", "CAPACITY"]),
+            "-ERR wrong number of arguments for 'bf.insert' command\r\n"
+        );
+        assert_eq!(
+            run(&s, &["CF.INSERT", "k", "CAPACITY"]),
+            "-ERR wrong number of arguments for 'cf.insert' command\r\n"
+        );
+        assert_eq!(
+            run(&s, &["BF.INSERT", "k", "ITEMS", "a", "ERROR"]),
+            "*2\r\n:1\r\n:1\r\n"
+        );
+    }
+
+    #[test]
+    fn duplicate_and_unknown_option_tokens_follow_redis() {
+        let s = Store::create("t_prob_dupopts", &cfg(1024 * 1024)).unwrap();
+        assert_eq!(run(&s, &["BF.RESERVE", "b1", "0.01", "100", "BOGUS"]), "+OK\r\n");
+        assert_eq!(run(&s, &["BF.RESERVE", "b2", "0.01", "100", "BOGUS", "BOGUS"]), "+OK\r\n");
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "b3", "0.01", "100", "NONSCALING", "NONSCALING"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "b4", "0.01", "100", "EXPANSION", "2", "EXPANSION", "3"]),
+            "-ERR wrong number of arguments for 'bf.reserve' command\r\n"
+        );
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "b5", "0.01", "100", "EXPANSION", "2", "EXPANSION"]),
+            "+OK\r\n"
+        );
+        assert_eq!(run(&s, &["BF.INFO", "b5", "EXPANSION"]), "*1\r\n:2\r\n");
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "b6", "0.01", "100", "X", "EXPANSION", "3"]),
+            "+OK\r\n"
+        );
+        assert_eq!(run(&s, &["BF.INFO", "b6", "EXPANSION"]), "*1\r\n:3\r\n");
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "b7", "0.01", "100", "EXPANSION", "3", "X"]),
+            "+OK\r\n"
+        );
+        assert_eq!(run(&s, &["BF.INFO", "b7", "EXPANSION"]), "*1\r\n:3\r\n");
+
+        assert_eq!(
+            run(&s, &["CF.RESERVE", "c1", "1000", "BUCKETSIZE", "4", "BUCKETSIZE", "8"]),
+            "+OK\r\n"
+        );
+        assert_eq!(cf_parse(s.get_typed(b"c1").unwrap().2).unwrap().bucket, 4);
+        assert_eq!(
+            run(&s, &["CF.RESERVE", "c2", "1000", "EXPANSION", "2", "EXPANSION", "4"]),
+            "+OK\r\n"
+        );
+        assert_eq!(cf_parse(s.get_typed(b"c2").unwrap().2).unwrap().expansion, 2);
+        assert_eq!(
+            run(&s, &["CF.RESERVE", "c3", "1000", "MAXITERATIONS", "5", "MAXITERATIONS", "9"]),
+            "+OK\r\n"
+        );
+        assert_eq!(cf_parse(s.get_typed(b"c3").unwrap().2).unwrap().maxiter, 5);
+
+        assert_eq!(
+            run(&s, &["BF.INSERT", "i1", "CAPACITY", "200", "CAPACITY", "300", "ITEMS", "x"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(run(&s, &["BF.INFO", "i1", "CAPACITY"]), "*1\r\n:300\r\n");
+        assert_eq!(
+            run(&s, &["BF.INSERT", "i2", "EXPANSION", "2", "EXPANSION", "3", "ITEMS", "x"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(run(&s, &["BF.INFO", "i2", "EXPANSION"]), "*1\r\n:3\r\n");
+        assert_eq!(
+            run(&s, &["CF.INSERT", "i3", "CAPACITY", "2000", "CAPACITY", "3000", "ITEMS", "x"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            cf_parse(s.get_typed(b"i3").unwrap().2).unwrap().subs[0].buckets,
+            2048
+        );
+    }
+
+    #[test]
+    fn an_empty_first_chunk_creates_no_key() {
+        let s = Store::create("t_prob_empty_chunk", &cfg(1024 * 1024)).unwrap();
+        let load = vec![
+            b"BF.LOADCHUNK".to_vec(),
+            b"zz".to_vec(),
+            b"1".to_vec(),
+            Vec::new(),
+        ];
+        let mut out = Vec::new();
+        dispatch(&s, b"BF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
+        assert_eq!(String::from_utf8_lossy(&out), format!("-{BAD_DATA}\r\n"));
+        assert!(s.get_typed(b"zz").is_none(), "an empty chunk must not create a key");
+        assert_eq!(run(&s, &["BF.RESERVE", "zz", "0.01", "100"]), "+OK\r\n");
+
+        let load = vec![
+            b"CF.LOADCHUNK".to_vec(),
+            b"cz".to_vec(),
+            b"1".to_vec(),
+            Vec::new(),
+        ];
+        let mut out = Vec::new();
+        dispatch(&s, b"CF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
+        assert_eq!(String::from_utf8_lossy(&out), format!("-{CF_INVALID_HEADER}\r\n"));
+        assert!(s.get_typed(b"cz").is_none());
+        assert_eq!(run(&s, &["CF.RESERVE", "cz", "100"]), "+OK\r\n");
+
+        assert_eq!(run(&s, &["BF.LOADCHUNK", "hz", "2", "\u{1}"]), format!("-{BAD_DATA}\r\n"));
+        assert!(s.get_typed(b"hz").is_none());
+        assert_eq!(run(&s, &["CF.LOADCHUNK", "hc", "2", "\u{2}"]), format!("-{CF_INVALID_HEADER}\r\n"));
+        assert!(s.get_typed(b"hc").is_none());
+        assert!(chunk_bytes(1) >= C_HDR, "a dump chunk must carry a whole header");
+    }
+
+    #[test]
+    fn a_bloom_chain_at_its_cap_reports_maximum_expansions() {
+        let s = Store::create("t_bloom_maxgrow", &cfg(8 * 1024 * 1024)).unwrap();
+        assert_eq!(run(&s, &["BF.RESERVE", "mfx", "0.01", "1", "EXPANSION", "1"]), "+OK\r\n");
+        for i in 0..60u32 {
+            let r = run(&s, &["BF.ADD", "mfx", &format!("f{i}")]);
+            assert!(r == ":1\r\n" || r == ":0\r\n", "BF.ADD answered {r} at item {i}");
+        }
+        assert!(parse(s.get_typed(b"mfx").unwrap().2).unwrap().subs.len() > 32);
+
+        assert_eq!(run(&s, &["BF.RESERVE", "cap", "0.01", "1", "EXPANSION", "1"]), "+OK\r\n");
+        let mut stopped = None;
+        for i in 0..4000u32 {
+            let r = run(&s, &["BF.ADD", "cap", &format!("c{i}")]);
+            if r != ":1\r\n" && r != ":0\r\n" {
+                stopped = Some(r);
+                break;
+            }
+        }
+        assert_eq!(stopped, Some(format!("-{MAX_EXPANSIONS}\r\n")));
+        assert_eq!(
+            parse(s.get_typed(b"cap").unwrap().2).unwrap().subs.len(),
+            MAX_FILTERS
+        );
+    }
+
+    #[test]
+    fn an_error_rate_outside_the_range_is_a_bad_error_rate() {
+        let s = Store::create("t_prob_errrange", &cfg(1024 * 1024)).unwrap();
+        for bad in ["-1", "0", "2"] {
+            assert_eq!(
+                run(&s, &["BF.INSERT", "e", "ERROR", bad, "ITEMS", "a"]),
+                format!("-{INSERT_BAD_ERROR}\r\n"),
+                "BF.INSERT ERROR {bad}"
+            );
+            assert_eq!(
+                run(&s, &["BF.RESERVE", "r", "0.01", "100"]).is_empty(),
+                false
+            );
+        }
+        for bad in ["-1", "0", "1.0", "2"] {
+            assert_eq!(
+                run(&s, &["BF.RESERVE", "rr", bad, "100"]),
+                format!("-{ERROR_RANGE}\r\n"),
+                "BF.RESERVE {bad}"
+            );
+        }
+        assert_eq!(
+            run(&s, &["BF.INSERT", "e", "ERROR", "5e-324", "ITEMS", "a"]),
+            format!("-{CANNOT_CREATE}\r\n")
+        );
+    }
+
+    #[test]
+    fn an_add_retries_when_the_key_lapses_inside_the_command() {
+        let s = Store::create("t_prob_lapse", &cfg(1024 * 1024)).unwrap();
+        let blob = new_blob(0.01, 100, 2, false).unwrap();
+        assert!(s.set_typed(b"g", &blob, 1, KIND_BLOOM));
+        assert!(matches!(add_item(&s, b"g", b"x", &Spec::default()), Add::Added));
+        assert_eq!(run(&s, &["BF.EXISTS", "g", "x"]), ":1\r\n");
+        assert_eq!(run(&s, &["BF.CARD", "g"]), ":1\r\n");
+
+        let cblob = cf_new_blob(&cspec(1000)).unwrap();
+        assert!(s.set_typed(b"c", &cblob, 1, KIND_CUCKOO));
+        assert!(matches!(
+            cf_add_item(&s, b"c", b"y", false, &CSpec::default()),
+            Add::Added
+        ));
+        assert_eq!(run(&s, &["CF.EXISTS", "c", "y"]), ":1\r\n");
     }
 }
