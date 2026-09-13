@@ -1997,6 +1997,76 @@ start_pg; wait_ready; sleep 2
 chk "the cluster is healthy again with read-through back off" "1" "$(psql_ "SELECT 1")"
 
 echo ""
+echo "########## AK. composite primary keys (#10) ##########"
+# Registering one column of a composite key was refused outright, and correctly:
+# matching a query that constrains that column alone to a row cached under the
+# whole key would serve one row where the query asks for a set. A row is now
+# keyed by every pk column instead.
+#
+# The table is declared PRIMARY KEY (b, a) on purpose. Its index-column order is
+# [b, a] but its attnum order is [a, b], so a side that composed the key in index
+# order would disagree with the decode plugin, which reads its key columns out of
+# a Bitmapset and is therefore inherently ascending. Declared (a, b) this section
+# would pass with that bug present.
+psql_ "DROP TABLE IF EXISTS public.ck CASCADE" >/dev/null 2>&1
+psql_ "CREATE TABLE public.ck(a bigint, b text, v text, PRIMARY KEY (b, a))" >/dev/null
+psql_ "INSERT INTO public.ck VALUES (1,'x','one-x'),(2,'x','two-x'),(1,'y','one-y')" >/dev/null
+chk "the single-column form still refuses a composite key" "f" \
+    "$(psql_ "SELECT supacache.rowcache_register('public.ck', 1)")"
+chk "the general form registers it" "t" "$(psql_ "SELECT supacache.rowcache_register('public.ck')")"
+chk "and reports its columns in attnum order, not index order" "{a,b}" \
+    "$(psql_ "SELECT supacache.rowcache_registration('public.ck')::text")"
+chk "the invalidation worker is up, so the cache is served at all" "1" "$(wait_coherent 30)"
+
+chk "the row is not cached before it is put" "" \
+    "$(psql_ "SELECT supacache.rowcache_cached_pk_has_external('public.ck', ARRAY['1','x'])")"
+chk "a composite put caches it" "t" \
+    "$(psql_ "SELECT supacache.rowcache_put_pk('public.ck', ARRAY['1','x'])")"
+chk "and the probe finds it" "f" \
+    "$(psql_ "SELECT supacache.rowcache_cached_pk_has_external('public.ck', ARRAY['1','x'])")"
+
+# The whole point: a full key is served, a partial key is not.
+chk "a full-key query is served from the cache" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.ck WHERE a=1 AND b='x'" | grep -c 'pg_keyspace_rowcache')"
+chk "and returns the right row" "one-x" "$(psql_ "SELECT v FROM public.ck WHERE a=1 AND b='x'")"
+chk "a PARTIAL key is not served from the cache" "0" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.ck WHERE b='x'" | grep -c 'pg_keyspace_rowcache')"
+chk "and a partial key still returns the whole set" "2" \
+    "$(psql_ "SELECT count(*) FROM public.ck WHERE b='x'")"
+chk "a different row on the same partial key is not a wrong hit" "two-x" \
+    "$(psql_ "SELECT v FROM public.ck WHERE a=2 AND b='x'")"
+
+# End-to-end proof that the plugin's emission and the planner's key agree: a
+# plugin emitting one part would compose a key that never matches the two-part
+# cached entry, so the entry would never be dropped and the stale row would go
+# on being served.
+psql_ "UPDATE public.ck SET v='one-x-v2' WHERE a=1 AND b='x'" >/dev/null
+AK_INV=0
+for _ in $(seq 1 30); do
+  [ "$(psql_ "SELECT v FROM public.ck WHERE a=1 AND b='x'")" = "one-x-v2" ] && { AK_INV=1; break; }
+  sleep 1
+done
+chk "an UPDATE to a cached composite row is seen (within 30s)" "1" "$AK_INV"
+chk "and the heap agrees" "one-x-v2" "$(psql_ "SELECT v FROM public.ck WHERE a+0=1 AND b='x'")"
+
+# A single-column key must be untouched by all of this, including the key bytes
+# it is cached under -- which is what the two probes agreeing proves.
+psql_ "DROP TABLE IF EXISTS public.sk1 CASCADE" >/dev/null 2>&1
+psql_ "CREATE TABLE public.sk1(id bigint primary key, v text)" >/dev/null
+psql_ "INSERT INTO public.sk1 VALUES (1,'one'),(2,'two')" >/dev/null
+chk "a single-column table still registers through the two-argument form" "t" \
+    "$(psql_ "SELECT supacache.rowcache_register('public.sk1', 1)")"
+chk "and through the general one" "t" "$(psql_ "SELECT supacache.rowcache_register('public.sk1')")"
+chk "put still works" "t" "$(psql_ "SELECT supacache.rowcache_put('public.sk1', 2)")"
+chk "the single-column probe finds it" "f" \
+    "$(psql_ "SELECT supacache.rowcache_cached_has_external('public.sk1', 2::bigint)")"
+chk "and the composite probe finds the same entry" "f" \
+    "$(psql_ "SELECT supacache.rowcache_cached_pk_has_external('public.sk1', ARRAY['2'])")"
+chk "it is served from the cache" "1" \
+    "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.sk1 WHERE id=2" | grep -c 'pg_keyspace_rowcache')"
+chk "and reads correctly" "two" "$(psql_ "SELECT v FROM public.sk1 WHERE id=2")"
+
+echo ""
 echo "================================================"
 echo "# result: $pass passed, $fail failed"
 echo "================================================"
