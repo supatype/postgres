@@ -423,14 +423,14 @@ fn add_in_place(blob: &mut [u8], item: &[u8]) -> Add {
 
 enum Kind {
     Absent,
-    Filter(i64),
+    Filter,
     Other,
 }
 
 fn kind_of(store: &Store, key: &[u8]) -> Kind {
     match store.get_typed(key) {
         None => Kind::Absent,
-        Some((KIND_BLOOM, exp, _)) => Kind::Filter(exp),
+        Some((KIND_BLOOM, _, _)) => Kind::Filter,
         Some(_) => Kind::Other,
     }
 }
@@ -494,7 +494,7 @@ fn add_error(out: &mut Vec<u8>, r: &Add) -> bool {
 
 fn prepare(store: &Store, key: &[u8], spec: &Spec, nocreate: bool, out: &mut Vec<u8>) -> bool {
     match kind_of(store, key) {
-        Kind::Filter(_) => true,
+        Kind::Filter => true,
         Kind::Other => {
             resp::error(out, WRONGTYPE);
             false
@@ -584,7 +584,7 @@ fn reserve(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
     }
     match kind_of(store, &args[1]) {
         Kind::Other => resp::error(out, WRONGTYPE),
-        Kind::Filter(_) => resp::error(out, ITEM_EXISTS),
+        Kind::Filter => resp::error(out, ITEM_EXISTS),
         Kind::Absent => {
             if create(store, &args[1], &spec) {
                 resp::simple(out, "OK");
@@ -965,17 +965,23 @@ fn cf_sub_bytes(c: &Cuckoo, s: &CSub) -> usize {
     (s.buckets * c.bucket as u64) as usize
 }
 
-fn cf_sub_insert(data: &mut [u8], buckets: u64, bucket: u32, maxiter: u32, h: u64, fp: u8) -> bool {
+fn cf_sub_place(data: &mut [u8], buckets: u64, bucket: u32, h: u64, fp: u8) -> bool {
     let i1 = h & (buckets - 1);
-    let i2 = cf_alt(i1, fp, buckets);
     if let Some(k) = cf_slot(data, i1, bucket, 0) {
         data[k] = fp;
         return true;
     }
+    let i2 = cf_alt(i1, fp, buckets);
     if let Some(k) = cf_slot(data, i2, bucket, 0) {
         data[k] = fp;
         return true;
     }
+    false
+}
+
+fn cf_sub_kick(data: &mut [u8], buckets: u64, bucket: u32, maxiter: u32, h: u64, fp: u8) -> bool {
+    let i1 = h & (buckets - 1);
+    let i2 = cf_alt(i1, fp, buckets);
     let mut seed = h | 1;
     let mut i = if xorshift(&mut seed) & 1 == 0 { i1 } else { i2 };
     let mut cur = fp;
@@ -997,6 +1003,15 @@ fn cf_sub_insert(data: &mut [u8], buckets: u64, bucket: u32, maxiter: u32, h: u6
         data[at] = victim;
     }
     false
+}
+
+fn cf_has(blob: &[u8], c: &Cuckoo, h: u64, fp: u8) -> bool {
+    c.subs.iter().any(|s| {
+        let data = &blob[s.data..s.data + cf_sub_bytes(c, s)];
+        let i1 = h & (s.buckets - 1);
+        cf_slot(data, i1, c.bucket, fp).is_some()
+            || cf_slot(data, cf_alt(i1, fp, s.buckets), c.bucket, fp).is_some()
+    })
 }
 
 fn cf_count_blob(blob: &[u8], c: &Cuckoo, h: u64, fp: u8) -> u64 {
@@ -1053,22 +1068,32 @@ fn cf_add_in_place(blob: &mut [u8], item: &[u8], nx: bool) -> Add {
         None => return Add::Bad,
     };
     let (h, fp) = cf_parts(item);
-    if nx && cf_count_blob(blob, &c, h, fp) > 0 {
+    if nx && cf_has(blob, &c, h, fp) {
         return Add::Present;
     }
-    let last = match c.subs.last() {
-        Some(s) => s,
-        None => return Add::Bad,
-    };
-    let end = last.data + cf_sub_bytes(&c, last);
-    let placed = cf_sub_insert(
-        &mut blob[last.data..end],
-        last.buckets,
-        c.bucket,
-        c.maxiter,
-        h,
-        fp,
-    );
+    let mut placed = false;
+    for s in c.subs.iter().rev() {
+        let end = s.data + cf_sub_bytes(&c, s);
+        if cf_sub_place(&mut blob[s.data..end], s.buckets, c.bucket, h, fp) {
+            placed = true;
+            break;
+        }
+    }
+    if !placed {
+        let last = match c.subs.last() {
+            Some(s) => s,
+            None => return Add::Bad,
+        };
+        let end = last.data + cf_sub_bytes(&c, last);
+        placed = cf_sub_kick(
+            &mut blob[last.data..end],
+            last.buckets,
+            c.bucket,
+            c.maxiter,
+            h,
+            fp,
+        );
+    }
     if !placed {
         if c.expansion == 0 {
             return Add::Full;
@@ -1129,14 +1154,14 @@ impl Default for CSpec {
 fn cf_kind_of(store: &Store, key: &[u8]) -> Kind {
     match store.get_typed(key) {
         None => Kind::Absent,
-        Some((KIND_CUCKOO, exp, _)) => Kind::Filter(exp),
+        Some((KIND_CUCKOO, _, _)) => Kind::Filter,
         Some(_) => Kind::Other,
     }
 }
 
 fn cf_prepare(store: &Store, key: &[u8], spec: &CSpec, nocreate: bool, out: &mut Vec<u8>) -> bool {
     match cf_kind_of(store, key) {
-        Kind::Filter(_) => true,
+        Kind::Filter => true,
         Kind::Other => {
             resp::error(out, WRONGTYPE);
             false
@@ -1255,7 +1280,7 @@ fn cf_reserve(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
     spec.capacity = capacity as u64;
     match cf_kind_of(store, &args[1]) {
         Kind::Other => resp::error(out, WRONGTYPE),
-        Kind::Filter(_) => resp::error(out, ITEM_EXISTS),
+        Kind::Filter => resp::error(out, ITEM_EXISTS),
         Kind::Absent => {
             let created = match cf_new_blob(&spec) {
                 Some(b) => store.set_typed(&args[1], &b, 0, KIND_CUCKOO),
@@ -1348,6 +1373,19 @@ fn cf_insert(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, res
     }
 }
 
+fn cf_contains(store: &Store, key: &[u8], item: &[u8]) -> bool {
+    let blob = match store.get_typed(key) {
+        Some((KIND_CUCKOO, _, v)) => v,
+        _ => return false,
+    };
+    let c = match cf_parse(blob) {
+        Some(c) => c,
+        None => return false,
+    };
+    let (h, fp) = cf_parts(item);
+    cf_has(blob, &c, h, fp)
+}
+
 fn cf_occurrences(store: &Store, key: &[u8], item: &[u8]) -> u64 {
     let blob = match store.get_typed(key) {
         Some((KIND_CUCKOO, _, v)) => v,
@@ -1365,7 +1403,7 @@ fn cf_exists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, res
     if args.len() != 3 {
         return arity(out, cmd);
     }
-    resp::boolean(out, cf_occurrences(store, &args[1], &args[2]) > 0, resp3);
+    resp::boolean(out, cf_contains(store, &args[1], &args[2]), resp3);
 }
 
 fn cf_mexists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: bool) {
@@ -1374,7 +1412,7 @@ fn cf_mexists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, re
     }
     resp::array_header(out, args.len() - 2);
     for item in &args[2..] {
-        resp::boolean(out, cf_occurrences(store, &args[1], item) > 0, resp3);
+        resp::boolean(out, cf_contains(store, &args[1], item), resp3);
     }
 }
 
@@ -1389,7 +1427,7 @@ fn cf_del(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3:
     if args.len() != 3 {
         return arity(out, cmd);
     }
-    if !matches!(cf_kind_of(store, &args[1]), Kind::Filter(_)) {
+    if !matches!(cf_kind_of(store, &args[1]), Kind::Filter) {
         return resp::error(out, CF_NOT_FOUND);
     }
     match store.with_value_mut(&args[1], |v| cf_del_in_place(v, &args[2])) {
@@ -1459,7 +1497,7 @@ fn cf_loadchunk(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) 
     let (exp, mut next) = if start == 0 {
         match cf_kind_of(store, &args[1]) {
             Kind::Other => return resp::error(out, WRONGTYPE),
-            Kind::Filter(_) => return resp::error(out, ITEM_EXISTS),
+            Kind::Filter => return resp::error(out, ITEM_EXISTS),
             Kind::Absent => (0, Vec::new()),
         }
     } else {
@@ -1962,6 +2000,11 @@ mod tests {
         assert_eq!(encoding_name(crate::store::KIND_SET), None);
     }
 
+    fn place(data: &mut [u8], buckets: u64, bucket: u32, maxiter: u32, h: u64, fp: u8) -> bool {
+        cf_sub_place(data, buckets, bucket, h, fp)
+            || cf_sub_kick(data, buckets, bucket, maxiter, h, fp)
+    }
+
     fn cspec(capacity: u64) -> CSpec {
         CSpec {
             capacity,
@@ -2153,7 +2196,7 @@ mod tests {
         let mut table = vec![0u8; 128];
         for it in &items {
             let (h, fp) = cf_parts(it.as_bytes());
-            if cf_sub_insert(&mut table, 64, 2, 0, h, fp) {
+            if place(&mut table, 64, 2, 0, h, fp) {
                 direct += 1;
             }
         }
@@ -2161,7 +2204,7 @@ mod tests {
         let mut table = vec![0u8; 128];
         for it in &items {
             let (h, fp) = cf_parts(it.as_bytes());
-            if cf_sub_insert(&mut table, 64, 2, 20, h, fp) {
+            if place(&mut table, 64, 2, 20, h, fp) {
                 placed.push(it.clone());
             }
         }
@@ -2189,7 +2232,7 @@ mod tests {
         for i in 0..400u32 {
             let item = format!("fail-{i}");
             let (h, fp) = cf_parts(item.as_bytes());
-            if cf_sub_insert(&mut table, 64, 2, 20, h, fp) {
+            if place(&mut table, 64, 2, 20, h, fp) {
                 placed.push(item);
             }
         }
@@ -2288,6 +2331,54 @@ mod tests {
                 "member-{i} must still be present"
             );
         }
+    }
+
+    fn cf_fill(blob: &mut Vec<u8>, item: &[u8]) {
+        loop {
+            match cf_add_in_place(blob, item, false) {
+                Add::Added => return,
+                Add::Grow => *blob = cf_grown(blob).expect("growth must succeed"),
+                other => panic!("insert refused ({})", other == Add::Full),
+            }
+        }
+    }
+
+    #[test]
+    fn a_right_sized_filter_holds_its_capacity_in_two_sub_filters() {
+        let n = 1_000_000u32;
+        let mut blob = cf_new_blob(&cspec(n as u64)).unwrap();
+        for i in 0..n {
+            cf_fill(&mut blob, format!("item-{i}").as_bytes());
+        }
+        let c = cf_parse(&blob).unwrap();
+        assert!(
+            c.subs.len() <= 2,
+            "{n} items in a capacity-{n} filter needed {} sub filters",
+            c.subs.len()
+        );
+        assert_eq!(c.items, n as u64);
+        for i in (0..n).step_by(997) {
+            let (h, fp) = cf_parts(format!("item-{i}").as_bytes());
+            assert!(cf_has(&blob, &c, h, fp), "item-{i} was lost");
+        }
+    }
+
+    #[test]
+    fn three_million_adds_from_a_million_item_space_stay_under_eight_sub_filters() {
+        let space = 1_000_000u64;
+        let mut blob = cf_new_blob(&cspec(space)).unwrap();
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        for _ in 0..3_000_000u32 {
+            let k = xorshift(&mut seed) % space;
+            cf_fill(&mut blob, format!("item:{k}").as_bytes());
+        }
+        let c = cf_parse(&blob).unwrap();
+        assert!(
+            c.subs.len() <= 8,
+            "3 000 000 adds needed {} sub filters",
+            c.subs.len()
+        );
+        assert_eq!(c.items, 3_000_000);
     }
 
     #[test]
