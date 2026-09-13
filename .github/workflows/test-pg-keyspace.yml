@@ -279,6 +279,16 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_tls_inherit.sh
 
+      # Correctness: a registration must survive a segment reinitialisation.
+      # Its own cluster and ports, and it needs the C output plugin, which it
+      # builds itself.
+      - name: Row-cache registration durability
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_rowcache_registration.sh
+
       - name: Durability + fault injection suite
         env:
           PGKS_BUILD_PROFILE: debug

@@ -2025,6 +2025,23 @@ fn pg_ensure_schema() {
         let _ = Spi::run(
             "ALTER TABLE supacache.kv_ttl ADD COLUMN IF NOT EXISTS kind \"char\" NOT NULL DEFAULT 's'",
         );
+        // Row-cache registrations. A registration is configuration, not cache
+        // content, and shared memory is the wrong home for configuration: a
+        // segment reinitialisation (watchdog relaunch, crash-restart, a
+        // terminated worker) took the pinned entry with it, and the table then
+        // silently stopped being cached with no error and a healthy-looking
+        // coherence check (#103). This table is the source of truth; the pinned
+        // shared-memory entry is a cache of it, reloaded whenever the segment
+        // turns out to be empty.
+        //
+        // Keyed by name rather than by oid so a dump/restore or a table
+        // recreated by a migration keeps its registration; the oid is resolved
+        // afresh on every reload.
+        let _ = Spi::run(
+            "CREATE TABLE IF NOT EXISTS supacache.rowcache_reg (\
+             tbl text PRIMARY KEY, attnums smallint[] NOT NULL, \
+             registered_at timestamptz NOT NULL DEFAULT now())",
+        );
         // Crash recovery in a multi-worker cluster reads one contiguous slot
         // range per worker (see pg_recover), so index the column it ranges over.
         // Single-worker recovery scans unfiltered and ignores these.
@@ -2824,6 +2841,18 @@ pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
     log!("pg_keyspace invalidation: draining slot '{slot}' every {poll:?} (keys-only)");
     while !BackgroundWorker::sigterm_received() {
         health_beat(health);
+        // A segment with no load marker is a fresh one -- this worker was
+        // relaunched, or the segment was reinitialised underneath a worker that
+        // was not -- so the pinned registrations in the previous instance are
+        // gone. Reload them from the catalogue before draining, or the tables
+        // an operator registered would quietly stop being cached (#103). O(1)
+        // when nothing is wrong, which is every pass but the first.
+        if !registrations_loaded() {
+            let n = load_registrations_worker();
+            if n > 0 {
+                log!("pg_keyspace invalidation: loaded {n} row-cache registration(s) into a fresh segment");
+            }
+        }
         let d = drain_invalidations(&slot);
         if d.reconciled > 0 {
             log!(
@@ -2975,6 +3004,90 @@ fn rc_reg_key(relid: u32) -> [u8; 5] {
     let mut k = [0xffu8; 5];
     k[1..].copy_from_slice(&relid.to_le_bytes());
     k
+}
+
+/// Marks that this instance of the row-cache segment has had the registrations
+/// in `supacache.rowcache_reg` loaded into it.
+///
+/// A distinct first byte from `rc_reg_key`, so it can never collide with a
+/// registration for some relid. Pinned like the registrations it vouches for,
+/// so its absence means exactly one thing: this is a *fresh* segment, and
+/// whatever was pinned into the previous one is gone.
+const RC_LOADED_KEY: [u8; 5] = [0xfe, 0xfe, 0xfe, 0xfe, 0xfe];
+
+/// Have the registrations been loaded into the segment currently mapped?
+///
+/// O(1), so the invalidation worker can ask on every pass. It deliberately
+/// tests the marker rather than tracking a generation number in worker-local
+/// state: a worker that never restarted still needs to notice a segment that
+/// was reinitialised underneath it.
+fn registrations_loaded() -> bool {
+    match rowcache_view() {
+        Some(v) => matches!(v.get(&RC_LOADED_KEY), Lookup::Hit(_)),
+        // No segment at all: nothing to load into, and nothing to report.
+        None => true,
+    }
+}
+
+/// Load every registration from `supacache.rowcache_reg` into the row-cache
+/// segment and mark it loaded. Returns how many were pinned.
+///
+/// Must be called with an SPI connection already open (a backend, or inside
+/// `BackgroundWorker::transaction`).
+///
+/// Names are resolved to oids here rather than stored as oids, so a table that
+/// was dropped is skipped and one that was recreated picks up its registration
+/// again. `to_regclass` returns NULL instead of raising for a name that no
+/// longer resolves, which is the common case after a migration.
+fn load_registrations_spi() -> i64 {
+    let view = match rowcache_view() {
+        Some(v) => v,
+        None => return 0,
+    };
+    let rows: Vec<(u32, Vec<i16>)> = Spi::connect(|client| {
+        let mut out = Vec::new();
+        let t = match client.select(
+            "SELECT to_regclass(r.tbl)::oid, r.attnums FROM supacache.rowcache_reg r \
+             WHERE to_regclass(r.tbl) IS NOT NULL",
+            None,
+            None,
+        ) {
+            Ok(t) => t,
+            Err(_) => return out,
+        };
+        for row in t {
+            if let (Ok(Some(oid)), Ok(Some(atts))) = (
+                row.get::<pg_sys::Oid>(1),
+                row.get::<Vec<i16>>(2),
+            ) {
+                if !atts.is_empty() {
+                    out.push((oid.as_u32(), atts));
+                }
+            }
+        }
+        out
+    });
+    let mut n = 0i64;
+    for (relid, attnums) in rows {
+        let packed: Vec<u8> = attnums.iter().flat_map(|a| a.to_le_bytes()).collect();
+        if view.set_pinned(&rc_reg_key(relid), &packed) {
+            n += 1;
+        }
+    }
+    // Last, and only on the same view: a marker written before the
+    // registrations would claim a segment was loaded that is not.
+    view.set_pinned(&RC_LOADED_KEY, b"1");
+    n
+}
+
+/// `load_registrations_spi` from a background worker, which has to open its own
+/// transaction.
+fn load_registrations_worker() -> i64 {
+    use std::panic::AssertUnwindSafe;
+    if !extension_installed() {
+        return 0;
+    }
+    BackgroundWorker::transaction(AssertUnwindSafe(load_registrations_spi))
 }
 
 /// Find a `pkcol = Const` restriction on the given attnum and return the pk in
@@ -4087,8 +4200,43 @@ mod supacache {
             Some(v) => v,
             None => return false,
         };
+        // The catalogue first, and a failure here fails the call. Pinning
+        // succeeds far more often than it survives: a segment reinitialisation
+        // takes the pinned entry with it, and before #103 the caller was told
+        // the registration had succeeded and the table then silently stopped
+        // being cached. Durable first means the worst case is a registration
+        // that is recorded and not yet loaded -- a miss, which is safe -- rather
+        // than one that is loaded and not recorded.
+        let recorded = Spi::run_with_args(
+            // Schema-qualified explicitly. `$1::regclass::text` renders
+            // relative to the *writer's* search_path, so a table registered as
+            // `public.reg` comes back as bare `reg` -- which a reload running
+            // under a different search_path could fail to resolve, or resolve
+            // to a different table of the same name in another schema.
+            "INSERT INTO supacache.rowcache_reg(tbl, attnums) \
+             SELECT format('%I.%I', n.nspname, c.relname), $2 \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1 \
+             ON CONFLICT (tbl) DO UPDATE SET attnums = EXCLUDED.attnums, registered_at = now()",
+            Some(vec![
+                (PgBuiltInOids::OIDOID.oid(), relid.into_datum()),
+                (PgBuiltInOids::INT2ARRAYOID.oid(), attnums.to_vec().into_datum()),
+            ]),
+        )
+        .is_ok();
+        if !recorded {
+            return false;
+        }
         let packed: Vec<u8> = attnums.iter().flat_map(|a| a.to_le_bytes()).collect();
-        view.set_pinned(&rc_reg_key(relid.as_u32()), &packed)
+        if !view.set_pinned(&rc_reg_key(relid.as_u32()), &packed) {
+            return false;
+        }
+        // Read it back rather than trusting the write. set_pinned already
+        // reports the entry being lost before its flag landed; this also covers
+        // the segment going away underneath the whole call. It narrows the
+        // window rather than closing it -- a reinit one instruction later still
+        // loses the entry -- which is why the catalogue above is the real fix
+        // and this is only the fast failure.
+        reg_attnums(relid.as_u32()).is_some()
     }
 
     /// Which pk columns a table is registered with, ascending by attnum. Empty
@@ -4123,9 +4271,28 @@ mod supacache {
             Ok(Some(o)) => o,
             _ => return false,
         };
+        // The catalogue row goes too, or the next reload would bring the
+        // registration back from the dead.
+        let _ = Spi::run_with_args(
+            "DELETE FROM supacache.rowcache_reg WHERE tbl = (\
+               SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1)",
+            Some(vec![(PgBuiltInOids::OIDOID.oid(), relid.into_datum())]),
+        );
         rowcache_view()
             .map(|v| v.del(&rc_reg_key(relid.as_u32())))
             .unwrap_or(false)
+    }
+
+    /// Reload registrations from `supacache.rowcache_reg` into the row-cache
+    /// segment, returning how many were loaded.
+    ///
+    /// The invalidation worker does this by itself whenever it finds a fresh
+    /// segment, so this is for forcing the issue: after restoring a dump, or to
+    /// assert in a test that the catalogue really is the source of truth.
+    #[pg_extern]
+    fn rowcache_reload_registrations() -> i64 {
+        load_registrations_spi()
     }
 
     /// Cache the current row for `tbl` where the registered pk column = `pk`.
