@@ -1063,6 +1063,13 @@ the persist worker is killed by name, and saturation comes from `ring_mb = 1`;
 no test-only hook ships in the extension. It runs in CI on every change to
 `extensions/pg_keyspace/`.
 
+`run_ttl_partition_race.sh` puts four persistence workers under TTL write load
+with a two-second bucket, so every rollover is contested. `CREATE TABLE IF NOT
+EXISTS` does not settle that race — two sessions can both pass the existence
+check — and the loser used to die with `duplicate_table`, taking its shard out
+of service until the watchdog returned it (#130). With the fix reverted the test
+records 44 worker deaths in a minute; with it, none.
+
 ---
 
 ## Backup, restore and upgrade
