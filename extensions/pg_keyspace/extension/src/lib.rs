@@ -66,6 +66,7 @@ const ROWCACHE_NAME: &CStr = c"pg_keyspace_rowcache";
 const PUBSUB_NAME: &CStr = c"pg_keyspace_pubsub";
 // Per-worker liveness, so a worker that goes away can be noticed and relaunched.
 const HEALTH_NAME: &CStr = c"pg_keyspace_health";
+const CLOCK_NAME: &CStr = c"pg_keyspace_clock";
 
 // Base address of the Postgres shared-memory segment, published by the startup
 // hook and inherited by every forked backend. Each context rebuilds a cheap
@@ -1357,6 +1358,30 @@ extern "C" fn ks_shmem_startup() {
             }
             ROWCACHE_BASE.store(rcptr, Ordering::Release);
         }
+        // The TTL clock anchor (#110), shared so every process agrees.
+        //
+        // A per-process anchor would be worse than the bug it fixes: backends
+        // that started either side of a wall-clock step would disagree about
+        // whether a key is expired, turning a global shift into per-process
+        // inconsistency. Written once by whoever creates the segment; every
+        // other process adopts it. On EXEC_BACKEND platforms this hook re-runs
+        // per backend and `found` is true, so they adopt rather than re-anchor;
+        // on fork platforms children inherit the adopted statics anyway.
+        let mut clk_found = false;
+        let ckptr = pg_sys::ShmemInitStruct(
+            CLOCK_NAME.as_ptr(),
+            std::mem::size_of::<[i64; 2]>(),
+            &mut clk_found,
+        ) as *mut i64;
+        if !ckptr.is_null() {
+            if !clk_found {
+                let (r, b) = store::capture_clock_anchor();
+                std::ptr::write(ckptr, r);
+                std::ptr::write(ckptr.add(1), b);
+            }
+            store::adopt_clock_anchor(std::ptr::read(ckptr), std::ptr::read(ckptr.add(1)));
+        }
+
         // Worker liveness table. Zeroed means "never claimed", which is what
         // startup expects, so nothing else needs initialising here.
         let h_bytes = health_bytes();

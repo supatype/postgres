@@ -285,6 +285,17 @@ jobs:
       # Correctness across a database boundary: two databases cloned from one
       # template (so their relids match) must never see each other's cached
       # rows. Its own cluster and ports; builds the C output plugin itself.
+      # Sets the system clock, so it needs CAP_SYS_TIME. It SKIPS rather than
+      # fails where the clock cannot be set — a test that silently does nothing
+      # is worse than one that says it did nothing. The arithmetic is covered by
+      # the store::tests::*clock* unit tests either way.
+      - name: TTL survives a wall-clock step
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_ttl_clock_step.sh
+
       - name: Row-cache database scoping
         env:
           PGKS_BUILD_PROFILE: debug
