@@ -442,10 +442,6 @@ impl TenantUse {
         scope_len: 0,
         scope: [0u8; TENANT_SCOPE_MAX],
     };
-    #[inline]
-    fn scope_bytes(&self) -> &[u8] {
-        &self.scope[..self.scope_len as usize]
-    }
 }
 
 /// The tenant a key belongs to, for eviction purposes: everything up to and
@@ -581,31 +577,52 @@ impl Store {
     /// Measured arena usage per tenant in this segment: (scope, bytes, entries),
     /// summed across partitions, largest first.
     ///
-    /// Forces a refresh rather than reusing the eviction path's snapshot, which
-    /// is deliberately allowed to lag. Reporting that lag as current numbers
-    /// would make the stats surface quietly wrong -- it over-counted by every
-    /// entry deleted since the last eviction-driven refresh, which is how the
-    /// drift test caught it.
+    /// Scans the live entries and aggregates into caller-local memory. It does
+    /// NOT go through `refresh_usage`, for two reasons that only matter once
+    /// this is a SQL view any backend can read (#111):
+    ///
+    /// 1. `refresh_usage` *writes* the result into the partition's shared meta
+    ///    and resets `usage_evictions`. A monitoring scrape would then push out
+    ///    the eviction path's next refresh by up to `USAGE_REFRESH_EVERY`
+    ///    evictions -- reading the stats would change the budget policy's
+    ///    timing. Two backends scraping at once would also interleave their
+    ///    writes into one shared array.
+    /// 2. The shared array holds `TENANT_SLOTS` entries because the budget
+    ///    policy only ever acts on the largest tenant. A stats surface has no
+    ///    such excuse: silently omitting the 33rd tenant is exactly the kind of
+    ///    thing an operator would only discover while trying to explain a
+    ///    memory graph. A local map has no cap.
+    ///
+    /// The numbers are as current as the scan, which is what the eviction
+    /// path's forced refresh gave before and what a caller asking for stats
+    /// wants.
     pub fn tenant_usage(&self) -> Vec<(Vec<u8>, u64, u64)> {
         let mut agg: Vec<(Vec<u8>, u64, u64)> = Vec::new();
         for p in 0..self.num_partitions {
             unsafe {
-                // Forced: a caller asking for stats wants a current answer, not
-                // whatever the eviction path last happened to need.
-                self.refresh_usage(p, true);
                 let meta = self.meta(p);
-                for i in 0..(*meta).usage_valid as usize {
-                    let u = (*meta).usage[i];
-                    if u.scope_len == 0 {
+                let bump = (*meta).entry_bump;
+                for idx in 0..bump {
+                    let e = self.entries_ptr(p).add(idx as usize);
+                    if (*e).flags & FLAG_OCCUPIED == 0 {
                         continue;
                     }
-                    let k = u.scope_bytes().to_vec();
-                    match agg.iter_mut().find(|(s, _, _)| *s == k) {
-                        Some(e) => {
-                            e.1 += u.bytes;
-                            e.2 += u.entries as u64;
+                    let key = std::slice::from_raw_parts(
+                        self.data_ptr(p).add((*e).key_off as usize),
+                        (*e).key_len as usize,
+                    );
+                    // Unscoped keys are nobody's tenant, matching the budget path.
+                    let scope = match tenant_scope(key) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let bytes = (*e).key_len as u64 + (*e).val_len as u64;
+                    match agg.iter_mut().find(|(s, _, _)| s.as_slice() == scope) {
+                        Some(entry) => {
+                            entry.1 += bytes;
+                            entry.2 += 1;
                         }
-                        None => agg.push((k, u.bytes, u.entries as u64)),
+                        None => agg.push((scope.to_vec(), bytes, 1)),
                     }
                 }
             }
@@ -1524,10 +1541,9 @@ impl Store {
     /// That is the safe direction: a tenant we are not tracking is a tenant we
     /// never decide is over budget, which is the behaviour from before there
     /// were budgets at all.
-    unsafe fn refresh_usage(&self, p: u32, force: bool) {
+    unsafe fn refresh_usage(&self, p: u32) {
         let meta = self.meta(p);
-        if !force
-            && (*meta).usage_valid > 0
+        if (*meta).usage_valid > 0
             && (*meta).evictions.saturating_sub((*meta).usage_evictions) < USAGE_REFRESH_EVERY
         {
             return;
@@ -1599,10 +1615,10 @@ impl Store {
         if self.arena_pct == 0 {
             return None;
         }
-        // Not forced: on the eviction path, a snapshot up to
-        // USAGE_REFRESH_EVERY evictions old is what keeps this amortised, and a
-        // budget tolerates that staleness.
-        self.refresh_usage(p, false);
+        // A snapshot up to USAGE_REFRESH_EVERY evictions old is what keeps this
+        // amortised, and a budget tolerates that staleness. The stats surface
+        // does not share this snapshot -- see `tenant_usage`.
+        self.refresh_usage(p);
         let meta = self.meta(p);
         let cap = self.entries as u64;
         if cap == 0 {
@@ -2242,6 +2258,97 @@ mod tests {
         assert_eq!(
             reported, actual,
             "measured usage must equal a fresh count: reported {reported}, actual {actual}"
+        );
+    }
+
+    /// #111: the stats surface must report EVERY tenant, not the largest 32.
+    ///
+    /// The shared `usage` array the budget policy maintains holds TENANT_SLOTS
+    /// entries and displaces the smallest when full -- correct for a policy that
+    /// only ever acts on the biggest tenant, wrong for a surface an operator
+    /// reads to explain a memory graph. This is the assertion that fails if
+    /// `tenant_usage` is ever routed back through that array.
+    #[test]
+    fn every_tenant_is_reported_not_just_the_budgeted_slots() {
+        let tenants = TENANT_SLOTS * 2;
+        assert!(tenants > TENANT_SLOTS, "test must exceed the shared array");
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 4096,
+            entries_per_part: 4096,
+            data_bytes_per_part: 1024 * 1024,
+        };
+        let s = Store::create("t_usage_all_tenants", &cfg).unwrap();
+        // Descending sizes, so the tenants past slot 32 are exactly the ones the
+        // displacement rule would have thrown away.
+        for t in 0..tenants {
+            for i in 0..(tenants - t) {
+                s.set(format!("t{t:03}:{i}").as_bytes(), b"v", 0);
+            }
+        }
+        // The arena must have held everything, or "missing tenant" would mean
+        // "evicted" rather than "dropped by the reporting path".
+        let st = s.stats(0);
+        assert_eq!(
+            st.evictions, 0,
+            "arena too small: {} evictions means this test cannot tell a \
+             dropped report from an evicted key",
+            st.evictions
+        );
+        let usage = s.tenant_usage();
+        assert_eq!(
+            usage.len(),
+            tenants,
+            "expected all {tenants} tenants, got {} -- the smallest were dropped",
+            usage.len()
+        );
+        for t in 0..tenants {
+            let want = format!("t{t:03}:").into_bytes();
+            let got = usage
+                .iter()
+                .find(|(sc, _, _)| *sc == want)
+                .unwrap_or_else(|| panic!("tenant t{t:03} missing from usage"));
+            assert_eq!(
+                got.2,
+                (tenants - t) as u64,
+                "tenant t{t:03} entry count"
+            );
+        }
+    }
+
+    /// #111: reading the stats must not disturb the budget policy's timing.
+    ///
+    /// `tenant_usage` used to force `refresh_usage`, which resets
+    /// `usage_evictions`. A monitoring scrape every 15s would then keep pushing
+    /// the eviction path's next refresh out by up to USAGE_REFRESH_EVERY
+    /// evictions -- reading a number changing what the cache does.
+    #[test]
+    fn reading_tenant_usage_does_not_touch_the_budget_snapshot() {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 128 * 1024,
+        };
+        let mut s = Store::create("t_usage_no_side_effect", &cfg).unwrap();
+        s.set_tenant_arena_pct(25);
+        // Drive enough traffic that the eviction path has taken a snapshot.
+        for i in 0..4000u32 {
+            s.set(format!("hog:{i}").as_bytes(), b"0123456789abcdef", 0);
+        }
+        let (before_valid, before_evictions) = unsafe {
+            let m = s.meta(0);
+            ((*m).usage_valid, (*m).usage_evictions)
+        };
+        let _ = s.tenant_usage();
+        let (after_valid, after_evictions) = unsafe {
+            let m = s.meta(0);
+            ((*m).usage_valid, (*m).usage_evictions)
+        };
+        assert_eq!(
+            (before_valid, before_evictions),
+            (after_valid, after_evictions),
+            "tenant_usage() rewrote the shared budget snapshot"
         );
     }
 

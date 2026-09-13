@@ -2116,6 +2116,24 @@ fn extension_installed() -> bool {
     })
 }
 
+/// Whether a relation exists, by name, without naming it in a statement that
+/// would fail to parse if it does not (#111).
+///
+/// The stats views select from functions that read the worker-created tables,
+/// and those tables appear later than the extension does. A guard has to be its
+/// own statement: Postgres resolves relations at parse time, so
+/// `CASE WHEN to_regclass(x) IS NULL THEN 0 ELSE (SELECT count(*) FROM x) END`
+/// still errors on a missing `x`, unreachable branch or not.
+fn table_exists(qualified: &str) -> bool {
+    Spi::get_one_with_args::<bool>(
+        "SELECT to_regclass($1) IS NOT NULL",
+        vec![(PgBuiltInOids::TEXTOID.oid(), qualified.into_datum())],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 /// Create the `supacache` schema and the hash-partitioned `supacache.kv`
 /// backing table if absent. Idempotent; runs in one transaction.
 fn pg_ensure_schema() {
@@ -2197,6 +2215,22 @@ fn pg_ensure_schema() {
         // Single-worker recovery scans unfiltered and ignores these.
         let _ = Spi::run("CREATE INDEX IF NOT EXISTS kv_slot_idx ON supacache.kv (slot)");
         let _ = Spi::run("CREATE INDEX IF NOT EXISTS kv_ttl_slot_idx ON supacache.kv_ttl (slot)");
+        // #111: two of the stats functions read these tables over SPI, and SPI
+        // inside a function runs as the CALLER -- the view owner's privileges
+        // do not reach down into it. Without these grants,
+        // supacache.pg_stat_keyspace_topology and _rowcache fail for a
+        // pg_monitor member with "permission denied for table topology", while
+        // the other eight views work, which is a confusing way to find out.
+        //
+        // They live here rather than in the extension's SQL because the worker
+        // creates these tables, so at CREATE EXTENSION time there is nothing to
+        // grant on. SELECT only, on two small configuration tables: which
+        // relations are row-cached, and the worker count the keyspace was last
+        // persisted under.
+        let _ = Spi::run("GRANT USAGE ON SCHEMA supacache TO pg_monitor");
+        let _ = Spi::run(
+            "GRANT SELECT ON supacache.topology, supacache.rowcache_reg TO pg_monitor",
+        );
     });
 }
 
@@ -4149,10 +4183,22 @@ mod supacache {
     /// Postgres. In a sync-ack tier it should sit near zero and return there;
     /// a number that climbs and stays is persistence falling behind.
     ///
-    /// `errors` counts batches that failed to commit. The records are retained
-    /// and retried, so this is a health signal rather than a loss count, but it
-    /// is the signal that a persistence failure is happening at all: without
-    /// it, a failing batch is visible only by grepping the Postgres log.
+    /// `failed_batches` is MISNAMED and kept only for compatibility -- use
+    /// `supacache.pg_stat_keyspace_persist.uncommitted_batches`, which reports
+    /// the same number under a name that matches it.
+    ///
+    /// It is a GAUGE, not a count of failures. The ring increments it before
+    /// attempting a batch and decrements it after the commit succeeds --
+    /// bracketing the attempt, because a Postgres ERROR unwinds out of the
+    /// worker and an `Err` branch never runs. A batch in flight therefore reads
+    /// as one "failed", and under sustained writes this sits at a small number
+    /// and oscillates rather than accumulating.
+    ///
+    /// What it does report is an increment that was never cancelled: a batch
+    /// that failed, or whose worker died mid-commit. So the signal is a floor
+    /// that does not drain -- when writes stop, this should return to zero, and
+    /// whatever remains never committed. Alerting on any nonzero value alerts
+    /// on ordinary traffic.
     ///
     /// `unresolved` counts by-reference records whose value could not be read
     /// back. Usually benign, since a key overwritten after staging has a newer
@@ -4249,9 +4295,16 @@ mod supacache {
         ),
     > {
         let running = super::worker_count();
-        let recorded = Spi::get_one::<i32>("SELECT workers FROM supacache.topology WHERE id = 1")
-            .ok()
-            .flatten();
+        // Guarded for the same reason as rowcache_registration_status(): the
+        // worker creates supacache.topology, so a scrape can arrive before it
+        // exists, and an erroring stats view reads as an outage (#111).
+        let recorded = if table_exists("supacache.topology") {
+            Spi::get_one::<i32>("SELECT workers FROM supacache.topology WHERE id = 1")
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let moved = recorded
             .filter(|p| *p > 0)
             .map(|p| crc16::slots_moved(p as usize, running))
@@ -4812,6 +4865,342 @@ mod supacache {
         TableIterator::new(rows)
     }
 
+    /// Per (slot worker, partition) counters and arena occupancy, with the
+    /// worker index reported as its own column (#111).
+    ///
+    /// `stats()` fuses the two into one `partition` index, which is fine to
+    /// read by eye and useless to a collector: undoing it needs the partition
+    /// count, which is a GUC the collector does not have. This is the same data
+    /// with the join key present, and it is what
+    /// `supacache.pg_stat_keyspace_workers` is built on.
+    ///
+    /// `hits`, `misses`, `evictions`, `sets`, `tombstones` and `rehashes` are
+    /// CUMULATIVE since the segment was created, the way Postgres's own stats
+    /// counters are, so a collector's rate() is meaningful. `entries`,
+    /// `arena_used_bytes` and `arena_capacity_bytes` are GAUGES.
+    #[pg_extern(stable, parallel_safe)]
+    fn worker_stats() -> TableIterator<
+        'static,
+        (
+            name!(worker, i32),
+            name!(partition, i32),
+            name!(entries, i64),
+            name!(hits, i64),
+            name!(misses, i64),
+            name!(evictions, i64),
+            name!(sets, i64),
+            name!(tombstones, i64),
+            name!(rehashes, i64),
+            name!(arena_used_bytes, i64),
+            name!(arena_capacity_bytes, i64),
+        ),
+    > {
+        let mut rows = Vec::new();
+        for w in 0..worker_count() {
+            let store = match store_view_for_worker(w) {
+                Some(s) => s,
+                None => continue,
+            };
+            for p in 0..store.num_partitions() {
+                let s = store.stats(p);
+                rows.push((
+                    w as i32,
+                    p as i32,
+                    s.entries as i64,
+                    s.hits as i64,
+                    s.misses as i64,
+                    s.evictions as i64,
+                    s.sets as i64,
+                    s.tombstones as i64,
+                    s.rehashes as i64,
+                    s.data_used as i64,
+                    s.data_cap as i64,
+                ));
+            }
+        }
+        TableIterator::new(rows)
+    }
+
+    /// Persistence ring health, ONE ROW PER RING rather than summed (#111).
+    ///
+    /// `ring_stats()` adds every ring together, which hides the failure this
+    /// surface exists to catch: persistence falls behind per shard, because a
+    /// shard is a single consumer draining a single ring. One ring at its drop
+    /// threshold inside a healthy-looking total is invisible in the sum and
+    /// obvious here.
+    ///
+    /// Rings are indexed `worker * pg_keyspace.persist_workers + shard`, which
+    /// is the layout `ring_index` uses; both halves are reported so a collector
+    /// can group by either.
+    ///
+    /// `pushed`, `dropped`, `committed` and `unresolved` are CUMULATIVE;
+    /// `backlog_bytes`, `lag` and `uncommitted_batches` are GAUGES.
+    ///
+    /// `uncommitted_batches` is NOT a failure count, despite what the
+    /// underlying ring counter's name suggests. `note_attempt` increments it
+    /// before a batch is tried and `note_commit` decrements it after the commit
+    /// succeeds -- bracketing the attempt, because a Postgres ERROR unwinds out
+    /// of the worker and an `Err` branch never runs. So a batch in flight reads
+    /// as one outstanding, and under load this sits at a small number and
+    /// oscillates.
+    ///
+    /// What it does report is a batch whose increment was never cancelled:
+    /// one that failed, or whose worker died mid-commit. The signal is
+    /// therefore a FLOOR THAT DOES NOT DRAIN -- when writes stop, this should
+    /// return to zero, and whatever is left never committed. Alerting on any
+    /// nonzero value alerts on ordinary traffic.
+    #[pg_extern(stable, parallel_safe)]
+    fn persist_shard_stats() -> TableIterator<
+        'static,
+        (
+            name!(worker, i32),
+            name!(shard, i32),
+            name!(pushed, i64),
+            name!(dropped, i64),
+            name!(backlog_bytes, i64),
+            name!(committed, i64),
+            name!(lag, i64),
+            name!(uncommitted_batches, i64),
+            name!(unresolved, i64),
+        ),
+    > {
+        let base = RING_BASE.load(Ordering::Acquire);
+        let mut rows = Vec::new();
+        if !base.is_null() {
+            let stride = ring_stride();
+            let shards = persist_shards();
+            for w in 0..worker_count() {
+                for sh in 0..shards {
+                    let i = ring_index(w, sh);
+                    let c = unsafe { ring::Consumer::attach(base.add(i * stride)) };
+                    let (pushed, dropped, backlog, committed, errors, unresolved) = c.stats();
+                    rows.push((
+                        w as i32,
+                        sh as i32,
+                        pushed as i64,
+                        dropped as i64,
+                        backlog as i64,
+                        committed as i64,
+                        (pushed as i64 - committed as i64).max(0),
+                        errors as i64,
+                        unresolved as i64,
+                    ));
+                }
+            }
+        }
+        TableIterator::new(rows)
+    }
+
+    /// Measured arena occupancy per tenant, summed across slot workers (#111).
+    ///
+    /// This is the accounting #102 added for the per-tenant budget, which until
+    /// now was reachable only by parsing the RESP `INFO` text. `tenant` is the
+    /// scope without its trailing `:`.
+    ///
+    /// Both columns are GAUGES. The numbers are measured by scanning the live
+    /// entries on each call, so they cost O(entries) per worker -- fine at a
+    /// collector's 15s, not something to put in a tight loop.
+    #[pg_extern(stable, parallel_safe)]
+    fn tenant_stats() -> TableIterator<
+        'static,
+        (
+            name!(tenant, String),
+            name!(arena_bytes, i64),
+            name!(entries, i64),
+        ),
+    > {
+        let mut agg: Vec<(String, i64, i64)> = Vec::new();
+        for w in 0..worker_count() {
+            let store = match store_view_for_worker(w) {
+                Some(s) => s,
+                None => continue,
+            };
+            for (scope, bytes, entries) in store.tenant_usage() {
+                let name = String::from_utf8_lossy(
+                    scope.strip_suffix(b":").unwrap_or(&scope),
+                )
+                .into_owned();
+                match agg.iter_mut().find(|(n, _, _)| *n == name) {
+                    Some(e) => {
+                        e.1 += bytes as i64;
+                        e.2 += entries as i64;
+                    }
+                    None => agg.push((name, bytes as i64, entries as i64)),
+                }
+            }
+        }
+        agg.sort_by(|a, b| b.1.cmp(&a.1));
+        TableIterator::new(agg)
+    }
+
+    /// One row per background worker the watchdog tracks, with its heartbeat
+    /// age (#111).
+    ///
+    /// The watchdog already relaunches a worker that stops beating, so this is
+    /// not how a dead worker gets restarted -- it is how an operator sees that
+    /// it keeps happening. A worker crash-looping is relaunched every time and
+    /// looks, from outside, exactly like a worker that is running.
+    ///
+    /// `role` is the slot's job, derived from its index: slots are laid out
+    /// RESP workers, then persistence shards, then expiry, then row-cache
+    /// invalidation. `beat_age_ms` is NULL for a slot that has never beaten,
+    /// which is a worker that has not started rather than one that has died.
+    /// `alive` is the watchdog's own test: beating within
+    /// `pg_keyspace.watchdog_secs`.
+    #[pg_extern(stable, parallel_safe)]
+    fn worker_health() -> TableIterator<
+        'static,
+        (
+            name!(slot, i32),
+            name!(role, String),
+            name!(worker, Option<i32>),
+            name!(pid, Option<i32>),
+            name!(beat_age_ms, Option<i64>),
+            name!(stale_after_ms, i64),
+            name!(alive, bool),
+        ),
+    > {
+        let nworkers = worker_count();
+        let shards = persist_shards();
+        let stale_ms = health_stale_us() / 1000;
+        let now = store::now_micros();
+        let mut rows = Vec::new();
+        for i in 0..health_slot_count() {
+            let (role, idx) = if i < nworkers {
+                ("resp", Some(i as i32))
+            } else if i < nworkers + shards {
+                ("persist", Some((i - nworkers) as i32))
+            } else if i == health_expiry_slot() {
+                ("expiry", None)
+            } else {
+                ("invalidation", None)
+            };
+            let sl = match health_slot(i) {
+                Some(sl) => sl,
+                None => continue,
+            };
+            let last = sl.last_seen_us.load(Ordering::Acquire);
+            let pid = sl.owner_pid.load(Ordering::Acquire);
+            let age = if last == 0 {
+                None
+            } else {
+                Some(now.saturating_sub(last) / 1000)
+            };
+            rows.push((
+                i as i32,
+                role.to_string(),
+                idx,
+                if pid == 0 { None } else { Some(pid as i32) },
+                age,
+                stale_ms,
+                age.map(|a| a <= stale_ms).unwrap_or(false),
+            ));
+        }
+        TableIterator::new(rows)
+    }
+
+    /// How far behind the row cache's WAL decoder is, in bytes (#111).
+    ///
+    /// The row cache is only as coherent as this worker is current, and
+    /// `rowcache_coherence()` answers the binary question ("is it beating?").
+    /// This answers the one that comes next: beating, but how far behind? A
+    /// decoder that is alive and losing ground serves rows that are stale for
+    /// exactly as long as it takes to catch up, and the heartbeat looks fine
+    /// throughout.
+    ///
+    /// `decode_lag_bytes` is `pg_current_wal_lsn() - confirmed_flush_lsn`: WAL
+    /// generated but not yet decoded. It is never zero on a busy cluster --
+    /// most WAL is not row-cache traffic and the slot only advances per drain
+    /// window -- so alert on the trend, not the value.
+    ///
+    /// `retained_bytes` is against `restart_lsn`, which is what the slot is
+    /// actually pinning on disk. That one is a disk-space risk: a stopped
+    /// decoder holds WAL until `max_slot_wal_keep_size` cuts the slot loose.
+    ///
+    /// All columns are GAUGES. Rows are absent (not zero) when decoding is off
+    /// or the slot does not exist yet, which distinguishes "not configured"
+    /// from "configured and stuck at zero".
+    #[pg_extern]
+    fn invalidation_stats() -> TableIterator<
+        'static,
+        (
+            name!(slot_name, String),
+            name!(active, bool),
+            name!(confirmed_flush_lsn, Option<String>),
+            name!(restart_lsn, Option<String>),
+            name!(current_lsn, Option<String>),
+            name!(decode_lag_bytes, Option<i64>),
+            name!(retained_bytes, Option<i64>),
+        ),
+    > {
+        let mut rows = Vec::new();
+        if !GUC_ROWCACHE_DECODE.get() {
+            return TableIterator::new(rows);
+        }
+        let slot = GUC_ROWCACHE_SLOT
+            .get()
+            .and_then(|c| c.to_str().ok().map(|s| s.to_string()))
+            .unwrap_or_else(|| "supacache_rowcache".to_string());
+        let found = Spi::connect(|client| {
+            let t = client.select(
+                "SELECT s.active, s.confirmed_flush_lsn::text, s.restart_lsn::text, \
+                        pg_current_wal_lsn()::text, \
+                        (pg_current_wal_lsn() - s.confirmed_flush_lsn)::bigint, \
+                        (pg_current_wal_lsn() - s.restart_lsn)::bigint \
+                 FROM pg_replication_slots s WHERE s.slot_name = $1",
+                None,
+                Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.clone().into_datum())]),
+            )
+            .ok()?;
+            let row = t.into_iter().next()?;
+            Some((
+                row.get::<bool>(1).ok().flatten().unwrap_or(false),
+                row.get::<String>(2).ok().flatten(),
+                row.get::<String>(3).ok().flatten(),
+                row.get::<String>(4).ok().flatten(),
+                row.get::<i64>(5).ok().flatten(),
+                row.get::<i64>(6).ok().flatten(),
+            ))
+        });
+        if let Some((active, flush, restart, cur, lag, retained)) = found {
+            rows.push((slot, active, flush, restart, cur, lag, retained));
+        }
+        TableIterator::new(rows)
+    }
+
+    /// Whether the row cache's registrations are currently resident in the
+    /// shared segment, and how many the catalogue holds (#111).
+    ///
+    /// `loaded` false with `registered` above zero is the #103 window: a fresh
+    /// segment the invalidation worker has not refilled yet. Rows for those
+    /// tables are not being cached, and nothing else reports it.
+    #[pg_extern]
+    fn rowcache_registration_status() -> TableIterator<
+        'static,
+        (name!(registered, i64), name!(loaded, bool)),
+    > {
+        // to_regclass in a SEPARATE statement, because Postgres resolves
+        // relations when it parses, before it evaluates anything: a CASE with
+        // the table named in the unreachable branch still fails with
+        // `relation "supacache.rowcache_reg" does not exist`. Only a second
+        // statement, parsed once the first says the table is there, is actually
+        // guarded.
+        //
+        // Worth guarding because the background worker creates this table, not
+        // CREATE EXTENSION, so there is a window at startup -- and after a
+        // DROP/CREATE EXTENSION -- where it is absent. An erroring stats view
+        // reads to a collector as the database being down.
+        let registered = if table_exists("supacache.rowcache_reg") {
+            Spi::get_one::<i64>("SELECT count(*) FROM supacache.rowcache_reg")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        TableIterator::once((registered, registrations_loaded()))
+    }
+
     #[pg_extern]
     fn stats() -> TableIterator<
         'static,
@@ -4861,3 +5250,190 @@ mod supacache {
 // silence unused warnings for the c_void import used only in casts on some paths
 #[allow(dead_code)]
 fn _keep(_: *mut c_void) {}
+
+// --------------------------------------------------------------------------
+// #111: operational metrics, shaped as pg_stat_* views.
+//
+// The instinct here is a Redis-style exporter process and a Grafana dashboard.
+// That is a second artefact to version, deploy and watch. Postgres already has
+// a monitoring ecosystem -- postgres_exporter, pgwatch, Datadog, pganalyze, and
+// a `SELECT` in cron -- and all of it collects from `pg_stat_*`-shaped views.
+// Exposing the numbers that way means every one of those tools picks the cache
+// up with NO new configuration. Borrowing an ecosystem beats building one, and
+// it is a thing a standalone keyspace structurally cannot do.
+//
+// Conventions, chosen to match what a collector expects rather than what is
+// convenient here:
+//
+//   * COUNTERS are cumulative since the segment or process started, never
+//     reset by reading, so `rate()` over two scrapes is meaningful. GAUGES are
+//     instantaneous. The two are never mixed in a column, and the README lists
+//     which is which per view.
+//   * A view is EMPTY, not zero-filled, when the thing it reports is switched
+//     off. `pg_stat_keyspace_invalidation` with no rows means decoding is
+//     disabled; a row of zeroes would mean decoding is on and stuck, and an
+//     alert cannot tell those apart if they look the same.
+//   * Views, not functions, are the supported surface. The functions stay
+//     callable, but their shapes are free to change; the views are the
+//     contract.
+//
+// Created with `finalize` so they are emitted after every function they select
+// from, whatever order pgrx generates the rest in.
+extension_sql!(
+    r#"
+-- One row: the cluster-wide rollup, for a dashboard's top line.
+CREATE VIEW supacache.pg_stat_keyspace AS
+SELECT
+    (SELECT count(DISTINCT worker)::int FROM supacache.worker_stats())      AS workers,
+    (SELECT count(*)::int FROM supacache.worker_stats())                    AS partitions,
+    COALESCE(sum(w.entries), 0)::bigint                                     AS entries,
+    COALESCE(sum(w.hits), 0)::bigint                                        AS hits,
+    COALESCE(sum(w.misses), 0)::bigint                                      AS misses,
+    COALESCE(sum(w.evictions), 0)::bigint                                   AS evictions,
+    COALESCE(sum(w.sets), 0)::bigint                                        AS sets,
+    COALESCE(sum(w.tombstones), 0)::bigint                                  AS tombstones,
+    COALESCE(sum(w.rehashes), 0)::bigint                                    AS rehashes,
+    COALESCE(sum(w.arena_used_bytes), 0)::bigint                            AS arena_used_bytes,
+    COALESCE(sum(w.arena_capacity_bytes), 0)::bigint                        AS arena_capacity_bytes,
+    -- NULL rather than 0 before the first lookup: a cache nobody has read from
+    -- has no hit ratio, and graphing it as 0% invents an outage.
+    CASE WHEN COALESCE(sum(w.hits + w.misses), 0) > 0
+         THEN round(sum(w.hits)::numeric * 100 / sum(w.hits + w.misses), 2)
+    END                                                                     AS hit_pct
+FROM supacache.worker_stats() w;
+
+-- One row per (slot worker, partition).
+CREATE VIEW supacache.pg_stat_keyspace_workers AS
+SELECT w.worker, w.partition, w.entries, w.hits, w.misses, w.evictions,
+       w.sets, w.tombstones, w.rehashes,
+       w.arena_used_bytes,
+       (w.arena_capacity_bytes - w.arena_used_bytes)                        AS arena_free_bytes,
+       w.arena_capacity_bytes,
+       CASE WHEN w.arena_capacity_bytes > 0
+            THEN round(w.arena_used_bytes::numeric * 100 / w.arena_capacity_bytes, 2)
+       END                                                                  AS arena_used_pct,
+       r.slot_lo, r.slot_hi, r.port
+FROM supacache.worker_stats() w
+LEFT JOIN supacache.slot_ranges() r ON r.worker = w.worker;
+
+-- One row per background worker the watchdog tracks.
+CREATE VIEW supacache.pg_stat_keyspace_activity AS
+SELECT slot, role, worker, pid, beat_age_ms, stale_after_ms, alive
+FROM supacache.worker_health();
+
+-- One row per persistence ring. Summed in pg_stat_keyspace_persist_total.
+CREATE VIEW supacache.pg_stat_keyspace_persist AS
+SELECT worker, shard, pushed, dropped, backlog_bytes, committed, lag,
+       uncommitted_batches, unresolved
+FROM supacache.persist_shard_stats();
+
+CREATE VIEW supacache.pg_stat_keyspace_persist_total AS
+SELECT COALESCE(sum(pushed), 0)::bigint          AS pushed,
+       COALESCE(sum(dropped), 0)::bigint         AS dropped,
+       COALESCE(sum(backlog_bytes), 0)::bigint   AS backlog_bytes,
+       COALESCE(sum(committed), 0)::bigint       AS committed,
+       COALESCE(sum(lag), 0)::bigint             AS lag,
+       COALESCE(sum(uncommitted_batches), 0)::bigint AS uncommitted_batches,
+       COALESCE(sum(unresolved), 0)::bigint      AS unresolved,
+       -- The ring with the deepest backlog, which is the one that will start
+       -- dropping. A healthy total hides it completely.
+       (SELECT max(backlog_bytes) FROM supacache.persist_shard_stats()) AS worst_ring_backlog_bytes
+FROM supacache.persist_shard_stats();
+
+-- One row per tenant with resident entries.
+CREATE VIEW supacache.pg_stat_keyspace_tenants AS
+SELECT tenant, arena_bytes, entries
+FROM supacache.tenant_stats();
+
+-- Row cache: occupancy, coherence, and whether registrations are resident.
+CREATE VIEW supacache.pg_stat_keyspace_rowcache AS
+SELECT s.entries, s.hits, s.misses, s.data_used AS arena_used_bytes,
+       s.data_cap AS arena_capacity_bytes,
+       CASE WHEN s.hits + s.misses > 0
+            THEN round(s.hits::numeric * 100 / (s.hits + s.misses), 2)
+       END                                       AS hit_pct,
+       c.coherent, c.decode_enabled, c.beat_age_ms, c.stale_after_ms,
+       g.registered AS registrations, g.loaded AS registrations_loaded
+FROM supacache.rowcache_stats() s
+CROSS JOIN supacache.rowcache_coherence() c
+CROSS JOIN supacache.rowcache_registration_status() g;
+
+-- Empty when decoding is off or the slot has not been created yet.
+CREATE VIEW supacache.pg_stat_keyspace_invalidation AS
+SELECT slot_name, active, confirmed_flush_lsn, restart_lsn, current_lsn,
+       decode_lag_bytes, retained_bytes
+FROM supacache.invalidation_stats();
+
+CREATE VIEW supacache.pg_stat_keyspace_pubsub AS
+SELECT dropped, route_full, name_too_long FROM supacache.pubsub_stats();
+
+CREATE VIEW supacache.pg_stat_keyspace_topology AS
+SELECT recorded_workers, running_workers, slots_moved, pct_moved
+FROM supacache.topology_change();
+
+-- A monitoring role gets these and nothing else. `pg_monitor` is the role
+-- postgres_exporter, pgwatch and Datadog are already told to use, so this is
+-- the whole of the setup: install the extension, and an existing collector
+-- picks the cache up. A team using a different role name grants it pg_monitor,
+-- which is the one line every Postgres monitoring guide already tells them to
+-- run.
+--
+-- EXECUTE is granted on the functions too, and that is not belt-and-braces. A
+-- view's *table* references are checked against the view owner, but a SET
+-- FUNCTION in its FROM clause is checked against the CALLER -- the executor
+-- asks pg_proc_aclcheck(..., GetUserId(), ACL_EXECUTE), and GetUserId() is the
+-- collector. Granting SELECT on the view alone gets "permission denied for
+-- function worker_stats", which is what run_pg_stat_views.sh reported when
+-- these grants were missing. Granting EXECUTE explicitly also means an operator
+-- hardening the install with REVOKE ... FROM PUBLIC does not break monitoring.
+GRANT USAGE ON SCHEMA supacache TO pg_monitor;
+GRANT EXECUTE ON FUNCTION
+    supacache.worker_stats(),
+    supacache.persist_shard_stats(),
+    supacache.tenant_stats(),
+    supacache.worker_health(),
+    supacache.invalidation_stats(),
+    supacache.rowcache_registration_status(),
+    supacache.rowcache_stats(),
+    supacache.rowcache_coherence(),
+    supacache.pubsub_stats(),
+    supacache.topology_change(),
+    supacache.slot_ranges()
+TO pg_monitor;
+GRANT SELECT ON
+    supacache.pg_stat_keyspace,
+    supacache.pg_stat_keyspace_workers,
+    supacache.pg_stat_keyspace_activity,
+    supacache.pg_stat_keyspace_persist,
+    supacache.pg_stat_keyspace_persist_total,
+    supacache.pg_stat_keyspace_tenants,
+    supacache.pg_stat_keyspace_rowcache,
+    supacache.pg_stat_keyspace_invalidation,
+    supacache.pg_stat_keyspace_pubsub,
+    supacache.pg_stat_keyspace_topology
+TO pg_monitor;
+
+COMMENT ON VIEW supacache.pg_stat_keyspace IS
+  'pg_keyspace: cluster-wide keyspace rollup. Counters are cumulative since segment creation; entries and arena_*_bytes are gauges.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_workers IS
+  'pg_keyspace: per (slot worker, partition) counters, arena occupancy and the slot range/port the worker serves.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_activity IS
+  'pg_keyspace: heartbeat age per background worker. alive=false is a worker the watchdog is about to relaunch; a row that flips repeatedly is a crash loop.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_persist IS
+  'pg_keyspace: persistence ring health, one row per (worker, shard). lag is acknowledged writes not yet committed. uncommitted_batches is a GAUGE of batches in flight, not a failure count: alert on a floor that never drains, not on it being nonzero.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_persist_total IS
+  'pg_keyspace: persistence rings summed, plus the deepest single ring backlog, which a sum hides.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_tenants IS
+  'pg_keyspace: measured arena occupancy per tenant (gauges). Scans live entries, so cost is O(entries) per call.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_rowcache IS
+  'pg_keyspace: Mode B row cache occupancy and coherence. coherent=false means invalidation is configured but not beating; reads fail closed.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_invalidation IS
+  'pg_keyspace: WAL decode lag for the row cache. Empty when decoding is off. retained_bytes is WAL the slot is pinning on disk.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_pubsub IS
+  'pg_keyspace: pub/sub messages NOT delivered. Every column is a cumulative loss counter; PUBLISH cannot report these to the client.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_topology IS
+  'pg_keyspace: worker layout the persisted keyspace was written under vs the one running now, and what a change between them costs.';
+"#,
+    name = "pg_stat_keyspace_views",
+    finalize
+);
