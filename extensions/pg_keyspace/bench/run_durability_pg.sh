@@ -1954,9 +1954,27 @@ psql_ "INSERT INTO public.rt VALUES (1,'one'),(2,'two'),(3,'three'),(4,'canary')
 # nothing but 0 -- which is exactly the shape of the intermittent failure this
 # section has shown in CI. The post-restart registration was already asserted;
 # this one was not, for no reason.
+# Order matters here, and getting it wrong is what made this section fail in CI
+# roughly one run in three while passing every standalone run.
+#
+# Section AI SIGSTOPs the invalidation worker with watchdog_secs = 10, so the
+# watchdog relaunches it. Registering before that has settled puts the pinned
+# registration into a segment that is then reinitialised underneath it: the
+# register call returns true, the entry is really gone, and every later step
+# fails for a reason none of them could name. The CI failure that finally
+# diagnosed this reported registered_cols={} and entries=0 with coherent=t --
+# an empty segment, not an evicted entry.
+#
+# So: wait for a coherent, settled cluster FIRST, then register, then assert the
+# registration is still there immediately before anything depends on it.
+chk "the invalidation worker is up, so the cache is served at all" "1" "$(wait_coherent 30)"
 chk "the table is registered before anything depends on it" "t" \
     "$(psql_ "SELECT supacache.rowcache_register('public.rt', 1)")"
-chk "the invalidation worker is up, so the cache is served at all" "1" "$(wait_coherent 30)"
+# Not redundant with the line above: that one asserts the call reported success,
+# this one asserts the registration actually survived to be readable. They came
+# apart in CI, which is the whole reason this section was intermittent.
+chk "and the registration survived, so the cache can hold this table's rows" "{id}" \
+    "$(psql_ "SELECT supacache.rowcache_registration('public.rt')::text" | tr -d '[:space:]')"
 chk "and it has caught up with this table, so the cache can hold a row" "1" \
     "$(wait_rowcache_quiet public.rt 4)"
 

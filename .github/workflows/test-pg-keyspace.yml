@@ -268,6 +268,17 @@ jobs:
       - name: Stop any preinstalled PostgreSQL
         run: sudo systemctl stop postgresql || true
 
+      # Correctness, not measurement: 20 boolean assertions about which
+      # certificate the RESP port serves, checked on the wire. Runs before the
+      # long suite so a TLS regression is reported in a couple of minutes
+      # rather than after twenty. Its own cluster, its own ports.
+      - name: RESP TLS certificate inheritance
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_tls_inherit.sh
+
       - name: Durability + fault injection suite
         env:
           PGKS_BUILD_PROFILE: debug

@@ -15,7 +15,7 @@
 //! Not MVCC. No tuple headers. No vacuum. Entries are overwritten in place.
 
 use crate::shmem::Shmem;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // v3 widens Entry with `staged_seq` and PartMeta with `commit_watermark`, for
 // values handed to the persistence worker by reference instead of being copied
