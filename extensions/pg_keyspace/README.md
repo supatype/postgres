@@ -687,6 +687,38 @@ ignored unless `rowcache_decode` is on — a row warmed automatically that nothi
 is watching would be served stale indefinitely, so the two are deliberately
 coupled.
 
+##### Who is allowed to write the row-cache segment
+
+The RESP keyspace segments each have exactly one writer: the worker that owns
+them. The row-cache segment has none. Its writers are ordinary **backends** —
+`rowcache_put`, registration, and above all read-through, which makes a writer
+of every backend that misses.
+
+`Store`'s API is single-writer-per-partition by contract, so two of those at
+once corrupted the arena and segfaulted a backend, which Postgres answers by
+killing every other backend and crash-restarting the cluster. It took four
+pgbench clients under a second ([#127](https://github.com/supatype/postgres/issues/127)).
+
+Writers now take an exclusive LWLock; **readers take nothing**. That is not a
+half-measure — one writer against many readers is the pattern the store is
+already built for, and the seqlock in `get_stable` is what makes it safe. The
+read path, which is the hot one, costs the same as before. The row cache was
+also the last reader that borrowed shared bytes rather than reading through the
+seqlock, so a concurrent rewrite could splice two tuples together; it now reads
+the way every SQL read of the RESP keyspace already did.
+
+The lock lives in the extension rather than in `core/`, because `core/` is
+shared with the standalone daemon, where every segment does have exactly one
+writing process and none of this applies.
+
+Asserted by `bench/run_rowcache_concurrency.sh`, which also covers
+[#128](https://github.com/supatype/postgres/issues/128): a query with **no
+`WHERE` clause** against a registered table dereferenced a null
+`baserestrictinfo` at plan time. An empty Postgres `List` is a null pointer, and
+`SELECT count(*) FROM t` is exactly that shape — so a registered table went down
+on the first unfiltered query against it. Every row-cache harness queried by
+primary key, which is the case that worked.
+
 #### What the row cache guarantees, and what it does not
 
 The invalidation worker polls the replication slot, so coherence is **eventual
@@ -1162,6 +1194,12 @@ control that a role *without* `pg_monitor` is refused all ten. It also asserts
 the views are extension members (so `pg_dump` and `DROP EXTENSION` handle them),
 that counters do not reset on read, and that switching a feature off empties its
 view rather than zeroing it.
+
+`run_rowcache_concurrency.sh` is a crash test, so its assertions are the absence
+of `signal 11` in the server log rather than a query result. It covers the two
+row-cache segfaults (#127, #128) and is sized so an unfixed build fails within
+seconds: without the writer lock it dies at around 1,400 transactions, with it
+the same run does over 600,000.
 
 ---
 
