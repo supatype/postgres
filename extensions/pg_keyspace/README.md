@@ -1348,6 +1348,39 @@ row-cache segfaults (#127, #128) and is sized so an unfixed build fails within
 seconds: without the writer lock it dies at around 1,400 transactions, with it
 the same run does over 600,000.
 
+`run_soak.sh` is the sustained, multi-tenant, fault-injected soak
+([#113](https://github.com/supatype/postgres/issues/113)). It runs a
+checksum-verifying RESP workload (`bench/k6/mixed.js`) and a pgbench row-cache
+workload together, injects faults on a schedule, samples the `pg_stat_keyspace*`
+views throughout, and then **judges the series** — RSS, live entries, eviction
+rate, persist lag, WAL decode lag — rather than reporting a headline rate.
+`bench/soak/drift.sh` does the sampling and the judging and runs standalone, so
+the generator can live on a different machine from the server. See
+`bench/k6/README.md`.
+
+What it is **not** is an answer to #113. That is gated on hardware: with the
+generator on the same box as the server, every throughput comparison is
+meaningless, and the numbers above are from a 4-vCPU container. What it does
+establish on any hardware is correctness under concurrency, drift, and recovery
+under load.
+
+Three conventions it enforces, each learned by getting them wrong first:
+
+- **A miss is not an error, and neither is an `OOM` refusal.** The cache is
+  entitled to have evicted anything, and a server correctly refusing a write it
+  has no room for is doing its job. Lumping either into an error count buries a
+  real failure under hundreds of legitimate ones — the first version reported
+  1.4M "errors" on a healthy run.
+- **A run with fault injection cannot demand zero errors**, because killing a
+  worker drops the connections it was holding. The budget is derived from the
+  fault schedule; with `NO_FAULTS=1` it is zero, and that control run is the one
+  that has to come back clean. It is also the run that found
+  [#130](https://github.com/supatype/postgres/issues/130).
+- **Judge queues on medians and drained tails, trends on halves.** Persist lag
+  and decode lag are sawtooths that a deliberate fault spikes; averaging halves
+  let one 34 MB sample report a decoder that was 0.2s behind as "falling
+  behind".
+
 `run_ttl_partition_race.sh` puts four persistence workers under TTL write load
 with a two-second bucket, so every rollover is contested. `CREATE TABLE IF NOT
 EXISTS` does not settle that race — two sessions can both pass the existence
