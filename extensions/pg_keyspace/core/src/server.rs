@@ -2390,25 +2390,7 @@ impl Worker {
                             None => resp::error(out, "ERR no such key"),
                             Some((kind, _, v)) => match sub.as_deref() {
                                 Some(b"ENCODING") => {
-                                    let enc: &[u8] = match kind {
-                                        KIND_HASH => b"hashtable",
-                                        k if k == crate::store::KIND_LIST => b"quicklist",
-                                        k if k == crate::store::KIND_ZSET => b"skiplist",
-                                        k if k == crate::store::KIND_SET => b"hashtable",
-                                        k if prob::encoding_name(k).is_some() => {
-                                            prob::encoding_name(k).unwrap().as_bytes()
-                                        }
-                                        // integer strings report "int" as Redis does
-                                        _ if std::str::from_utf8(v)
-                                            .ok()
-                                            .and_then(|t| t.parse::<i64>().ok())
-                                            .is_some() =>
-                                        {
-                                            b"int"
-                                        }
-                                        _ => b"embstr",
-                                    };
-                                    resp::bulk(out, enc);
+                                    resp::bulk(out, crate::store::encoding_name(kind, v));
                                 }
                                 Some(b"REFCOUNT") => resp::integer(out, 1),
                                 _ => resp::integer(out, 0), // IDLETIME / FREQ
@@ -2706,14 +2688,7 @@ impl Worker {
                 } else {
                     let t = match store.get_typed(&args[1]) {
                         None => "none",
-                        Some((KIND_HASH, _, _)) => "hash",
-                        Some((k, _, _)) if k == crate::store::KIND_LIST => "list",
-                        Some((k, _, _)) if k == crate::store::KIND_ZSET => "zset",
-                        Some((k, _, _)) if k == crate::store::KIND_SET => "set",
-                        Some((k, _, _)) if prob::type_name(k).is_some() => {
-                            prob::type_name(k).unwrap()
-                        }
-                        Some(_) => "string",
+                        Some((kind, _, _)) => crate::store::type_name(kind),
                     };
                     resp::simple(out, t);
                 }
@@ -4455,7 +4430,19 @@ impl Worker {
         // if the key was emptied/deleted — so it recovers as the right type.
         if persist_on && stages.is_empty() && is_aggregate_write(&cmd) && nargs >= 2 {
             stages.push(match store.get_typed(&args[1]) {
-                Some((kind, exp, blob)) => (args[1].clone(), blob.to_vec(), exp, kind as u8),
+                Some((kind, exp, blob)) => match (blob.len() > INLINE_MAX
+                    && exp != DELETE_TOMBSTONE)
+                    .then(|| store.version_of(&args[1]))
+                    .flatten()
+                {
+                    Some(version) => (
+                        args[1].clone(),
+                        version.to_le_bytes().to_vec(),
+                        exp,
+                        kind as u8 | ring::KIND_REF,
+                    ),
+                    None => (args[1].clone(), blob.to_vec(), exp, kind as u8),
+                },
                 None => (args[1].clone(), Vec::new(), DELETE_TOMBSTONE, b's'),
             });
         }
@@ -4472,7 +4459,8 @@ impl Worker {
             // bounding how large a value may be. `stage_by_ref` also records
             // the sequence on the entry so eviction cannot drop it before the
             // worker has committed it.
-            let staged = match (v.len() > INLINE_MAX && e != DELETE_TOMBSTONE)
+            let staged = match (kind & ring::KIND_REF != 0
+                || (v.len() > INLINE_MAX && e != DELETE_TOMBSTONE))
                 .then(|| store.version_of(&k))
                 .flatten()
             {

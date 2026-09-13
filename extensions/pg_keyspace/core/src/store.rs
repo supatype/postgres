@@ -54,6 +54,35 @@ pub const KIND_SET: u32 = b'S' as u32;
 pub const KIND_BLOOM: u32 = b'b' as u32;
 pub const KIND_CUCKOO: u32 = b'c' as u32;
 
+pub fn type_name(kind: u32) -> &'static str {
+    match kind {
+        KIND_HASH => "hash",
+        KIND_LIST => "list",
+        KIND_ZSET => "zset",
+        KIND_SET => "set",
+        KIND_BLOOM => "MBbloom--",
+        KIND_CUCKOO => "MBbloomCF",
+        _ => "string",
+    }
+}
+
+pub fn encoding_name(kind: u32, val: &[u8]) -> &'static [u8] {
+    match kind {
+        KIND_HASH | KIND_SET => b"hashtable",
+        KIND_LIST => b"quicklist",
+        KIND_ZSET => b"skiplist",
+        KIND_BLOOM | KIND_CUCKOO => b"raw",
+        _ if std::str::from_utf8(val)
+            .ok()
+            .and_then(|t| t.parse::<i64>().ok())
+            .is_some() =>
+        {
+            b"int"
+        }
+        _ => b"embstr",
+    }
+}
+
 #[repr(C)]
 struct SegHeader {
     magic: u64,
@@ -1904,6 +1933,25 @@ fn i64_to_bytes(mut n: i64, buf: &mut [u8; 20]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_kind_has_a_type_and_an_encoding_name() {
+        for (kind, name, enc) in [
+            (KIND_STR, "string", &b"embstr"[..]),
+            (KIND_HASH, "hash", b"hashtable"),
+            (KIND_LIST, "list", b"quicklist"),
+            (KIND_ZSET, "zset", b"skiplist"),
+            (KIND_SET, "set", b"hashtable"),
+            (KIND_BLOOM, "MBbloom--", b"raw"),
+            (KIND_CUCKOO, "MBbloomCF", b"raw"),
+        ] {
+            assert_eq!(type_name(kind), name, "kind {kind}");
+            assert_eq!(encoding_name(kind, b"x"), enc, "kind {kind}");
+        }
+        assert_eq!(encoding_name(KIND_STR, b"42"), b"int");
+        assert_eq!(encoding_name(KIND_STR, b"4.2"), b"embstr");
+        assert_eq!(type_name(b'?' as u32), "string");
+    }
 
     fn store(name: &str) -> Store {
         let cfg = Config::for_capacity(2, 10_000, 128);

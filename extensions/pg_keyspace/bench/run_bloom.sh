@@ -290,6 +290,8 @@ else
     $1 BF.ADD pstr x 2>&1
     $1 BF.SCANDUMP pstr 0 2>&1
     $1 BF.LOADCHUNK pstr 1 zz 2>&1
+    $1 BF.EXISTS pstr x 2>&1
+    $1 BF.MEXISTS pstr x y 2>&1
     $1 BF.RESERVE psub 5e-324 1 2>&1
     $1 BF.INSERT psub ERROR 5e-324 ITEMS x 2>&1
     $1 BF.RESERVE psub -1 100 2>&1

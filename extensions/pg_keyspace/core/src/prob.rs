@@ -79,21 +79,6 @@ const MAX_EXPANSIONS: &str = "Maximum expansions reached";
 const CF_INVALID_POSITION: &str = "Invalid position";
 const CF_INVALID_HEADER: &str = "Invalid header";
 
-pub fn type_name(kind: u32) -> Option<&'static str> {
-    match kind {
-        KIND_BLOOM => Some("MBbloom--"),
-        KIND_CUCKOO => Some("MBbloomCF"),
-        _ => None,
-    }
-}
-
-pub fn encoding_name(kind: u32) -> Option<&'static str> {
-    match kind {
-        KIND_BLOOM | KIND_CUCKOO => Some("raw"),
-        _ => None,
-    }
-}
-
 pub fn dispatch(
     store: &Store,
     cmd: &[u8],
@@ -229,6 +214,11 @@ fn bits_per_item(error: f64) -> f64 {
 
 fn hash_count(bpe: f64) -> u32 {
     ((bpe * std::f64::consts::LN_2).ceil() as u32).clamp(1, MAX_HASHES)
+}
+
+fn bits_fit(capacity: u64, error: f64) -> bool {
+    let n = capacity as f64 * bits_per_item(error);
+    n.is_finite() && n < (MAX_BLOB_BYTES as u64 * 8) as f64
 }
 
 fn bit_count(capacity: u64, bpe: f64) -> u64 {
@@ -393,6 +383,9 @@ fn grown(blob: &[u8]) -> Option<Vec<u8>> {
         .saturating_mul(f.expansion.max(1) as u64)
         .min(MAX_CAPACITY);
     let error = (f.error * TIGHTEN.powi(f.subs.len() as i32)).max(MIN_ERROR);
+    if !bits_fit(capacity, error) {
+        return None;
+    }
     let mut out = blob.to_vec();
     push_sub(&mut out, capacity, error)?;
     out[OFF_FILTERS..HDR].copy_from_slice(&((f.subs.len() + 1) as u32).to_le_bytes());
@@ -512,7 +505,7 @@ fn add_item(store: &Store, key: &[u8], item: &[u8], spec: &Spec) -> Add {
     };
     let mut next = match grown(&blob) {
         Some(b) => b,
-        None => return Add::Oom,
+        None => return Add::MaxGrow,
     };
     let r = add_in_place(&mut next, item);
     if r == Add::Bad {
@@ -601,6 +594,9 @@ fn reserve(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
     };
     if capacity < 1 || capacity as u64 > MAX_CAPACITY {
         return resp::error(out, CAPACITY_RANGE);
+    }
+    if !bits_fit(capacity as u64, error) {
+        return resp::error(out, CANNOT_CREATE);
     }
     let mut spec = Spec {
         error,
@@ -737,6 +733,9 @@ fn insert(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3:
     if items.is_empty() {
         return arity(out, cmd);
     }
+    if !bits_fit(spec.capacity, spec.error) {
+        return resp::error(out, CANNOT_CREATE);
+    }
     if !prepare(store, &args[1], &spec, nocreate, out) {
         return;
     }
@@ -756,9 +755,19 @@ fn contains(store: &Store, key: &[u8], item: &[u8]) -> bool {
     f.subs.iter().any(|s| sub_has(blob, s, h1, h2))
 }
 
+fn readable(store: &Store, key: &[u8]) -> bool {
+    match store.get_typed(key) {
+        Some((KIND_BLOOM, _, v)) => parse(v).is_some(),
+        _ => true,
+    }
+}
+
 fn exists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: bool) {
     if args.len() != 3 {
         return arity(out, cmd);
+    }
+    if !readable(store, &args[1]) {
+        return resp::error(out, BAD_DATA);
     }
     resp::boolean(out, contains(store, &args[1], &args[2]), resp3);
 }
@@ -766,6 +775,9 @@ fn exists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3:
 fn mexists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: bool) {
     if args.len() < 3 {
         return arity(out, cmd);
+    }
+    if !readable(store, &args[1]) {
+        return resp::error(out, BAD_DATA);
     }
     resp::array_header(out, args.len() - 2);
     for item in &args[2..] {
@@ -1488,9 +1500,19 @@ fn cf_occurrences(store: &Store, key: &[u8], item: &[u8]) -> u64 {
     cf_count_blob(blob, &c, h, fp)
 }
 
+fn cf_readable(store: &Store, key: &[u8]) -> bool {
+    match store.get_typed(key) {
+        Some((KIND_CUCKOO, _, v)) => cf_parse(v).is_some(),
+        _ => true,
+    }
+}
+
 fn cf_exists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: bool) {
     if args.len() != 3 {
         return arity(out, cmd);
+    }
+    if !cf_readable(store, &args[1]) {
+        return resp::error(out, CF_INVALID_HEADER);
     }
     resp::boolean(out, cf_contains(store, &args[1], &args[2]), resp3);
 }
@@ -1498,6 +1520,9 @@ fn cf_exists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, res
 fn cf_mexists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: bool) {
     if args.len() < 3 {
         return arity(out, cmd);
+    }
+    if !cf_readable(store, &args[1]) {
+        return resp::error(out, CF_INVALID_HEADER);
     }
     resp::array_header(out, args.len() - 2);
     for item in &args[2..] {
@@ -1508,6 +1533,9 @@ fn cf_mexists(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, re
 fn cf_count(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
     if args.len() != 3 {
         return arity(out, cmd);
+    }
+    if !cf_readable(store, &args[1]) {
+        return resp::error(out, CF_INVALID_HEADER);
     }
     resp::integer(out, cf_occurrences(store, &args[1], &args[2]) as i64);
 }
@@ -2088,11 +2116,10 @@ mod tests {
 
     #[test]
     fn the_type_and_encoding_names_match_redis() {
-        assert_eq!(type_name(KIND_BLOOM), Some("MBbloom--"));
-        assert_eq!(type_name(KIND_CUCKOO), Some("MBbloomCF"));
-        assert_eq!(type_name(crate::store::KIND_STR), None);
-        assert_eq!(encoding_name(KIND_BLOOM), Some("raw"));
-        assert_eq!(encoding_name(crate::store::KIND_SET), None);
+        assert_eq!(crate::store::type_name(KIND_BLOOM), "MBbloom--");
+        assert_eq!(crate::store::type_name(KIND_CUCKOO), "MBbloomCF");
+        assert_eq!(crate::store::encoding_name(KIND_BLOOM, b""), b"raw");
+        assert_eq!(crate::store::encoding_name(KIND_CUCKOO, b""), b"raw");
     }
 
     fn place(data: &mut [u8], buckets: u64, bucket: u32, maxiter: u32, h: u64, fp: u8) -> bool {
@@ -2210,7 +2237,6 @@ mod tests {
         assert_eq!(run(&s, &["CF.COUNT", "f", "hello"]), ":2\r\n");
         assert_eq!(run(&s, &["CF.MEXISTS", "f", "hello", "zz"]), "*2\r\n:1\r\n:0\r\n");
         assert_eq!(run(&s, &["TYPE"]), "-ERR unknown command 'TYPE'\r\n");
-        assert_eq!(type_name(KIND_CUCKOO), Some("MBbloomCF"));
     }
 
     #[test]
@@ -3168,5 +3194,100 @@ mod tests {
             Add::Added
         ));
         assert_eq!(run(&s, &["CF.EXISTS", "c", "y"]), ":1\r\n");
+    }
+
+    #[test]
+    fn a_capacity_whose_bits_cannot_fit_the_blob_is_refused() {
+        let s = Store::create("t_prob_bits", &cfg(1024 * 1024)).unwrap();
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "k", "0.01", "1000000000"]),
+            format!("-{CANNOT_CREATE}\r\n")
+        );
+        assert!(s.get_typed(b"k").is_none());
+        assert_eq!(
+            run(&s, &["BF.INSERT", "j", "CAPACITY", "1000000000", "ITEMS", "x"]),
+            format!("-{CANNOT_CREATE}\r\n")
+        );
+        assert!(s.get_typed(b"j").is_none());
+        assert!(bits_fit(448_000_000, 0.01));
+        assert!(!bits_fit(1_000_000_000, 0.01));
+        assert!(!bits_fit(u64::MAX, 0.01));
+        assert!(bits_fit(100, 0.01));
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "ok", "0.01", "400000000"]),
+            format!("-{}\r\n", crate::server::OOM_ERR),
+            "a capacity whose bits fit is refused by the arena, not by the bit bound"
+        );
+    }
+
+    #[test]
+    fn a_chain_that_cannot_size_its_next_filter_reports_maximum_expansions() {
+        let mut blob = new_blob(0.01, 400_000_000, 4, false).unwrap();
+        assert!(grown(&blob).is_none(), "the next sub-filter cannot fit");
+        let f = parse(&blob).unwrap();
+        blob[f.subs[0].hdr + 8..f.subs[0].hdr + 16]
+            .copy_from_slice(&f.subs[0].capacity.to_le_bytes());
+        assert!(matches!(add_in_place(&mut blob, b"x"), Add::Grow));
+
+        let s = Store::create("t_prob_growbits", &cfg(1024 * 1024 * 1024)).unwrap();
+        assert!(s.set_typed(b"g", &blob, 0, KIND_BLOOM));
+        assert_eq!(run(&s, &["BF.ADD", "g", "x"]), format!("-{MAX_EXPANSIONS}\r\n"));
+    }
+
+    #[test]
+    fn a_filter_blob_that_does_not_parse_is_reported_not_treated_as_absent() {
+        let s = Store::create("t_prob_partial", &cfg(4 * 1024 * 1024)).unwrap();
+        assert_eq!(run(&s, &["BF.RESERVE", "src", "0.01", "5000"]), "+OK\r\n");
+        assert_eq!(run(&s, &["BF.ADD", "src", "a"]), ":1\r\n");
+        let head = s.get_typed(b"src").unwrap().2[..64].to_vec();
+        let load = vec![
+            b"BF.LOADCHUNK".to_vec(),
+            b"part".to_vec(),
+            (head.len() + 1).to_string().into_bytes(),
+            head,
+        ];
+        let mut out = Vec::new();
+        dispatch(&s, b"BF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
+        assert_eq!(String::from_utf8_lossy(&out), "+OK\r\n");
+        assert!(parse(s.get_typed(b"part").unwrap().2).is_none());
+        let bad = format!("-{BAD_DATA}\r\n");
+        assert_eq!(run(&s, &["BF.EXISTS", "part", "a"]), bad);
+        assert_eq!(run(&s, &["BF.MEXISTS", "part", "a", "b"]), bad);
+        assert_eq!(run(&s, &["BF.CARD", "part"]), bad);
+        assert_eq!(run(&s, &["BF.INFO", "part"]), bad);
+
+        assert_eq!(run(&s, &["CF.RESERVE", "csrc", "5000"]), "+OK\r\n");
+        assert_eq!(run(&s, &["CF.ADD", "csrc", "a"]), ":1\r\n");
+        let chead = s.get_typed(b"csrc").unwrap().2[..64].to_vec();
+        let load = vec![
+            b"CF.LOADCHUNK".to_vec(),
+            b"cpart".to_vec(),
+            (chead.len() + 1).to_string().into_bytes(),
+            chead,
+        ];
+        let mut out = Vec::new();
+        dispatch(&s, b"CF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
+        assert_eq!(String::from_utf8_lossy(&out), "+OK\r\n");
+        assert!(cf_parse(s.get_typed(b"cpart").unwrap().2).is_none());
+        let cbad = format!("-{CF_INVALID_HEADER}\r\n");
+        assert_eq!(run(&s, &["CF.EXISTS", "cpart", "a"]), cbad);
+        assert_eq!(run(&s, &["CF.MEXISTS", "cpart", "a", "b"]), cbad);
+        assert_eq!(run(&s, &["CF.COUNT", "cpart", "a"]), cbad);
+        assert_eq!(run(&s, &["CF.DEL", "cpart", "a"]), cbad);
+        assert_eq!(run(&s, &["CF.INFO", "cpart"]), cbad);
+    }
+
+    #[test]
+    fn a_wrong_type_key_still_reads_as_absent_the_way_redis_does() {
+        let s = Store::create("t_prob_wt_reads", &cfg(1024 * 1024)).unwrap();
+        assert!(s.set(b"str", b"v", 0));
+        assert_eq!(run(&s, &["BF.EXISTS", "str", "x"]), ":0\r\n");
+        assert_eq!(run(&s, &["BF.MEXISTS", "str", "x", "y"]), "*2\r\n:0\r\n:0\r\n");
+        assert_eq!(run(&s, &["CF.EXISTS", "str", "x"]), ":0\r\n");
+        assert_eq!(run(&s, &["CF.MEXISTS", "str", "x", "y"]), "*2\r\n:0\r\n:0\r\n");
+        assert_eq!(run(&s, &["CF.COUNT", "str", "x"]), ":0\r\n");
+        assert_eq!(run(&s, &["CF.DEL", "str", "x"]), format!("-{CF_NOT_FOUND}\r\n"));
+        assert_eq!(run(&s, &["BF.EXISTS", "gone", "x"]), ":0\r\n");
+        assert_eq!(run(&s, &["CF.COUNT", "gone", "x"]), ":0\r\n");
     }
 }

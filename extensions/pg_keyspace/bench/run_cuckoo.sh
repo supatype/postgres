@@ -404,6 +404,7 @@ else
     $1 CF.RESERVE pstr 100 2>&1
     $1 CF.SCANDUMP pstr 0 2>&1
     $1 CF.EXISTS pstr x 2>&1
+    $1 CF.MEXISTS pstr x y 2>&1
     $1 CF.COUNT pstr x 2>&1
     $1 CF.DEL pstr x 2>&1
   }

@@ -106,7 +106,7 @@ jobs:
 
       - name: Start redis 8 (bloom/cuckoo parity reference)
         run: |
-          docker run --rm -d --name redis8 -p 6380:6379 redis:8
+          docker run --rm -d --name redis8 -p 6380:6379 redis:8.10.1
           for _ in $(seq 1 30); do redis-cli -p 6380 PING 2>/dev/null | grep -q PONG && break; sleep 0.5; done
           redis-cli -p 6380 PING
 
