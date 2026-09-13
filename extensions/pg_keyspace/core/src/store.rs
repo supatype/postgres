@@ -51,6 +51,8 @@ pub const KIND_LIST: u32 = b'l' as u32;
 pub const KIND_ZSET: u32 = b'z' as u32;
 // 'S' (distinct from KIND_STR 's'): a serialized unordered set of members.
 pub const KIND_SET: u32 = b'S' as u32;
+pub const KIND_BLOOM: u32 = b'b' as u32;
+pub const KIND_CUCKOO: u32 = b'c' as u32;
 
 #[repr(C)]
 struct SegHeader {
@@ -1413,6 +1415,30 @@ impl Store {
         }
     }
 
+    pub fn with_value_mut<R>(&self, key: &[u8], f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
+        unsafe {
+            let (found, _) = self.probe(p, hash, key);
+            let b = found?;
+            let idx = *self.buckets_ptr(p).add(b) - 1;
+            let e = self.entries_ptr(p).add(idx as usize);
+            let exp = (*e).expires_at;
+            if exp != 0 && exp <= now_micros() {
+                self.remove_at(p, b, idx);
+                return None;
+            }
+            seq_begin(e);
+            let vp = self.data_ptr(p).add((*e).val_off as usize);
+            let val = std::slice::from_raw_parts_mut(vp, (*e).val_len as usize);
+            let out = f(val);
+            (*e).flags |= FLAG_REF;
+            (*self.meta(p)).sets += 1;
+            seq_end(e);
+            Some(out)
+        }
+    }
+
     unsafe fn remove_at(&self, p: u32, bucket: usize, idx: u32) {
         let e = self.entries_ptr(p).add(idx as usize);
         self.slab_free(p, (*e).key_off, (*e).key_class);
@@ -2704,5 +2730,82 @@ mod tests {
             torn, 0,
             "{torn} of {reads} reads observed a spliced value: the reader saw              bytes from two different writes in one buffer"
         );
+    }
+
+    #[test]
+    fn with_value_mut_returns_none_for_an_absent_key() {
+        let s = store("t_wvm_absent");
+        assert!(s.with_value_mut(b"nope", |_v| ()).is_none());
+    }
+
+    #[test]
+    fn with_value_mut_edits_the_value_in_place() {
+        let s = store("t_wvm_inplace");
+        let val = vec![0x0fu8; 64];
+        assert!(s.set_typed(b"f", &val, 60_000_000, KIND_BLOOM));
+        let (_, exp_before, _) = s.get_typed(b"f").expect("present after set");
+
+        let n = s
+            .with_value_mut(b"f", |v| {
+                for b in v.iter_mut() {
+                    *b ^= 0xff;
+                }
+                v.len()
+            })
+            .expect("present");
+        assert_eq!(n, 64);
+
+        match s.get(b"f") {
+            Lookup::Hit(v) => assert_eq!(v, vec![0xf0u8; 64].as_slice()),
+            _ => panic!("miss after in-place edit"),
+        }
+        let (kind, exp_after, v) = s.get_typed(b"f").expect("still present");
+        assert_eq!(kind, KIND_BLOOM);
+        assert_eq!(exp_after, exp_before);
+        assert_eq!(v, vec![0xf0u8; 64].as_slice());
+    }
+
+    #[test]
+    fn with_value_mut_bumps_the_version_and_leaves_it_even() {
+        let s = store("t_wvm_version");
+        assert!(s.set(b"f", &[1u8; 64], 0));
+        let before = s.version(b"f").expect("present after set");
+        assert!(s.with_value_mut(b"f", |v| v[0] = 2).is_some());
+        let after = s.version(b"f").expect("present after edit");
+        assert!(
+            after >= before + 2,
+            "version must advance by a full write ({before} -> {after})"
+        );
+        assert_eq!(after % 2, 0, "version must settle even ({after})");
+    }
+
+    #[test]
+    fn with_value_mut_returns_none_for_an_expired_key() {
+        let s = store("t_wvm_expired");
+        assert!(s.set(b"f", &[1u8; 64], 1));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(s.with_value_mut(b"f", |v| v[0] = 2).is_none());
+        assert!(matches!(s.get(b"f"), Lookup::Miss));
+        assert_eq!(s.version(b"f"), None);
+    }
+
+    #[test]
+    fn with_value_mut_edits_an_oversized_value_in_place() {
+        let s = store("t_wvm_oversized");
+        let len = 16 * 1024;
+        assert!(s.set_typed(b"big", &vec![0u8; len], 0, KIND_CUCKOO));
+        assert!(s
+            .with_value_mut(b"big", |v| {
+                assert_eq!(v.len(), len);
+                v[len - 1] = 7;
+                v[0] = 7;
+            })
+            .is_some());
+        let (kind, _, v) = s.get_typed(b"big").expect("present");
+        assert_eq!(kind, KIND_CUCKOO);
+        assert_eq!(v.len(), len);
+        assert_eq!(v[0], 7);
+        assert_eq!(v[len - 1], 7);
+        assert!(v[1..len - 1].iter().all(|&b| b == 0));
     }
 }
