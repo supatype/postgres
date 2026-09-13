@@ -950,7 +950,7 @@ to borrow. Living inside Postgres means there is.
 | `pg_stat_keyspace` | 1 row | the top line: entries, hits/misses, `hit_pct`, arena used/capacity |
 | `pg_stat_keyspace_workers` | (worker, partition) | per-worker counters, `arena_used_pct`, and the slot range + port that worker serves |
 | `pg_stat_keyspace_activity` | background worker | heartbeat age and pid per RESP/persist/expiry/invalidation worker |
-| `pg_stat_keyspace_persist` | (worker, shard) | per-ring `pushed`/`committed`/`lag`/`backlog_bytes`/`dropped` |
+| `pg_stat_keyspace_persist` | (worker, shard) | per-ring `pushed`/`committed`/`lag`/`backlog_bytes`/`dropped`/`uncommitted_batches` |
 | `pg_stat_keyspace_persist_total` | 1 row | the above summed, plus `worst_ring_backlog_bytes` |
 | `pg_stat_keyspace_tenants` | tenant | measured arena bytes and entries per tenant |
 | `pg_stat_keyspace_rowcache` | 1 row | row-cache occupancy, `coherent`, registrations and whether they are resident |
@@ -962,11 +962,25 @@ Three conventions, each chosen because a collector depends on it:
 
 **Counters are cumulative; gauges are instantaneous; the two never share a
 column.** `hits`, `misses`, `sets`, `evictions`, `tombstones`, `rehashes`,
-`pushed`, `dropped`, `committed`, `failed_batches`, `unresolved` and the pub/sub
-columns count since the segment or process started and are *not* reset by
-reading, so `rate()` over two scrapes means something. `entries`, `arena_*`,
-`backlog_bytes`, `lag`, `beat_age_ms`, `decode_lag_bytes` and `retained_bytes`
-are gauges.
+`pushed`, `dropped`, `committed`, `unresolved` and the pub/sub columns count
+since the segment or process started and are *not* reset by reading, so
+`rate()` over two scrapes means something. `entries`, `arena_*`,
+`backlog_bytes`, `lag`, `beat_age_ms`, `decode_lag_bytes`, `retained_bytes` and
+`uncommitted_batches` are gauges.
+
+`uncommitted_batches` deserves its own note, because the underlying counter's
+legacy name (`ring_stats().failed_batches`) says something it does not mean. The
+ring increments it *before* attempting a batch and decrements it after the
+commit succeeds — bracketing the attempt, because a Postgres `ERROR` unwinds out
+of the worker and an `Err` branch never runs. So **a batch in flight reads as
+one outstanding**, and under sustained writes this sits at a small number and
+oscillates. Measured on a soak: it moved between 2 and 4 across 4 rings the
+whole run, with nothing wrong.
+
+What it really reports is an increment that was never cancelled — a batch that
+failed, or whose worker died mid-commit. **The signal is a floor that does not
+drain**: when writes stop, it should return to zero, and whatever is left never
+committed. An alert on "nonzero" is an alert on ordinary traffic.
 
 **A switched-off feature returns NO ROWS, not a row of zeroes.** With
 `rowcache_decode = off`, `pg_stat_keyspace_invalidation` is empty.

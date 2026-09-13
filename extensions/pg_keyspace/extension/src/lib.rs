@@ -4074,10 +4074,22 @@ mod supacache {
     /// Postgres. In a sync-ack tier it should sit near zero and return there;
     /// a number that climbs and stays is persistence falling behind.
     ///
-    /// `errors` counts batches that failed to commit. The records are retained
-    /// and retried, so this is a health signal rather than a loss count, but it
-    /// is the signal that a persistence failure is happening at all: without
-    /// it, a failing batch is visible only by grepping the Postgres log.
+    /// `failed_batches` is MISNAMED and kept only for compatibility -- use
+    /// `supacache.pg_stat_keyspace_persist.uncommitted_batches`, which reports
+    /// the same number under a name that matches it.
+    ///
+    /// It is a GAUGE, not a count of failures. The ring increments it before
+    /// attempting a batch and decrements it after the commit succeeds --
+    /// bracketing the attempt, because a Postgres ERROR unwinds out of the
+    /// worker and an `Err` branch never runs. A batch in flight therefore reads
+    /// as one "failed", and under sustained writes this sits at a small number
+    /// and oscillates rather than accumulating.
+    ///
+    /// What it does report is an increment that was never cancelled: a batch
+    /// that failed, or whose worker died mid-commit. So the signal is a floor
+    /// that does not drain -- when writes stop, this should return to zero, and
+    /// whatever remains never committed. Alerting on any nonzero value alerts
+    /// on ordinary traffic.
     ///
     /// `unresolved` counts by-reference records whose value could not be read
     /// back. Usually benign, since a key overwritten after staging has a newer
@@ -4807,8 +4819,22 @@ mod supacache {
     /// is the layout `ring_index` uses; both halves are reported so a collector
     /// can group by either.
     ///
-    /// `pushed`, `dropped`, `committed`, `failed_batches` and `unresolved` are
-    /// CUMULATIVE; `backlog_bytes` and `lag` are GAUGES.
+    /// `pushed`, `dropped`, `committed` and `unresolved` are CUMULATIVE;
+    /// `backlog_bytes`, `lag` and `uncommitted_batches` are GAUGES.
+    ///
+    /// `uncommitted_batches` is NOT a failure count, despite what the
+    /// underlying ring counter's name suggests. `note_attempt` increments it
+    /// before a batch is tried and `note_commit` decrements it after the commit
+    /// succeeds -- bracketing the attempt, because a Postgres ERROR unwinds out
+    /// of the worker and an `Err` branch never runs. So a batch in flight reads
+    /// as one outstanding, and under load this sits at a small number and
+    /// oscillates.
+    ///
+    /// What it does report is a batch whose increment was never cancelled:
+    /// one that failed, or whose worker died mid-commit. The signal is
+    /// therefore a FLOOR THAT DOES NOT DRAIN -- when writes stop, this should
+    /// return to zero, and whatever is left never committed. Alerting on any
+    /// nonzero value alerts on ordinary traffic.
     #[pg_extern(stable, parallel_safe)]
     fn persist_shard_stats() -> TableIterator<
         'static,
@@ -4820,7 +4846,7 @@ mod supacache {
             name!(backlog_bytes, i64),
             name!(committed, i64),
             name!(lag, i64),
-            name!(failed_batches, i64),
+            name!(uncommitted_batches, i64),
             name!(unresolved, i64),
         ),
     > {
@@ -5184,7 +5210,7 @@ FROM supacache.worker_health();
 -- One row per persistence ring. Summed in pg_stat_keyspace_persist_total.
 CREATE VIEW supacache.pg_stat_keyspace_persist AS
 SELECT worker, shard, pushed, dropped, backlog_bytes, committed, lag,
-       failed_batches, unresolved
+       uncommitted_batches, unresolved
 FROM supacache.persist_shard_stats();
 
 CREATE VIEW supacache.pg_stat_keyspace_persist_total AS
@@ -5193,7 +5219,7 @@ SELECT COALESCE(sum(pushed), 0)::bigint          AS pushed,
        COALESCE(sum(backlog_bytes), 0)::bigint   AS backlog_bytes,
        COALESCE(sum(committed), 0)::bigint       AS committed,
        COALESCE(sum(lag), 0)::bigint             AS lag,
-       COALESCE(sum(failed_batches), 0)::bigint  AS failed_batches,
+       COALESCE(sum(uncommitted_batches), 0)::bigint AS uncommitted_batches,
        COALESCE(sum(unresolved), 0)::bigint      AS unresolved,
        -- The ring with the deepest backlog, which is the one that will start
        -- dropping. A healthy total hides it completely.
@@ -5280,7 +5306,7 @@ COMMENT ON VIEW supacache.pg_stat_keyspace_workers IS
 COMMENT ON VIEW supacache.pg_stat_keyspace_activity IS
   'pg_keyspace: heartbeat age per background worker. alive=false is a worker the watchdog is about to relaunch; a row that flips repeatedly is a crash loop.';
 COMMENT ON VIEW supacache.pg_stat_keyspace_persist IS
-  'pg_keyspace: persistence ring health, one row per (worker, shard). lag is acknowledged writes not yet committed to Postgres.';
+  'pg_keyspace: persistence ring health, one row per (worker, shard). lag is acknowledged writes not yet committed. uncommitted_batches is a GAUGE of batches in flight, not a failure count: alert on a floor that never drains, not on it being nonzero.';
 COMMENT ON VIEW supacache.pg_stat_keyspace_persist_total IS
   'pg_keyspace: persistence rings summed, plus the deepest single ring backlog, which a sum hides.';
 COMMENT ON VIEW supacache.pg_stat_keyspace_tenants IS
