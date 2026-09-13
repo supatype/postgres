@@ -159,6 +159,36 @@ for i in $(seq 1 400); do
 done
 chk "and every key still reads back from some worker ($STILL/400)" "400" "$STILL"
 
+echo
+echo "########## 4. the SQL routing table agrees with CLUSTER SLOTS ##########"
+# The defect was the two surfaces disagreeing about the same function's output
+# (#121). CLUSTER SLOTS/SHARDS/NODES all emit `hi - 1` because the Redis
+# convention is inclusive; slot_ranges() emitted crc16::slot_range's half-open
+# bounds raw, so adjacent workers OVERLAPPED -- worker 0 ending at 4096 and
+# worker 1 starting at 4096. A client sharding from that table sent every
+# boundary slot to the wrong worker.
+#
+# Four workers are running here, so there are three interior boundaries to get
+# wrong.
+OVERLAPS=$(psql_ "SELECT count(*) FROM (SELECT slot_hi, lead(slot_lo) OVER (ORDER BY worker) AS nxt FROM supacache.slot_ranges()) t WHERE nxt IS NOT NULL AND nxt <= slot_hi" | tr -d '[:space:]')
+chk "adjacent workers' ranges do not overlap" "0" "$OVERLAPS"
+GAPS=$(psql_ "SELECT count(*) FROM (SELECT slot_hi, lead(slot_lo) OVER (ORDER BY worker) AS nxt FROM supacache.slot_ranges()) t WHERE nxt IS NOT NULL AND nxt <> slot_hi + 1" | tr -d '[:space:]')
+chk "and leave no gap between them" "0" "$GAPS"
+chk "together they cover every slot exactly once" "16384" \
+    "$(psql_ "SELECT sum(slot_hi - slot_lo + 1) FROM supacache.slot_ranges()" | tr -d '[:space:]')"
+# The agreement itself, which nothing compared before.
+SQL_RANGES=$(psql_ "SELECT string_agg(slot_lo||'-'||slot_hi, ',' ORDER BY worker) FROM supacache.slot_ranges()" | tr -d '[:space:]')
+# Parsed from CLUSTER NODES, not CLUSTER SLOTS: the latter is a nested array
+# that redis-cli flattens into bare integers, so scraping it also picks up the
+# port numbers and produces nonsense. NODES is line-oriented --
+# "<id> <ip:port@bus> <flags> - 0 0 <worker> connected <lo>-<hi>" -- so the
+# range is the last field and the worker index is field 7.
+RESP_RANGES=$(redis-cli -p $RESP CLUSTER NODES 2>/dev/null \
+  | awk 'NF>=9 {print $7" "$NF}' | sort -n | awk '{printf "%s%s", (NR>1?",":""), $2}')
+chk "the SQL table and CLUSTER NODES report identical ranges" "$RESP_RANGES" "$SQL_RANGES"
+chk "and the ranges are non-empty, so that comparison means something" "1" \
+    "$([ -n "$SQL_RANGES" ] && echo 1 || echo 0)"
+
 stop_pg
 echo
 echo "================================================"
