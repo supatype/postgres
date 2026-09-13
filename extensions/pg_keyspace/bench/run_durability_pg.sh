@@ -1158,8 +1158,16 @@ if [ "$PLUGIN_OK" = "1" ]; then
   chk "the row cache is serving cached rows" "1" \
       "$(psql_ "EXPLAIN (COSTS OFF) SELECT v FROM public.inv66 WHERE id=1" | grep -c 'pg_keyspace_rowcache')"
 
+  # The slot is named for the DATABASE, not for the configuration (#120) --
+  # `pg_keyspace.rowcache_slot` is only the stem. Resolve it through the
+  # extension's own view rather than reconstructing the name here, so this
+  # stays correct if the naming ever changes again.
+  SLOT=$(psql_ "SELECT slot_name FROM supacache.pg_stat_keyspace_invalidation")
+  chk "the decode slot is named for this database" "1" \
+      "$(psql_ "SELECT ('$SLOT' LIKE 'supacache\\_rowcache\\_%')::int")"
+
   PMT0=$(psql_ "SELECT pg_postmaster_start_time()")
-  LSN0=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='supacache_rowcache'")
+  LSN0=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='$SLOT'")
   LOG0=$(wc -l < $PGDATA/log)
 
   # Change every cached row, then make the apply impossible before the worker
@@ -1177,7 +1185,7 @@ if [ "$PLUGIN_OK" = "1" ]; then
 
   ERRS=$(tail -n +$((LOG0+1)) $PGDATA/log | grep -c "rowcache invalidation worker.*exit code 1" || true)
   PMT1=$(psql_ "SELECT pg_postmaster_start_time()")
-  LSN1=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='supacache_rowcache'")
+  LSN1=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='$SLOT'")
 
   chk "the apply failed while the lock was held" "1" "$([ "${ERRS:-0}" -ge 1 ] && echo 1 || echo 0)"
   chk "the cluster stayed up, so the row cache survived the failure" "$PMT0" "$PMT1"
@@ -1200,7 +1208,7 @@ UNION ALL SELECT v FROM public.inv66 WHERE id=200"
 
   # And the slot must move once a batch really has been applied, or the fix
   # would trade lost invalidations for unbounded WAL retention.
-  LSN2=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='supacache_rowcache'")
+  LSN2=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='$SLOT'")
   chk "the slot advances once the batch is applied" "1" \
       "$(psql_ "SELECT ('$LSN2'::pg_lsn > '$LSN0'::pg_lsn)::int")"
 fi

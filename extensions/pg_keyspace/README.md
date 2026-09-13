@@ -829,6 +829,31 @@ also the last reader that borrowed shared bytes rather than reading through the
 seqlock, so a concurrent rewrite could splice two tuples together; it now reads
 the way every SQL read of the RESP keyspace already did.
 
+**One lock, though, is one lock for the whole cluster.** Every mutation of the
+store is confined to a single partition — the probe, the slab allocator, and
+above all `evict_one`, which moves the bucket array, the entry array and the
+bump pointer — so the lock follows the segment's own partitioning rather than
+sitting in front of all of it. `pg_keyspace.rowcache_partitions` (default 8)
+sets both, and writers in different partitions never wait on each other.
+
+That matters more than it used to. The row cache serves every database
+([#120](https://github.com/supatype/postgres/issues/120)), so a single lock
+would be a cluster-wide serialisation point for row-cache writes: one database
+with a cold cache and heavy read-through would stall caching for every other
+one. Partitions **divide** `rowcache_mb` rather than multiplying it — the
+setting has always meant the size of the whole segment — so raising the count
+never quietly grows the shared-memory request.
+
+The correctness risk this introduces is specific and worth naming: a lock chosen
+for one partition while the write lands in another is the #127 corruption again,
+with a lock in front of it saying it cannot happen. `Store::partition_of` is
+therefore a thin wrapper over the same two lines `get`/`set` route through
+rather than a second implementation, `rowcache_write` takes its partition from
+the same view the write goes through, and `bench/run_rowcache_lock_contention.sh`
+asserts that rows still read back well-formed at both 1 and 8 partitions after a
+concurrent read-through race. It prints the contention numbers too, as
+measurement rather than as a gate.
+
 The lock lives in the extension rather than in `core/`, because `core/` is
 shared with the standalone daemon, where every segment does have exactly one
 writing process and none of this applies.
@@ -869,6 +894,29 @@ across shutdown** so invalidation can resume, which means a stopped worker pins
 WAL from its `restart_lsn`: set `max_slot_wal_keep_size`. And if the slot is
 lost, the worker exits and the cache keeps serving whatever it holds with no
 further invalidation, so alert on the worker being alive rather than assuming.
+
+##### The slot is named for the database, not for the configuration
+
+`pg_keyspace.rowcache_slot` is the **stem** of the slot name; the slot itself is
+`<stem>_<database oid>`, e.g. `supacache_rowcache_16384`. A logical slot belongs
+to the database it was created in and only ever decodes changes from that
+database, so the slot has never been able to mean anything else, and naming it
+for the database is what lets there be more than one
+([#120](https://github.com/supatype/postgres/issues/120)).
+
+The oid rather than the name, because a slot name is capped at 63 characters and
+a database name can fill that on its own — a name-derived slot would have to be
+truncated, and two long database names sharing a prefix would truncate to the
+**same** slot. Two databases sharing one slot is the #117 cross-database failure
+one layer down, with the invalidations crossing instead of the rows.
+
+**Upgrading:** a cluster that ran an earlier version has a slot named for the
+configuration verbatim. Nothing consumes it after the upgrade, and an unconsumed
+slot pins WAL from its `restart_lsn` forever, so the worker drops it on first
+start and logs that it did. Nothing is lost — the row cache is empty after the
+restart an upgrade requires, and the new slot is correct from its first pass. If
+the drop fails (it is refused if the slot is somehow still active) the log says
+so and names the `pg_drop_replication_slot` call to run by hand.
 
 RLS is not subject to any of this. The quals re-apply above the cached row on
 every query, so a stale row is still filtered by the *current* policy for the
@@ -1212,6 +1260,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.tls_cert_file` / `tls_key_file` | *(empty)* | PEM cert + key → serve RESP over TLS |
 | `pg_keyspace.tls_use_postgres_cert` | `off` | with those unset, serve RESP with the cluster's `ssl_cert_file`/`ssl_key_file` (needs `ssl = on`) |
 | `pg_keyspace.rowcache_mb` | 64 | Mode B row-cache segment size (never RESP-addressable) |
+| `pg_keyspace.rowcache_partitions` | 8 | partitions the row-cache segment is carved into, and writer locks it has; divides `rowcache_mb`, does not multiply it |
 | `pg_keyspace.rowcache_decode` | `off` | keys-only Mode B invalidation worker (needs `wal_level=logical`) |
 | `pg_keyspace.rowcache_refill` | `off` | on: re-cache a changed hot key; off: drop-only (lazy) |
 | `pg_keyspace.rowcache_readthrough` | `off` | on: a pk lookup that misses caches the row it read (ignored unless `rowcache_decode` is on) |

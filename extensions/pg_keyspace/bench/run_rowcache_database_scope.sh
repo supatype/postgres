@@ -96,6 +96,48 @@ chk "the invalidation worker is up, so the cache is served at all" "t" \
     "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" proj_a)"
 
 echo
+echo "########## 1b. the decode slot is named for the database ##########"
+# A logical slot belongs to the database it was created in and only ever decodes
+# changes from that database, so the slot has never been able to mean anything
+# else -- and naming it for the database is what lets there be more than one
+# (#120). The oid, not the name: a slot name is capped at 63 characters, a
+# database name can fill that on its own, and two long names sharing a prefix
+# would truncate to the SAME slot. Two databases sharing one slot is the leak
+# below, one layer down, with the invalidations crossing instead of the rows.
+A_DBOID=$(Q "SELECT oid FROM pg_database WHERE datname='proj_a'")
+chk "a slot exists named for proj_a's oid" "1" \
+    "$(Q "SELECT count(*) FROM pg_replication_slots \
+          WHERE slot_name = 'supacache_rowcache_$A_DBOID' AND plugin = 'supacache_keys'")"
+chk "and it belongs to proj_a" "proj_a" \
+    "$(Q "SELECT database FROM pg_replication_slots WHERE slot_name='supacache_rowcache_$A_DBOID'")"
+chk "no slot is left under the bare configured name" "0" \
+    "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'supacache_rowcache'")"
+
+# The upgrade path. A cluster that ran an earlier version has a slot named for
+# the configuration verbatim, and after the upgrade NOTHING consumes it -- an
+# unconsumed slot pins WAL from its restart_lsn forever, which is the worst
+# operational failure this subsystem has and would arrive silently, on a cluster
+# that had done nothing but upgrade. Simulated here by creating that slot by
+# hand and restarting into it.
+Q "SELECT pg_create_logical_replication_slot('supacache_rowcache','supacache_keys')" proj_a >/dev/null
+chk "(setup) a pre-upgrade slot exists to be cleaned up" "1" \
+    "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'supacache_rowcache'")"
+restart
+for _ in $(seq 1 40); do
+  [ "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name='supacache_rowcache'")" = "0" ] && break
+  sleep 1
+done
+chk "the worker drops the pre-upgrade slot rather than leaving it pinning WAL" "0" \
+    "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'supacache_rowcache'")"
+chk "and says so in the log, naming what it dropped" "1" \
+    "$(grep -c "dropped the pre-per-database slot 'supacache_rowcache'" $PGDATA/log || true)"
+chk "the per-database slot is untouched" "1" \
+    "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'supacache_rowcache_$A_DBOID'")"
+for _ in $(seq 1 40); do [ "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" proj_a)" = "t" ] && break; sleep 1; done
+chk "and invalidation is still healthy afterwards" "t" \
+    "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" proj_a)"
+
+echo
 echo "########## 2. proj_a caches its own row ##########"
 chk "registering in the worker's database succeeds" "t" \
     "$(Q "SELECT supacache.rowcache_register('public.orders')" proj_a)"

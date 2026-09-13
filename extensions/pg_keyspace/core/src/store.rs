@@ -371,6 +371,40 @@ impl Config {
         }
     }
 
+    /// Carve a segment of a FIXED total size into partitions.
+    ///
+    /// `for_capacity` sizes a segment from what you want to store; this sizes
+    /// it from what you are willing to spend, which is the shape a Postgres
+    /// shared-memory request has: an operator sets a number of megabytes and
+    /// that number means the whole segment. Partitions therefore **divide** the
+    /// budget. Growing it instead would multiply a shared-memory request behind
+    /// the operator's back, and on a machine sized for the old request that is
+    /// a postmaster that will not start.
+    ///
+    /// `want_partitions` is rounded up to a power of two and then capped so no
+    /// partition is smaller than `min_bytes_per_part`. Each partition is a
+    /// separate arena with its own CLOCK eviction, so one too small to hold a
+    /// working set evicts continuously and caches nothing.
+    pub fn partitioned(
+        total_data_bytes: u64,
+        total_entries: u32,
+        want_partitions: u32,
+        min_bytes_per_part: u64,
+    ) -> Config {
+        let want = want_partitions.max(1).next_power_of_two();
+        // Largest power of two whose partitions still clear the floor.
+        let affordable = (total_data_bytes / min_bytes_per_part.max(1)).max(1);
+        let cap = 1u64 << (u64::BITS - affordable.leading_zeros() - 1);
+        let parts = (want as u64).min(cap).max(1) as u32;
+        let entries = (total_entries / parts).max(64);
+        Config {
+            num_partitions: parts,
+            buckets_per_part: (entries.saturating_mul(2)).next_power_of_two().max(1024),
+            entries_per_part: entries,
+            data_bytes_per_part: total_data_bytes / parts as u64,
+        }
+    }
+
     fn partition_bytes(&self) -> usize {
         let mut off = std::mem::size_of::<PartMeta>();
         off = align_up(off, 64) + self.buckets_per_part as usize * 4;
@@ -722,6 +756,26 @@ impl Store {
     #[inline]
     pub fn num_partitions(&self) -> u32 {
         self.num_partitions
+    }
+
+    /// Which partition `key` lives in.
+    ///
+    /// Every mutation of a partition — the probe, the slab allocator, and above
+    /// all `evict_one`, which moves the bucket array, the entry array and the
+    /// bump pointer — is confined to that one partition. So a caller that has to
+    /// serialise writers itself (the extension's row-cache segment, which has no
+    /// owning process) can take one lock per partition rather than one for the
+    /// whole segment, and two writers touching different partitions never wait
+    /// on each other.
+    ///
+    /// It MUST agree exactly with where `get`/`set` route, or such a lock would
+    /// guard the wrong arena while the caller believed it was protected — the
+    /// #127 crash wearing a lock. That is what keeps this a thin wrapper over
+    /// the same two lines the read and write paths use, rather than a second
+    /// implementation of the routing.
+    #[inline]
+    pub fn partition_of(&self, key: &[u8]) -> u32 {
+        self.partition_for_hash(fnv1a(key))
     }
 
     #[inline]
@@ -2996,5 +3050,128 @@ mod tests {
         assert_eq!(v[0], 7);
         assert_eq!(v[len - 1], 7);
         assert!(v[1..len - 1].iter().all(|&b| b == 0));
+    }
+
+    /// `partition_of` must name the partition a key actually lands in (#120).
+    ///
+    /// The extension takes one LWLock per partition over the row-cache segment,
+    /// choosing the lock with this function. If it disagreed with the routing
+    /// `set`/`get` use, two writers could hold different locks and mutate the
+    /// same arena — the #127 crash, with a lock in front of it saying it could
+    /// not happen. So this asserts against the store's own bookkeeping rather
+    /// than against a second copy of the hash: every key is written, and each
+    /// partition's live-entry count must equal the number of keys this function
+    /// claims for it.
+    #[test]
+    fn partition_of_names_the_partition_a_key_lands_in() {
+        for nparts in [1u32, 2, 8] {
+            let cfg = Config {
+                num_partitions: nparts,
+                buckets_per_part: 4096,
+                entries_per_part: 2048,
+                // Generous, so nothing is evicted and `entries` is exactly what
+                // was written.
+                data_bytes_per_part: 1024 * 1024,
+            };
+            let s = Store::create(&format!("t_part_of_{nparts}"), &cfg).unwrap();
+            let keys: Vec<String> = (0..1000u32).map(|i| format!("rowcache:{i}")).collect();
+            for k in &keys {
+                assert!(s.set(k.as_bytes(), b"v", 0), "set {k}");
+            }
+            for p in 0..nparts {
+                let claimed = keys
+                    .iter()
+                    .filter(|k| s.partition_of(k.as_bytes()) == p)
+                    .count();
+                assert_eq!(
+                    s.stats(p).entries as usize,
+                    claimed,
+                    "partition {p} of {nparts}: store holds {} entries, partition_of claims {claimed}",
+                    s.stats(p).entries
+                );
+            }
+            // And every partition is actually used at the widths that have
+            // more than one, or the test above would pass trivially on a
+            // router that sent everything to partition 0.
+            if nparts > 1 {
+                assert!(
+                    (0..nparts).all(|p| s.stats(p).entries > 0),
+                    "{nparts} partitions but some are empty: {:?}",
+                    (0..nparts).map(|p| s.stats(p).entries).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// Partitioning a fixed budget must DIVIDE it, never multiply it (#120).
+    ///
+    /// The row-cache segment is sized by `pg_keyspace.rowcache_mb`, which has
+    /// always meant the size of the whole segment. If raising the partition
+    /// count grew the arena instead, an operator who set
+    /// `rowcache_partitions = 8` would silently get eight times the shared
+    /// memory they asked for -- and on a machine sized for the old request, a
+    /// postmaster that will not start. The floor is enforced by capping the
+    /// partition COUNT rather than by rounding each partition up, which is the
+    /// only way to have both a floor and a fixed total.
+    #[test]
+    fn partitioned_divides_the_budget_instead_of_multiplying_it() {
+        const MB: u64 = 1024 * 1024;
+        for total_mb in [1u64, 4, 16, 64, 1024] {
+            for want in [1u32, 2, 3, 8, 64] {
+                let total = total_mb * MB;
+                let cfg = Config::partitioned(total, 200_000, want, MB);
+                let arena = cfg.data_bytes_per_part * cfg.num_partitions as u64;
+                assert!(
+                    arena <= total,
+                    "{total_mb}MB / {want} partitions: arena is {arena} bytes, over the \
+                     {total}-byte budget"
+                );
+                // And not so much less that the budget is being wasted: the
+                // only loss allowed is integer division across partitions.
+                assert!(
+                    total - arena < cfg.num_partitions as u64,
+                    "{total_mb}MB / {want} partitions: {} bytes of the budget unused",
+                    total - arena
+                );
+                assert!(
+                    cfg.data_bytes_per_part >= MB,
+                    "{total_mb}MB / {want} partitions: partition is under the 1MB floor"
+                );
+                assert!(cfg.num_partitions.is_power_of_two());
+                assert!(cfg.num_partitions <= want.next_power_of_two());
+            }
+        }
+    }
+
+    /// A budget too small to split is served by one partition rather than by a
+    /// partition under the floor, and the segment is still usable.
+    #[test]
+    fn partitioned_falls_back_to_one_partition_on_a_tiny_budget() {
+        const MB: u64 = 1024 * 1024;
+        let cfg = Config::partitioned(MB, 200_000, 64, MB);
+        assert_eq!(cfg.num_partitions, 1);
+        assert_eq!(cfg.data_bytes_per_part, MB);
+        let s = Store::create("t_part_tiny", &cfg).unwrap();
+        assert!(s.set(b"k", b"v", 0));
+        assert!(matches!(s.get(b"k"), Lookup::Hit(b"v")));
+    }
+
+    /// The routing is a pure function of the key, so a second view over the
+    /// same segment agrees with the first. A lock chosen in one backend has to
+    /// mean the same partition in every other one.
+    #[test]
+    fn partition_of_is_stable_across_views() {
+        let cfg = Config {
+            num_partitions: 8,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 128 * 1024,
+        };
+        let a = Store::create("t_part_of_stable", &cfg).unwrap();
+        let b = Store::attach("t_part_of_stable", &cfg).unwrap();
+        for i in 0..256u32 {
+            let k = format!("k{i}");
+            assert_eq!(a.partition_of(k.as_bytes()), b.partition_of(k.as_bytes()));
+        }
     }
 }
