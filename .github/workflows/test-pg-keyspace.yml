@@ -334,6 +334,15 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_rowcache_concurrency.sh
 
+      # Four persistence workers contending over TTL bucket partitions. With
+      # the fix reverted this kills 44 workers in a minute; with it, none.
+      - name: TTL partition creation race
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_ttl_partition_race.sh
+
       - name: Durability + fault injection suite
         env:
           PGKS_BUILD_PROFILE: debug

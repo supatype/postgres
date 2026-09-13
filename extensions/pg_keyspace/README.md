@@ -1201,6 +1201,13 @@ row-cache segfaults (#127, #128) and is sized so an unfixed build fails within
 seconds: without the writer lock it dies at around 1,400 transactions, with it
 the same run does over 600,000.
 
+`run_ttl_partition_race.sh` puts four persistence workers under TTL write load
+with a two-second bucket, so every rollover is contested. `CREATE TABLE IF NOT
+EXISTS` does not settle that race — two sessions can both pass the existence
+check — and the loser used to die with `duplicate_table`, taking its shard out
+of service until the watchdog returned it (#130). With the fix reverted the test
+records 44 worker deaths in a minute; with it, none.
+
 ---
 
 ## Backup, restore and upgrade

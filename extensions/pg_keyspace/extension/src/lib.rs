@@ -2232,12 +2232,37 @@ fn pg_ensure_schema() {
     });
 }
 
-/// Ensure the TTL bucket partition for `bucket` exists (idempotent).
+/// Ensure the TTL bucket partition for `bucket` exists (idempotent, and safe
+/// against another persistence worker doing the same thing at the same time).
+///
+/// `CREATE TABLE IF NOT EXISTS` is NOT race-free: two sessions can both pass the
+/// existence check before either inserts its catalogue row, and the loser raises
+/// `duplicate_table`. Partitions are created on demand by whichever worker first
+/// sees a write land in a new time bucket, so with `persist_workers > 1` every
+/// bucket rollover is a race with that many entrants -- measured, four
+/// persistence workers killed in a three-minute soak, one per bucket boundary
+/// (#130).
+///
+/// `let _ =` was never protection. A Postgres ERROR inside SPI longjmps out and
+/// aborts the transaction, which pgrx surfaces as a panic that takes the worker
+/// down; the discarded `Result` never sees it. The watchdog relaunches ~2s
+/// later, so nothing is lost -- the records are retained and retried -- but the
+/// shard stops draining for that gap, acknowledged durable writes back up, and
+/// clients see errors.
+///
+/// A plpgsql EXCEPTION handler opens an implicit subtransaction, so the
+/// duplicate is caught and rolled back without touching the outer persist
+/// transaction. One subtransaction per new bucket per worker -- once every
+/// `ttl_bucket_secs` -- which is nothing. `invalid_object_definition` covers the
+/// overlapping-bound form of the same race.
 fn ensure_ttl_partition(client: &mut pgrx::spi::SpiClient, bucket: i64) {
     let _ = client.update(
         &format!(
-            "CREATE TABLE IF NOT EXISTS supacache.kv_ttl_b{bucket} \
-             PARTITION OF supacache.kv_ttl FOR VALUES FROM ({bucket}) TO ({})",
+            "DO $ttl$ BEGIN \
+               CREATE TABLE supacache.kv_ttl_b{bucket} PARTITION OF supacache.kv_ttl \
+                 FOR VALUES FROM ({bucket}) TO ({}); \
+             EXCEPTION WHEN duplicate_table OR invalid_object_definition THEN NULL; \
+             END $ttl$",
             bucket + 1
         ),
         None,
