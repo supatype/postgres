@@ -227,6 +227,46 @@ for v in $VIEWS; do
 done
 chk "a pg_monitor member reads all ten, with no further grant" "" "$BADM"
 
+# Calling them, because a function that resolves is not yet a function that
+# works. A missing symbol is not the risk here -- Postgres's C-language
+# validator looks it up at CREATE FUNCTION time, so an upgrade script naming a
+# wrapper that is not in the library fails the whole ALTER EXTENSION with
+# `could not find function "..." in file "..."` and never reaches this point
+# (checked, by adding exactly such a function to the upgrade script).
+#
+# What survives CREATE is a row whose DECLARED shape disagrees with what the
+# wrapper returns -- the ring_stats() bug this whole PR exists for, where the
+# catalogue promised three columns and the wrapper returned seven. That is
+# caught by calling, and only by calling.
+#
+# Semantic errors are fine here and expected: the row cache serves one database
+# and these run in another. So this looks only for the loader's complaint, which
+# must never appear.
+UNRESOLVED=""
+probe() {
+  out=$(Q "$1" upgraded)
+  case "$out" in *"could not find function"*|*"undefined symbol"*)
+    UNRESOLVED="$UNRESOLVED ${2:-$1}";; esac
+}
+# Zero-argument functions come from the catalogue rather than a list, so a
+# function added later is probed without anyone remembering to add it here.
+ZERO_ARG=$(Q "SELECT p.proname FROM pg_proc p JOIN pg_depend d ON d.classid='pg_proc'::regclass AND d.objid=p.oid JOIN pg_extension e ON e.oid=d.refobjid WHERE e.extname='pg_keyspace' AND d.deptype='e' AND p.pronargs=0 ORDER BY 1" upgraded)
+# An exact count, in the same spirit as the 18 above: a sweep that quietly
+# stopped finding functions would probe nothing and pass. Bump it deliberately
+# when a zero-argument function is added.
+chk "the sweep found all 16 zero-argument functions" "16" \
+    "$(echo "$ZERO_ARG" | grep -c .)"
+for f in $ZERO_ARG; do probe "SELECT * FROM supacache.$f()" "$f()"; done
+# The rest take arguments, so they are named with values that are safe to pass:
+# reads, a registration of a table made for it, and a reload that is idempotent.
+Q "CREATE TABLE public.smoke(id bigint primary key, v text)" upgraded >/dev/null
+probe "SELECT supacache.key_worker('smoke')"                                "key_worker(text)"
+probe "SELECT supacache.rowcache_registration('public.smoke')"              "rowcache_registration(text)"
+probe "SELECT supacache.rowcache_register('public.smoke')"                  "rowcache_register(text)"
+probe "SELECT supacache.rowcache_put_pk('public.smoke', ARRAY['1'])"        "rowcache_put_pk(text,text[])"
+probe "SELECT supacache.rowcache_cached_pk_has_external('public.smoke', ARRAY['1'])" "rowcache_cached_pk_has_external(text,text[])"
+chk "every function is callable against the $NEW_VER library" "" "$UNRESOLVED"
+
 echo
 echo "########## 5. the upgraded install is still a clean extension ##########"
 # A script that created objects outside the extension would look fine above and
