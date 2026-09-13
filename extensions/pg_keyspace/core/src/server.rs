@@ -2460,8 +2460,34 @@ impl Worker {
                     .into_iter()
                     .filter(|(t, _)| who == 0 || *t == who)
                     .collect();
-                if !rows.is_empty() || !throttles.is_empty() {
+                // Measured cache-arena usage per tenant (#102). Scoped the same
+                // way as the ring rows: a tenant sees only its own. Reported
+                // whether or not a budget is configured, because knowing whether
+                // any deployment actually has this problem is useful before
+                // deciding to enforce anything about it.
+                let arena: Vec<(String, u64, u64)> = self
+                    .store
+                    .tenant_usage()
+                    .into_iter()
+                    .filter_map(|(scope, bytes, entries)| {
+                        let label = String::from_utf8_lossy(
+                            scope.strip_suffix(b":").unwrap_or(&scope),
+                        )
+                        .to_string();
+                        let id = share::tenant_id(&label);
+                        if who != 0 && id != who {
+                            return None;
+                        }
+                        Some((sanitize_label(&label), bytes, entries))
+                    })
+                    .collect();
+                if !rows.is_empty() || !throttles.is_empty() || !arena.is_empty() {
                     body.push_str("# Tenants\r\n");
+                    for (name, bytes, entries) in &arena {
+                        body.push_str(&format!(
+                            "tenant_{name}_arena:bytes={bytes},entries={entries}\r\n"
+                        ));
+                    }
                     for (ring, name, bytes, held) in rows {
                         body.push_str(&format!(
                             "tenant_{name}_ring{ring}:inflight_bytes={bytes},held={held}\r\n"

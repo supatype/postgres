@@ -166,6 +166,15 @@ static GUC_ROWCACHE_READTHROUGH: GucSetting<bool> = GucSetting::<bool>::new(fals
 static GUC_TENANT_RING_SHARE: GucSetting<bool> = GucSetting::<bool>::new(true);
 /// Tenant-scoped row-cache eviction (#43). On by default.
 static GUC_TENANT_SCOPED_EVICTION: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Cap any one tenant at this percentage of a segment partition's entries
+/// (0 = off, the default).
+///
+/// Scoped eviction stops a flood from evicting you; it does not guarantee you
+/// a share. A tenant that grows steadily rather than flooding is never the one
+/// inserting under pressure, so the preference never points at it and it keeps
+/// everything it has. A budget is what takes space back (#102).
+static GUC_TENANT_ARENA_PCT: GucSetting<i32> = GucSetting::<i32>::new(0);
 /// Per-tenant command rate (#43). 0 = no limit, which is the default.
 static GUC_TENANT_OPS_PER_SEC: GucSetting<i32> = GucSetting::<i32>::new(0);
 
@@ -801,6 +810,7 @@ fn store_view_for(w: usize) -> Option<Store> {
     // 256 has 0x3a as its low byte, which would read as a one-byte ":" tenant.
     let mut st = unsafe { Store::from_raw(base, &ks_config(), false) };
     st.set_scoped_eviction(GUC_TENANT_SCOPED_EVICTION.get());
+    st.set_tenant_arena_pct(GUC_TENANT_ARENA_PCT.get().max(0) as u32);
     Some(st)
 }
 
@@ -812,6 +822,7 @@ fn store_view_for_worker(w: usize) -> Option<Store> {
     }
     let mut st = unsafe { Store::from_raw(base, &ks_config(), false) };
     st.set_scoped_eviction(GUC_TENANT_SCOPED_EVICTION.get());
+    st.set_tenant_arena_pct(GUC_TENANT_ARENA_PCT.get().max(0) as u32);
     Some(st)
 }
 
@@ -1112,6 +1123,20 @@ pub extern "C" fn _PG_init() {
         GucContext::Postmaster,
         GucFlags::empty(),
     );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.tenant_arena_pct",
+        "Cap any one tenant at this percentage of a partition's cache entries",
+        "0 (default) = no budget: tenant_scoped_eviction still stops a flood from \
+         evicting other tenants, but nothing caps the share one tenant may hold. \
+         Above 0, a tenant over its share is evicted from first, whoever is \
+         inserting. A preference protects you from a flood; a budget also reclaims \
+         from a tenant that simply grew.",
+        &GUC_TENANT_ARENA_PCT,
+        0,
+        100,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
     GucRegistry::define_bool_guc(
         "pg_keyspace.tenant_ring_share",
         "Give each tenant a share of the persistence ring rather than first come, first served",
@@ -1387,6 +1412,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     let store = Arc::new(unsafe {
         let mut st = Store::from_raw(base, &cfg, false);
         st.set_scoped_eviction(GUC_TENANT_SCOPED_EVICTION.get());
+        st.set_tenant_arena_pct(GUC_TENANT_ARENA_PCT.get().max(0) as u32);
         st
     });
     // Persistence and recovery are per slot worker: this worker owns a disjoint

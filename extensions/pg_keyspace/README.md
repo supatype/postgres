@@ -828,6 +828,51 @@ connection's own tenant (an unscoped or exempt connection sees every tenant).
 Measure all of it with `bench/run_tenant_fairness.sh`, which runs the same loads
 with each policy off and on and prints both.
 
+
+#### Cache memory: a preference, and a budget
+
+`pg_keyspace.tenant_scoped_eviction` (on by default) makes the CLOCK sweep prefer
+a victim under the same `{tenant}:` prefix as the key being inserted, so a
+cold-key flood recycles its own space. A victim tenant's 200-key working set
+against a 40 000-key flood survives **193/200**, against 0/200 without it.
+
+That is a *preference*, and it leaves a gap: it points at whoever is inserting.
+A tenant that arrived first and grew steadily is never the one inserting under
+pressure, so the preference never points at it and it keeps everything it has.
+
+`pg_keyspace.tenant_arena_pct` (0 = off, the default) closes that. Above 0, a
+tenant holding more than that share of a partition's entries is evicted from
+first, whoever is inserting. A 900-key hog against a 1500-key arena, with a
+second tenant then writing steadily (`bench/run_tenant_fairness.sh`):
+
+| the second tenant's writes | hog, no budget | hog, `tenant_arena_pct = 25` |
+|---:|---:|---:|
+| 900 | 887 | 766 |
+| 2 700 | 873 | **382** |
+| 5 400 | 873 | **382** |
+
+It **converges on the share and stops** — 382 against a 375-key budget, and more
+pressure does not push it lower. Without a budget the hog holds 873 however long
+the contention lasts, which is the gap in one number.
+
+Two properties worth knowing:
+
+- **It reclaims on demand, not proactively.** Space is taken from an over-budget
+  tenant when somebody needs a slot, never by background-trimming space nobody
+  wants. So a budget does nothing at all on an uncontended cache, and converges
+  as contention continues — which is why the 900-write row above only dents it.
+- **Usage is measured, not accumulated.** The obvious implementation is a running
+  total per tenant adjusted on every insert, overwrite, eviction and expiry.
+  `set_in` alone changes a value's length in four places, and a counter that
+  drifts enforces something fictional — evicting a tenant that is not over,
+  silently, with no cheap way to notice. Instead the snapshot is recomputed by
+  one linear pass over the entry array, amortised across evictions. It cannot
+  drift, because nothing accumulates. The cost is that the eviction path's view
+  is slightly stale, which a policy tolerates.
+
+`INFO` reports `tenant_<name>_arena:bytes=…,entries=…` beside the ring rows,
+whether or not a budget is configured — knowing whether a deployment actually
+has this problem is useful before enforcing anything about it.
 ### Configuration (GUCs)
 
 All are `Postmaster` context (set in `postgresql.conf`).
@@ -853,6 +898,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.rowcache_readthrough` | `off` | on: a pk lookup that misses caches the row it read (ignored unless `rowcache_decode` is on) |
 | `pg_keyspace.tenant_ring_share` | `on` | give each tenant a share of the persistence ring instead of first come, first served |
 | `pg_keyspace.tenant_scoped_eviction` | `on` | evict a tenant's own cold keys before another tenant's |
+| `pg_keyspace.tenant_arena_pct` | 0 | cap one tenant at this % of a partition's entries (0 = off); over-budget tenants are evicted from first |
 | `pg_keyspace.tenant_ops_per_sec` | 0 | commands per second one tenant may issue (0 = no limit) |
 
 ### Sizing
@@ -1092,13 +1138,10 @@ Scoping for this version — the extension works; these are the edges to know:
   a worker to stay stopped.
 
 - **Per-tenant fairness covers the ring, cache memory and request rate; worker
-  placement is still unbalanced.** Keys and channels are force-scoped to
-  `{tenant}:`, and persistence capacity, cache eviction and command rate are now
-  accounted against that scope. What remains is placement: keys map to workers
-  by CRC16 slot, so a tenant with a hot key range concentrates on one worker
-  with no rebalancing. Cache memory is also a *preference* rather than a hard
-  budget — a tenant's flood evicts its own keys first, but nothing caps the
-  share of the arena it may hold.
+  placement is still unmanaged.** Keys map to workers by CRC16 slot, so a tenant
+  with a hot key range concentrates on one worker with no rebalancing, and
+  changing `pg_keyspace.workers` is a restart
+  ([#101](https://github.com/supatype/postgres/issues/101)).
 - Operational metrics are partial. `supacache.stats()`, `ring_stats()`,
   `rowcache_stats()` and `replication_status()` exist, and `ring_stats()` reports
   commit lag, failed batches and unresolved references; row cache invalidation

@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const MAGIC: u64 = 0x70_67_6b_73_5f_76_33_00; // "pgks_v3\0"
 /// Layout version inside a given MAGIC. Bumped when the meaning of the header's
 /// own fields changes; MAGIC is bumped when the partition layout does.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 // Size classes for the slab allocator ("size-classed, 32B..8KB").
 const CLASS_SIZES: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
@@ -93,6 +93,23 @@ struct PartMeta {
     sets: u64,
     tombstones: u64,
     rehashes: u64,
+    // Per-tenant arena usage (#102), MEASURED rather than accumulated.
+    //
+    // The obvious implementation is a running total per tenant, adjusted on
+    // every insert, overwrite, eviction and expiry. It is also the wrong one
+    // here: `set_in` alone changes a value's length in four places, and a
+    // counter that drifts enforces something fictional -- evicting a tenant
+    // that is not over, silently. There is no cheap way to notice.
+    //
+    // So this is a snapshot recomputed by one linear pass over the entry array,
+    // amortised across USAGE_REFRESH_EVERY evictions. It cannot drift, because
+    // nothing accumulates: every read of it was measured. The cost is that it
+    // is up to that many evictions stale, which a budget tolerates -- it is a
+    // policy about who to take space from, not an invariant anything depends on.
+    usage_evictions: u64, // value of `evictions` when the snapshot was taken
+    usage_valid: u32,     // occupied slots in `usage`
+    _usage_pad: u32,
+    usage: [TenantUse; TENANT_SLOTS],
 }
 
 #[repr(C)]
@@ -264,6 +281,47 @@ enum Backing {
 /// for the pressure.
 const SCOPED_EVICT_PROBE: u32 = 64;
 
+/// How many tenants a partition tracks arena usage for. A fixed array rather
+/// than a map because this lives in shared memory and is read on the eviction
+/// path; tenants past the cap are simply not budgeted, which is the safe
+/// direction (no budget is the old behaviour).
+const TENANT_SLOTS: usize = 32;
+
+/// Longest tenant scope recorded in a usage slot, including its `:`.
+const TENANT_SCOPE_MAX: usize = 40;
+
+/// Refresh the usage snapshot after this many evictions in a partition.
+///
+/// The snapshot is a *measurement*, not a running total, so this is the only
+/// thing that makes it stale -- and staleness is harmless for a budget, which
+/// is a policy rather than an invariant.
+const USAGE_REFRESH_EVERY: u64 = 512;
+
+/// One tenant's measured arena usage in one partition.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TenantUse {
+    scope_hash: u64,
+    bytes: u64,
+    entries: u32,
+    scope_len: u32,
+    scope: [u8; TENANT_SCOPE_MAX],
+}
+
+impl TenantUse {
+    const EMPTY: TenantUse = TenantUse {
+        scope_hash: 0,
+        bytes: 0,
+        entries: 0,
+        scope_len: 0,
+        scope: [0u8; TENANT_SCOPE_MAX],
+    };
+    #[inline]
+    fn scope_bytes(&self) -> &[u8] {
+        &self.scope[..self.scope_len as usize]
+    }
+}
+
 /// The tenant a key belongs to, for eviction purposes: everything up to and
 /// including the first `:`.
 ///
@@ -301,6 +359,7 @@ pub struct Store {
     /// meaningful for a segment whose keys are the tenant-scoped RESP keyspace
     /// -- see [`tenant_scope`].
     scoped_eviction: bool,
+    arena_pct: u32,
 }
 
 // A partition is written by exactly one worker; SQL-surface readers in other
@@ -371,6 +430,7 @@ impl Store {
             partition_bytes: cfg.partition_bytes(),
             header_bytes: align_up(std::mem::size_of::<SegHeader>(), 64),
             scoped_eviction: false,
+            arena_pct: 0,
         }
     }
 
@@ -381,6 +441,51 @@ impl Store {
     /// turns up, and the preference would group unrelated rows together.
     pub fn set_scoped_eviction(&mut self, on: bool) {
         self.scoped_eviction = on;
+    }
+
+    /// Cap any one tenant at this percentage of a partition's entries
+    /// (0 = no budget, the default and the pre-#102 behaviour).
+    ///
+    /// A share rather than an absolute, because the arena size is already a
+    /// setting and the tenant count varies.
+    pub fn set_tenant_arena_pct(&mut self, pct: u32) {
+        self.arena_pct = pct.min(100);
+    }
+
+    /// Measured arena usage per tenant in this segment: (scope, bytes, entries),
+    /// summed across partitions, largest first.
+    ///
+    /// Forces a refresh rather than reusing the eviction path's snapshot, which
+    /// is deliberately allowed to lag. Reporting that lag as current numbers
+    /// would make the stats surface quietly wrong -- it over-counted by every
+    /// entry deleted since the last eviction-driven refresh, which is how the
+    /// drift test caught it.
+    pub fn tenant_usage(&self) -> Vec<(Vec<u8>, u64, u64)> {
+        let mut agg: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+        for p in 0..self.num_partitions {
+            unsafe {
+                // Forced: a caller asking for stats wants a current answer, not
+                // whatever the eviction path last happened to need.
+                self.refresh_usage(p, true);
+                let meta = self.meta(p);
+                for i in 0..(*meta).usage_valid as usize {
+                    let u = (*meta).usage[i];
+                    if u.scope_len == 0 {
+                        continue;
+                    }
+                    let k = u.scope_bytes().to_vec();
+                    match agg.iter_mut().find(|(s, _, _)| *s == k) {
+                        Some(e) => {
+                            e.1 += u.bytes;
+                            e.2 += u.entries as u64;
+                        }
+                        None => agg.push((k, u.bytes, u.entries as u64)),
+                    }
+                }
+            }
+        }
+        agg.sort_by(|a, b| b.1.cmp(&a.1));
+        agg
     }
 
     fn init_header(&self) {
@@ -1242,6 +1347,116 @@ impl Store {
     /// that skipped them found nothing, every time, and fell through to the
     /// global sweep -- which is the behaviour being fixed. A tenant competing
     /// with itself is exactly who should be clearing its own reference bits.
+    /// Recompute this partition's per-tenant usage, if the snapshot has gone
+    /// stale. One linear pass over the entry array.
+    ///
+    /// Measured, never accumulated -- see the note on `PartMeta::usage`. The
+    /// pass is over a contiguous array of fixed-size entries, so it is a
+    /// sequential read rather than a pointer chase, and it happens once per
+    /// USAGE_REFRESH_EVERY evictions rather than per operation.
+    ///
+    /// Tenants past TENANT_SLOTS are dropped from the snapshot, smallest first.
+    /// That is the safe direction: a tenant we are not tracking is a tenant we
+    /// never decide is over budget, which is the behaviour from before there
+    /// were budgets at all.
+    unsafe fn refresh_usage(&self, p: u32, force: bool) {
+        let meta = self.meta(p);
+        if !force
+            && (*meta).usage_valid > 0
+            && (*meta).evictions.saturating_sub((*meta).usage_evictions) < USAGE_REFRESH_EVERY
+        {
+            return;
+        }
+        let mut slots = [TenantUse::EMPTY; TENANT_SLOTS];
+        let mut used = 0usize;
+        let bump = (*meta).entry_bump;
+        for idx in 0..bump {
+            let e = self.entries_ptr(p).add(idx as usize);
+            if (*e).flags & FLAG_OCCUPIED == 0 {
+                continue;
+            }
+            let key = std::slice::from_raw_parts(
+                self.data_ptr(p).add((*e).key_off as usize),
+                (*e).key_len as usize,
+            );
+            // Unscoped keys are nobody's tenant and are never budgeted.
+            let scope = match tenant_scope(key) {
+                Some(s) if s.len() <= TENANT_SCOPE_MAX => s,
+                _ => continue,
+            };
+            let bytes = (*e).key_len as u64 + (*e).val_len as u64;
+            let h = fnv1a(scope);
+            if let Some(slot) = slots[..used].iter_mut().find(|s| s.scope_hash == h) {
+                slot.bytes += bytes;
+                slot.entries += 1;
+                continue;
+            }
+            if used < TENANT_SLOTS {
+                let slot = &mut slots[used];
+                slot.scope_hash = h;
+                slot.bytes = bytes;
+                slot.entries = 1;
+                slot.scope_len = scope.len() as u32;
+                slot.scope[..scope.len()].copy_from_slice(scope);
+                used += 1;
+                continue;
+            }
+            // Full: displace the smallest, but only if this one is bigger.
+            // Budgets are about the largest tenants, so losing the tail costs
+            // nothing that the policy would have acted on.
+            if let Some((i, _)) = slots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.bytes)
+                .filter(|(_, s)| s.bytes < bytes)
+                .map(|(i, s)| (i, s.bytes))
+            {
+                let slot = &mut slots[i];
+                slot.scope_hash = h;
+                slot.bytes = bytes;
+                slot.entries = 1;
+                slot.scope_len = scope.len() as u32;
+                slot.scope[..scope.len()].copy_from_slice(scope);
+            }
+        }
+        (*meta).usage = slots;
+        (*meta).usage_valid = used as u32;
+        (*meta).usage_evictions = (*meta).evictions;
+    }
+
+    /// The tenant holding more than the configured share of this partition's
+    /// entries, if any. Largest first, so the worst offender is taken from.
+    ///
+    /// Measured against entry count rather than bytes: the arena is carved into
+    /// size classes, so a tenant's share of *capacity* is what its entries
+    /// occupy, and entries are what a partition runs out of first.
+    unsafe fn over_budget_scope(&self, p: u32) -> Option<[u8; TENANT_SCOPE_MAX]> {
+        if self.arena_pct == 0 {
+            return None;
+        }
+        // Not forced: on the eviction path, a snapshot up to
+        // USAGE_REFRESH_EVERY evictions old is what keeps this amortised, and a
+        // budget tolerates that staleness.
+        self.refresh_usage(p, false);
+        let meta = self.meta(p);
+        let cap = self.entries as u64;
+        if cap == 0 {
+            return None;
+        }
+        let budget = cap * self.arena_pct as u64 / 100;
+        let mut best: Option<(u64, [u8; TENANT_SCOPE_MAX])> = None;
+        for i in 0..(*meta).usage_valid as usize {
+            let u = (*meta).usage[i];
+            if u.scope_len == 0 || u.entries as u64 <= budget {
+                continue;
+            }
+            if best.map(|(b, _)| u.entries as u64 > b).unwrap_or(true) {
+                best = Some((u.entries as u64, u.scope));
+            }
+        }
+        best.map(|(_, s)| s)
+    }
+
     unsafe fn evict_scoped(&self, p: u32, prefer: &[u8]) -> bool {
         let meta = self.meta(p);
         let bump = (*meta).entry_bump;
@@ -1295,6 +1510,19 @@ impl Store {
     /// own still falls through to the ordinary sweep, so a small or new tenant
     /// is never starved of the arena by this.
     unsafe fn evict_one(&self, p: u32, prefer: Option<&[u8]>) -> bool {
+        // A tenant over its budget is taken from first, whoever is inserting.
+        // This is what makes the budget a budget rather than the preference
+        // scoped eviction already gives: without it, a tenant that grew
+        // steadily rather than flooding keeps everything it has, because it
+        // always has an evictable entry of its own to recycle (#102).
+        if let Some(scope) = self.over_budget_scope(p) {
+            let len = scope.iter().position(|b| *b == 0).unwrap_or(TENANT_SCOPE_MAX);
+            if len > 0 && self.evict_scoped(p, &scope[..len]) {
+                return true;
+            }
+            // Nothing evictable of theirs right now (all pinned, all staged, or
+            // out of probe range): fall through rather than refusing to evict.
+        }
         if self.scoped_eviction {
             if let Some(scope) = prefer {
                 if self.evict_scoped(p, scope) {
@@ -1714,6 +1942,123 @@ mod tests {
         assert!(st.evictions > 0, "expected evictions, got {}", st.evictions);
         // latest key must still be present
         assert!(matches!(s.get(b"key4999"), Lookup::Hit(_)));
+    }
+
+    /// #102: the gap scoped eviction leaves. A tenant that grows *steadily*
+    /// rather than flooding is never the one inserting when the arena is
+    /// pressured, so the preference never points at it and it keeps whatever it
+    /// has. Only a budget takes space back from it.
+    ///
+    /// `hog` writes first and stops; `late` then writes a modest working set.
+    /// Without a budget the hog keeps the arena; with one it is cut back to
+    /// roughly its share.
+    fn steady_hog_share(pct: u32) -> (usize, usize) {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 256 * 1024,
+        };
+        let name = format!("t_budget_{pct}");
+        let mut s = Store::create(&name, &cfg).unwrap();
+        s.set_scoped_eviction(true);
+        s.set_tenant_arena_pct(pct);
+        // The hog fills most of the arena and then goes quiet.
+        for i in 0..400u32 {
+            s.set(format!("hog:{i}").as_bytes(), b"0123456789abcdef", 0);
+        }
+        // A second tenant arrives and writes steadily, needing room.
+        for round in 0..6u32 {
+            for i in 0..100u32 {
+                s.set(format!("late:{round}:{i}").as_bytes(), b"0123456789abcdef", 0);
+            }
+        }
+        let hog = (0..400u32)
+            .filter(|i| matches!(s.get(format!("hog:{i}").as_bytes()), Lookup::Hit(_)))
+            .count();
+        let late = (0..100u32)
+            .filter(|i| matches!(s.get(format!("late:5:{i}").as_bytes()), Lookup::Hit(_)))
+            .count();
+        (hog, late)
+    }
+
+    #[test]
+    fn a_budget_cuts_back_a_steadily_grown_tenant() {
+        let (hog_off, _) = steady_hog_share(0);
+        let (hog_on, _) = steady_hog_share(25);
+        assert!(
+            hog_on < hog_off,
+            "a budget must reclaim from the hog: {hog_off} keys without one, {hog_on} with"
+        );
+    }
+
+    #[test]
+    fn a_budget_does_not_starve_the_tenant_it_protects() {
+        // The failure mode of an over-eager budget: reclaim so hard that the
+        // arriving tenant cannot keep its own recent writes either.
+        let (_, late) = steady_hog_share(25);
+        assert!(late > 50, "the arriving tenant should hold its recent keys, got {late}/100");
+    }
+
+    #[test]
+    fn no_budget_is_the_default_and_changes_nothing() {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 256,
+            entries_per_part: 128,
+            data_bytes_per_part: 32 * 1024,
+        };
+        let s = Store::create("t_budget_default", &cfg).unwrap();
+        assert_eq!(s.arena_pct, 0, "budgets are off unless a caller opts in");
+        assert!(unsafe { s.over_budget_scope(0) }.is_none());
+    }
+
+    /// The snapshot is measured, never accumulated, so it cannot drift -- this
+    /// is the property the design was chosen for, and it is worth asserting
+    /// rather than assuming. Churn the arena hard, then check the snapshot
+    /// against a fresh count of what is actually resident.
+    #[test]
+    fn usage_matches_a_fresh_count_after_heavy_churn() {
+        let cfg = Config {
+            num_partitions: 1,
+            buckets_per_part: 1024,
+            entries_per_part: 512,
+            data_bytes_per_part: 256 * 1024,
+        };
+        let mut s = Store::create("t_usage_drift", &cfg).unwrap();
+        s.set_tenant_arena_pct(50);
+        for round in 0..8u32 {
+            for i in 0..300u32 {
+                s.set(format!("a:{round}:{i}").as_bytes(), b"0123456789abcdef", 0);
+                s.set(format!("b:{i}").as_bytes(), b"0123456789abcdefghij", 0);
+            }
+            for i in 0..100u32 {
+                s.del(format!("a:{round}:{i}").as_bytes());
+            }
+        }
+        let reported: u64 = s.tenant_usage().iter().map(|(_, _, n)| *n).sum();
+        // Count what is really resident, independently of the snapshot.
+        let mut actual = 0u64;
+        unsafe {
+            let meta = s.meta(0);
+            for idx in 0..(*meta).entry_bump {
+                let e = s.entries_ptr(0).add(idx as usize);
+                if (*e).flags & FLAG_OCCUPIED == 0 {
+                    continue;
+                }
+                let key = std::slice::from_raw_parts(
+                    s.data_ptr(0).add((*e).key_off as usize),
+                    (*e).key_len as usize,
+                );
+                if tenant_scope(key).is_some() {
+                    actual += 1;
+                }
+            }
+        }
+        assert_eq!(
+            reported, actual,
+            "measured usage must equal a fresh count: reported {reported}, actual {actual}"
+        );
     }
 
     /// The case #43 describes: "a cold-key flood from one tenant simply evicts
