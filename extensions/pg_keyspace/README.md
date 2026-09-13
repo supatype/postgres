@@ -829,6 +829,42 @@ Measure all of it with `bench/run_tenant_fairness.sh`, which runs the same loads
 with each policy off and on and prints both.
 
 
+#### Changing the worker count
+
+`pg_keyspace.workers` is a restart, and the restart reshuffles which worker owns
+which slot. `supacache.kv.slot` is stable so **nothing is lost** — but most of
+the persisted keyspace comes back into a *different* worker's segment, which is
+that much of the warm cache dropped and re-recovered.
+
+How much moves is not intuitive:
+
+| change | slots moving |
+|---|---:|
+| 1 → 2 | 50% |
+| 2 → 4 | **75%** |
+| 4 → 8 | **87.5%** |
+
+The guess that "each range splits in half, so half stays put" is wrong. The
+ranges are contiguous, so only worker 0's first sub-range keeps its owner —
+with 4 workers slot 4096 belongs to worker 1, with 8 workers it belongs to
+worker 2, and so on up the range.
+
+The layout is recorded in `supacache.topology`, so a change is logged at startup
+with what it costs, and `supacache.topology_change()` reports it:
+
+```sql
+SELECT * FROM supacache.topology_change();
+-- recorded_workers | running_workers | slots_moved | pct_moved
+--                2 |               4 |       12288 |      75.0
+```
+
+This is the first slice of
+[#101](https://github.com/supatype/postgres/issues/101) and only that: the
+change is made visible, not made online. Verified by
+`bench/run_topology_change.sh`, which asserts both the reported number and that
+every key still reads back afterwards — the "no data is lost" half of the
+warning is worth asserting rather than just claiming.
+
 #### Cache memory: a preference, and a budget
 
 `pg_keyspace.tenant_scoped_eviction` (on by default) makes the CLOCK sweep prefer
@@ -1141,7 +1177,10 @@ Scoping for this version — the extension works; these are the edges to know:
   placement is still unmanaged.** Keys map to workers by CRC16 slot, so a tenant
   with a hot key range concentrates on one worker with no rebalancing, and
   changing `pg_keyspace.workers` is a restart
-  ([#101](https://github.com/supatype/postgres/issues/101)).
+  ([#101](https://github.com/supatype/postgres/issues/101)). Slots cannot be
+  moved between running workers: there is no slot map to consult, no
+  migrating/importing state, and no `ASK` redirection. What a worker-count
+  change *does* do is now reported rather than silent — see below.
 - Operational metrics are partial. `supacache.stats()`, `ring_stats()`,
   `rowcache_stats()` and `replication_status()` exist, and `ring_stats()` reports
   commit lag, failed batches and unresolved references; row cache invalidation

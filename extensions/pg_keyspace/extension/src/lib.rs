@@ -2051,6 +2051,17 @@ fn pg_ensure_schema() {
         let _ = Spi::run(
             "ALTER TABLE supacache.kv_ttl ADD COLUMN IF NOT EXISTS kind \"char\" NOT NULL DEFAULT 's'",
         );
+        // The worker layout the persisted keyspace was written under (#101).
+        // supacache.kv.slot is stable, so a worker-count change never loses a
+        // key -- but it does move most of them to a different worker's segment,
+        // which drops that much of the warm cache and re-recovers it. Recording
+        // the layout is what lets the change be reported instead of happening
+        // silently.
+        let _ = Spi::run(
+            "CREATE TABLE IF NOT EXISTS supacache.topology (\
+             id int PRIMARY KEY DEFAULT 1 CHECK (id = 1), workers int NOT NULL, \
+             updated_at timestamptz NOT NULL DEFAULT now())",
+        );
         // Row-cache registrations. A registration is configuration, not cache
         // content, and shared memory is the wrong home for configuration: a
         // segment reinitialisation (watchdog relaunch, crash-restart, a
@@ -2207,6 +2218,21 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
     // rather than the absolute: a relaunched worker recovers into a segment that
     // may already carry its predecessor's counts.
     let evicted_before = total_evictions(store);
+    // Worker 0 only: one record for the cluster, and one log line rather than
+    // the same warning from every worker.
+    if w == 0 {
+        if let Some((was, moved)) = record_topology(nworkers) {
+            let pct = moved as f64 * 100.0 / crc16::NUM_SLOTS as f64;
+            log!(
+                "pg_keyspace worker 0: WORKER COUNT CHANGED {was} -> {nworkers}. \
+                 {moved} of {} slots ({pct:.1}%) now belong to a different worker, so that \
+                 much of the persisted keyspace is recovering into a different segment. \
+                 No data is lost (supacache.kv.slot is stable) but expect a cold cache \
+                 for those keys",
+                crc16::NUM_SLOTS
+            );
+        }
+    }
     log!(
         "pg_keyspace worker {w}: recovering slots {lo}..{hi} from supacache.kv \
          (no RESP traffic is served until this finishes)"
@@ -3104,6 +3130,40 @@ fn load_registrations_spi() -> i64 {
     // registrations would claim a segment was loaded that is not.
     view.set_pinned(&RC_LOADED_KEY, b"1");
     n
+}
+
+/// Record the running worker count, reporting a change from what the persisted
+/// keyspace was last written under.
+///
+/// Returns `(previous, moved)` when the layout changed. `pg_keyspace.workers` is
+/// `Postmaster` context, so this runs once per start rather than on a timer.
+///
+/// This does not *prevent* anything: the change has already happened by the time
+/// a worker is running, and `supacache.kv.slot` is stable so nothing is lost.
+/// What it prevents is the change being invisible -- an operator who doubles the
+/// worker count and then wonders why the hit rate collapsed for an hour has no
+/// way to connect the two today.
+fn record_topology(running: usize) -> Option<(usize, u32)> {
+    use std::panic::AssertUnwindSafe;
+    if !extension_installed() {
+        return None;
+    }
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        let previous = Spi::get_one::<i32>("SELECT workers FROM supacache.topology WHERE id = 1")
+            .ok()
+            .flatten();
+        let _ = Spi::run_with_args(
+            "INSERT INTO supacache.topology(id, workers, updated_at) VALUES (1, $1, now()) \
+             ON CONFLICT (id) DO UPDATE SET workers = EXCLUDED.workers, updated_at = now()",
+            Some(vec![(PgBuiltInOids::INT4OID.oid(), (running as i32).into_datum())]),
+        );
+        match previous {
+            Some(p) if p as usize != running && p > 0 => {
+                Some((p as usize, crc16::slots_moved(p as usize, running)))
+            }
+            _ => None,
+        }
+    }))
 }
 
 /// `load_registrations_spi` from a background worker, which has to open its own
@@ -4010,6 +4070,35 @@ mod supacache {
             }
         }
         TableIterator::new(rows)
+    }
+
+    /// The worker layout the persisted keyspace was last written under, against
+    /// the one running now, and what a change between them costs (#101).
+    ///
+    /// `slots_moved` is the number that matters and it is not intuitive:
+    /// doubling the worker count moves 87.5% of slots, not half, because the
+    /// ranges are contiguous and only worker 0's first sub-range keeps its
+    /// owner.
+    #[pg_extern]
+    fn topology_change() -> TableIterator<
+        'static,
+        (
+            name!(recorded_workers, Option<i32>),
+            name!(running_workers, i32),
+            name!(slots_moved, i32),
+            name!(pct_moved, f64),
+        ),
+    > {
+        let running = super::worker_count();
+        let recorded = Spi::get_one::<i32>("SELECT workers FROM supacache.topology WHERE id = 1")
+            .ok()
+            .flatten();
+        let moved = recorded
+            .filter(|p| *p > 0)
+            .map(|p| crc16::slots_moved(p as usize, running))
+            .unwrap_or(0);
+        let pct = moved as f64 * 100.0 / crc16::NUM_SLOTS as f64;
+        TableIterator::once((recorded, running as i32, moved as i32, pct))
     }
 
     /// The slot range and RESP port of every shared-nothing slot worker.
