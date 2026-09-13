@@ -104,6 +104,12 @@ jobs:
           for _ in $(seq 1 20); do redis-cli -p 6379 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
           redis-cli -p 6379 PING
 
+      - name: Start redis 8 (bloom/cuckoo parity reference)
+        run: |
+          docker run --rm -d --name redis8 -p 6380:6379 redis:8.10.1
+          for _ in $(seq 1 30); do redis-cli -p 6380 PING 2>/dev/null | grep -q PONG && break; sleep 0.5; done
+          redis-cli -p 6380 PING
+
       - name: Run conformance + integration benches
         working-directory: extensions/pg_keyspace
         env:
@@ -133,8 +139,8 @@ jobs:
             >/tmp/pgks_ci_daemon.log 2>&1 &
           dpid=$!
           for _ in $(seq 1 30); do redis-cli -p 6400 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
-          for s in run_hashes.sh run_lists.sh run_zsets.sh run_pubsub.sh run_ttl_scan.sh run_strings.sh run_keys_admin.sh run_aggr_gaps.sh run_sets.sh run_scans.sh run_zset_ops.sh run_txn.sh run_resp3.sh; do
-            runbench "$s" RESP=6400
+          for s in run_hashes.sh run_lists.sh run_zsets.sh run_pubsub.sh run_ttl_scan.sh run_strings.sh run_keys_admin.sh run_aggr_gaps.sh run_sets.sh run_scans.sh run_zset_ops.sh run_txn.sh run_resp3.sh run_bloom.sh run_cuckoo.sh; do
+            runbench "$s" RESP=6400 REDIS8=6380
           done
           kill $dpid 2>/dev/null || true
 
@@ -204,7 +210,7 @@ jobs:
             >/tmp/pgks_ci_daemon.log 2>&1 &
           dpid=$!
           for _ in $(seq 1 30); do redis-cli -p 6400 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
-          for s in run_resp3.sh run_hashes.sh run_lists.sh run_zsets.sh run_sets.sh run_ttl_scan.sh run_pubsub.sh run_txn.sh; do
+          for s in run_resp3.sh run_hashes.sh run_lists.sh run_zsets.sh run_sets.sh run_ttl_scan.sh run_pubsub.sh run_txn.sh run_bloom.sh run_cuckoo.sh; do
             runbench "$s" RESP=6400
           done
           kill $dpid 2>/dev/null || true
@@ -309,6 +315,13 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_rowcache_registration.sh
+
+      - name: Probabilistic filter durability
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_prob_durability_pg.sh
 
       - name: Durability + fault injection suite
         env:
