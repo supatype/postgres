@@ -13,6 +13,7 @@
 use crate::aggr;
 use crate::batcher::{Batcher, Tier};
 use crate::crc16;
+use crate::prob;
 use crate::pubsub;
 use crate::resp::{self, Parse};
 use crate::ring;
@@ -104,6 +105,8 @@ const CMD_KEY1_READ: &[&str] = &[
     "ZREVRANGEBYLEX", "ZLEXCOUNT",
     "SCARD", "SISMEMBER", "SMISMEMBER", "SMEMBERS", "SRANDMEMBER",
     "HSCAN", "SSCAN", "ZSCAN",
+    "BF.EXISTS", "BF.MEXISTS", "BF.INFO", "BF.CARD", "BF.SCANDUMP",
+    "CF.EXISTS", "CF.MEXISTS", "CF.COUNT", "CF.INFO", "CF.SCANDUMP",
 ];
 const CMD_KEY1_WRITE: &[&str] = &[
     "SET", "SETNX", "GETSET", "INCR", "DECR", "INCRBY", "DECRBY", "EXPIRE", "PEXPIRE",
@@ -113,6 +116,8 @@ const CMD_KEY1_WRITE: &[&str] = &[
     "LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LSET", "LTRIM", "LINSERT", "LREM",
     "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX",
     "SADD", "SREM", "SPOP",
+    "BF.RESERVE", "BF.ADD", "BF.MADD", "BF.INSERT", "BF.LOADCHUNK",
+    "CF.RESERVE", "CF.ADD", "CF.ADDNX", "CF.INSERT", "CF.INSERTNX", "CF.DEL", "CF.LOADCHUNK",
 ];
 /// Every argument is a key.
 const CMD_ALLKEYS_READ: &[&str] = &["EXISTS", "MGET", "TOUCH", "SUNION", "SINTER", "SDIFF", "WATCH"];
@@ -1327,6 +1332,7 @@ impl Worker {
         // push frames). Read once up front so every reply site — including the
         // auth-gate nil below — can use the right encoding.
         let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
+        let max_bulk = self.max_value_bytes;
 
         // ---- AUTH command ----
         if cmd == b"AUTH" {
@@ -2384,22 +2390,7 @@ impl Worker {
                             None => resp::error(out, "ERR no such key"),
                             Some((kind, _, v)) => match sub.as_deref() {
                                 Some(b"ENCODING") => {
-                                    let enc: &[u8] = match kind {
-                                        KIND_HASH => b"hashtable",
-                                        k if k == crate::store::KIND_LIST => b"quicklist",
-                                        k if k == crate::store::KIND_ZSET => b"skiplist",
-                                        k if k == crate::store::KIND_SET => b"hashtable",
-                                        // integer strings report "int" as Redis does
-                                        _ if std::str::from_utf8(v)
-                                            .ok()
-                                            .and_then(|t| t.parse::<i64>().ok())
-                                            .is_some() =>
-                                        {
-                                            b"int"
-                                        }
-                                        _ => b"embstr",
-                                    };
-                                    resp::bulk(out, enc);
+                                    resp::bulk(out, crate::store::encoding_name(kind, v));
                                 }
                                 Some(b"REFCOUNT") => resp::integer(out, 1),
                                 _ => resp::integer(out, 0), // IDLETIME / FREQ
@@ -2697,11 +2688,7 @@ impl Worker {
                 } else {
                     let t = match store.get_typed(&args[1]) {
                         None => "none",
-                        Some((KIND_HASH, _, _)) => "hash",
-                        Some((k, _, _)) if k == crate::store::KIND_LIST => "list",
-                        Some((k, _, _)) if k == crate::store::KIND_ZSET => "zset",
-                        Some((k, _, _)) if k == crate::store::KIND_SET => "set",
-                        Some(_) => "string",
+                        Some((kind, _, _)) => crate::store::type_name(kind),
                     };
                     resp::simple(out, t);
                 }
@@ -4429,6 +4416,9 @@ impl Worker {
                 }
                 resp::integer(out, count as i64);
             }
+            c if c.starts_with(b"BF.") || c.starts_with(b"CF.") => {
+                prob::dispatch(&store, c, args, out, resp3, max_bulk)
+            }
             other => resp::error(
                 out,
                 &format!("ERR unknown command '{}'", String::from_utf8_lossy(other)),
@@ -4440,7 +4430,19 @@ impl Worker {
         // if the key was emptied/deleted — so it recovers as the right type.
         if persist_on && stages.is_empty() && is_aggregate_write(&cmd) && nargs >= 2 {
             stages.push(match store.get_typed(&args[1]) {
-                Some((kind, exp, blob)) => (args[1].clone(), blob.to_vec(), exp, kind as u8),
+                Some((kind, exp, blob)) => match (blob.len() > INLINE_MAX
+                    && exp != DELETE_TOMBSTONE)
+                    .then(|| store.version_of(&args[1]))
+                    .flatten()
+                {
+                    Some(version) => (
+                        args[1].clone(),
+                        version.to_le_bytes().to_vec(),
+                        exp,
+                        kind as u8 | ring::KIND_REF,
+                    ),
+                    None => (args[1].clone(), blob.to_vec(), exp, kind as u8),
+                },
                 None => (args[1].clone(), Vec::new(), DELETE_TOMBSTONE, b's'),
             });
         }
@@ -4457,7 +4459,8 @@ impl Worker {
             // bounding how large a value may be. `stage_by_ref` also records
             // the sequence on the entry so eviction cannot drop it before the
             // worker has committed it.
-            let staged = match (v.len() > INLINE_MAX && e != DELETE_TOMBSTONE)
+            let staged = match (kind & ring::KIND_REF != 0
+                || (v.len() > INLINE_MAX && e != DELETE_TOMBSTONE))
                 .then(|| store.version_of(&k))
                 .flatten()
             {
@@ -6150,7 +6153,12 @@ fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
         | b"SADD" | b"SREM" | b"SCARD" | b"SISMEMBER" | b"SMISMEMBER" | b"SMEMBERS"
         | b"SPOP" | b"SRANDMEMBER"
         // container scans: the key is the first argument
-        | b"HSCAN" | b"SSCAN" | b"ZSCAN" => {
+        | b"HSCAN" | b"SSCAN" | b"ZSCAN"
+        | b"BF.RESERVE" | b"BF.ADD" | b"BF.MADD" | b"BF.INSERT" | b"BF.EXISTS"
+        | b"BF.MEXISTS" | b"BF.INFO" | b"BF.CARD" | b"BF.SCANDUMP" | b"BF.LOADCHUNK"
+        | b"CF.RESERVE" | b"CF.ADD" | b"CF.ADDNX" | b"CF.INSERT" | b"CF.INSERTNX"
+        | b"CF.EXISTS" | b"CF.MEXISTS" | b"CF.DEL" | b"CF.COUNT" | b"CF.INFO"
+        | b"CF.SCANDUMP" | b"CF.LOADCHUNK" => {
             if nargs > 1 {
                 vec![1]
             } else {
@@ -6267,6 +6275,18 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"SUNIONSTORE"
             | b"SINTERSTORE"
             | b"SDIFFSTORE"
+            | b"BF.RESERVE"
+            | b"BF.ADD"
+            | b"BF.MADD"
+            | b"BF.INSERT"
+            | b"BF.LOADCHUNK"
+            | b"CF.RESERVE"
+            | b"CF.ADD"
+            | b"CF.ADDNX"
+            | b"CF.INSERT"
+            | b"CF.INSERTNX"
+            | b"CF.DEL"
+            | b"CF.LOADCHUNK"
     )
 }
 
@@ -6283,6 +6303,9 @@ fn is_aggregate_write(cmd: &[u8]) -> bool {
             | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"ZDIFFSTORE"
             // sets: SMOVE stages both keys manually, so it is not auto-staged here
             | b"SADD" | b"SREM" | b"SPOP" | b"SUNIONSTORE" | b"SINTERSTORE" | b"SDIFFSTORE"
+            | b"BF.RESERVE" | b"BF.ADD" | b"BF.MADD" | b"BF.INSERT" | b"BF.LOADCHUNK"
+            | b"CF.RESERVE" | b"CF.ADD" | b"CF.ADDNX" | b"CF.INSERT" | b"CF.INSERTNX"
+            | b"CF.DEL" | b"CF.LOADCHUNK"
     )
 }
 
