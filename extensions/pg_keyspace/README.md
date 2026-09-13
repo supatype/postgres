@@ -626,6 +626,25 @@ is whatever `pg_index` says it is, single-column or composite. `rowcache_registe
 still exists and is still single-column only. `rowcache_registration(tbl)` reports
 which columns a table is registered with, in key order.
 
+**Registrations are durable.** They are rows in `supacache.rowcache_reg`, recorded
+under the table's schema-qualified name, with the pinned shared-memory entry as a
+cache of that. Anything that reinitialises the row-cache segment — a watchdog
+relaunch, a crash-restart, `pg_terminate_backend` on a worker, an ordinary
+restart — loses the cached rows, as a cache should, but not the registrations:
+the invalidation worker reloads them on its next pass. Recording the *name*
+rather than the oid means a table dropped and recreated by a migration, or
+restored from a dump, keeps its registration. `rowcache_reload_registrations()`
+forces a reload if you ever need to.
+
+Before this ([#103](https://github.com/supatype/postgres/issues/103)) a
+registration lived only in shared memory. `rowcache_register` returned true, the
+entry could then vanish, and the table silently stopped being cached — with no
+error and `rowcache_coherence()` still reporting healthy, because coherence
+describes the invalidation worker rather than your registration. Verified by
+`bench/run_rowcache_registration.sh`, which asserts the cached row is gone after
+a restart *and* the registration is not, since only that pair distinguishes a
+reload from a segment that happened to survive.
+
 The scan serves the **raw** cached row at the leaf; the relation's RLS quals and
 mask `CASE` expressions re-apply above it, so a role that couldn't see the row (or
 a masked column) via a normal query still can't via the cache. Any single-column
