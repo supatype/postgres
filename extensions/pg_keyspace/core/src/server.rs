@@ -13,6 +13,7 @@
 use crate::aggr;
 use crate::batcher::{Batcher, Tier};
 use crate::crc16;
+use crate::prob;
 use crate::pubsub;
 use crate::resp::{self, Parse};
 use crate::ring;
@@ -104,6 +105,8 @@ const CMD_KEY1_READ: &[&str] = &[
     "ZREVRANGEBYLEX", "ZLEXCOUNT",
     "SCARD", "SISMEMBER", "SMISMEMBER", "SMEMBERS", "SRANDMEMBER",
     "HSCAN", "SSCAN", "ZSCAN",
+    "BF.EXISTS", "BF.MEXISTS", "BF.INFO", "BF.CARD", "BF.SCANDUMP",
+    "CF.EXISTS", "CF.MEXISTS", "CF.COUNT", "CF.INFO", "CF.SCANDUMP",
 ];
 const CMD_KEY1_WRITE: &[&str] = &[
     "SET", "SETNX", "GETSET", "INCR", "DECR", "INCRBY", "DECRBY", "EXPIRE", "PEXPIRE",
@@ -113,6 +116,8 @@ const CMD_KEY1_WRITE: &[&str] = &[
     "LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LSET", "LTRIM", "LINSERT", "LREM",
     "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX",
     "SADD", "SREM", "SPOP",
+    "BF.RESERVE", "BF.ADD", "BF.MADD", "BF.INSERT", "BF.LOADCHUNK",
+    "CF.RESERVE", "CF.ADD", "CF.ADDNX", "CF.INSERT", "CF.INSERTNX", "CF.DEL", "CF.LOADCHUNK",
 ];
 /// Every argument is a key.
 const CMD_ALLKEYS_READ: &[&str] = &["EXISTS", "MGET", "TOUCH", "SUNION", "SINTER", "SDIFF", "WATCH"];
@@ -2389,6 +2394,9 @@ impl Worker {
                                         k if k == crate::store::KIND_LIST => b"quicklist",
                                         k if k == crate::store::KIND_ZSET => b"skiplist",
                                         k if k == crate::store::KIND_SET => b"hashtable",
+                                        k if prob::encoding_name(k).is_some() => {
+                                            prob::encoding_name(k).unwrap().as_bytes()
+                                        }
                                         // integer strings report "int" as Redis does
                                         _ if std::str::from_utf8(v)
                                             .ok()
@@ -2701,6 +2709,9 @@ impl Worker {
                         Some((k, _, _)) if k == crate::store::KIND_LIST => "list",
                         Some((k, _, _)) if k == crate::store::KIND_ZSET => "zset",
                         Some((k, _, _)) if k == crate::store::KIND_SET => "set",
+                        Some((k, _, _)) if prob::type_name(k).is_some() => {
+                            prob::type_name(k).unwrap()
+                        }
                         Some(_) => "string",
                     };
                     resp::simple(out, t);
@@ -4429,6 +4440,9 @@ impl Worker {
                 }
                 resp::integer(out, count as i64);
             }
+            c if c.starts_with(b"BF.") || c.starts_with(b"CF.") => {
+                prob::dispatch(&store, c, args, out, resp3)
+            }
             other => resp::error(
                 out,
                 &format!("ERR unknown command '{}'", String::from_utf8_lossy(other)),
@@ -6150,7 +6164,12 @@ fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
         | b"SADD" | b"SREM" | b"SCARD" | b"SISMEMBER" | b"SMISMEMBER" | b"SMEMBERS"
         | b"SPOP" | b"SRANDMEMBER"
         // container scans: the key is the first argument
-        | b"HSCAN" | b"SSCAN" | b"ZSCAN" => {
+        | b"HSCAN" | b"SSCAN" | b"ZSCAN"
+        | b"BF.RESERVE" | b"BF.ADD" | b"BF.MADD" | b"BF.INSERT" | b"BF.EXISTS"
+        | b"BF.MEXISTS" | b"BF.INFO" | b"BF.CARD" | b"BF.SCANDUMP" | b"BF.LOADCHUNK"
+        | b"CF.RESERVE" | b"CF.ADD" | b"CF.ADDNX" | b"CF.INSERT" | b"CF.INSERTNX"
+        | b"CF.EXISTS" | b"CF.MEXISTS" | b"CF.DEL" | b"CF.COUNT" | b"CF.INFO"
+        | b"CF.SCANDUMP" | b"CF.LOADCHUNK" => {
             if nargs > 1 {
                 vec![1]
             } else {
@@ -6267,6 +6286,18 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"SUNIONSTORE"
             | b"SINTERSTORE"
             | b"SDIFFSTORE"
+            | b"BF.RESERVE"
+            | b"BF.ADD"
+            | b"BF.MADD"
+            | b"BF.INSERT"
+            | b"BF.LOADCHUNK"
+            | b"CF.RESERVE"
+            | b"CF.ADD"
+            | b"CF.ADDNX"
+            | b"CF.INSERT"
+            | b"CF.INSERTNX"
+            | b"CF.DEL"
+            | b"CF.LOADCHUNK"
     )
 }
 
@@ -6283,6 +6314,9 @@ fn is_aggregate_write(cmd: &[u8]) -> bool {
             | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"ZDIFFSTORE"
             // sets: SMOVE stages both keys manually, so it is not auto-staged here
             | b"SADD" | b"SREM" | b"SPOP" | b"SUNIONSTORE" | b"SINTERSTORE" | b"SDIFFSTORE"
+            | b"BF.RESERVE" | b"BF.ADD" | b"BF.MADD" | b"BF.INSERT" | b"BF.LOADCHUNK"
+            | b"CF.RESERVE" | b"CF.ADD" | b"CF.ADDNX" | b"CF.INSERT" | b"CF.INSERTNX"
+            | b"CF.DEL" | b"CF.LOADCHUNK"
     )
 }
 
