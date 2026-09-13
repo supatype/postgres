@@ -83,7 +83,7 @@ ceiling for deep Postgres integration.
 | Column masking / RLS on cached rows | **Yes** — re-applied above the cache | N/A |
 | Durability | Tiered: ephemeral→relaxed→durable(fsync)→replicated; crash-recovers from PG tables | RDB / AOF snapshots & log |
 | Synchronous replication | **Yes** — ack held until standby fsync | Async by default (WAIT for quorum) |
-| Data types | strings, hashes, lists, sets, sorted sets, pub/sub (+ TTL), transactions | Superset (adds streams, HLL, bitmaps, geo, scripting) |
+| Data types | strings, hashes, lists, sets, sorted sets, Bloom filters, Cuckoo filters, pub/sub (+ TTL), transactions | Superset (adds streams, HLL, bitmaps, geo, scripting) |
 | Raw write ceiling under no-persistence load | Lower (bounded by 1 event loop / worker) | **Higher** — purpose-built |
 | Maturity / ecosystem / ops tooling | New, focused feature set | **Mature**, huge ecosystem |
 
@@ -120,6 +120,8 @@ client-side caching (`invalidate` pushes) in every mode — default, `BCAST`
 | Sorted sets | `ZADD` `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZINCRBY` `ZRANK` `ZREVRANK` `ZCOUNT` `ZRANGE` `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` `ZLEXCOUNT` `ZRANGESTORE` `ZPOPMIN` `ZPOPMAX` `ZRANDMEMBER` `ZMPOP` `ZSCAN` `ZUNION` `ZINTER` `ZDIFF` `ZUNIONSTORE` `ZINTERSTORE` `ZDIFFSTORE` |
 | Pub/sub | `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` |
 | Transactions | `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` |
+| Bloom filter | `BF.RESERVE` `BF.ADD` `BF.MADD` `BF.INSERT` `BF.EXISTS` `BF.MEXISTS` `BF.INFO` `BF.CARD` `BF.SCANDUMP` `BF.LOADCHUNK` |
+| Cuckoo filter | `CF.RESERVE` `CF.ADD` `CF.ADDNX` `CF.INSERT` `CF.INSERTNX` `CF.EXISTS` `CF.MEXISTS` `CF.DEL` `CF.COUNT` `CF.INFO` `CF.SCANDUMP` `CF.LOADCHUNK` |
 
 **Not yet supported** — scripting (`EVAL`/`FUNCTION`), streams (`XADD`…),
 blocking ops (`BLPOP`/`BRPOP`/`BZPOPMIN`…), HyperLogLog / bitmaps / geo, and
@@ -550,6 +552,126 @@ batch, so the durable store converges on the last write rather than replaying
 every one. And the ring lives in Postgres shared memory, so anything in flight
 and **not yet acknowledged** is gone if the whole cluster restarts, which is
 what "not yet acknowledged" means.
+
+### Bloom and Cuckoo filters
+
+A Bloom filter and a Cuckoo filter answer "have I seen this item?" in a fixed
+amount of memory: a false positive is possible at a rate you choose, a false
+negative is not. A Cuckoo filter also deletes an item and counts how many copies
+of it are present; a Bloom filter does neither.
+
+```bash
+redis-cli -p 6381 BF.RESERVE seen 0.01 1000000
+redis-cli -p 6381 BF.ADD seen user:42         # 1
+redis-cli -p 6381 BF.EXISTS seen user:42      # 1
+```
+```bash
+redis-cli -p 6381 CF.RESERVE recent 1000000
+redis-cli -p 6381 CF.ADD recent user:42       # 1
+redis-cli -p 6381 CF.DEL recent user:42       # 1
+redis-cli -p 6381 CF.EXISTS recent user:42    # 0
+```
+
+`TYPE` answers `MBbloom--` and `MBbloomCF`, exactly as RedisBloom does, so a
+stock client works unchanged — `redis-py`'s `bf()` and `cf()` helpers,
+`NRedisStack`, `redis-om`. Error texts and reply shapes match Redis 8 reply for
+reply: the two conformance harnesses (`bench/run_bloom.sh`,
+`bench/run_cuckoo.sh`) exercise every command, then replay the same sequences
+against a real Redis 8 in Docker and compare the replies, on every CI run.
+
+#### How a filter behaves in the store
+
+One key holds one value blob, the same as a hash or a set. `BF.ADD` and `CF.ADD`
+set bits or fingerprints **in place**, under the entry's seqlock, so an add
+costs the same whatever the filter size. A filter that fills up grows by
+appending a sub-filter, which rewrites the blob once: a Bloom filter appends
+capacity × expansion and halves the error rate each time, a Cuckoo filter
+appends the same bucket count each time. Defaults match RedisBloom — Bloom
+capacity 100, error 0.01, expansion 2; Cuckoo bucket size 2, max iterations 20,
+expansion 1.
+
+Hashing is MurmurHash64A with the same double-hashing scheme RedisBloom uses, so
+false-positive behaviour is close to it. The blob layout is pg_keyspace's own.
+
+#### Benchmarks (`bench/run_prob_bench.sh`)
+
+Measured on a 24-vCPU WSL2 box against Redis 8.10.1 in Docker. Closed-loop p50,
+and pipelined throughput at `-c50 -P16`. **The Redis column is measured inside
+the container**: the published Docker port adds about 0.08 ms to every round
+trip, which would flatter pg_keyspace — the script prints both columns so you
+can see that cost rather than take it on trust.
+
+| Operation | pg_keyspace p50 | Redis 8 p50 | pg_keyspace pipelined | Redis 8 pipelined |
+|---|---:|---:|---:|---:|
+| `BF.ADD`, 1 M-item filter | **0.070 ms** | 0.071 ms | 949 k/s | 952 k/s |
+| `BF.EXISTS`, 1 M-item filter | 0.063 ms | 0.063 ms | **1.17 M/s** | 1.07 M/s |
+| `BF.ADD`, 10 M-item filter | **0.057 ms** | 0.063 ms | **944 k/s** | 899 k/s |
+| `BF.EXISTS`, 10 M-item filter | **0.053 ms** | 0.055 ms | **1.06 M/s** | 1.01 M/s |
+| `CF.ADD`, 1 M-item filter | **0.050 ms** | 0.055 ms | **1.13 M/s** | 1.07 M/s |
+| `CF.EXISTS`, 1 M-item filter | **0.049 ms** | 0.055 ms | **1.08 M/s** | 1.03 M/s |
+| `CF.DEL`, 1 M-item filter | **0.050 ms** | 0.055 ms | 996 k/s | 995 k/s |
+| `GET` (baseline) | 0.050 ms | 0.055 ms | — | — |
+
+A **filled** 10 M-item filter answers `BF.EXISTS` at the speed of an empty one —
+1.38 M/s against 1.40 M/s pipelined. That is what the in-place path buys.
+
+Memory, from `BF.INFO SIZE` and `CF.INFO Size` against the same reserve:
+
+| Filter | pg_keyspace | Redis 8 |
+|---|---:|---:|
+| Bloom, 1 M items at 1% | **1 198 193 B** | 1 378 568 B |
+| Bloom, 10 M items at 1% | **11 981 385 B** | 13 784 792 B |
+| Cuckoo, `CF.RESERVE 1000000` | 1 048 617 B | 1 048 632 B |
+
+#### What a filter costs to persist
+
+Filters ride the existing aggregate path, so in the `relaxed`, `durable` and
+`replicated` tiers a dirty filter is written to `supacache.kv` once per persist
+window, **whole**. A 1.2 MB filter (1 M items at 1%) under steady adds is about
+120 MB/s of WAL at the default 10 ms window. A filter of tens of MB cannot keep
+up, and its writers park on the ring. So: any size in `ephemeral`; in a
+persisted tier, only filters that are small or write-cold.
+
+Crash recovery brings a persisted filter back with its type, its items and its
+TTL, and a filter whose TTL expired stays gone —
+`bench/run_prob_durability_pg.sh` asserts all of that in CI, across 30 checks. A
+per-item delta log is the fix for the write cost, and is not in this change.
+
+#### Sizing a filter
+
+A filter is a value, so it has to fit the arena. Three consequences:
+
+- **The oversized allocator rounds to a power of two**, so a 120 MB filter
+  reserves 128 MB.
+- **A scaling chain is not free.** It holds two to three times the bits of one
+  right-sized filter, because each sub-filter carries a tighter error rate.
+- **One filter blob stops at 512 MB**, which is also the
+  `pg_keyspace.max_value_bytes` default — about 400 M items at 1%. Raising
+  `max_value_bytes` past its default does not raise this ceiling.
+
+What to do about it: `BF.RESERVE` with the real capacity, so the filter
+allocates once; `NONSCALING` when the population is known; and raise
+`pg_keyspace.val_bytes` and `pg_keyspace.keys` so the arena holds the filters
+*plus* the cache. Note also that the oversized allocator is first-fit and does
+not split blocks, so many filters of different sizes growing at different times
+fragment the arena — the same warning [Sizing](#sizing) gives for large values.
+
+#### `SCANDUMP` and `LOADCHUNK`
+
+The iterator is a byte offset into the blob, and a chunk is at most 16 MiB, or
+`pg_keyspace.max_value_bytes` when that is lower. A dump round-trips within
+pg_keyspace. A dump made by RedisBloom does **not** load here: the blob layout
+is pg_keyspace's own. `LOADCHUNK` validates every header field and refuses a
+chunk that does not describe a filter.
+
+#### Limits worth knowing
+
+- `BF.INFO SIZE` and `CF.INFO Size` report the pg_keyspace blob size, not
+  RedisBloom's — compare them across servers with that in mind.
+- `CF.INFO` "Number of buckets" reports the *first* sub-filter's bucket count,
+  as RedisBloom does, not the total across a grown chain.
+- There are no `BF.*`/`CF.*` SQL functions yet. The filters are reachable over
+  RESP only.
 
 ### Multi-worker scale-out
 
@@ -1048,6 +1170,7 @@ extensions/pg_keyspace/
 │       ├── server.rs         RESP2/RESP3 event loop (mio: epoll/kqueue) + dispatch
 │       ├── resp.rs           RESP2/RESP3 codec
 │       ├── aggr.rs           hashes/lists/sorted sets, incl. indexed large-collection encodings
+│       ├── prob.rs           Bloom (`BF.*`) and Cuckoo (`CF.*`) filters: blob formats, hashing, handlers
 │       ├── pubsub.rs         cross-worker pub/sub bus
 │       ├── batcher.rs        commit batching + the four durability tiers
 │       ├── repl.rs           real synchronous replication to a standby
@@ -1072,7 +1195,10 @@ the code measured standalone is the same code that runs inside Postgres.
 `cargo test` in `core/` runs the self-contained unit tests (data structures, slab
 allocator, auth, replication). The `bench/` scripts are integration + conformance
 harnesses, each named for what it checks: Redis parity for every type
-(`run_hashes.sh`, `run_lists.sh`, `run_zsets.sh`, `run_pubsub.sh`), security
+(`run_hashes.sh`, `run_lists.sh`, `run_zsets.sh`, `run_pubsub.sh`), the
+probabilistic filters — every `BF.*`/`CF.*` command, then the same sequences
+against a real Redis 8 in Docker reply for reply (`run_bloom.sh`,
+`run_cuckoo.sh`) — security
 (`run_hardening.sh`, `run_tls.sh`, `run_threats.sh`, `run_security.sh`), Mode B
 row-cache coherence for int/uuid/text/TOAST PKs (`run_rowcache.sh`,
 `run_nonint_pk.sh`, `run_toast.sh`, `run_invalidation.sh`), tenant-scoped pub/sub
@@ -1083,7 +1209,10 @@ real synchronous replication (`run_replication.sh`), a real PostgREST v12.2.3
 end-to-end (`run_postgrest_e2e.sh`), and scale-out (`run_scaleout.sh`,
 `run_scaleout_inpg.sh`) including durability and scale-out together — slot-routed
 writes, `MOVED` on misrouting, and per-worker crash recovery
-(`run_persist_multiworker.sh`). Each prints its own `# result: N passed, M failed`.
+(`run_persist_multiworker.sh`). Each prints its own `# result: N passed, M
+failed`. `run_prob_bench.sh` is a benchmark rather than a harness: it prints the
+`BF.*`/`CF.*` latency, throughput and `INFO SIZE` tables above, against the same
+Redis 8.
 
 Those all drive the standalone daemon. `run_durability_pg.sh` is the exception
 and covers what only exists in-process: it installs the extension into a real
@@ -1092,7 +1221,11 @@ tiers, crash recovery, the large-value reference path, slab reclamation and the
 replicated tier's startup refusal, **including injected failures**. A
 persistence transaction is failed with a `CHECK (false) NOT VALID` constraint,
 the persist worker is killed by name, and saturation comes from `ring_mb = 1`;
-no test-only hook ships in the extension. It runs in CI on every change to
+no test-only hook ships in the extension. `run_prob_durability_pg.sh` runs the
+same way on its own cluster, for the filters: it writes a Bloom filter and a
+Cuckoo filter in the `durable` tier, kills the cluster with `kill -9`, and
+asserts that each one comes back with its type and its items — and that a filter
+whose TTL expired stays gone. Both run in CI on every change to
 `extensions/pg_keyspace/`.
 
 `run_rowcache_concurrency.sh` is a crash test, so its assertions are the absence
@@ -1219,6 +1352,12 @@ Scoping for this version — the extension works; these are the edges to know:
   number and `persist_workers` is not — see
   [tuning durable throughput](#tuning-durable-throughput-which-knob-actually-moves-it)
   for the measured curve.
+- **A Bloom or Cuckoo filter in a persisted tier is rewritten whole, once per
+  persist window.** A 1.2 MB filter under steady adds is about 120 MB/s of WAL
+  at the default window, and a filter of tens of MB cannot keep up — its writers
+  park on the ring. Large filters belong in the `ephemeral` tier until a
+  per-item delta log exists; see
+  [what a filter costs to persist](#what-a-filter-costs-to-persist).
 - **TTL expiry is immune to wall-clock steps, and still reports wall-clock
   times.** Expiry compares against an anchor — realtime and `CLOCK_BOOTTIME`
   captured together, then advanced by the boottime delta — so a clock *step*
