@@ -67,6 +67,8 @@ const PUBSUB_NAME: &CStr = c"pg_keyspace_pubsub";
 // Per-worker liveness, so a worker that goes away can be noticed and relaunched.
 const HEALTH_NAME: &CStr = c"pg_keyspace_health";
 const CLOCK_NAME: &CStr = c"pg_keyspace_clock";
+// Serialises WRITES to the row-cache segment. See `rowcache_write`.
+const RC_LOCK_NAME: &CStr = c"pg_keyspace_rowcache_write";
 
 // Base address of the Postgres shared-memory segment, published by the startup
 // hook and inherited by every forked backend. Each context rebuilds a cheap
@@ -76,6 +78,9 @@ static SEG_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static RING_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // Base of the Mode B row-cache segment (read by the planner-hook custom scan).
 static ROWCACHE_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+// The LWLock serialising row-cache WRITES (#127). Resolved once per process in
+// the shmem startup hook and inherited by every forked backend.
+static ROWCACHE_LOCK: AtomicPtr<pg_sys::LWLock> = AtomicPtr::new(std::ptr::null_mut());
 // Base of the cross-process pub/sub segment.
 static PUBSUB_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // Base of the worker liveness table.
@@ -236,6 +241,53 @@ fn rowcache_coherent() -> bool {
 }
 
 /// A row-cache Store view over the Mode B segment (any backend).
+/// Run `f` as the only writer to the row-cache segment (#127).
+///
+/// `Store`'s public API is documented as "called only by the owning worker for
+/// partition p", and every RESP keyspace segment honours that: one worker
+/// process owns it. The Mode B row-cache segment has no owner. Its writers are
+/// ordinary backends -- `rowcache_put`, registration, and above all the
+/// read-through path in `rc_access`, which runs in EVERY backend that misses.
+///
+/// Two of those at once corrupt the arena: `ensure_alloc` walks the slab free
+/// lists and can call `evict_one`, which moves the bucket array, the entry
+/// array and the bump pointer. The first backend to follow a torn pointer
+/// segfaults, and Postgres answers a segfault by killing every other backend
+/// and crash-restarting the cluster. Measured: four pgbench clients, 80% read
+/// / 20% update against a registered table, dead in under a second.
+///
+/// So writers take an exclusive LWLock and readers take nothing. That is not a
+/// half-measure -- concurrent reader against a single writer is the pattern the
+/// store is already built for, and `get_stable`'s seqlock is what makes it
+/// safe. Restoring "one writer at a time" is the whole of the fix, and it keeps
+/// the read path, which is the hot one, at zero added cost.
+///
+/// The lock lives here rather than in `core/` deliberately: `core/` is shared
+/// with the standalone daemon, which has no Postgres LWLocks and does not have
+/// this problem, because there every segment has exactly one writing process.
+#[inline]
+fn rowcache_write<T>(f: impl FnOnce() -> T, default: T) -> T {
+    let lock = ROWCACHE_LOCK.load(Ordering::Acquire);
+    if lock.is_null() {
+        // No lock means the shmem startup hook did not run, which means there
+        // is no segment to write either. Refusing is right: writing unguarded
+        // is what this function exists to prevent.
+        return default;
+    }
+    unsafe {
+        pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE);
+    }
+    // The callers are plain shared-memory manipulations with no allocation and
+    // no SPI, so there is nothing here that can ereport past the release. The
+    // lock is also released by Postgres on transaction abort regardless, so a
+    // panic cannot leave it held for the life of the cluster.
+    let out = f();
+    unsafe {
+        pg_sys::LWLockRelease(lock);
+    }
+    out
+}
+
 fn rowcache_view() -> Option<Store> {
     let base = ROWCACHE_BASE.load(Ordering::Acquire);
     if base.is_null() {
@@ -1291,6 +1343,10 @@ extern "C" fn ks_shmem_request() {
         pg_sys::RequestAddinShmemSpace(rowcache_config().total_bytes());
         pg_sys::RequestAddinShmemSpace(pubsub_bytes());
         pg_sys::RequestAddinShmemSpace(health_bytes());
+        // One LWLock to serialise row-cache writers (#127). Requested here
+        // because RequestNamedLWLockTranche is only legal from the shmem
+        // request hook; resolved to a pointer in the startup hook.
+        pg_sys::RequestNamedLWLockTranche(RC_LOCK_NAME.as_ptr(), 1);
     }
 }
 
@@ -1357,6 +1413,13 @@ extern "C" fn ks_shmem_startup() {
                 let _ = Store::from_raw(rcptr, &rc_cfg, true);
             }
             ROWCACHE_BASE.store(rcptr, Ordering::Release);
+        }
+        // Resolve the row-cache writer lock (#127). GetNamedLWLockTranche must
+        // run with AddinShmemInitLock held, which is exactly this hook; every
+        // backend then inherits the pointer across the fork.
+        let tranche = pg_sys::GetNamedLWLockTranche(RC_LOCK_NAME.as_ptr());
+        if !tranche.is_null() {
+            ROWCACHE_LOCK.store(std::ptr::addr_of_mut!((*tranche).lock), Ordering::Release);
         }
         // The TTL clock anchor (#110), shared so every process agrees.
         //
@@ -2857,10 +2920,13 @@ fn drain_invalidations(slot: &str) -> Drain {
                 rowcache_refill_locked(pg_sys::Oid::from(relid), &pk)
             }));
             if !matches!(outcome, Refill::Stored) {
-                view.del(&key); // gone or unresolvable -> invalidate
+                // The worker is the only process that deletes, but it shares the
+                // segment with every backend that writes, so it takes the same
+                // lock; a lock one writer skips protects nothing (#127).
+                rowcache_write(|| view.del(&key), false); // gone/unresolvable -> invalidate
             }
         } else {
-            view.del(&key);
+            rowcache_write(|| view.del(&key), false);
         }
         reconciled += 1;
     }
@@ -3172,13 +3238,13 @@ fn load_registrations_spi() -> i64 {
     let mut n = 0i64;
     for (relid, attnums) in rows {
         let packed: Vec<u8> = attnums.iter().flat_map(|a| a.to_le_bytes()).collect();
-        if view.set_pinned(&rc_reg_key(relid), &packed) {
+        if rowcache_write(|| view.set_pinned(&rc_reg_key(relid), &packed), false) {
             n += 1;
         }
     }
     // Last, and only on the same view: a marker written before the
     // registrations would claim a segment was loaded that is not.
-    view.set_pinned(&RC_LOADED_KEY, b"1");
+    rowcache_write(|| view.set_pinned(&RC_LOADED_KEY, b"1"), false);
     n
 }
 
@@ -3256,8 +3322,28 @@ unsafe fn find_pk_parts(rel: *mut pg_sys::RelOptInfo, attnums: &[i16]) -> Option
 }
 
 unsafe fn find_pk_bytes(rel: *mut pg_sys::RelOptInfo, attnum: i16) -> Option<Vec<u8>> {
-    let cell = (*(*rel).baserestrictinfo).elements;
-    let n = (*(*rel).baserestrictinfo).length;
+    // An empty Postgres List IS a null pointer -- NIL, with no empty-list object
+    // to point at -- so a base relation with no restriction clauses arrives here
+    // with `baserestrictinfo == NULL`. Reading through it segfaulted the backend
+    // at PLAN time, which Postgres answers by killing every other backend and
+    // crash-restarting the cluster (#128).
+    //
+    // `SELECT count(*) FROM t` and `SELECT * FROM t` are exactly that shape, so
+    // a registered table took the cluster down on the first unfiltered query
+    // against it. The existing row-cache harnesses all query by primary key,
+    // which is the case that works.
+    //
+    // None is the honest answer as well as the safe one: no clauses means no
+    // `pk = const` to find, and the caller then leaves the ordinary path alone.
+    let list = (*rel).baserestrictinfo;
+    if list.is_null() {
+        return None;
+    }
+    let cell = (*list).elements;
+    let n = (*list).length;
+    if cell.is_null() || n <= 0 {
+        return None;
+    }
     for i in 0..n {
         let ri = (*cell.offset(i as isize)).ptr_value as *mut pg_sys::RestrictInfo;
         if ri.is_null() {
@@ -3540,9 +3626,27 @@ unsafe extern "C" fn rc_access(ss: *mut pg_sys::ScanState) -> *mut pg_sys::Tuple
     // once per scan, so this costs one clock read per scan rather than per row.
     let trusted = rowcache_coherent();
     let fallback;
-    let bytes: &[u8] = match view.get(&rc_key(relid, pk)) {
-        Lookup::Hit(b) if trusted => b,
-        _ => {
+    // get_stable, not get (#127). `get` hands back a BORROW into shared memory
+    // and the bytes are copied a few lines below; a writer between those two
+    // points -- another backend's read-through, or the invalidation worker's
+    // refill -- rewrites them in place, and the copy takes the head of one
+    // tuple and the tail of another. That is then deformed as a HeapTuple,
+    // which reads lengths and offsets out of the spliced bytes.
+    //
+    // The writer lock does not help here and is not meant to: readers are
+    // deliberately not serialised, because a lock on the read path would cost
+    // more than the cache saves. `get_stable` re-reads through the entry's
+    // seqlock and retries, which is the same thing every SQL read of the RESP
+    // keyspace already does for exactly this reason -- the row cache was the
+    // one reader that still borrowed.
+    let hit: Option<Vec<u8>> = if trusted {
+        view.get_stable(&rc_key(relid, pk))
+    } else {
+        None
+    };
+    let bytes: &[u8] = match hit {
+        Some(ref b) => &b[..],
+        None => {
             // Resolved from the attnum the planner carried, not from the
             // registration entry: that entry is an ordinary cache entry and a
             // busy cache evicts it, which is exactly the situation a miss means
@@ -3566,7 +3670,10 @@ unsafe extern "C" fn rc_access(ss: *mut pg_sys::ScanState) -> *mut pg_sys::Tuple
                     // repopulating on every miss would let one scan over evicted
                     // rows churn a cache that is doing its job.
                     if rowcache_readthrough_active() {
-                        view.set(&rc_key(relid, pk), &raw, 0);
+                        // THE #127 CRASH SITE. This runs in an ordinary backend,
+                        // and every backend that misses reaches it, so without
+                        // the lock this is N concurrent writers into one arena.
+                        rowcache_write(|| view.set(&rc_key(relid, pk), &raw, 0), false);
                     }
                     fallback = raw;
                     &fallback[..]
@@ -3793,7 +3900,7 @@ unsafe fn rowcache_refill_locked(relid: pg_sys::Oid, pk_lookup: &[u8]) -> Refill
     }
     match fetch_row_and_pk(&meta, &parts, false) {
         Some((raw, canon)) if !canon.is_empty() => {
-            view.set(&rc_key(relid.as_u32(), &canon), &raw, 0);
+            rowcache_write(|| view.set(&rc_key(relid.as_u32(), &canon), &raw, 0), false);
             Refill::Stored
         }
         _ => Refill::Gone,
@@ -4437,7 +4544,7 @@ mod supacache {
             return false;
         }
         let packed: Vec<u8> = attnums.iter().flat_map(|a| a.to_le_bytes()).collect();
-        if !view.set_pinned(&rc_reg_key(relid.as_u32()), &packed) {
+        if !rowcache_write(|| view.set_pinned(&rc_reg_key(relid.as_u32()), &packed), false) {
             return false;
         }
         // Read it back rather than trusting the write. set_pinned already
@@ -4490,7 +4597,7 @@ mod supacache {
             Some(vec![(PgBuiltInOids::OIDOID.oid(), relid.into_datum())]),
         );
         rowcache_view()
-            .map(|v| v.del(&rc_reg_key(relid.as_u32())))
+            .map(|v| rowcache_write(|| v.del(&rc_reg_key(relid.as_u32())), false))
             .unwrap_or(false)
     }
 
@@ -4535,7 +4642,10 @@ mod supacache {
             match fetch_row_and_pk(&meta, std::slice::from_ref(&canon), false) {
                 Some((raw, canon)) if !canon.is_empty() => {
                     if let Some(view) = rowcache_view() {
-                        return view.set(&rc_key(relid.as_u32(), &canon), &raw, 0);
+                        return rowcache_write(
+                            || view.set(&rc_key(relid.as_u32(), &canon), &raw, 0),
+                            false,
+                        );
                     }
                     false
                 }
@@ -4574,7 +4684,9 @@ mod supacache {
             }
             match fetch_row_and_pk(&meta, &parts, false) {
                 Some((raw, canon)) if !canon.is_empty() => rowcache_view()
-                    .map(|v| v.set(&rc_key(relid.as_u32(), &canon), &raw, 0))
+                    .map(|v| {
+                        rowcache_write(|| v.set(&rc_key(relid.as_u32(), &canon), &raw, 0), false)
+                    })
                     .unwrap_or(false),
                 _ => false,
             }

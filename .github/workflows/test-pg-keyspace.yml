@@ -310,6 +310,18 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_rowcache_registration.sh
 
+      # Two whole-cluster segfaults, both in the Mode B row cache: a query with
+      # no WHERE clause dereferencing a null baserestrictinfo at plan time
+      # (#128), and concurrent backends writing one unsynchronised arena under
+      # read-through (#127). Both reproduce in seconds, so this is cheap and it
+      # is the one test that fails loudly if either comes back.
+      - name: Row-cache crash regressions
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_rowcache_concurrency.sh
+
       - name: Durability + fault injection suite
         env:
           PGKS_BUILD_PROFILE: debug
