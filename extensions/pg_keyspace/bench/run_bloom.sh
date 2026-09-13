@@ -90,6 +90,8 @@ chk "BF.LOADCHUNK of a foreign chunk"   "ERR received bad data" "$($K BF.LOADCHU
 chk "BF.LOADCHUNK iterator 0"           "ERR not found" "$($K BF.LOADCHUNK lc 0 not-a-filter 2>&1)"
 chk "BF.SCANDUMP iterator not numeric"  "Second argument must be numeric" "$($K BF.SCANDUMP b abc 2>&1)"
 chk "BF.SCANDUMP on a missing key"      "ERR not found" "$($K BF.SCANDUMP gone 0 2>&1)"
+chk "BF.RESERVE a subnormal error rate"  "ERR could not create filter" "$($K BF.RESERVE sub 5e-324 1 2>&1)"
+chk "BF.INSERT a subnormal error rate"   "ERR could not create filter" "$($K BF.INSERT sub ERROR 5e-324 ITEMS x 2>&1)"
 chk "BF.LOADCHUNK iterator not numeric" "ERR Second argument must be numeric" "$($K BF.LOADCHUNK b abc data 2>&1)"
 chk "BF.ADD wrong arity"                "ERR wrong number of arguments for 'bf.add' command" "$($K BF.ADD b 2>&1)"
 chk "BF.RESERVE wrong arity"            "ERR wrong number of arguments for 'bf.reserve' command" "$($K BF.RESERVE b 2>&1)"
@@ -97,13 +99,28 @@ chk "BF.RESERVE wrong arity"            "ERR wrong number of arguments for 'bf.r
 # a NONSCALING filter fills up and refuses more
 $K BF.ADD ns n1 >/dev/null; $K BF.ADD ns n2 >/dev/null; $K BF.ADD ns n3 >/dev/null
 chk "a full NONSCALING filter refuses"  "ERR non scaling filter is full" "$($K BF.ADD ns over 2>&1)"
-chk "BF.MADD on a full NONSCALING filter" "ERR non scaling filter is full" "$($K BF.MADD ns o1 o2 2>&1)"
+# BF.MADD and BF.INSERT answer the array built so far, then the error as its
+# last element, and stop. Redis 8 does the same.
+$K DEL mfull >/dev/null; $K BF.RESERVE mfull 0.01 2 NONSCALING >/dev/null
+chk "BF.MADD fills then errors in the array" "1,1,ERR non scaling filter is full" \
+                                        "$($K BF.MADD mfull p q r s 2>&1 | grep . | paste -sd,)"
+chk "BF.MADD on a full filter -> 1 element" "ERR non scaling filter is full" \
+                                        "$($K BF.MADD mfull z 2>&1 | grep . | paste -sd,)"
+$K DEL mfull2 >/dev/null; $K BF.RESERVE mfull2 0.01 2 NONSCALING >/dev/null
+chk "BF.INSERT fills then errors in the array" "1,1,ERR non scaling filter is full" \
+                                        "$($K BF.INSERT mfull2 ITEMS p q r s 2>&1 | grep . | paste -sd,)"
+$K DEL mfull3 >/dev/null; $K BF.RESERVE mfull3 0.01 2 NONSCALING >/dev/null
+chk "BF.MADD keeps the duplicate result"  "1,0,1,ERR non scaling filter is full" \
+                                        "$($K BF.MADD mfull3 p p q r 2>&1 | grep . | paste -sd,)"
+$K DEL mfull mfull2 mfull3 >/dev/null
 
 # WRONGTYPE both ways, TYPE and OBJECT ENCODING
 $K SET str v >/dev/null
 chk "BF.ADD on a string -> WRONGTYPE"   "1" "$($K BF.ADD str x 2>&1 | grep -c WRONGTYPE)"
 chk "BF.INFO on a string -> WRONGTYPE"  "1" "$($K BF.INFO str 2>&1 | grep -c WRONGTYPE)"
 chk "BF.CARD on a string -> WRONGTYPE"  "1" "$($K BF.CARD str 2>&1 | grep -c WRONGTYPE)"
+chk "BF.SCANDUMP on a string -> WRONGTYPE"  "1" "$($K BF.SCANDUMP str 0 2>&1 | grep -c WRONGTYPE)"
+chk "BF.LOADCHUNK on a string -> WRONGTYPE" "1" "$($K BF.LOADCHUNK str 1 zz 2>&1 | grep -c WRONGTYPE)"
 chk "GET on a filter -> WRONGTYPE"      "1" "$($K GET b 2>&1 | grep -c WRONGTYPE)"
 chk "SADD on a filter -> WRONGTYPE"     "1" "$($K SADD b x 2>&1 | grep -c WRONGTYPE)"
 chk "TYPE reports MBbloom--"            "MBbloom--" "$($K TYPE b)"
@@ -242,9 +259,27 @@ else
     $1 BF.ADD pn n1 2>&1; $1 BF.ADD pn n2 2>&1; $1 BF.ADD pn n3 2>&1
     $1 SET pstr v 2>&1
     $1 BF.ADD pstr x 2>&1
+    $1 BF.SCANDUMP pstr 0 2>&1
+    $1 BF.LOADCHUNK pstr 1 zz 2>&1
+    $1 BF.RESERVE psub 5e-324 1 2>&1
+    $1 BF.INSERT psub ERROR 5e-324 ITEMS x 2>&1
   }
   a=$(errs "$R8" | grep . | paste -sd'|'); b=$(errs "$K" | grep . | paste -sd'|')
   chk "error text parity"               "$a" "$b"
+  mfull() {
+    $1 DEL pmf >/dev/null 2>&1
+    $1 BF.RESERVE pmf 0.01 2 NONSCALING >/dev/null 2>&1
+    $1 BF.MADD pmf p q r s 2>&1 | grep . | paste -sd,
+    $1 BF.MADD pmf z 2>&1 | grep . | paste -sd,
+    $1 DEL pmf2 >/dev/null 2>&1
+    $1 BF.RESERVE pmf2 0.01 2 NONSCALING >/dev/null 2>&1
+    $1 BF.INSERT pmf2 ITEMS p q r s 2>&1 | grep . | paste -sd,
+    $1 DEL pmf3 >/dev/null 2>&1
+    $1 BF.RESERVE pmf3 0.01 2 NONSCALING >/dev/null 2>&1
+    $1 BF.MADD pmf3 p p q r 2>&1 | grep . | paste -sd,
+  }
+  chk "a full NONSCALING array parity"  "$(mfull "$R8" | paste -sd'|')" "$(mfull "$K" | paste -sd'|')"
+  for R in "$K" "$R8"; do $R DEL pmf pmf2 pmf3 psub >/dev/null 2>&1; done
   expl() { $1 BF.RESERVE px 0.01 100 EXPANSION -1 2>&1; $1 BF.RESERVE px 0.01 100 EXPANSION 99999 2>&1; }
   chk "BF.RESERVE expansion range parity" "$(expl "$R8" | grep . | paste -sd'|')" "$(expl "$K" | grep . | paste -sd'|')"
   for R in "$K" "$R8"; do $R DEL px >/dev/null 2>&1; done

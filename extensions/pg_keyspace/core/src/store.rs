@@ -1243,6 +1243,12 @@ impl Store {
         }
     }
 
+    /// Whether the arena could ever hold a `len`-byte value, measured the way
+    /// `slab_alloc` reserves it. Lets a caller refuse before it builds the bytes.
+    pub fn can_hold(&self, len: usize) -> bool {
+        self.alloc_footprint(len) <= self.data_bytes
+    }
+
     unsafe fn ensure_alloc(&self, p: u32, size: usize, prefer: Option<&[u8]>) -> Option<(u64, u32)> {
         // Refuse an allocation the arena could never satisfy, before evicting
         // anything. Without this, a single write too large for the arena evicts
@@ -1428,13 +1434,22 @@ impl Store {
                 self.remove_at(p, b, idx);
                 return None;
             }
+            struct SeqGuard(*mut Entry, *mut PartMeta);
+            impl Drop for SeqGuard {
+                fn drop(&mut self) {
+                    unsafe {
+                        (*self.0).flags |= FLAG_REF;
+                        (*self.1).sets += 1;
+                        seq_end(self.0);
+                    }
+                }
+            }
             seq_begin(e);
+            let guard = SeqGuard(e, self.meta(p));
             let vp = self.data_ptr(p).add((*e).val_off as usize);
             let val = std::slice::from_raw_parts_mut(vp, (*e).val_len as usize);
             let out = f(val);
-            (*e).flags |= FLAG_REF;
-            (*self.meta(p)).sets += 1;
-            seq_end(e);
+            drop(guard);
             Some(out)
         }
     }
@@ -2777,6 +2792,25 @@ mod tests {
             "version must advance by a full write ({before} -> {after})"
         );
         assert_eq!(after % 2, 0, "version must settle even ({after})");
+    }
+
+    #[test]
+    fn with_value_mut_closes_the_seqlock_when_the_closure_panics() {
+        let s = store("t_wvm_panic");
+        assert!(s.set(b"f", &[1u8; 64], 0));
+        let before = s.version(b"f").expect("present after set");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.with_value_mut(b"f", |v| {
+                v[0] = 9;
+                panic!("the closure fails halfway");
+            })
+        }));
+        assert!(r.is_err(), "the panic must reach the caller");
+        let after = s.version(b"f").expect("present after the panic");
+        assert_eq!(after % 2, 0, "version must settle even ({after})");
+        assert!(after >= before + 2, "version must advance ({before} -> {after})");
+        assert!(s.with_value_mut(b"f", |v| v[0] = 3).is_some());
+        assert_eq!(s.get_typed(b"f").unwrap().2[0], 3);
     }
 
     #[test]

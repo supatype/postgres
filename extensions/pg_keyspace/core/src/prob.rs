@@ -39,6 +39,9 @@ const FILTER_FULL: &str = "ERR non scaling filter is full";
 const SCANDUMP_NUMERIC: &str = "Second argument must be numeric";
 const LOADCHUNK_NUMERIC: &str = "ERR Second argument must be numeric";
 const BAD_DATA: &str = "ERR received bad data";
+const CANNOT_CREATE: &str = "ERR could not create filter";
+const MIN_ERROR: f64 = 9.881312916824931e-324;
+const MAX_COUNTER: u64 = 1 << 62;
 const NO_EXPANSION: &str = "ERR no expansion";
 const EXPANSION_RANGE: &str = "ERR expansion must be in the range [0, 32768]";
 
@@ -90,7 +93,14 @@ pub fn encoding_name(kind: u32) -> Option<&'static str> {
     }
 }
 
-pub fn dispatch(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: bool) {
+pub fn dispatch(
+    store: &Store,
+    cmd: &[u8],
+    args: &[Vec<u8>],
+    out: &mut Vec<u8>,
+    resp3: bool,
+    max_bulk: usize,
+) {
     match cmd {
         b"BF.RESERVE" => reserve(store, cmd, args, out),
         b"BF.ADD" => add(store, cmd, args, out, resp3),
@@ -100,7 +110,7 @@ pub fn dispatch(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, 
         b"BF.MEXISTS" => mexists(store, cmd, args, out, resp3),
         b"BF.INFO" => info(store, cmd, args, out, resp3),
         b"BF.CARD" => card(store, cmd, args, out),
-        b"BF.SCANDUMP" => scandump(store, cmd, args, out),
+        b"BF.SCANDUMP" => scandump(store, cmd, args, out, max_bulk),
         b"BF.LOADCHUNK" => loadchunk(store, cmd, args, out),
         b"CF.RESERVE" => cf_reserve(store, cmd, args, out),
         b"CF.ADD" => cf_add(store, cmd, args, out, resp3, false),
@@ -112,7 +122,7 @@ pub fn dispatch(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, 
         b"CF.DEL" => cf_del(store, cmd, args, out, resp3),
         b"CF.COUNT" => cf_count(store, cmd, args, out),
         b"CF.INFO" => cf_info(store, cmd, args, out, resp3),
-        b"CF.SCANDUMP" => cf_scandump(store, cmd, args, out, resp3),
+        b"CF.SCANDUMP" => cf_scandump(store, cmd, args, out, resp3, max_bulk),
         b"CF.LOADCHUNK" => cf_loadchunk(store, cmd, args, out),
         other => resp::error(
             out,
@@ -169,8 +179,12 @@ fn rd_f64(b: &[u8], at: usize) -> Option<f64> {
     rd_u64(b, at).map(f64::from_bits)
 }
 
-fn chunk_start(it: i64, len: usize) -> usize {
-    (it as usize - 1).checked_sub(len).unwrap_or(0)
+fn chunk_bytes(max_bulk: usize) -> usize {
+    CHUNK_BYTES.min(max_bulk).max(1)
+}
+
+fn chunk_start(it: i64, len: usize) -> Option<usize> {
+    (it as usize - 1).checked_sub(len)
 }
 
 const MURMUR_M: u64 = 0xc6a4a793_5bd1e995;
@@ -217,8 +231,12 @@ fn hash_count(bpe: f64) -> u32 {
 }
 
 fn bit_count(capacity: u64, bpe: f64) -> u64 {
-    let n = (capacity as f64 * bpe).ceil() as u64;
-    n.div_ceil(64).max(1) * 64
+    let cap_bits = MAX_BLOB_BYTES as u64 * 8;
+    let n = capacity as f64 * bpe;
+    if !n.is_finite() || n >= cap_bits as f64 {
+        return cap_bits;
+    }
+    (n.ceil() as u64).div_ceil(64).max(1) * 64
 }
 
 struct Sub {
@@ -307,7 +325,7 @@ fn shape(blob: &[u8]) -> Shape {
         });
         at = end;
     }
-    if at != blob.len() {
+    if at != blob.len() || items > subs.iter().map(|s| s.capacity).sum::<u64>() {
         return Shape::Bad;
     }
     Shape::Ok(Filter {
@@ -376,7 +394,7 @@ fn grown(blob: &[u8]) -> Option<Vec<u8>> {
         .capacity
         .saturating_mul(f.expansion.max(1) as u64)
         .min(MAX_CAPACITY);
-    let error = f.error * TIGHTEN.powi(f.subs.len() as i32);
+    let error = (f.error * TIGHTEN.powi(f.subs.len() as i32)).max(MIN_ERROR);
     let mut out = blob.to_vec();
     push_sub(&mut out, capacity, error)?;
     out[OFF_FILTERS..HDR].copy_from_slice(&((f.subs.len() + 1) as u32).to_le_bytes());
@@ -416,8 +434,8 @@ fn add_in_place(blob: &mut [u8], item: &[u8]) -> Add {
     for i in 0..last.hashes {
         set_bit(bits, h1.wrapping_add((i as u64).wrapping_mul(h2)) % last.bits);
     }
-    blob[last.hdr + 8..last.hdr + 16].copy_from_slice(&(last.items + 1).to_le_bytes());
-    blob[OFF_ITEMS..OFF_FILTERS].copy_from_slice(&(f.items + 1).to_le_bytes());
+    blob[last.hdr + 8..last.hdr + 16].copy_from_slice(&last.items.saturating_add(1).to_le_bytes());
+    blob[OFF_ITEMS..OFF_FILTERS].copy_from_slice(&f.items.saturating_add(1).to_le_bytes());
     Add::Added
 }
 
@@ -453,7 +471,14 @@ impl Default for Spec {
     }
 }
 
+fn bloom_blob_bytes(error: f64, capacity: u64) -> usize {
+    HDR + SUB_HDR + (bit_count(capacity, bits_per_item(error)) / 8) as usize
+}
+
 fn create(store: &Store, key: &[u8], spec: &Spec) -> bool {
+    if !store.can_hold(bloom_blob_bytes(spec.error, spec.capacity)) {
+        return false;
+    }
     match new_blob(spec.error, spec.capacity, spec.expansion, spec.nonscaling) {
         Some(b) => store.set_typed(key, &b, 0, KIND_BLOOM),
         None => false,
@@ -473,6 +498,9 @@ fn add_item(store: &Store, key: &[u8], item: &[u8]) -> Add {
                 None => return Add::Oom,
             };
             let r = add_in_place(&mut next, item);
+            if r == Add::Bad {
+                return Add::Bad;
+            }
             if !store.set_typed(key, &next, remaining_ttl(exp), KIND_BLOOM) {
                 return Add::Oom;
             }
@@ -517,15 +545,17 @@ fn add_many(store: &Store, key: &[u8], items: &[Vec<u8>], out: &mut Vec<u8>, res
     let mut results = Vec::with_capacity(items.len());
     for item in items {
         let r = add_item(store, key, item);
-        if matches!(r, Add::Full | Add::Oom | Add::Bad) {
-            add_error(out, &r);
-            return;
+        let stop = matches!(r, Add::Full | Add::MaxGrow | Add::Oom | Add::Bad);
+        results.push(r);
+        if stop {
+            break;
         }
-        results.push(r == Add::Added);
     }
     resp::array_header(out, results.len());
-    for ok in results {
-        resp::boolean(out, ok, resp3);
+    for r in &results {
+        if !add_error(out, r) {
+            resp::boolean(out, *r == Add::Added, resp3);
+        }
     }
 }
 
@@ -539,6 +569,9 @@ fn reserve(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
     };
     if !(error > 0.0 && error < 1.0) {
         return resp::error(out, ERROR_RANGE);
+    }
+    if error < MIN_ERROR {
+        return resp::error(out, CANNOT_CREATE);
     }
     let capacity = match arg_i64(&args[3]) {
         Some(v) => v,
@@ -649,6 +682,7 @@ fn insert(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3:
                 }
             } else if eq(&args[i], "ERROR") {
                 match arg_f64(&args[i + 1]) {
+                    Some(v) if v < MIN_ERROR => return resp::error(out, CANNOT_CREATE),
                     Some(v) if v > 0.0 && v < 1.0 => spec.error = v,
                     _ => return resp::error(out, INSERT_BAD_ERROR),
                 }
@@ -780,7 +814,7 @@ fn card(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
     }
 }
 
-fn scandump(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
+fn scandump(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, max_bulk: usize) {
     if args.len() != 3 {
         return arity(out, cmd);
     }
@@ -790,7 +824,8 @@ fn scandump(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
     };
     let blob = match store.get_typed(&args[1]) {
         Some((KIND_BLOOM, _, v)) => v,
-        _ => return resp::error(out, NOT_FOUND),
+        Some(_) => return resp::error(out, WRONGTYPE),
+        None => return resp::error(out, NOT_FOUND),
     };
     let off = if it <= 0 { 0 } else { (it - 1) as usize };
     resp::array_header(out, 2);
@@ -799,7 +834,7 @@ fn scandump(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
         resp::bulk(out, b"");
         return;
     }
-    let end = off.saturating_add(CHUNK_BYTES).min(blob.len());
+    let end = off.saturating_add(chunk_bytes(max_bulk)).min(blob.len());
     resp::integer(out, (end + 1) as i64);
     resp::bulk(out, &blob[off..end]);
 }
@@ -816,16 +851,16 @@ fn loadchunk(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
         return resp::error(out, NOT_FOUND);
     }
     let start = chunk_start(it, args[3].len());
-    let (exp, mut next) = if start == 0 {
-        match kind_of(store, &args[1]) {
-            Kind::Absent => (0, Vec::new()),
+    let (exp, mut next) = match kind_of(store, &args[1]) {
+        Kind::Other => return resp::error(out, WRONGTYPE),
+        Kind::Absent => match start {
+            Some(0) => (0, Vec::new()),
             _ => return resp::error(out, BAD_DATA),
-        }
-    } else {
-        match store.get_typed(&args[1]) {
-            Some((KIND_BLOOM, e, v)) if v.len() == start => (e, v.to_vec()),
+        },
+        Kind::Filter => match store.get_typed(&args[1]) {
+            Some((KIND_BLOOM, e, v)) if start == Some(v.len()) => (e, v.to_vec()),
             _ => return resp::error(out, BAD_DATA),
-        }
+        },
     };
     if next.len() + args[3].len() > MAX_BLOB_BYTES {
         return resp::error(out, BAD_DATA);
@@ -907,7 +942,8 @@ fn cshape(blob: &[u8]) -> CShape {
         subs.push(CSub { buckets, data });
         at = end;
     }
-    if at != blob.len() {
+    let slots = subs.iter().map(|s| s.buckets).sum::<u64>() * bucket as u64;
+    if at != blob.len() || items > slots || deletes > MAX_COUNTER {
         return CShape::Bad;
     }
     CShape::Ok(Cuckoo {
@@ -1103,7 +1139,7 @@ fn cf_add_in_place(blob: &mut [u8], item: &[u8], nx: bool) -> Add {
         }
         return Add::Grow;
     }
-    blob[C_OFF_ITEMS..C_OFF_DELETES].copy_from_slice(&(c.items + 1).to_le_bytes());
+    blob[C_OFF_ITEMS..C_OFF_DELETES].copy_from_slice(&c.items.saturating_add(1).to_le_bytes());
     Add::Added
 }
 
@@ -1127,7 +1163,8 @@ fn cf_del_in_place(blob: &mut [u8], item: &[u8]) -> Option<bool> {
             blob[at] = 0;
             blob[C_OFF_ITEMS..C_OFF_DELETES]
                 .copy_from_slice(&c.items.saturating_sub(1).to_le_bytes());
-            blob[C_OFF_DELETES..C_OFF_FILTERS].copy_from_slice(&(c.deletes + 1).to_le_bytes());
+            blob[C_OFF_DELETES..C_OFF_FILTERS]
+                .copy_from_slice(&c.deletes.saturating_add(1).to_le_bytes());
             Some(true)
         }
     }
@@ -1159,6 +1196,20 @@ fn cf_kind_of(store: &Store, key: &[u8]) -> Kind {
     }
 }
 
+fn cuckoo_blob_bytes(capacity: u64, bucket: u32) -> usize {
+    C_HDR + C_SUB_HDR + (cf_buckets(capacity, bucket) * bucket as u64) as usize
+}
+
+fn cf_create(store: &Store, key: &[u8], spec: &CSpec) -> bool {
+    if !store.can_hold(cuckoo_blob_bytes(spec.capacity, spec.bucket)) {
+        return false;
+    }
+    match cf_new_blob(spec) {
+        Some(b) => store.set_typed(key, &b, 0, KIND_CUCKOO),
+        None => false,
+    }
+}
+
 fn cf_prepare(store: &Store, key: &[u8], spec: &CSpec, nocreate: bool, out: &mut Vec<u8>) -> bool {
     match cf_kind_of(store, key) {
         Kind::Filter => true,
@@ -1171,11 +1222,7 @@ fn cf_prepare(store: &Store, key: &[u8], spec: &CSpec, nocreate: bool, out: &mut
                 resp::error(out, NOT_FOUND);
                 return false;
             }
-            let created = match cf_new_blob(spec) {
-                Some(b) => store.set_typed(key, &b, 0, KIND_CUCKOO),
-                None => false,
-            };
-            if !created {
+            if !cf_create(store, key, spec) {
                 resp::error(out, crate::server::OOM_ERR);
                 return false;
             }
@@ -1197,6 +1244,9 @@ fn cf_add_item(store: &Store, key: &[u8], item: &[u8], nx: bool) -> Add {
                 None => return Add::Oom,
             };
             let r = cf_add_in_place(&mut next, item, nx);
+            if r == Add::Bad {
+                return Add::Bad;
+            }
             if !store.set_typed(key, &next, remaining_ttl(exp), KIND_CUCKOO) {
                 return Add::Oom;
             }
@@ -1261,14 +1311,8 @@ fn cf_reserve(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
         Some(v) => v,
         None => return resp::error(out, INSERT_BAD_CAPACITY),
     };
-    let mut i = 3;
-    while i < args.len() {
-        if (eq(&args[i], "BUCKETSIZE") || eq(&args[i], "MAXITERATIONS") || eq(&args[i], "EXPANSION"))
-            && i + 1 >= args.len()
-        {
-            return arity(out, cmd);
-        }
-        i += 1;
+    if (args.len() - 3) % 2 != 0 {
+        return arity(out, cmd);
     }
     let mut spec = CSpec::default();
     if !cf_opts(args, 3, &mut spec, out) {
@@ -1282,11 +1326,7 @@ fn cf_reserve(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) {
         Kind::Other => resp::error(out, WRONGTYPE),
         Kind::Filter => resp::error(out, ITEM_EXISTS),
         Kind::Absent => {
-            let created = match cf_new_blob(&spec) {
-                Some(b) => store.set_typed(&args[1], &b, 0, KIND_CUCKOO),
-                None => false,
-            };
-            if created {
+            if cf_create(store, &args[1], &spec) {
                 resp::simple(out, "OK");
             } else {
                 resp::error(out, crate::server::OOM_ERR);
@@ -1460,7 +1500,14 @@ fn cf_info(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3
     info_field(out, "Max iterations", Some(c.maxiter as i64), resp3);
 }
 
-fn cf_scandump(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, resp3: bool) {
+fn cf_scandump(
+    store: &Store,
+    cmd: &[u8],
+    args: &[Vec<u8>],
+    out: &mut Vec<u8>,
+    resp3: bool,
+    max_bulk: usize,
+) {
     if args.len() != 3 {
         return arity(out, cmd);
     }
@@ -1480,7 +1527,7 @@ fn cf_scandump(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>, r
         resp::null(out, resp3);
         return;
     }
-    let end = off.saturating_add(CHUNK_BYTES).min(blob.len());
+    let end = off.saturating_add(chunk_bytes(max_bulk)).min(blob.len());
     resp::integer(out, (end + 1) as i64);
     resp::bulk(out, &blob[off..end]);
 }
@@ -1494,18 +1541,17 @@ fn cf_loadchunk(store: &Store, cmd: &[u8], args: &[Vec<u8>], out: &mut Vec<u8>) 
         _ => return resp::error(out, CF_INVALID_POSITION),
     };
     let start = chunk_start(it, args[3].len());
-    let (exp, mut next) = if start == 0 {
-        match cf_kind_of(store, &args[1]) {
-            Kind::Other => return resp::error(out, WRONGTYPE),
-            Kind::Filter => return resp::error(out, ITEM_EXISTS),
-            Kind::Absent => (0, Vec::new()),
-        }
-    } else {
-        match store.get_typed(&args[1]) {
-            Some((KIND_CUCKOO, e, v)) if v.len() == start => (e, v.to_vec()),
-            Some((KIND_CUCKOO, _, _)) | None => return resp::error(out, CF_INVALID_POSITION),
-            Some(_) => return resp::error(out, WRONGTYPE),
-        }
+    let (exp, mut next) = match cf_kind_of(store, &args[1]) {
+        Kind::Other => return resp::error(out, WRONGTYPE),
+        Kind::Absent => match start {
+            Some(0) => (0, Vec::new()),
+            Some(_) => return resp::error(out, CF_INVALID_POSITION),
+            None => return resp::error(out, CF_INVALID_HEADER),
+        },
+        Kind::Filter => match store.get_typed(&args[1]) {
+            Some((KIND_CUCKOO, e, v)) if start == Some(v.len()) => (e, v.to_vec()),
+            _ => return resp::error(out, ITEM_EXISTS),
+        },
     };
     if next.len() + args[3].len() > MAX_BLOB_BYTES {
         return resp::error(out, CF_INVALID_HEADER);
@@ -1539,7 +1585,7 @@ mod tests {
         let args: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
         let cmd = argv[0].to_uppercase().into_bytes();
         let mut out = Vec::new();
-        dispatch(store, &cmd, &args, &mut out, false);
+        dispatch(store, &cmd, &args, &mut out, false, CHUNK_BYTES);
         String::from_utf8_lossy(&out).into_owned()
     }
 
@@ -1699,7 +1745,7 @@ mod tests {
                 b"src".to_vec(),
                 it.to_string().into_bytes(),
             ];
-            dispatch(&s, b"BF.SCANDUMP", &args, &mut out, false);
+            dispatch(&s, b"BF.SCANDUMP", &args, &mut out, false, CHUNK_BYTES);
             let (next, data) = decode_scandump(&out);
             if next == 0 {
                 assert!(data.is_empty());
@@ -1737,7 +1783,7 @@ mod tests {
                 it.to_string().into_bytes(),
             ];
             let mut out = Vec::new();
-            dispatch(s, b"BF.SCANDUMP", &args, &mut out, false);
+            dispatch(s, b"BF.SCANDUMP", &args, &mut out, false, CHUNK_BYTES);
             let (next, data) = decode_scandump(&out);
             if next == 0 {
                 assert!(data.is_empty());
@@ -1766,7 +1812,7 @@ mod tests {
                 data.clone(),
             ];
             let mut out = Vec::new();
-            dispatch(&s, b"BF.LOADCHUNK", &load, &mut out, false);
+            dispatch(&s, b"BF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
             assert_eq!(String::from_utf8_lossy(&out), "+OK\r\n");
         }
         assert_eq!(
@@ -1800,7 +1846,7 @@ mod tests {
                 data.clone(),
             ];
             let mut out = Vec::new();
-            dispatch(&s, b"BF.LOADCHUNK", &load, &mut out, false);
+            dispatch(&s, b"BF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
             assert_eq!(String::from_utf8_lossy(&out), "+OK\r\n");
         }
         assert_eq!(s.get_typed(b"dst").unwrap().2, blob);
@@ -1880,7 +1926,7 @@ mod tests {
             assert_eq!(run(&s, &["BF.ADD", "ns", &format!("x{i}")]), ":1\r\n");
         }
         assert_eq!(run(&s, &["BF.ADD", "ns", "over"]), format!("-{FILTER_FULL}\r\n"));
-        assert_eq!(run(&s, &["BF.MADD", "ns", "a", "b"]), format!("-{FILTER_FULL}\r\n"));
+        assert_eq!(run(&s, &["BF.MADD", "ns", "a", "b"]), format!("*1\r\n-{FILTER_FULL}\r\n"));
     }
 
     #[test]
@@ -1912,12 +1958,12 @@ mod tests {
 
         let args: Vec<Vec<u8>> = vec![b"BF.INFO".to_vec(), b"b".to_vec()];
         let mut out = Vec::new();
-        dispatch(&s, b"BF.INFO", &args, &mut out, true);
+        dispatch(&s, b"BF.INFO", &args, &mut out, true, CHUNK_BYTES);
         assert!(String::from_utf8_lossy(&out).starts_with("%5\r\n+Capacity\r\n:100\r\n"));
 
         let args: Vec<Vec<u8>> = vec![b"BF.INFO".to_vec(), b"b".to_vec(), b"CAPACITY".to_vec()];
         let mut out = Vec::new();
-        dispatch(&s, b"BF.INFO", &args, &mut out, true);
+        dispatch(&s, b"BF.INFO", &args, &mut out, true, CHUNK_BYTES);
         assert_eq!(String::from_utf8_lossy(&out), "%1\r\n+Capacity\r\n:100\r\n");
 
         assert_eq!(run(&s, &["BF.RESERVE", "ns", "0.01", "10", "NONSCALING"]), "+OK\r\n");
@@ -1932,7 +1978,7 @@ mod tests {
             let args: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
             let cmd = argv[0].to_uppercase().into_bytes();
             let mut out = Vec::new();
-            dispatch(&s, &cmd, &args, &mut out, true);
+            dispatch(&s, &cmd, &args, &mut out, true, CHUNK_BYTES);
             String::from_utf8_lossy(&out).into_owned()
         };
         assert_eq!(call(&["BF.ADD", "r", "a"]), "#t\r\n");
@@ -2038,7 +2084,7 @@ mod tests {
                 it.to_string().into_bytes(),
             ];
             let mut out = Vec::new();
-            dispatch(s, b"CF.SCANDUMP", &args, &mut out, false);
+            dispatch(s, b"CF.SCANDUMP", &args, &mut out, false, CHUNK_BYTES);
             let (next, data) = decode_cf_scandump(&out);
             if next == 0 {
                 assert!(data.is_none(), "the terminal chunk must be a nil bulk");
@@ -2416,7 +2462,7 @@ mod tests {
                 data.clone(),
             ];
             let mut out = Vec::new();
-            dispatch(&s, b"CF.LOADCHUNK", &load, &mut out, false);
+            dispatch(&s, b"CF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
             assert_eq!(String::from_utf8_lossy(&out), "+OK\r\n");
         }
         assert_eq!(
@@ -2455,7 +2501,7 @@ mod tests {
                 data.clone(),
             ];
             let mut out = Vec::new();
-            dispatch(&s, b"CF.LOADCHUNK", &load, &mut out, false);
+            dispatch(&s, b"CF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
             assert_eq!(String::from_utf8_lossy(&out), "+OK\r\n");
         }
         assert_eq!(s.get_typed(b"dst").unwrap().2, blob);
@@ -2493,6 +2539,14 @@ mod tests {
         assert_eq!(run(&s, &["CF.RESERVE", "k", "100", "EXPANSION", "-1"]), format!("-{CF_EXPANSION_RANGE}\r\n"));
         assert_eq!(run(&s, &["CF.RESERVE", "k", "100", "EXPANSION", "32769"]), format!("-{CF_EXPANSION_RANGE}\r\n"));
         assert_eq!(run(&s, &["CF.RESERVE", "k", "100", "BOGUS", "1"]), "+OK\r\n");
+        assert_eq!(
+            run(&s, &["CF.RESERVE", "k9", "1000", "BOGUS"]),
+            "-ERR wrong number of arguments for 'cf.reserve' command\r\n"
+        );
+        assert_eq!(
+            run(&s, &["CF.RESERVE", "k9", "1000", "BOGUS", "1", "2"]),
+            "-ERR wrong number of arguments for 'cf.reserve' command\r\n"
+        );
         assert_eq!(run(&s, &["CF.RESERVE", "k", "100"]), format!("-{ITEM_EXISTS}\r\n"));
         assert_eq!(run(&s, &["CF.RESERVE", "k", "100", "BUCKETSIZE", "abc"]), format!("-{CF_PARSE_BUCKETSIZE}\r\n"));
 
@@ -2591,7 +2645,7 @@ mod tests {
             let args: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
             let cmd = argv[0].to_uppercase().into_bytes();
             let mut out = Vec::new();
-            dispatch(&s, &cmd, &args, &mut out, true);
+            dispatch(&s, &cmd, &args, &mut out, true, CHUNK_BYTES);
             String::from_utf8_lossy(&out).into_owned()
         };
         assert_eq!(call(&["CF.ADD", "r", "a"]), "#t\r\n");
@@ -2660,5 +2714,213 @@ mod tests {
             run(&s, &["BF.INSERT", "j", "EXPANSION"]),
             "-ERR wrong number of arguments for 'bf.insert' command\r\n"
         );
+    }
+
+    #[test]
+    fn a_subnormal_error_rate_is_refused_the_way_redis_does() {
+        let s = Store::create("t_bloom_tiny", &cfg(1024 * 1024)).unwrap();
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "tiny", "5e-324", "1"]),
+            format!("-{CANNOT_CREATE}\r\n")
+        );
+        assert_eq!(run(&s, &["BF.EXISTS", "tiny", "a"]), ":0\r\n");
+        assert_eq!(
+            run(&s, &["BF.INSERT", "ti", "ERROR", "5e-324", "ITEMS", "x"]),
+            format!("-{CANNOT_CREATE}\r\n")
+        );
+        assert_eq!(
+            run(&s, &["BF.RESERVE", "small", "9.881312916824931e-324", "1"]),
+            "+OK\r\n"
+        );
+        for i in 0..8u32 {
+            assert_eq!(run(&s, &["BF.ADD", "small", &format!("s{i}")]), ":1\r\n");
+        }
+        assert_eq!(run(&s, &["BF.EXISTS", "small", "s0"]), ":1\r\n");
+        assert_eq!(run(&s, &["BF.CARD", "small"]), ":8\r\n");
+    }
+
+    #[test]
+    fn bit_count_saturates_instead_of_overflowing() {
+        let cap_bits = MAX_BLOB_BYTES as u64 * 8;
+        assert_eq!(bit_count(1, f64::INFINITY), cap_bits);
+        assert_eq!(bit_count(u64::MAX, 1.0), cap_bits);
+        assert_eq!(bit_count(1_000_000_000, 1e300), cap_bits);
+        assert_eq!(bit_count(1, bits_per_item(MIN_ERROR)), 1600);
+        assert_eq!(bit_count(100, bits_per_item(0.01)), 960);
+        let deep = (0..MAX_FILTERS)
+            .map(|n| (MIN_ERROR * TIGHTEN.powi(n as i32)).max(MIN_ERROR))
+            .all(|e| e >= MIN_ERROR && bits_per_item(e).is_finite());
+        assert!(deep, "a tightened error must stay positive and finite");
+    }
+
+    #[test]
+    fn a_loaded_header_with_an_impossible_counter_is_refused() {
+        let s = Store::create("t_prob_counters", &cfg(1024 * 1024)).unwrap();
+        let mut blob = new_blob(0.01, 100, 2, false).unwrap();
+        blob[OFF_ITEMS..OFF_FILTERS].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(shape(&blob), Shape::Bad));
+        let load = vec![
+            b"BF.LOADCHUNK".to_vec(),
+            b"k".to_vec(),
+            (blob.len() + 1).to_string().into_bytes(),
+            blob.clone(),
+        ];
+        let mut out = Vec::new();
+        dispatch(&s, b"BF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
+        assert_eq!(String::from_utf8_lossy(&out), format!("-{BAD_DATA}\r\n"));
+        assert_eq!(run(&s, &["BF.CARD", "k"]), ":0\r\n");
+
+        let mut c = cf_new_blob(&cspec(100)).unwrap();
+        c[C_OFF_ITEMS..C_OFF_DELETES].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(cshape(&c), CShape::Bad));
+        let mut d = cf_new_blob(&cspec(100)).unwrap();
+        d[C_OFF_DELETES..C_OFF_FILTERS].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(cshape(&d), CShape::Bad));
+        let load = vec![
+            b"CF.LOADCHUNK".to_vec(),
+            b"ck".to_vec(),
+            (c.len() + 1).to_string().into_bytes(),
+            c.clone(),
+        ];
+        let mut out = Vec::new();
+        dispatch(&s, b"CF.LOADCHUNK", &load, &mut out, false, CHUNK_BYTES);
+        assert_eq!(String::from_utf8_lossy(&out), format!("-{CF_INVALID_HEADER}\r\n"));
+        assert_eq!(run(&s, &["CF.COUNT", "ck", "x"]), ":0\r\n");
+    }
+
+    #[test]
+    fn a_grown_blob_that_does_not_parse_is_reported_as_bad() {
+        let mut g = grown(&new_blob(0.01, 4, 2, false).unwrap()).unwrap();
+        assert!(matches!(add_in_place(&mut g, b"x"), Add::Added));
+        g.truncate(g.len() - 1);
+        assert!(matches!(add_in_place(&mut g, b"y"), Add::Bad));
+
+        let mut cg = cf_grown(&cf_new_blob(&cspec(8)).unwrap()).unwrap();
+        assert!(matches!(cf_add_in_place(&mut cg, b"x", false), Add::Added));
+        cg.truncate(cg.len() - 1);
+        assert!(matches!(cf_add_in_place(&mut cg, b"y", false), Add::Bad));
+
+        let s = Store::create("t_prob_grow_guard", &cfg(1024 * 1024)).unwrap();
+        assert_eq!(run(&s, &["BF.RESERVE", "g", "0.01", "2"]), "+OK\r\n");
+        for i in 0..20u32 {
+            let r = run(&s, &["BF.ADD", "g", &format!("g{i}")]);
+            assert!(r == ":1\r\n" || r == ":0\r\n", "BF.ADD answered {r} at item {i}");
+            assert!(
+                parse(s.get_typed(b"g").unwrap().2).is_some(),
+                "the stored filter stopped parsing at item {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn madd_and_insert_answer_the_array_with_the_error_element() {
+        let s = Store::create("t_bloom_madd_full", &cfg(1024 * 1024)).unwrap();
+        assert_eq!(run(&s, &["BF.RESERVE", "mn", "0.01", "2", "NONSCALING"]), "+OK\r\n");
+        assert_eq!(
+            run(&s, &["BF.MADD", "mn", "p", "q", "r", "s"]),
+            format!("*3\r\n:1\r\n:1\r\n-{FILTER_FULL}\r\n")
+        );
+        assert_eq!(run(&s, &["BF.MADD", "mn", "zzz"]), format!("*1\r\n-{FILTER_FULL}\r\n"));
+        assert_eq!(run(&s, &["BF.MEXISTS", "mn", "p", "q", "r"]), "*3\r\n:1\r\n:1\r\n:0\r\n");
+
+        assert_eq!(run(&s, &["BF.RESERVE", "mn2", "0.01", "2", "NONSCALING"]), "+OK\r\n");
+        assert_eq!(
+            run(&s, &["BF.INSERT", "mn2", "ITEMS", "p", "q", "r", "s"]),
+            format!("*3\r\n:1\r\n:1\r\n-{FILTER_FULL}\r\n")
+        );
+
+        assert_eq!(run(&s, &["BF.RESERVE", "mn3", "0.01", "2", "NONSCALING"]), "+OK\r\n");
+        assert_eq!(
+            run(&s, &["BF.MADD", "mn3", "p", "p", "q", "r"]),
+            format!("*4\r\n:1\r\n:0\r\n:1\r\n-{FILTER_FULL}\r\n")
+        );
+    }
+
+    #[test]
+    fn bloom_scandump_and_loadchunk_answer_wrongtype_on_a_string() {
+        let s = Store::create("t_bloom_wt_dump", &cfg(1024 * 1024)).unwrap();
+        assert!(s.set(b"str", b"v", 0));
+        let wt = format!("-{WRONGTYPE}\r\n");
+        assert_eq!(run(&s, &["BF.SCANDUMP", "str", "0"]), wt);
+        assert_eq!(run(&s, &["BF.LOADCHUNK", "str", "1", "zz"]), wt);
+        assert_eq!(run(&s, &["CF.SCANDUMP", "str", "0"]), wt);
+        assert_eq!(run(&s, &["CF.LOADCHUNK", "str", "1", "zz"]), wt);
+    }
+
+    #[test]
+    fn an_under_positioned_chunk_iterator_is_refused() {
+        assert_eq!(chunk_start(1, 0), Some(0));
+        assert_eq!(chunk_start(9, 8), Some(0));
+        assert_eq!(chunk_start(9, 4), Some(4));
+        assert_eq!(chunk_start(1, 4), None);
+
+        let s = Store::create("t_prob_chunk_pos", &cfg(1024 * 1024)).unwrap();
+        assert_eq!(
+            run(&s, &["BF.LOADCHUNK", "k", "1", "not-a-filter"]),
+            format!("-{BAD_DATA}\r\n")
+        );
+        assert_eq!(
+            run(&s, &["CF.LOADCHUNK", "k", "1", "not-a-filter"]),
+            format!("-{CF_INVALID_HEADER}\r\n")
+        );
+        assert_eq!(run(&s, &["CF.RESERVE", "src", "2000"]), "+OK\r\n");
+        let chunks = cf_dump(&s, "src");
+        let (it, data) = &chunks[0];
+        let bad = vec![
+            b"CF.LOADCHUNK".to_vec(),
+            b"dst".to_vec(),
+            (it - 1).to_string().into_bytes(),
+            data.clone(),
+        ];
+        let mut out = Vec::new();
+        dispatch(&s, b"CF.LOADCHUNK", &bad, &mut out, false, CHUNK_BYTES);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            format!("-{CF_INVALID_HEADER}\r\n")
+        );
+        assert!(s.get_typed(b"dst").is_none(), "a bad iterator must not create the key");
+    }
+
+    #[test]
+    fn a_reserve_too_big_for_the_arena_is_refused_before_the_bytes_are_built() {
+        let s = Store::create("t_prob_oom", &cfg(1024 * 1024)).unwrap();
+        assert!(!s.can_hold(400_000_000));
+        assert!(s.can_hold(1024));
+        let oom = format!("-{}\r\n", crate::server::OOM_ERR);
+        assert_eq!(run(&s, &["BF.RESERVE", "zz", "0.01", "400000000"]), oom);
+        assert_eq!(run(&s, &["CF.RESERVE", "cz", "400000000"]), oom);
+        assert!(s.get_typed(b"zz").is_none());
+        assert!(s.get_typed(b"cz").is_none());
+        assert!(bloom_blob_bytes(0.01, 400_000_000) > 400_000_000);
+        assert_eq!(cuckoo_blob_bytes(1000, 2), 1065);
+    }
+
+    #[test]
+    fn scandump_chunks_never_exceed_the_max_bulk_limit() {
+        let s = Store::create("t_prob_chunk_limit", &cfg(1024 * 1024)).unwrap();
+        assert_eq!(run(&s, &["BF.RESERVE", "b", "0.01", "20000"]), "+OK\r\n");
+        let blob_len = s.get_typed(b"b").unwrap().2.len();
+        assert!(blob_len > 4096, "the dump must need several small chunks");
+        let mut it = 0i64;
+        let mut total = 0usize;
+        let mut chunks = 0;
+        loop {
+            let args = vec![b"BF.SCANDUMP".to_vec(), b"b".to_vec(), it.to_string().into_bytes()];
+            let mut out = Vec::new();
+            dispatch(&s, b"BF.SCANDUMP", &args, &mut out, false, 4096);
+            let (next, data) = decode_scandump(&out);
+            if next == 0 {
+                break;
+            }
+            assert!(data.len() <= 4096, "a chunk of {} exceeds max_bulk", data.len());
+            total += data.len();
+            it = next;
+            chunks += 1;
+            assert!(chunks < 100, "the chunk loop did not terminate");
+        }
+        assert_eq!(total, blob_len);
+        assert!(chunks > 1);
+        assert_eq!(chunk_bytes(0), 1);
+        assert_eq!(chunk_bytes(usize::MAX), CHUNK_BYTES);
     }
 }

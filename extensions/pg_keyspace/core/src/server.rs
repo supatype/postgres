@@ -1332,6 +1332,7 @@ impl Worker {
         // push frames). Read once up front so every reply site — including the
         // auth-gate nil below — can use the right encoding.
         let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
+        let max_bulk = self.max_value_bytes;
 
         // ---- AUTH command ----
         if cmd == b"AUTH" {
@@ -4441,7 +4442,7 @@ impl Worker {
                 resp::integer(out, count as i64);
             }
             c if c.starts_with(b"BF.") || c.starts_with(b"CF.") => {
-                prob::dispatch(&store, c, args, out, resp3)
+                prob::dispatch(&store, c, args, out, resp3, max_bulk)
             }
             other => resp::error(
                 out,

@@ -108,6 +108,13 @@ chk "CF.RESERVE expansion range"        "EXPANSION: value must be in the range [
                                         "$($K CF.RESERVE q 100 EXPANSION -1 2>&1)"
 chk "CF.RESERVE a dangling BUCKETSIZE"  "ERR wrong number of arguments for 'cf.reserve' command" \
                                         "$($K CF.RESERVE q 100 BUCKETSIZE 2>&1)"
+chk "CF.RESERVE an odd trailing token"  "ERR wrong number of arguments for 'cf.reserve' command" \
+                                        "$($K CF.RESERVE q 1000 BOGUS 2>&1)"
+chk "CF.RESERVE three trailing tokens"  "ERR wrong number of arguments for 'cf.reserve' command" \
+                                        "$($K CF.RESERVE q 1000 BOGUS 1 2 2>&1)"
+$K DEL qpair >/dev/null
+chk "CF.RESERVE a token pair is ignored" "OK" "$($K CF.RESERVE qpair 1000 BOGUS 1 2>&1)"
+$K DEL qpair >/dev/null
 chk "CF.INFO on a missing key"          "ERR not found" "$($K CF.INFO gone 2>&1)"
 chk "CF.INSERT NOCREATE on a missing key" "ERR not found" "$($K CF.INSERT gone NOCREATE ITEMS a 2>&1)"
 chk "CF.INSERTNX NOCREATE on a missing key" "ERR not found" "$($K CF.INSERTNX gone NOCREATE ITEMS a 2>&1)"
@@ -149,6 +156,8 @@ chk "CF.RESERVE on a string -> WRONGTYPE" "1" "$($K CF.RESERVE str 100 2>&1 | gr
 chk "CF.EXISTS on a string -> 0"        "0" "$($K CF.EXISTS str x 2>&1)"
 chk "CF.COUNT on a string -> 0"         "0" "$($K CF.COUNT str x 2>&1)"
 chk "CF.DEL on a string -> Not found"   "Not found" "$($K CF.DEL str x 2>&1)"
+chk "CF.SCANDUMP on a string -> WRONGTYPE"  "1" "$($K CF.SCANDUMP str 0 2>&1 | grep -c WRONGTYPE)"
+chk "CF.LOADCHUNK on a string -> WRONGTYPE" "1" "$($K CF.LOADCHUNK str 1 zz 2>&1 | grep -c WRONGTYPE)"
 chk "GET on a filter -> WRONGTYPE"      "1" "$($K GET c 2>&1 | grep -c WRONGTYPE)"
 chk "SADD on a filter -> WRONGTYPE"     "1" "$($K SADD c x 2>&1 | grep -c WRONGTYPE)"
 chk "BF.ADD on a cuckoo filter"         "1" "$($K BF.ADD c x 2>&1 | grep -c WRONGTYPE)"
@@ -316,6 +325,8 @@ else
     $1 CF.RESERVE pe 100 BUCKETSIZE 2>&1
     $1 CF.RESERVE pe 100 MAXITERATIONS 2>&1
     $1 CF.RESERVE pe 100 EXPANSION 2>&1
+    $1 CF.RESERVE pe 1000 BOGUS 2>&1
+    $1 CF.RESERVE pe 1000 BOGUS 1 2 2>&1
     $1 CF.INSERT pe NOCREATE ITEMS a 2>&1
     $1 CF.INSERTNX pe NOCREATE ITEMS a 2>&1
     $1 CF.INSERT pe CAPACITY abc ITEMS a 2>&1
