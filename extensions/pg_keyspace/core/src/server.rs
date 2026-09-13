@@ -16,7 +16,7 @@ use crate::crc16;
 use crate::pubsub;
 use crate::resp::{self, Parse};
 use crate::ring;
-use crate::share::{self, RingShare, TenantId};
+use crate::share::{self, RingShare, TenantId, TenantRates};
 use crate::store::{now_micros, Lookup, Store, KIND_HASH, KIND_LIST, KIND_SET, KIND_ZSET};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Registry, Token};
@@ -584,6 +584,9 @@ pub struct Worker {
     // hatch exists because a fairness policy that cannot be turned off is one an
     // operator cannot measure against.
     tenant_share: bool,
+    // Per-tenant command rate (#43). Off unless configured; an over-rate tenant
+    // parks and retries, exactly as one meeting a full ring does.
+    rates: TenantRates,
     // Tenant scope names by id, for the stats surface only -- the accounting
     // itself is by id. Populated at AUTH, so it holds the tenants this worker
     // has actually seen rather than every configured one.
@@ -658,6 +661,7 @@ impl Worker {
             producers: Vec::new(),
             shares: Vec::new(),
             tenant_share: true,
+            rates: TenantRates::new(),
             tenant_names: HashMap::new(),
             auth: None,
             sync_ack: false,
@@ -712,6 +716,11 @@ impl Worker {
     /// Enforce (or stop enforcing) the per-tenant ring share.
     pub fn set_tenant_ring_share(&mut self, on: bool) {
         self.tenant_share = on;
+    }
+
+    /// Commands per second per tenant; 0 disables.
+    pub fn set_tenant_rate_limit(&mut self, ops: u32) {
+        self.rates.set_limit(ops);
     }
 
     /// `(ring, tenant, in-flight bytes, times held back)` for every tenant with
@@ -1464,6 +1473,25 @@ impl Worker {
         // (ring, seq) records enqueued this command; a durable write's reply is
         // held until all of them commit.
         let mut acks: Vec<(usize, u64)> = Vec::new();
+
+        // ---- per-tenant command rate (#43) --------------------------------
+        // Placed with the ring pre-flight and not before it by accident: both
+        // must run after the auth gate (so the tenant is known) and before
+        // anything is mutated or replied, so that parking leaves the command
+        // sitting in `rbuf` to be retried verbatim.
+        //
+        // Parking rather than erroring is the point. A tenant over its rate is
+        // slowed, not refused, so no client learns a new error and no command is
+        // lost -- the same contract a full persistence ring already has. Reads
+        // are covered too: a tenant issuing only reads stages no ring records
+        // and evicts nothing, so neither of the other two axes would see it at
+        // all, and it can still saturate the loop.
+        if self.rates.limit() > 0 && who != 0 && !self.rates.allow(who) {
+            if let Some(c) = self.conns.get_mut(&fd) {
+                c.parked = true;
+            }
+            return;
+        }
 
         // ---- backpressure pre-flight (sync-ack tiers only) ----------------
         // Check the ring BEFORE touching the store. Applying the write first
@@ -2426,12 +2454,26 @@ impl Worker {
                 // scope the fairness decision is made at.
                 let mut body = body;
                 let rows = tenant_ring_usage(&self.shares, &self.tenant_names, who);
-                if !rows.is_empty() {
+                let throttles: Vec<(TenantId, u64)> = self
+                    .rates
+                    .throttled_tenants()
+                    .into_iter()
+                    .filter(|(t, _)| who == 0 || *t == who)
+                    .collect();
+                if !rows.is_empty() || !throttles.is_empty() {
                     body.push_str("# Tenants\r\n");
                     for (ring, name, bytes, held) in rows {
                         body.push_str(&format!(
                             "tenant_{name}_ring{ring}:inflight_bytes={bytes},held={held}\r\n"
                         ));
+                    }
+                    for (id, n) in throttles {
+                        let name = self
+                            .tenant_names
+                            .get(&id)
+                            .map(|s| sanitize_label(s))
+                            .unwrap_or_else(|| format!("x{id:016x}"));
+                        body.push_str(&format!("tenant_{name}_rate:throttled={n}\r\n"));
                     }
                 }
                 resp::bulk(out, body.as_bytes());
