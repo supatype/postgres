@@ -391,6 +391,97 @@ chk "scoped eviction protects the victim tenant (${EV_OFF:-0} -> ${EV_ON:-0} of 
 chk "the flooding tenant still holds its own recent keys" "1" \
     "$([ -n "$(redis-cli -p $RESP --user flood -a pw1 --no-auth-warning GET "c$FLOOD_KEYS" 2>/dev/null)" ] && echo 1 || echo 0)"
 
+echo ""
+echo "########## cache memory: a budget also reclaims from a tenant that just GREW ##########"
+# The gap the section above leaves, and the whole of #102. Scoped eviction is a
+# preference: it points at whoever is inserting. A tenant that arrived first and
+# grew steadily is never the one inserting under pressure, so the preference
+# never points at it and it keeps everything it has -- it always has an
+# evictable entry of its own to recycle.
+#
+# So this is the mirror image of the flood test. The hog writes a large working
+# set and then STOPS. The other tenant then writes a modest one and needs room.
+# The measurement is how much of the hog's set survives.
+#
+# Sizes matter here and the first attempt got them wrong: 1200 + 400 keys fit
+# inside a 2000-key arena, so nothing was ever evicted and both runs reported an
+# untouched hog. The guard below caught it. The hog must exceed its share on its
+# own, and hog + late must exceed the arena, or there is no pressure and the
+# comparison measures nothing.
+HOG_KEYS=${PGKS_FAIRNESS_HOG_KEYS:-900}
+# Enough sustained pressure to CONVERGE, not merely to dent. The budget reclaims
+# on demand -- it takes from an over-budget tenant whenever anyone needs a slot,
+# rather than background-trimming space nobody wants -- so how far it gets
+# depends on how long the contention lasts. Measured across three settings:
+#
+#   late writes    hog, no budget    hog, budget 25%
+#          900               887                766
+#        2 700               873                382
+#        5 400               873                382
+#
+# It converges on 382 of a 1500-key arena (25% is 375) and then STOPS: more
+# pressure does not push it lower. 900 only dents it, which would understate the
+# mechanism; 5400 costs runtime and shows nothing 2700 does not.
+LATE_KEYS=${PGKS_FAIRNESS_LATE_KEYS:-2700}
+ARENA_KEYS=${PGKS_FAIRNESS_ARENA_KEYS:-1500}
+BUDGET_PCT=${PGKS_FAIRNESS_BUDGET_PCT:-25}
+
+budget_run() {
+  local pct=$1
+  stop_pg; sleep 1
+  set_conf "pg_keyspace.tenant_scoped_eviction" "on"
+  set_conf "pg_keyspace.tenant_arena_pct" "$pct"
+  set_conf "pg_keyspace.durability" "'ephemeral'"
+  set_conf "pg_keyspace.keys" "$ARENA_KEYS"
+  set_conf "pg_keyspace.val_bytes" "256"
+  start_pg; wait_ready || { echo "NO START"; return 1; }
+  # The hog fills the arena, then goes quiet.
+  { for i in $(seq 1 $HOG_KEYS); do echo "SET h$i vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"; done; } \
+    | redis-cli -p $RESP --user flood -a pw1 --no-auth-warning --pipe >/dev/null 2>&1
+  # A second tenant arrives and writes steadily.
+  { for i in $(seq 1 $LATE_KEYS); do echo "SET L$i vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"; done; } \
+    | redis-cli -p $RESP --user victim -a pw2 --no-auth-warning --pipe >/dev/null 2>&1
+  local hog=0 i
+  for i in $(seq 1 $HOG_KEYS); do
+    [ -n "$(redis-cli -p $RESP --user flood -a pw1 --no-auth-warning GET "h$i" 2>/dev/null)" ] \
+      && hog=$((hog+1))
+  done
+  # The late tenant's own recent keys, so an over-eager budget that wrecks
+  # everyone is not mistaken for a working one.
+  local late=0
+  for i in $(seq $((LATE_KEYS - 49)) $LATE_KEYS); do
+    [ -n "$(redis-cli -p $RESP --user victim -a pw2 --no-auth-warning GET "L$i" 2>/dev/null)" ] \
+      && late=$((late+1))
+  done
+  echo "$hog $late"
+}
+
+read -r BG_OFF_HOG BG_OFF_LATE <<<"$(budget_run 0)"
+echo "  no budget:        hog holds $BG_OFF_HOG/$HOG_KEYS, late tenant holds $BG_OFF_LATE/50 recent"
+read -r BG_ON_HOG BG_ON_LATE <<<"$(budget_run $BUDGET_PCT)"
+echo "  budget at ${BUDGET_PCT}%:    hog holds $BG_ON_HOG/$HOG_KEYS, late tenant holds $BG_ON_LATE/50 recent"
+
+chk "the budget is actually in force for the second run" "$BUDGET_PCT" \
+    "$(psql_ "SHOW pg_keyspace.tenant_arena_pct" | tr -d '[:space:]')"
+chk "there was real arena pressure, so there was something to reclaim" "1" \
+    "$([ "$(psql_ "SELECT sum(evictions) > 0 FROM supacache.stats()")" = "t" ] && echo 1 || echo 0)"
+chk "the budget reclaims from the steadily-grown tenant (${BG_OFF_HOG:-0} -> ${BG_ON_HOG:-0} of $HOG_KEYS)" "1" \
+    "$([ "${BG_ON_HOG:-0}" -lt "${BG_OFF_HOG:-0}" ] && echo 1 || echo 0)"
+# Converging on the configured share is the claim, not merely "fewer". A budget
+# that reclaimed a token amount would pass the line above and be useless; one
+# that kept eating past the share would pass it too and be harmful.
+BUDGET_TARGET=$(( ARENA_KEYS * BUDGET_PCT / 100 ))
+chk "and converges on its share rather than stopping short (${BG_ON_HOG:-0} vs a ${BUDGET_TARGET}-key share)" "1" \
+    "$([ "${BG_ON_HOG:-0}" -le $(( BUDGET_TARGET * 2 )) ] && echo 1 || echo 0)"
+chk "without over-evicting past it (${BG_ON_HOG:-0} >= half the share)" "1" \
+    "$([ "${BG_ON_HOG:-0}" -ge $(( BUDGET_TARGET / 2 )) ] && echo 1 || echo 0)"
+# A budget that reclaims by wrecking the arriving tenant too is not a budget,
+# it is just more eviction.
+chk "and the arriving tenant keeps its own recent keys (${BG_ON_LATE:-0}/50)" "1" \
+    "$([ "${BG_ON_LATE:-0}" -ge 40 ] && echo 1 || echo 0)"
+chk "a tenant can see its own arena usage through INFO" "1" \
+    "$(redis-cli -p $RESP --user victim -a pw2 --no-auth-warning INFO 2>/dev/null | grep -c "_arena:bytes=")"
+
 stop_pg; rm -rf $PGDATA
 echo ""
 echo "================================================"
