@@ -39,6 +39,8 @@ mod resp;
 mod batcher;
 #[path = "../../core/src/ring.rs"]
 mod ring;
+#[path = "../../core/src/prob.rs"]
+mod prob;
 #[path = "../../core/src/pubsub.rs"]
 mod pubsub;
 #[path = "../../core/src/pubsub_shm.rs"]
