@@ -323,6 +323,18 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_prob_durability_pg.sh
 
+      # Observability: the pg_stat_*-shaped views a monitoring stack collects
+      # from. Asserts the grants against a live pg_monitor member rather than
+      # describing them, including the negative control that a role WITHOUT
+      # pg_monitor is refused. Its own cluster and ports; builds the C output
+      # plugin itself.
+      - name: Operational metrics views
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_pg_stat_views.sh
+
       - name: Durability + fault injection suite
         env:
           PGKS_BUILD_PROFILE: debug

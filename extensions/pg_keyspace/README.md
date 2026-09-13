@@ -1053,6 +1053,113 @@ Two properties worth knowing:
 `INFO` reports `tenant_<name>_arena:bytes=…,entries=…` beside the ring rows,
 whether or not a budget is configured — knowing whether a deployment actually
 has this problem is useful before enforcing anything about it.
+### Monitoring (`pg_stat_keyspace*`)
+
+Everything an operator needs to watch is a **view in the `supacache` schema**,
+shaped like Postgres's own `pg_stat_*`. There is no exporter to deploy, no
+sidecar, no dashboard to import. postgres_exporter, pgwatch, Datadog, pganalyze
+and a `SELECT` in cron all collect from views like these already, and all of
+them are already pointed at a role that is a member of `pg_monitor` — which is
+what `CREATE EXTENSION` grants these to. **The whole of the setup is installing
+the extension.**
+
+That is the point of doing it this way rather than the Redis-shaped way. A
+standalone keyspace has to ship its own exporter, because there is no ecosystem
+to borrow. Living inside Postgres means there is.
+
+| view | grain | what it answers |
+|---|---|---|
+| `pg_stat_keyspace` | 1 row | the top line: entries, hits/misses, `hit_pct`, arena used/capacity |
+| `pg_stat_keyspace_workers` | (worker, partition) | per-worker counters, `arena_used_pct`, and the slot range + port that worker serves |
+| `pg_stat_keyspace_activity` | background worker | heartbeat age and pid per RESP/persist/expiry/invalidation worker |
+| `pg_stat_keyspace_persist` | (worker, shard) | per-ring `pushed`/`committed`/`lag`/`backlog_bytes`/`dropped`/`uncommitted_batches` |
+| `pg_stat_keyspace_persist_total` | 1 row | the above summed, plus `worst_ring_backlog_bytes` |
+| `pg_stat_keyspace_tenants` | tenant | measured arena bytes and entries per tenant |
+| `pg_stat_keyspace_rowcache` | 1 row | row-cache occupancy, `coherent`, registrations and whether they are resident |
+| `pg_stat_keyspace_invalidation` | 1 row | `decode_lag_bytes` and `retained_bytes` for the WAL decoder |
+| `pg_stat_keyspace_pubsub` | 1 row | messages **not** delivered: `dropped`, `route_full`, `name_too_long` |
+| `pg_stat_keyspace_topology` | 1 row | recorded vs running worker count, and what a change between them costs |
+
+Three conventions, each chosen because a collector depends on it:
+
+**Counters are cumulative; gauges are instantaneous; the two never share a
+column.** `hits`, `misses`, `sets`, `evictions`, `tombstones`, `rehashes`,
+`pushed`, `dropped`, `committed`, `unresolved` and the pub/sub columns count
+since the segment or process started and are *not* reset by reading, so
+`rate()` over two scrapes means something. `entries`, `arena_*`,
+`backlog_bytes`, `lag`, `beat_age_ms`, `decode_lag_bytes`, `retained_bytes` and
+`uncommitted_batches` are gauges.
+
+`uncommitted_batches` deserves its own note, because the underlying counter's
+legacy name (`ring_stats().failed_batches`) says something it does not mean. The
+ring increments it *before* attempting a batch and decrements it after the
+commit succeeds — bracketing the attempt, because a Postgres `ERROR` unwinds out
+of the worker and an `Err` branch never runs. So **a batch in flight reads as
+one outstanding**, and under sustained writes this sits at a small number and
+oscillates. Measured on a soak: it moved between 2 and 4 across 4 rings the
+whole run, with nothing wrong.
+
+What it really reports is an increment that was never cancelled — a batch that
+failed, or whose worker died mid-commit. **The signal is a floor that does not
+drain**: when writes stop, it should return to zero, and whatever is left never
+committed. An alert on "nonzero" is an alert on ordinary traffic.
+
+**A switched-off feature returns NO ROWS, not a row of zeroes.** With
+`rowcache_decode = off`, `pg_stat_keyspace_invalidation` is empty.
+`decode_lag_bytes = 0` means the decoder is current; *no row* means there is no
+decoder. An alert that cannot tell those apart reads "invalidation has been off
+in production for a week" as perfect health.
+
+**Per-shard, not only summed.** `ring_stats()` adds every persistence ring
+together, and persistence falls behind *per shard* — one ring at its drop
+threshold disappears into a healthy-looking total.
+`pg_stat_keyspace_persist` has a row each, and
+`pg_stat_keyspace_persist_total.worst_ring_backlog_bytes` carries the maximum
+into the rollup for anyone who only scrapes the one row.
+
+Three things worth alerting on, in order of how quietly they fail:
+
+| condition | means |
+|---|---|
+| `pg_stat_keyspace_rowcache.coherent = false` | invalidation is configured but not beating. Reads fail closed, so this is an availability signal, not a correctness one |
+| `pg_stat_keyspace_persist.lag` climbing and not returning | persistence is falling behind; `dropped > 0` next means acknowledged writes are being discarded |
+| `pg_stat_keyspace_activity.alive = false`, flapping | a worker is crash-looping. The watchdog relaunches it every time, so from outside it looks like a worker that is running |
+
+`decode_lag_bytes` is never zero on a busy cluster — most WAL is not row-cache
+traffic and the slot advances one drain window at a time — so alert on its
+trend. `retained_bytes` is the one with a disk-space consequence: a stopped
+decoder pins WAL until `max_slot_wal_keep_size` cuts the slot loose.
+
+Under the views are ordinary functions (`supacache.worker_stats()`,
+`persist_shard_stats()`, `tenant_stats()`, `worker_health()`,
+`invalidation_stats()`, and the pre-existing `stats()`, `ring_stats()`,
+`rowcache_stats()`, `rowcache_coherence()`, `topology_change()`). They stay
+callable, but **the views are the supported surface** — the function shapes are
+free to change.
+
+Two details that cost a debugging session each, both asserted in
+`bench/run_pg_stat_views.sh` rather than assumed:
+
+- A view's *table* references are checked against the view owner, but a
+  **set-returning function in its `FROM` clause is checked against the caller**.
+  Granting `SELECT` on the views alone gets `permission denied for function
+  worker_stats`. `EXECUTE` is therefore granted to `pg_monitor` explicitly,
+  which also means an operator hardening the install with `REVOKE … FROM PUBLIC`
+  does not break monitoring.
+- `supacache.topology` and `supacache.rowcache_reg` are created by the
+  background worker, not by `CREATE EXTENSION`, so a scrape can arrive before
+  they exist. The functions check with `to_regclass` **in a separate statement**,
+  because Postgres resolves relations when it parses: a `CASE` with the table
+  named in the unreachable branch still errors. An erroring stats view reads to
+  a collector as the database being down.
+
+Using a role other than `pg_monitor`:
+
+```sql
+CREATE ROLE metrics LOGIN;
+GRANT pg_monitor TO metrics;   -- that is the whole of it
+```
+
 ### Configuration (GUCs)
 
 All are `Postmaster` context (set in `postgresql.conf`).
@@ -1195,6 +1302,13 @@ Cuckoo filter in the `durable` tier, kills the cluster with `kill -9`, and
 asserts that each one comes back with its type and its items — and that a filter
 whose TTL expired stays gone. Both run in CI on every change to
 `extensions/pg_keyspace/`.
+
+`run_pg_stat_views.sh` covers the monitoring surface the same way: a live
+cluster, a real `pg_monitor` member scraping every view, and the negative
+control that a role *without* `pg_monitor` is refused all ten. It also asserts
+the views are extension members (so `pg_dump` and `DROP EXTENSION` handle them),
+that counters do not reset on read, and that switching a feature off empties its
+view rather than zeroing it.
 
 ---
 
@@ -1351,7 +1465,9 @@ Scoping for this version — the extension works; these are the edges to know:
   moved between running workers: there is no slot map to consult, no
   migrating/importing state, and no `ASK` redirection. What a worker-count
   change *does* do is now reported rather than silent — see below.
-- Operational metrics are partial. `supacache.stats()`, `ring_stats()`,
-  `rowcache_stats()` and `replication_status()` exist, and `ring_stats()` reports
-  commit lag, failed batches and unresolved references; row cache invalidation
-  lag is still not exposed.
+- Operational metrics are exposed as `pg_stat_*`-shaped views granted to
+  `pg_monitor` — see [Monitoring](#monitoring-pg_stat_keyspace). Row-cache
+  invalidation lag, per-ring persistence depth, per-tenant arena occupancy and
+  per-worker heartbeats are all covered. What is *not* there is a historical
+  store: these are instantaneous reads, and retention is whatever your collector
+  keeps.
