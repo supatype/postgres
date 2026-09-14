@@ -2922,13 +2922,21 @@ fn pg_ensure_schema() {
 /// transaction. One subtransaction per new bucket per worker -- once every
 /// `ttl_bucket_secs` -- which is nothing. `invalid_object_definition` covers the
 /// overlapping-bound form of the same race.
+///
+/// `duplicate_object` covers a third form, found in #120 on the row-cache
+/// catalogue and the same here: creating a table also creates its composite
+/// type, and a racing loser can fail at the TYPE rather than at the relation --
+/// `type "kv_ttl_b123" already exists` is duplicate_object (42710), not
+/// duplicate_table (42P07). Catching only the latter leaves exactly the escape
+/// this function exists to prevent, just rarer than the one it was written for.
 fn ensure_ttl_partition(client: &mut pgrx::spi::SpiClient, bucket: i64) {
     let _ = client.update(
         &format!(
             "DO $ttl$ BEGIN \
                CREATE TABLE supacache.kv_ttl_b{bucket} PARTITION OF supacache.kv_ttl \
                  FOR VALUES FROM ({bucket}) TO ({}); \
-             EXCEPTION WHEN duplicate_table OR invalid_object_definition THEN NULL; \
+             EXCEPTION WHEN duplicate_table OR duplicate_object \
+                          OR invalid_object_definition THEN NULL; \
              END $ttl$",
             bucket + 1
         ),

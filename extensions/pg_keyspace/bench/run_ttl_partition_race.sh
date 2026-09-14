@@ -105,7 +105,13 @@ wait
 sleep 3
 
 CRASHES=$(since $N0 | grep -c "persistence worker.*exited with exit code")
-DUPES=$(since $N0 | grep -c 'relation "kv_ttl_b[0-9]*" already exists')
+# BOTH forms. Creating a partition also creates its composite type, and a racing
+# loser can fail at the TYPE rather than at the relation -- `type "kv_ttl_b123"
+# already exists` is duplicate_object (42710), not duplicate_table (42P07).
+# Grepping only for `relation ...` made this harness blind to precisely the
+# escape it exists to catch, which is how the gap survived #130 (found in #120,
+# on the row-cache catalogue, where the same handler had the same hole).
+DUPES=$(since $N0 | grep -cE '(relation|type) "kv_ttl_b[0-9]*" already exists')
 BUCKETS1=$(Q "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhparent WHERE c.relname='kv_ttl'")
 ROLLOVERS=$(( BUCKETS1 - BUCKETS0 ))
 
@@ -115,6 +121,13 @@ chk "the run crossed enough bucket rollovers to race ($ROLLOVERS)" "t" \
     "$([ "$ROLLOVERS" -ge 5 ] && echo t || echo f)"
 chk "no persistence worker died" "0" "$CRASHES"
 chk "no worker lost a partition-creation race" "0" "$DUPES"
+# Which object raced decides whether the hole is in the handler's exception list
+# or somewhere with no guard at all, so print it rather than only counting it.
+[ "${DUPES:-0}" != "0" ] && {
+  echo "--- partition-race evidence ---"
+  since $N0 | grep -E '(relation|type) "kv_ttl_b[0-9]*" already exists' | head -10
+  echo "---"
+}
 chk "the cluster is still up" "1" "$(Q "SELECT 1")"
 
 echo
