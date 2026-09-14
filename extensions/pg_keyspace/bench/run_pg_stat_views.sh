@@ -367,8 +367,17 @@ Q "INSERT INTO things VALUES (1,'one'),(2,'two')" >/dev/null
 # the first version passed 'id' as the attnum, which ERRORed, and the section
 # then reported "0 registrations" as though the view were wrong.
 chk "the table registers" "t" "$(Q "SELECT supacache.rowcache_register('public.things')")"
-chk "the registration is counted" "1" \
+# TWO: `slotmaker` from section 10, which had to register something to give this
+# database a slot at all (databases are picked up lazily since #120), and
+# `things` just now. Counted against the catalogue rather than hardcoded, so
+# this does not have to be re-edited every time an earlier section registers
+# something -- and so it still fails if the view and the catalogue disagree,
+# which is the thing being tested.
+chk "the registration is counted" \
+    "$(Q "SELECT count(*) FROM supacache.rowcache_reg")" \
     "$(Q "SELECT registrations FROM supacache.pg_stat_keyspace_rowcache")"
+chk "and there are the two this run registered" "2" \
+    "$(Q "SELECT count(*) FROM supacache.rowcache_reg")"
 chk "registrations are resident in the segment" "t" \
     "$(Q "SELECT registrations_loaded FROM supacache.pg_stat_keyspace_rowcache")"
 for _ in $(seq 1 40); do [ "$(Q "SELECT coherent FROM supacache.pg_stat_keyspace_rowcache")" = "t" ] && break; sleep 1; done
