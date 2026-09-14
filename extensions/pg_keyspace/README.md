@@ -812,6 +812,18 @@ the server instead of being allowed to pin WAL indefinitely. pg_keyspace logs a
 warning at startup when it is unset, and reports it as a column on
 `pg_stat_keyspace_invalidation`.
 
+**Size the bound against the decode interval, not just against the disk.** It
+bounds the *cluster*, not one database against another. A healthy decoder still
+retains up to one `rowcache_decode_ms` worth of WAL between advances, and that
+WAL is whatever the whole cluster generated — so a bound tight enough to catch a
+stalled database can also cut loose a perfectly healthy one that simply had a
+busy neighbour. Observed while building
+`bench/run_rowcache_slot_invalidation.sh`: at `max_slot_wal_keep_size = 32MB`, a
+flood in one database invalidated the *other* database's slot, which was doing
+nothing wrong. Nothing was served stale — the recovery below is the same either
+way — but that database lost its cache and had to rebuild it. Leave room for
+`decode interval × peak cluster WAL rate` above whatever a stall would reserve.
+
 When the server does invalidate a slot, that is a **gap**: the changes it had not
 yet delivered are gone, and there is no way to tell which rows they were. So
 pg_keyspace marks that database incoherent (its reads fall back to the heap

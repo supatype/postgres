@@ -136,7 +136,15 @@ chk "the view reports the setting, so it is visible without reading logs" "-1" \
 
 echo
 echo "########## 2. both databases cache and are coherent ##########"
-set_conf "max_slot_wal_keep_size" "32MB"
+# Big enough that only a slot which has stopped advancing ENTIRELY crosses it.
+# At 32MB the bystander was cut loose too: its decoder advances once per decode
+# interval, so it legitimately retains an interval's worth of WAL, and a flood
+# in ANOTHER database pushed that past the bound. That is a real property of
+# max_slot_wal_keep_size -- it bounds the cluster, not one database against
+# another -- and it is documented in the README rather than tuned away here.
+# What this section is testing is the STALLED slot, so the bound is set where
+# only a stall crosses it.
+set_conf "max_slot_wal_keep_size" "128MB"
 restart
 for d in victim bystander; do
   chk "  $d is coherent" "ok" "$(wait_coherent $d && echo ok || echo timeout)"
@@ -189,7 +197,7 @@ chk "(setup) the victim's table is locked, so the apply cannot complete" "t" \
         && echo t || echo f)"
 # Generate far more WAL than the bound, and force segment recycling, which is
 # what actually invalidates an over-reserving slot.
-for i in $(seq 1 14); do
+for i in $(seq 1 22); do
   Q "CREATE TABLE IF NOT EXISTS wal_$i(id int, pad text)" victim >/dev/null
   Q "INSERT INTO wal_$i SELECT g, repeat('x',2000) FROM generate_series(1,12000) g" victim >/dev/null
   Q "CHECKPOINT" >/dev/null
