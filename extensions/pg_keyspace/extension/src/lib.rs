@@ -73,6 +73,10 @@ const HEALTH_NAME: &CStr = c"pg_keyspace_health";
 const CLOCK_NAME: &CStr = c"pg_keyspace_clock";
 // Serialises WRITES to the row-cache segment. See `rowcache_write`.
 const RC_LOCK_NAME: &CStr = c"pg_keyspace_rowcache_write";
+// Which databases the row cache serves, and how each one is doing (#120).
+const RC_DB_NAME: &CStr = c"pg_keyspace_rowcache_dbs";
+// Serialises allocation of a directory entry. Never held across SPI.
+const RC_DB_LOCK_NAME: &CStr = c"pg_keyspace_rowcache_dbs_lock";
 
 // Base address of the Postgres shared-memory segment, published by the startup
 // hook and inherited by every forked backend. Each context rebuilds a cheap
@@ -91,6 +95,10 @@ static ROWCACHE_LOCKS: AtomicPtr<pg_sys::LWLockPadded> = AtomicPtr::new(std::ptr
 static PUBSUB_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // Base of the worker liveness table.
 static HEALTH_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+// Base of the row-cache database directory, and the lock guarding allocation
+// of an entry in it (#120).
+static RC_DB_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static RC_DB_LOCK: AtomicPtr<pg_sys::LWLock> = AtomicPtr::new(std::ptr::null_mut());
 // The bus itself, built by the postmaster in the shmem startup hook so that the
 // wake descriptors it opens are inherited by every worker that forks from it.
 // Built after the fork, each worker would hold private descriptors and wake
@@ -129,6 +137,14 @@ static GUC_ROWCACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 /// How many partitions the Mode B row-cache segment is carved into, which is
 /// also how many writer locks it has (#120).
 static GUC_ROWCACHE_PARTITIONS: GucSetting<i32> = GucSetting::<i32>::new(8);
+/// Size of the bounded pool of invalidation workers (#120). Worker count is
+/// something an operator sets, not a function of how many databases exist.
+static GUC_ROWCACHE_INVALIDATION_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
+/// How long one pool worker holds a database before handing its slot on, when
+/// there are more participating databases than workers.
+static GUC_ROWCACHE_LEASE_MS: GucSetting<i32> = GucSetting::<i32>::new(5_000);
+/// Entries in the shared row-cache database directory.
+static GUC_ROWCACHE_MAX_DATABASES: GucSetting<i32> = GucSetting::<i32>::new(32);
 
 /// Whether the RESP worker requires `supatype_mask` to be loaded (and outermost)
 /// before it will serve. Default OFF: pg_keyspace runs standalone as a
@@ -244,17 +260,39 @@ fn rowcache_readthrough_active() -> bool {
 /// worker by design -- the cache is warmed and managed by hand -- and refusing
 /// to serve it would break a deliberate choice rather than protect anyone.
 ///
-/// A slot that has never beaten reads as not coherent, so the window between a
-/// cluster starting and the worker's first beat is closed rather than open.
+/// A database that has never been drained reads as not coherent, so the window
+/// between a cluster starting and the first drain is closed rather than open.
+///
+/// PER-DATABASE (#120), and that is a correctness property rather than a
+/// reporting one. The cache fails closed on incoherence, so "which database is
+/// incoherent" decides which queries are served from the cache at all. Judged
+/// against the *directory's* `last_drained_us` for this database, not against a
+/// pool worker's heartbeat: under cycling a worker is alive and draining some
+/// OTHER database for most of its life, so its heartbeat says nothing about
+/// whether this database is current. One database's stalled worker must not read
+/// as the whole cache being incoherent, and a healthy pool must not read as
+/// every database being current.
 fn rowcache_coherent() -> bool {
     if !GUC_ROWCACHE_DECODE.get() {
         return true; // manual coherence, operator's choice
     }
-    match health_slot(health_invalidation_slot()) {
-        None => true, // no health table at all: nothing to judge against
-        Some(sl) => {
-            let last = sl.last_seen_us.load(Ordering::Acquire);
-            last != 0 && store::now_micros().saturating_sub(last) < health_stale_us()
+    if RC_DB_BASE.load(Ordering::Acquire).is_null() {
+        return true; // no directory at all: nothing to judge against
+    }
+    match rcdb_find(rc_db()) {
+        // This database is not in the directory, so nothing is decoding for it.
+        // Refusing is the point: a database nobody is invalidating is exactly
+        // the case that used to be cached and served stale forever.
+        None => false,
+        Some(s) => {
+            if s.slot_lost.load(Ordering::Acquire) != 0 {
+                // The server cut this database's slot loose, so an unknown set
+                // of invalidations was never delivered. Whatever is cached may
+                // disagree with the heap, and no heartbeat can say otherwise.
+                return false;
+            }
+            let last = s.last_drained_us.load(Ordering::Acquire);
+            last != 0 && store::now_micros().saturating_sub(last) < rcdb_stale_us()
         }
     }
 }
@@ -488,18 +526,32 @@ struct WorkerSlot {
 const HEALTH_STRIDE: usize = 64;
 
 /// Slots are laid out RESP workers, then persistence shards, then the expiry
-/// worker, then the row-cache invalidation worker, so an index maps back to
+/// worker, then the row-cache invalidation POOL, so an index maps back to
 /// exactly what to relaunch.
 fn health_slot_count() -> usize {
-    worker_count() + persist_shards() + 2
+    worker_count() + persist_shards() + 1 + rowcache_pool_size()
 }
 
 fn health_expiry_slot() -> usize {
     worker_count() + persist_shards()
 }
 
-fn health_invalidation_slot() -> usize {
-    worker_count() + persist_shards() + 1
+/// The health slot for pool worker `k`.
+///
+/// A range rather than a single slot (#120): the pool is bounded by
+/// `pg_keyspace.rowcache_invalidation_workers`, and each member claims its own
+/// slot so two workers can never both drain one database's slot.
+///
+/// Note what this is NOT: it is not where a database's coherence is judged. A
+/// pool worker's heartbeat says only that the worker is alive, and under
+/// cycling it is alive on some OTHER database half the time. Coherence is
+/// per-database and lives in the directory's `last_drained_us`.
+fn health_invalidation_slot(k: usize) -> usize {
+    worker_count() + persist_shards() + 1 + k
+}
+
+fn rowcache_pool_size() -> usize {
+    GUC_ROWCACHE_INVALIDATION_WORKERS.get().clamp(1, 64) as usize
 }
 
 fn health_bytes() -> usize {
@@ -603,6 +655,263 @@ fn health_release(i: usize) {
     }
 }
 
+// ==== the row-cache database directory (#120) ========================
+//
+// The row cache serves every database, and the thing that decides which ones is
+// not the catalogue and not the keys: it is INVALIDATION. A logical replication
+// slot belongs to the database it was created in and only ever decodes changes
+// from that database, so a database is served only if some worker is holding a
+// slot in it and draining. A table registered anywhere else would be cached and
+// then never invalidated -- stale indefinitely, while coherence still reported
+// healthy, because coherence described the worker rather than your table.
+//
+// This directory is the shared answer to "which databases, and how is each one
+// doing". It has to be in shared memory rather than in a catalogue, because
+// every reader of it is in a DIFFERENT database: a backend deciding whether to
+// serve its own database's cache cannot query a table in another one, and a
+// worker choosing which database to bind to next has not connected to any
+// database yet. Postgres has no cross-database read, which is the whole reason
+// this is a fixed array of oids rather than a table.
+//
+// It is a CACHE of the per-database `supacache.rowcache_reg` catalogues, not the
+// truth. Shared memory does not survive a restart, so after one the directory is
+// empty and is rebuilt by probing: a worker binds to a database, looks for
+// registrations, and records what it found. Registration publishes directly as
+// well, so the probe is only ever catching up after a restart rather than being
+// the normal path.
+
+/// What the directory knows about one database.
+///
+/// Every field is atomic and written without the directory lock, which is held
+/// only to ALLOCATE an entry. Readers are backends on the hot path -- a planner
+/// hook asking "is my database's cache trustworthy right now" -- and making them
+/// take a lock would put a cluster-wide serialisation point in front of every
+/// plan of every registered table.
+#[repr(C)]
+struct DbSlot {
+    /// Database oid, or 0 for a free entry. Written last when claiming, so a
+    /// reader never sees a half-initialised entry.
+    datoid: AtomicU32,
+    /// `DB_*` below.
+    state: AtomicU32,
+    /// Rows in that database's `supacache.rowcache_reg` as last observed.
+    registrations: AtomicI64,
+    /// When a worker last completed a drain pass for this database. This, not
+    /// the worker's heartbeat, is what coherence is judged against: a pool
+    /// worker that is alive and serving a DIFFERENT database says nothing about
+    /// whether this one is current.
+    last_drained_us: AtomicI64,
+    /// When this database was last probed for registrations.
+    last_probe_us: AtomicI64,
+    /// When a worker last TOOK A TURN on this database, successful or not.
+    ///
+    /// Separate from `last_drained_us` because a turn that failed still has to
+    /// count for scheduling. A database that cannot get a slot -- because
+    /// `max_replication_slots` is exhausted -- drains never, so ordering by
+    /// `last_drained_us` alone would put it first every single time: it would
+    /// be leased, fail, exit, be relaunched immediately (Postgres restarts a
+    /// cleanly-exited worker at once) and lease itself again, starving every
+    /// healthy database behind it. Ordering by the attempt instead sends it to
+    /// the back of the queue, where a database that cannot be served belongs.
+    last_attempt_us: AtomicI64,
+    /// The pool worker currently holding this database, and until when.
+    owner_pid: AtomicU32,
+    lease_until_us: AtomicI64,
+    /// The server invalidated this database's slot (`wal_status = 'lost'`),
+    /// usually because it reserved more WAL than `max_slot_wal_keep_size`.
+    /// Everything committed since it stopped advancing is an invalidation that
+    /// will never arrive, so the cache for this database is NOT trustworthy
+    /// until it has been purged and the slot rebuilt.
+    slot_lost: AtomicU32,
+    /// Database name, for the stats views. Fixed width because this is shared
+    /// memory; written once, before `datoid` is published.
+    datname: [u8; DB_NAME_MAX],
+}
+
+/// Never probed, or probed and the answer is not known yet.
+const DB_UNKNOWN: u32 = 0;
+/// Has registrations: needs a slot and a turn in the cycle.
+const DB_PARTICIPATING: u32 = 1;
+/// Probed and has no registrations: no slot, no turn. This is the "launch
+/// lazily" half -- most clusters have one or two participating databases and
+/// should pay nothing for the rest.
+const DB_IDLE: u32 = 2;
+
+const DB_NAME_MAX: usize = 64;
+const DB_STRIDE: usize = 128;
+
+fn rcdb_count() -> usize {
+    GUC_ROWCACHE_MAX_DATABASES.get().clamp(1, 1024) as usize
+}
+
+fn rcdb_bytes() -> usize {
+    rcdb_count() * DB_STRIDE
+}
+
+// An entry must fit its stride, or entry N would overlap entry N+1 and two
+// databases would share a heartbeat -- which reads as one of them being
+// perpetually current.
+const _: () = assert!(std::mem::size_of::<DbSlot>() <= DB_STRIDE);
+
+fn rcdb_at(i: usize) -> Option<&'static DbSlot> {
+    let base = RC_DB_BASE.load(Ordering::Acquire);
+    if base.is_null() || i >= rcdb_count() {
+        return None;
+    }
+    unsafe { Some(&*(base.add(i * DB_STRIDE) as *const DbSlot)) }
+}
+
+fn rcdb_find(datoid: u32) -> Option<&'static DbSlot> {
+    (0..rcdb_count())
+        .filter_map(rcdb_at)
+        .find(|s| s.datoid.load(Ordering::Acquire) == datoid)
+}
+
+fn rcdb_name(s: &DbSlot) -> String {
+    let raw = &s.datname;
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
+/// Record a database in the directory, creating its entry if it has none.
+///
+/// Returns None only when the directory is full, which is an operator-visible
+/// misconfiguration rather than something to paper over: a database that cannot
+/// be recorded cannot be served, and silently not serving it is the failure
+/// this whole issue exists to remove.
+fn rcdb_publish(datoid: u32, datname: &str, state: u32) -> Option<&'static DbSlot> {
+    if let Some(s) = rcdb_find(datoid) {
+        if state != DB_UNKNOWN {
+            s.state.store(state, Ordering::Release);
+        }
+        return Some(s);
+    }
+    let lock = RC_DB_LOCK.load(Ordering::Acquire);
+    if lock.is_null() {
+        return None;
+    }
+    unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+    // Re-check under the lock: two backends registering in the same database at
+    // the same moment must end up with ONE entry, or the database would get two
+    // slots and two workers draining them.
+    let found = rcdb_find(datoid).or_else(|| {
+        let free = (0..rcdb_count())
+            .filter_map(rcdb_at)
+            .find(|s| s.datoid.load(Ordering::Acquire) == 0)?;
+        let bytes = datname.as_bytes();
+        let n = bytes.len().min(DB_NAME_MAX - 1);
+        unsafe {
+            let dst = free.datname.as_ptr() as *mut u8;
+            std::ptr::write_bytes(dst, 0, DB_NAME_MAX);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
+        }
+        free.state.store(state, Ordering::Release);
+        free.registrations.store(0, Ordering::Release);
+        free.last_drained_us.store(0, Ordering::Release);
+        free.last_probe_us.store(0, Ordering::Release);
+        free.last_attempt_us.store(0, Ordering::Release);
+        free.owner_pid.store(0, Ordering::Release);
+        free.lease_until_us.store(0, Ordering::Release);
+        free.slot_lost.store(0, Ordering::Release);
+        // Published LAST: an entry is visible to a lock-free reader only once
+        // everything it describes is already written.
+        free.datoid.store(datoid, Ordering::Release);
+        Some(free)
+    });
+    unsafe { pg_sys::LWLockRelease(lock) };
+    if let Some(s) = found {
+        if state != DB_UNKNOWN {
+            s.state.store(state, Ordering::Release);
+        }
+    }
+    found
+}
+
+/// How many databases currently need a slot and a turn.
+fn rcdb_participating() -> usize {
+    (0..rcdb_count())
+        .filter_map(rcdb_at)
+        .filter(|s| {
+            s.datoid.load(Ordering::Acquire) != 0
+                && s.state.load(Ordering::Acquire) == DB_PARTICIPATING
+        })
+        .count()
+}
+
+/// How long one database may go undrained before its cache stops being trusted.
+///
+/// Not simply `watchdog_secs`. With more participating databases than pool
+/// workers, invalidation CYCLES: a worker leases a database, drains it, and
+/// hands the slot on. A database waiting its turn is behind by the cycle time
+/// and that is by design, so judging it against a fixed heartbeat window would
+/// declare a perfectly healthy cluster incoherent as soon as it had a few
+/// databases -- and the cache fails closed, so that is not a cosmetic error, it
+/// is the cache switching itself off.
+///
+/// So the window is the worse of the two: the watchdog's own staleness bound,
+/// and a full cycle with headroom. It is reported as a column, because an
+/// operator cannot be expected to derive it and it is exactly the number that
+/// says how this design scales.
+fn rcdb_stale_us() -> i64 {
+    let pool = rowcache_pool_size().max(1);
+    let dbs = rcdb_participating().max(1);
+    let turns = dbs.div_ceil(pool) as i64;
+    let lease = (GUC_ROWCACHE_LEASE_MS.get().max(100) as i64) * 1000;
+    // Twice a cycle, plus the relaunch gap between one lease ending and the
+    // next worker binding, so an ordinary cycle never reads as a stall.
+    let cycle = turns.saturating_mul(lease.saturating_add(RC_RELAUNCH_US)) * 2;
+    health_stale_us().max(cycle)
+}
+
+/// How long Postgres waits before restarting a pool worker that exited, which
+/// is the gap between one database's turn ending and the next one beginning.
+const RC_RELAUNCH_US: i64 = 1_000_000;
+
+/// Whether `max_slot_wal_keep_size` bounds how much WAL a slot may retain.
+///
+/// `-1` (the default) means unbounded, which is the operational hazard this
+/// whole design creates: one slot per participating database, and a slot holds
+/// WAL until it is consumed, so any single database's stalled invalidation pins
+/// WAL for the WHOLE CLUSTER. Bounded, the server invalidates the offending slot
+/// instead, which this extension detects and answers by marking that database
+/// incoherent -- trading a little cache for the cluster staying up.
+/// Whether `max_replication_slots` looks too small for the databases that want
+/// one, and if so, what to say about it.
+///
+/// One slot per participating database is not a design choice that could have
+/// gone another way: slots are inherently per-database. So the cluster-wide slot
+/// budget becomes a limit on how many databases can be cached, and it is a
+/// budget shared with whatever real replication the cluster is already doing.
+fn replication_slots_short() -> Option<String> {
+    let cap: i64 = pg_setting(c"max_replication_slots")?.parse().ok()?;
+    let used = Spi::get_one::<i64>("SELECT count(*) FROM pg_replication_slots")
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let want = rcdb_participating() as i64;
+    if used < cap && want < cap {
+        return None;
+    }
+    Some(format!(
+        "max_replication_slots is {cap} and {used} slot(s) are already in use, with \
+         {want} database(s) registered for the row cache"
+    ))
+}
+
+fn wal_keep_size_bounded() -> bool {
+    pg_setting(c"max_slot_wal_keep_size")
+        .and_then(|v| {
+            // Reported with a unit, e.g. "-1" or "1024MB".
+            let digits: String = v
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
+            digits.parse::<i64>().ok()
+        })
+        .map(|v| v >= 0)
+        .unwrap_or(false)
+}
+
 /// Relaunch any worker whose heartbeat has gone stale.
 ///
 /// Called from the tick of every pg_keyspace worker. Registration is dynamic
@@ -618,10 +927,10 @@ fn health_watchdog() {
     let nworkers = worker_count();
     for i in 0..health_slot_count() {
         // Workers that are not supposed to be running are not gaps. The
-        // invalidation worker does not follow the persistence tiers -- Mode B
+        // invalidation pool does not follow the persistence tiers -- Mode B
         // runs on an ephemeral cluster too -- so it is gated on its own GUC
         // rather than on `persisted`.
-        if i == health_invalidation_slot() {
+        if i > health_expiry_slot() {
             if !GUC_ROWCACHE_DECODE.get() {
                 continue;
             }
@@ -662,10 +971,17 @@ fn health_relaunch(i: usize, nworkers: usize) {
     } else if i == health_expiry_slot() {
         ("pg_keyspace: expiry worker".to_string(), "pg_keyspace_expiry_main", 0)
     } else {
+        // A pool member (#120). The argument is the POOL INDEX, never a
+        // database: a background worker has to choose its database before it
+        // connects, and it makes that choice from the shared directory on
+        // start. So a relaunch needs to carry nothing but which slot to claim,
+        // and the replacement picks up whatever is unserved at that moment
+        // rather than re-binding to a database that may no longer need it.
+        let k = i - health_expiry_slot() - 1;
         (
-            "pg_keyspace: rowcache invalidation worker".to_string(),
+            format!("pg_keyspace: rowcache invalidation worker {k}"),
             "pg_keyspace_invalidation_main",
-            0,
+            k as i32,
         )
     };
     log!("pg_keyspace watchdog: '{name}' has not beaten in {}s; relaunching it", GUC_WATCHDOG_SECS.get());
@@ -1221,6 +1537,56 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_int_guc(
+        "pg_keyspace.rowcache_invalidation_workers",
+        "Size of the bounded pool of Mode B invalidation workers",
+        "The row cache serves every database that has registrations, and each \
+         one needs its own logical replication slot, because a slot only ever \
+         decodes changes from the database it was created in. This bounds how \
+         many are drained AT ONCE: worker count is something you set, not a \
+         function of how many databases exist. With no more participating \
+         databases than workers, every database has its own worker and \
+         invalidation latency is `rowcache_decode_ms`, exactly as with one \
+         database. Above that, workers CYCLE -- each leases a database for \
+         `rowcache_lease_ms`, drains it, and hands the slot on -- so latency \
+         becomes the cycle time, which `supacache.pg_stat_keyspace_rowcache_\
+         databases.stale_after_ms` reports rather than leaving you to derive. \
+         Raise it with `max_worker_processes`, which must also cover the RESP, \
+         persistence and expiry workers.",
+        &GUC_ROWCACHE_INVALIDATION_WORKERS,
+        1,
+        64,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.rowcache_lease_ms",
+        "How long a pooled invalidation worker holds one database before handing it on",
+        "Only has an effect when there are more participating databases than \
+         `rowcache_invalidation_workers`, because otherwise nothing is waiting \
+         for a turn and a worker keeps its database indefinitely. Shorter means \
+         a fairer cycle and more worker restarts; longer means fewer restarts \
+         and a longer wait for the databases queued behind.",
+        &GUC_ROWCACHE_LEASE_MS,
+        100,
+        600_000,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_keyspace.rowcache_max_databases",
+        "How many databases the row cache can serve at once",
+        "Sizes the shared directory that records which databases have row-cache \
+         registrations and how current each one is. A database that cannot be \
+         recorded cannot be served, so registration is REFUSED rather than \
+         accepted into a cache nothing would invalidate -- the failure this \
+         directory exists to prevent. Cheap: 128 bytes per entry.",
+        &GUC_ROWCACHE_MAX_DATABASES,
+        1,
+        1024,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
         "pg_keyspace.tenant_ops_per_sec",
         "Commands per second one tenant may issue (0 = no limit)",
         "Bounds how much of a worker's event loop one tenant can ask for. The \
@@ -1370,14 +1736,50 @@ pub extern "C" fn _PG_init() {
         );
     }
 
-    // Mode B: keys-only invalidation worker keeps the row cache coherent.
+    // Mode B: a BOUNDED POOL of keys-only invalidation workers keeps the row
+    // cache coherent in every database that has registrations (#120).
+    //
+    // Bounded, and by a setting rather than by how many databases exist. A
+    // worker per database would make the cluster's process count a function of
+    // its tenant count, which is the thing per-project-database provisioning is
+    // least able to afford. The autovacuum launcher makes the same trade.
+    //
+    // Each member is given its POOL INDEX, not a database. A background worker
+    // must choose its database before it connects and can never change it, so a
+    // member reads the shared directory on start, leases a database that nobody
+    // is serving, and binds to that. Handing a turn on means exiting and being
+    // restarted, which is what `set_restart_time` below is for -- and it is why
+    // the restart interval is a second rather than the five the other workers
+    // use, since here it is not a failure path but the cycle itself.
     if GUC_ROWCACHE_DECODE.get() {
-        BackgroundWorkerBuilder::new("pg_keyspace: rowcache invalidation worker")
+        for k in 0..rowcache_pool_size() {
+            BackgroundWorkerBuilder::new(&format!(
+                "pg_keyspace: rowcache invalidation worker {k}"
+            ))
             .set_library("pg_keyspace")
             .set_function("pg_keyspace_invalidation_main")
-            .set_restart_time(Some(Duration::from_secs(5)))
+            .set_argument((k as i32).into_datum())
+            .set_restart_time(Some(Duration::from_secs(1)))
             .enable_spi_access()
             .load();
+        }
+        // One slot per participating database, and a slot holds WAL until it is
+        // consumed. With one database that risk was singular and visible; with
+        // several, ANY ONE stalled database pins WAL for the whole cluster, so
+        // one slow tenant can fill the WAL volume for everyone. Postgres already
+        // solves this and the solution is off by default, so say so at the only
+        // moment an operator is definitely reading the log.
+        if !wal_keep_size_bounded() {
+            log!(
+                "pg_keyspace: max_slot_wal_keep_size is unset (-1), so a row-cache \
+                 invalidation slot can retain WAL without bound. The row cache holds one \
+                 replication slot PER participating database, so a single database whose \
+                 invalidation stalls can fill the WAL volume for the entire cluster. Set \
+                 max_slot_wal_keep_size; a slot that exceeds it is invalidated by the \
+                 server, and pg_keyspace then marks that database's cache incoherent and \
+                 rebuilds it rather than serving rows it can no longer keep current."
+            );
+        }
     }
 
     log!("pg_keyspace: initialised (shmem hooks + {nworkers} RESP worker(s) registered)");
@@ -1401,6 +1803,10 @@ extern "C" fn ks_shmem_request() {
         // RequestNamedLWLockTranche is only legal from the shmem request hook;
         // resolved to a pointer in the startup hook.
         pg_sys::RequestNamedLWLockTranche(RC_LOCK_NAME.as_ptr(), rowcache_partitions() as i32);
+        // Which databases the row cache serves (#120), plus the one lock that
+        // guards allocating an entry in it.
+        pg_sys::RequestAddinShmemSpace(rcdb_bytes());
+        pg_sys::RequestNamedLWLockTranche(RC_DB_LOCK_NAME.as_ptr(), 1);
     }
 }
 
@@ -1476,6 +1882,24 @@ extern "C" fn ks_shmem_startup() {
         let tranche = pg_sys::GetNamedLWLockTranche(RC_LOCK_NAME.as_ptr());
         if !tranche.is_null() {
             ROWCACHE_LOCKS.store(tranche, Ordering::Release);
+        }
+
+        // The row-cache database directory (#120). Zeroed means every entry is
+        // free and no database is known, which is what a fresh cluster should
+        // believe: registrations are rediscovered by probing, and until a
+        // database is in here its cache is not served at all.
+        let db_bytes = rcdb_bytes();
+        let mut db_found = false;
+        let dbptr = pg_sys::ShmemInitStruct(RC_DB_NAME.as_ptr(), db_bytes, &mut db_found) as *mut u8;
+        if !dbptr.is_null() {
+            if !db_found {
+                std::ptr::write_bytes(dbptr, 0, db_bytes);
+            }
+            RC_DB_BASE.store(dbptr, Ordering::Release);
+        }
+        let db_tranche = pg_sys::GetNamedLWLockTranche(RC_DB_LOCK_NAME.as_ptr());
+        if !db_tranche.is_null() {
+            RC_DB_LOCK.store(std::ptr::addr_of_mut!((*db_tranche).lock), Ordering::Release);
         }
         // The TTL clock anchor (#110), shared so every process agrees.
         //
@@ -3008,6 +3432,16 @@ struct Drain {
     /// more is already pending and the caller should come straight back instead
     /// of sleeping.
     full: bool,
+    /// The pass actually read the slot, as opposed to giving up before it got
+    /// there (no segment mapped, no slot row, an LSN that would not parse).
+    ///
+    /// This is what the per-database coherence heartbeat is recorded on (#120),
+    /// and the distinction is the point: "a worker ran" and "this database's
+    /// changes have been consumed up to now" are different claims, and only the
+    /// second one makes a cached row safe to serve. Recording the first as if
+    /// it were the second is how a cache reports itself healthy while nothing
+    /// is invalidating it.
+    reached: bool,
 }
 
 /// Drain pending changes from the slot and apply them to the row cache.
@@ -3158,6 +3592,7 @@ fn drain_invalidations(slot: &str) -> Drain {
         reconciled,
         unparsed,
         full: target < current,
+        reached: true,
     }
 }
 
@@ -3214,8 +3649,13 @@ fn drop_legacy_decode_slot(base: &str, in_use: &str) {
     }
     let found = BackgroundWorker::transaction(AssertUnwindSafe(|| {
         Spi::get_one_with_args::<bool>(
+            // `database = current_database()` narrows it to the one place the
+            // pre-#120 slot could have been created. Without it, every pool
+            // worker in every database would try to drop the same slot, and all
+            // but one would log a failure for a slot that was already gone.
             "SELECT EXISTS(SELECT 1 FROM pg_replication_slots \
-             WHERE slot_name = $1 AND plugin = 'supacache_keys' AND NOT active)",
+             WHERE slot_name = $1 AND plugin = 'supacache_keys' AND NOT active \
+               AND database = current_database())",
             vec![(PgBuiltInOids::TEXTOID.oid(), base.into_datum())],
         )
         .ok()
@@ -3253,42 +3693,588 @@ fn drop_legacy_decode_slot(base: &str, in_use: &str) {
     }
 }
 
+/// Take a turn on a database, if one is free.
+///
+/// Called BEFORE connecting, which is the constraint the whole pool design is
+/// shaped by: a background worker chooses its database once and can never
+/// change it, so "connect to X, drain it, move on to Y" has to mean a new
+/// process for Y. That is why this reads shared memory rather than a catalogue,
+/// and why handing a turn on is an `exit` rather than a reconnect.
+///
+/// Preference order: a participating database nobody is draining, oldest first,
+/// so the cycle is fair and the database furthest behind is served next; then an
+/// unprobed one, which costs a connection to find out whether it participates at
+/// all. A database whose owner is gone (crashed worker, expired lease) is free
+/// again -- `pid_alive` is what stops one dead worker parking a database forever.
+fn rcdb_lease() -> Option<(u32, String)> {
+    let lock = RC_DB_LOCK.load(Ordering::Acquire);
+    if lock.is_null() {
+        return None;
+    }
+    let now = store::now_micros();
+    let me = unsafe { pg_sys::MyProcPid } as u32;
+    unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+    let free = |s: &DbSlot| rcdb_free(s, me, now);
+    let pick = (0..rcdb_count())
+        .filter_map(rcdb_at)
+        .filter(|s| s.datoid.load(Ordering::Acquire) != 0 && free(s))
+        .filter(|s| {
+            let st = s.state.load(Ordering::Acquire);
+            st == DB_PARTICIPATING || st == DB_UNKNOWN
+        })
+        .min_by_key(|s| {
+            // Participating first, then least-recently-attempted, then least
+            // recently drained. The attempt is what makes the cycle turn even
+            // when a database can never be served: see `last_attempt_us`.
+            let st = s.state.load(Ordering::Acquire);
+            let rank = if st == DB_PARTICIPATING { 0i64 } else { 1 };
+            (
+                rank,
+                s.last_attempt_us.load(Ordering::Acquire),
+                s.last_drained_us.load(Ordering::Acquire),
+            )
+        });
+    let out = pick.map(|s| {
+        s.last_attempt_us.store(now, Ordering::Release);
+        s.owner_pid.store(me, Ordering::Release);
+        s.lease_until_us.store(
+            now + (GUC_ROWCACHE_LEASE_MS.get().max(100) as i64) * 1000,
+            Ordering::Release,
+        );
+        (s.datoid.load(Ordering::Acquire), rcdb_name(s))
+    });
+    unsafe { pg_sys::LWLockRelease(lock) };
+    out
+}
+
+/// Is this database available to a worker other than its current owner?
+///
+/// Ordinarily NO while the owner is alive: handing a turn on is the owner
+/// exiting and releasing, not somebody else taking the database out from under
+/// it. Two workers on one slot is not a subtle problem -- Postgres answers it
+/// with "replication slot is active for PID" and the loser dies every pass.
+///
+/// The lease is a safety valve for the case liveness cannot see: a worker whose
+/// process is alive but which has stopped draining. It is renewed on every
+/// successful pass, so a healthy owner's lease never expires however long it
+/// holds the database, and only a wedged one's does. `health_stale_us` of grace
+/// on top, so a slow pass is not mistaken for a wedged worker.
+#[inline]
+fn rcdb_free(s: &DbSlot, me: u32, now: i64) -> bool {
+    let owner = s.owner_pid.load(Ordering::Acquire);
+    if owner == 0 || owner == me || !pid_alive(owner) {
+        return true;
+    }
+    let until = s.lease_until_us.load(Ordering::Acquire);
+    until != 0 && now.saturating_sub(until) > health_stale_us()
+}
+
+/// Take ownership of a database this worker has already connected to.
+///
+/// The fallback path needs it and so does correctness. A worker that found the
+/// directory empty connected to `pg_keyspace.database` without leasing anything,
+/// and with a pool of more than one they ALL did -- then all of them would drain
+/// one slot, which Postgres answers with "replication slot is active for PID"
+/// and a dead worker per pass. Claiming here, after the connection has told us
+/// which database we are actually in, is what makes exactly one of them proceed.
+///
+/// Refuses only to a LIVE owner, for the same reason `health_claim` does: a
+/// worker restarted two seconds after its predecessor exited must not be locked
+/// out by the lease that predecessor left behind.
+fn rcdb_own(datoid: u32) -> bool {
+    let s = match rcdb_find(datoid) {
+        Some(s) => s,
+        None => return false,
+    };
+    let me = unsafe { pg_sys::MyProcPid } as u32;
+    let now = store::now_micros();
+    loop {
+        let owner = s.owner_pid.load(Ordering::Acquire);
+        if owner == me {
+            return true;
+        }
+        if !rcdb_free(s, me, now) {
+            return false;
+        }
+        if s.owner_pid
+            .compare_exchange(owner, me, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            s.lease_until_us.store(
+                now + (GUC_ROWCACHE_LEASE_MS.get().max(100) as i64) * 1000,
+                Ordering::Release,
+            );
+            return true;
+        }
+    }
+}
+
+/// Give a database back, so another worker can take it.
+fn rcdb_release(datoid: u32) {
+    if let Some(s) = rcdb_find(datoid) {
+        let me = unsafe { pg_sys::MyProcPid } as u32;
+        let _ = s.owner_pid.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire);
+        s.lease_until_us.store(0, Ordering::Release);
+    }
+}
+
+/// Is some database waiting for a worker that is not busy on it already?
+///
+/// What makes cycling happen at all. With no more participating databases than
+/// pool workers this is always false, every worker keeps its database, and
+/// invalidation latency is `rowcache_decode_ms` exactly as with one database --
+/// the common case pays nothing for the mechanism.
+fn rcdb_waiting(except: u32) -> bool {
+    let now = store::now_micros();
+    (0..rcdb_count()).filter_map(rcdb_at).any(|s| {
+        let oid = s.datoid.load(Ordering::Acquire);
+        if oid == 0 || oid == except {
+            return false;
+        }
+        let st = s.state.load(Ordering::Acquire);
+        if st != DB_PARTICIPATING && st != DB_UNKNOWN {
+            return false;
+        }
+        rcdb_free(s, unsafe { pg_sys::MyProcPid } as u32, now)
+    })
+}
+
+/// Record every connectable database in the directory, so the pool can find the
+/// ones it has never seen.
+///
+/// Needed only because shared memory does not survive a restart: registration
+/// publishes its own database directly, so in steady state there is nothing here
+/// to discover. After a restart the directory is empty and this is what rebuilds
+/// it -- one cheap catalogue read, then a connection per unknown database to
+/// find out whether it actually has registrations.
+///
+/// Template databases and those with `datallowconn = false` are skipped: a
+/// worker cannot connect to them, so listing them would make the pool cycle
+/// through databases it can never serve.
+fn rcdb_discover() {
+    use std::panic::AssertUnwindSafe;
+    let rows: Vec<(u32, String)> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::connect(|client| {
+            let mut out = Vec::new();
+            let t = match client.select(
+                "SELECT oid::int8, datname::text FROM pg_database \
+                 WHERE datallowconn AND NOT datistemplate",
+                None,
+                None,
+            ) {
+                Ok(t) => t,
+                Err(_) => return out,
+            };
+            for row in t {
+                if let (Ok(Some(oid)), Ok(Some(name))) =
+                    (row.get::<i64>(1), row.get::<String>(2))
+                {
+                    out.push((oid as u32, name));
+                }
+            }
+            out
+        })
+    }));
+    if rows.is_empty() {
+        return; // the read failed; do not conclude every database is gone
+    }
+    // Forget databases that no longer exist. Not housekeeping: a directory entry
+    // for a dropped database is one a pool worker will lease and then fail to
+    // connect to, dying and being restarted a second later, forever. Only
+    // entries nobody holds are cleared, so this can never pull a database out
+    // from under the worker currently draining it.
+    let now = store::now_micros();
+    for i in 0..rcdb_count() {
+        let s = match rcdb_at(i) {
+            Some(s) => s,
+            None => continue,
+        };
+        let oid = s.datoid.load(Ordering::Acquire);
+        if oid == 0 || rows.iter().any(|(o, _)| *o == oid) {
+            continue;
+        }
+        let owner = s.owner_pid.load(Ordering::Acquire);
+        if owner != 0 && pid_alive(owner) && s.lease_until_us.load(Ordering::Acquire) > now {
+            continue;
+        }
+        s.state.store(DB_IDLE, Ordering::Release);
+        s.datoid.store(0, Ordering::Release);
+        log!("pg_keyspace invalidation: database oid {oid} is gone; freed its directory entry");
+    }
+    let full = rows.len();
+    let mut recorded = 0usize;
+    for (oid, name) in rows {
+        if rcdb_publish(oid, &name, DB_UNKNOWN).is_some() {
+            recorded += 1;
+        }
+    }
+    if recorded < full {
+        log!(
+            "pg_keyspace invalidation: the row-cache database directory is full at \
+             {} entries, so {} database(s) cannot be served and their registrations \
+             would never be invalidated. Raise pg_keyspace.rowcache_max_databases.",
+            rcdb_count(),
+            full - recorded
+        );
+    }
+}
+
+/// Does the database this worker is connected to have row-cache registrations?
+///
+/// The catalogue is the truth and the directory is a cache of it, so this is the
+/// only thing that decides whether a database gets a slot. A database with no
+/// registrations gets no slot and no turn, which is the "launch lazily" rule:
+/// most clusters have one or two participating databases and should pay nothing
+/// at all for the rest.
+fn rcdb_probe_self() -> i64 {
+    use std::panic::AssertUnwindSafe;
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        if !table_exists("supacache.rowcache_reg") {
+            return 0;
+        }
+        Spi::get_one::<i64>("SELECT count(*) FROM supacache.rowcache_reg")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }))
+}
+
+/// Whether the server has invalidated this slot, i.e. cut it loose rather than
+/// let it retain WAL past `max_slot_wal_keep_size`.
+///
+/// Returns the `wal_status` text: `reserved`/`extended` are healthy, `unreserved`
+/// means it is about to be at risk, and `lost` means the slot can no longer be
+/// read from and the changes it had not yet delivered are gone.
+fn slot_wal_status(slot: &str) -> Option<String> {
+    use std::panic::AssertUnwindSafe;
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::get_one_with_args::<String>(
+            "SELECT wal_status::text FROM pg_replication_slots WHERE slot_name = $1",
+            vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())],
+        )
+        .ok()
+        .flatten()
+    }))
+}
+
+/// Drop every cached ROW belonging to one database, leaving its registrations
+/// and its loaded-marker alone.
+///
+/// Returns how many entries went. Used when a slot has been lost: an unknown set
+/// of invalidations was never delivered, so every row cached for that database
+/// is suspect and none of it can be told apart from the rest. Registrations
+/// survive deliberately -- they are configuration, not cache content, and
+/// dropping them would silently stop caching the tables an operator asked for
+/// (#103) on top of the outage that caused this.
+fn rowcache_purge_database(datoid: u32) -> u64 {
+    let view = match rowcache_view() {
+        Some(v) => v,
+        None => return 0,
+    };
+    let prefix = rc_key_for(datoid, 0, &[]);
+    let prefix = &prefix[..5]; // tag byte + database oid
+    let mut doomed: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let (next, batch) = view.scan(cursor, 512);
+        for k in batch {
+            if k.starts_with(prefix) {
+                doomed.push(k);
+            }
+        }
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    // Collected first, then deleted: `del` mutates the partition the scan is
+    // walking, and moving the ground under a cursor loses entries.
+    let mut gone = 0u64;
+    for k in doomed {
+        if rowcache_write(&view, &k, || view.del(&k), false) {
+            gone += 1;
+        }
+    }
+    gone
+}
+
+/// Rebuild a database's invalidation after its slot was lost.
+///
+/// The order is the whole of the correctness here. The database is marked
+/// incoherent FIRST, so reads stop being served from the cache before anything
+/// else happens; then the cached rows go, because the gap in the slot is exactly
+/// a set of invalidations that will never arrive and there is no way to tell
+/// which rows they were; then a new slot is created, which starts from the
+/// current WAL position; and only then is the database trusted again.
+///
+/// Resuming without the purge is the failure this system must never have: a
+/// stale row served as truth, with a healthy-looking slot in front of it.
+fn recover_lost_slot(datoid: u32, slot: &str) {
+    use std::panic::AssertUnwindSafe;
+    if let Some(s) = rcdb_find(datoid) {
+        s.slot_lost.store(1, Ordering::Release);
+    }
+    log!(
+        "pg_keyspace invalidation: slot '{slot}' has been invalidated by the server \
+         (wal_status = lost), which happens when it retains more WAL than \
+         max_slot_wal_keep_size. Changes committed since it stopped advancing were \
+         never delivered, so this database's cached rows are being dropped and the \
+         slot rebuilt. Reads fall back to the heap until that is done."
+    );
+    let dropped = rowcache_purge_database(datoid);
+    let res: Result<(), String> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT pg_drop_replication_slot($1)",
+                    None,
+                    Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())]),
+                )
+                .map(|_| ())
+        })
+        .map_err(|e| e.to_string())
+    }));
+    if let Err(why) = res {
+        log!("pg_keyspace invalidation: cannot drop lost slot '{slot}': {why}");
+        return; // stays marked incoherent; retried next pass
+    }
+    if let Err(why) = ensure_decode_slot(slot) {
+        log!("pg_keyspace invalidation: cannot recreate slot '{slot}': {why}");
+        return;
+    }
+    // The registrations were deliberately not purged, but the marker may have
+    // been lost with the segment at some earlier point; reloading is O(1) when
+    // there is nothing to do.
+    if !registrations_loaded() {
+        load_registrations_worker();
+    }
+    if let Some(s) = rcdb_find(datoid) {
+        s.slot_lost.store(0, Ordering::Release);
+    }
+    log!(
+        "pg_keyspace invalidation: slot '{slot}' rebuilt; dropped {dropped} cached row(s) \
+         for this database, which is the whole of what it could no longer keep current."
+    );
+}
+
+/// Drop a database's decode slot, because it no longer has registrations.
+///
+/// Retiring a database matters more than tidiness: a slot retains WAL until it
+/// is consumed, and one left behind for a database nobody caches any more would
+/// pin WAL for the whole cluster with nothing to show for it.
+fn drop_decode_slot(slot: &str) {
+    use std::panic::AssertUnwindSafe;
+    let exists = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots \
+             WHERE slot_name = $1 AND plugin = 'supacache_keys' AND NOT active \
+               AND database = current_database())",
+            vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    }));
+    if !exists {
+        return;
+    }
+    let res: Result<(), String> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT pg_drop_replication_slot($1)",
+                    None,
+                    Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())]),
+                )
+                .map(|_| ())
+        })
+        .map_err(|e| e.to_string())
+    }));
+    match res {
+        Ok(()) => log!(
+            "pg_keyspace invalidation: dropped slot '{slot}'; this database has no \
+             row-cache registrations, so it no longer needs one and would otherwise \
+             retain WAL for nothing."
+        ),
+        Err(why) => log!("pg_keyspace invalidation: cannot drop unused slot '{slot}': {why}"),
+    }
+}
+
 #[no_mangle]
 #[pg_guard]
-pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
+pub extern "C" fn pg_keyspace_invalidation_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
-    let dbname = GUC_DATABASE
+    let k = unsafe { i32::from_polymorphic_datum(arg, false, pg_sys::INT4OID) }.unwrap_or(0) as usize;
+
+    // Claim the pool slot BEFORE choosing a database, so two workers cannot both
+    // take a turn and then both drain one database's slot -- which the store's
+    // single-writer contract and the slot's own semantics would both refuse.
+    let health = health_invalidation_slot(k);
+    if !health_claim(health) {
+        log!("pg_keyspace invalidation {k}: another worker holds this pool slot; exiting");
+        return;
+    }
+
+    // Choose the database before connecting. This is the constraint the pool is
+    // shaped by: a background worker binds to one database for its whole life,
+    // so "move on to the next database" is an exit and a relaunch, and the
+    // choice has to be made from shared memory because nothing else is readable
+    // yet. With nothing in the directory -- a fresh cluster, where shared memory
+    // is empty and no registration has published yet -- fall back to
+    // `pg_keyspace.database`, which is the one database that certainly exists,
+    // and rebuild the directory from there.
+    let fallback = GUC_DATABASE
         .get()
         .and_then(|c| c.to_str().ok())
         .unwrap_or("postgres")
         .to_string();
+    let leased = rcdb_lease();
+    let dbname = leased
+        .as_ref()
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| fallback.clone());
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
-    // Per-database from here on (#120). One database today, but the slot is
-    // named for the database it decodes rather than for the configuration,
-    // because a logical slot has never been able to mean anything else.
-    let base = rowcache_slot_base();
-    let slot = slot_name_for(&base, rc_db());
-    drop_legacy_decode_slot(&base, &slot);
 
-    if let Err(why) = ensure_decode_slot(&slot) {
-        log!(
-            "pg_keyspace invalidation: cannot create slot '{slot}' \
-             (is wal_level=logical?): {why}; exiting, will retry on restart"
-        );
-        return;
-    }
+    // Now that there is a connection, this database's own oid is authoritative
+    // -- and for the fallback path it is the only way to learn it.
+    let datoid = rc_db();
+    let base = rowcache_slot_base();
+    let slot = slot_name_for(&base, datoid);
+    drop_legacy_decode_slot(&base, &slot);
+    rcdb_discover();
+    rcdb_publish(datoid, &dbname, DB_UNKNOWN);
     let poll = Duration::from_millis(GUC_ROWCACHE_DECODE_MS.get().max(10) as u64);
-    // The heartbeat is what lets a reader tell "coherent" from "nobody has been
-    // invalidating anything for a while". Claimed the same way the other workers
-    // claim theirs, so two invalidation workers cannot both drain one slot.
-    let health = health_invalidation_slot();
-    if !health_claim(health) {
-        log!("pg_keyspace invalidation: another invalidation worker is live; exiting");
+    // Nothing to do in a database with no registrations: no slot, no turn. Long
+    // enough that an idle cluster is not a background load, short enough that a
+    // first registration is picked up promptly.
+    let idle_poll = Duration::from_millis(1000);
+    let lease_us = (GUC_ROWCACHE_LEASE_MS.get().max(100) as i64) * 1000;
+
+    // Claim it for real now that the connection has said which database this
+    // actually is. On the fallback path nothing was leased, and with a pool
+    // larger than one EVERY member would otherwise land on
+    // `pg_keyspace.database` and drain one slot between them -- which Postgres
+    // answers with "replication slot is active for PID" and a dead worker per
+    // pass.
+    //
+    // Losing the claim means this worker is surplus: the pool is larger than
+    // the number of databases that want one. It PARKS rather than exiting,
+    // because Postgres restarts a cleanly-exited worker IMMEDIATELY, so exiting
+    // here would be a hot loop of fork/connect/exit for as long as the pool
+    // stayed oversized. Parked, it costs a wakeup a second and is ready to
+    // rebind the moment a database needs it.
+    if !rcdb_own(datoid) {
+        log!(
+            "pg_keyspace invalidation {k}: database '{dbname}' is already being drained \
+             by another pool worker; parking until a database needs one"
+        );
+        while !BackgroundWorker::sigterm_received() {
+            health_beat(health);
+            if rcdb_waiting(0) {
+                // Something is unserved. Exit so the relaunch can lease it --
+                // this worker cannot change database without being reborn.
+                break;
+            }
+            std::thread::sleep(idle_poll);
+        }
+        health_release(health);
         return;
     }
-    log!("pg_keyspace invalidation: draining slot '{slot}' every {poll:?} (keys-only)");
+
+    let started = store::now_micros();
+    let mut serving = false;
+    let mut announced = false;
+
+    // The drain loop runs several times a second; the catalogue and the
+    // database list change on human timescales. Re-asking at drain speed would
+    // put a `count(*)` and a `pg_database` scan in front of every pass for no
+    // new information, so both are throttled and the drain is left alone.
+    const PROBE_EVERY_US: i64 = 2_000_000;
+    const DISCOVER_EVERY_US: i64 = 30_000_000;
+    let mut probed_at = 0i64;
+    let mut discovered_at = store::now_micros();
+    let mut regs = 0i64;
+
     while !BackgroundWorker::sigterm_received() {
         health_beat(health);
+        // The catalogue is the truth about whether this database participates,
+        // and it can change under us: an operator registers a first table, or
+        // unregisters the last one, in a session this worker knows nothing about.
+        let now = store::now_micros();
+        if now.saturating_sub(probed_at) >= PROBE_EVERY_US || probed_at == 0 {
+            probed_at = now;
+            regs = rcdb_probe_self();
+            let state = if regs > 0 { DB_PARTICIPATING } else { DB_IDLE };
+            if let Some(s) = rcdb_publish(datoid, &dbname, state) {
+                s.registrations.store(regs, Ordering::Release);
+                s.last_probe_us.store(now, Ordering::Release);
+            }
+        }
+
+        if regs == 0 {
+            // Retire the database rather than leaving a slot behind. A slot
+            // retains WAL until it is consumed, and one kept for a database
+            // nobody caches any more pins WAL for the whole cluster with
+            // nothing to show for it.
+            if serving {
+                drop_decode_slot(&slot);
+                serving = false;
+            }
+            // Somebody else needs a worker more than this database does.
+            if rcdb_waiting(datoid) {
+                break;
+            }
+            if now.saturating_sub(discovered_at) >= DISCOVER_EVERY_US {
+                discovered_at = now;
+                rcdb_discover();
+            }
+            std::thread::sleep(idle_poll);
+            continue;
+        }
+
+        if !serving {
+            if let Err(why) = ensure_decode_slot(&slot) {
+                // No slot means no invalidation, and no invalidation must NOT
+                // read as a healthy cache: leaving `last_drained_us` alone is
+                // what makes this database fail closed rather than serve rows
+                // nothing is keeping current.
+                log!(
+                    "pg_keyspace invalidation {k}: cannot create slot '{slot}' for database \
+                     '{dbname}' (is wal_level=logical, and does max_replication_slots cover \
+                     one slot per participating database?): {why}. This database's row cache \
+                     is NOT being invalidated and reads will fall back to the heap."
+                );
+                rcdb_release(datoid);
+                // Postgres restarts a cleanly-exited worker IMMEDIATELY, so
+                // returning here would fork, connect, fail and exit in a tight
+                // loop for as long as the cause persisted -- and
+                // `max_replication_slots` being too small persists until an
+                // operator changes it and restarts. Pausing first turns that
+                // into one attempt a second. The database keeps failing closed
+                // throughout, which is the part that matters: `last_drained_us`
+                // was never set, so its cache is not served.
+                std::thread::sleep(idle_poll);
+                health_release(health);
+                return;
+            }
+            serving = true;
+        }
+        if !announced {
+            log!(
+                "pg_keyspace invalidation {k}: draining slot '{slot}' for database \
+                 '{dbname}' every {poll:?} (keys-only)"
+            );
+            announced = true;
+        }
+
+        // A slot the server cut loose is not a slow slot, it is a hole: the
+        // changes it had not delivered are gone. Checked before draining, so a
+        // pass never applies a partial view of a gap and then reports success.
+        if slot_wal_status(&slot).as_deref() == Some("lost") {
+            recover_lost_slot(datoid, &slot);
+            continue;
+        }
+
         // A segment with no load marker is a fresh one -- this worker was
         // relaunched, or the segment was reinitialised underneath a worker that
         // was not -- so the pinned registrations in the previous instance are
@@ -3298,23 +4284,64 @@ pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
         if !registrations_loaded() {
             let n = load_registrations_worker();
             if n > 0 {
-                log!("pg_keyspace invalidation: loaded {n} row-cache registration(s) into a fresh segment");
+                log!(
+                    "pg_keyspace invalidation {k}: loaded {n} row-cache registration(s) \
+                     for database '{dbname}' into a fresh segment"
+                );
             }
         }
         let d = drain_invalidations(&slot);
+        // The heartbeat that coherence is judged against, and it is recorded on
+        // the DATABASE rather than on this worker. A pool worker's own liveness
+        // says nothing about whether this database is current -- under cycling
+        // it is alive and draining somebody else for most of its life.
+        if d.reached {
+            if let Some(s) = rcdb_find(datoid) {
+                let t = store::now_micros();
+                s.last_drained_us.store(t, Ordering::Release);
+                // Renew while healthy. Without this a worker that legitimately
+                // keeps its database -- which is every worker when the pool is
+                // big enough, i.e. the common case -- would look wedged once its
+                // first lease elapsed, and another worker would take the
+                // database out from under it.
+                s.lease_until_us.store(t + lease_us, Ordering::Release);
+            }
+        }
         if d.reconciled > 0 {
             log!(
-                "pg_keyspace invalidation: reconciled {} changed row-cache entr(ies)",
+                "pg_keyspace invalidation {k}: reconciled {} changed row-cache entr(ies) \
+                 in database '{dbname}'",
                 d.reconciled
             );
         }
         if d.unparsed > 0 {
             log!(
-                "pg_keyspace invalidation: skipped {} unreadable change record(s) on slot \
+                "pg_keyspace invalidation {k}: skipped {} unreadable change record(s) on slot \
                  '{slot}' (supacache_keys output format mismatch?)",
                 d.unparsed
             );
         }
+
+        // Hand the turn on, but only once this database is actually current and
+        // only if somebody is waiting. With no more participating databases than
+        // pool workers nothing ever waits, every worker keeps its database, and
+        // latency is `rowcache_decode_ms` exactly as it was with one database --
+        // the common case pays nothing at all for the pool existing.
+        //
+        // `!d.full` is what makes "current" mean something: a pass that stopped
+        // at its WAL window has a backlog behind it, and handing over mid-drain
+        // would leave this database further behind than the cycle time claims.
+        if !d.full
+            && store::now_micros().saturating_sub(started) >= lease_us
+            && rcdb_waiting(datoid)
+        {
+            log!(
+                "pg_keyspace invalidation {k}: lease on database '{dbname}' is up and \
+                 another database is waiting; handing the turn on"
+            );
+            break;
+        }
+
         // A batch that came back full means more is already waiting: come
         // straight back for it rather than letting a backlog drain one poll
         // interval at a time. Each pass does a batch of real work, so this is
@@ -3324,7 +4351,15 @@ pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
         }
         std::thread::sleep(poll);
     }
-    log!("pg_keyspace invalidation: shutting down (slot '{slot}' retained for resume)");
+    rcdb_release(datoid);
+    // Released so the replacement can claim it immediately rather than waiting
+    // out a staleness window; the slot itself is retained, so the next worker on
+    // this database resumes where this one stopped.
+    health_release(health);
+    log!(
+        "pg_keyspace invalidation {k}: stopping (slot '{slot}' for database '{dbname}' \
+         retained for resume)"
+    );
 }
 
 /// DROP every `supacache.kv_ttl_b<N>` partition with N < `now_bucket` (fully
@@ -4790,42 +5825,53 @@ mod supacache {
             Some(v) => v,
             None => return false,
         };
-        // The row cache is single-database, and this is where that becomes
-        // visible (#118).
-        //
-        // Not a limitation of the catalogue but of logical decoding: the
-        // invalidation worker's slot is created in `pg_keyspace.database`, and a
+        // Any database may register (#120, subsuming #118). What used to be
+        // refused here was not a limitation of the catalogue or of the keys but
+        // of INVALIDATION: the one slot lived in `pg_keyspace.database`, and a
         // logical slot only ever decodes changes from the database it belongs
-        // to. A table registered anywhere else would be cached and then never
-        // invalidated -- stale indefinitely, with `rowcache_coherence()` still
-        // reporting healthy, because coherence describes the worker rather than
-        // your table.
+        // to, so a table registered anywhere else would be cached and then never
+        // invalidated -- stale indefinitely, with coherence still reporting
+        // healthy because it described the worker rather than your table.
         //
-        // Before this check the failure was `relation "supacache.rowcache_reg"
-        // does not exist`, because the backing tables are created by the worker
-        // in its own database. Loud, but it named the symptom rather than the
-        // reason.
-        let want = GUC_DATABASE
-            .get()
-            .and_then(|c| c.to_str().ok().map(str::to_string))
-            .unwrap_or_else(|| "postgres".to_string());
+        // Every database now gets its own slot and its own turn in a bounded
+        // pool, so the only thing left to refuse is a database the cluster
+        // cannot actually serve. Publishing into the directory is what says "a
+        // worker should come and drain this one", and it is done BEFORE the
+        // registration is recorded: a directory entry with no registration is a
+        // database a worker visits, probes, and marks idle -- free. A
+        // registration with no directory entry would be a cached table nothing
+        // invalidates, which is the failure this whole issue exists to remove.
+        //
         // `::text` is load-bearing: current_database() returns `name`, and
-        // reading that as a String comes back empty, which compared unequal to
-        // every configured value and refused registration everywhere --
-        // including in the database that is supposed to allow it.
+        // reading that as a String comes back empty.
         let here = Spi::get_one::<String>("SELECT current_database()::text")
             .ok()
             .flatten()
             .unwrap_or_default();
-        if here.is_empty() || here != want {
+        if rcdb_publish(rc_db(), &here, DB_PARTICIPATING).is_none() {
             warning!(
-                "pg_keyspace: the row cache is served only from the database named by \
-                 pg_keyspace.database ('{want}'), because the invalidation worker's logical \
-                 slot only decodes changes from that database. Registering from '{here}' \
-                 would cache rows that are never invalidated, so it is refused. Register from \
-                 '{want}', or point pg_keyspace.database at this database."
+                "pg_keyspace: the row-cache database directory is full at {} entries, so \
+                 database '{here}' cannot be served and a table registered here would be \
+                 cached with nothing to invalidate it. Refused. Raise \
+                 pg_keyspace.rowcache_max_databases (it costs 128 bytes per entry) and \
+                 restart.",
+                rcdb_count()
             );
             return false;
+        }
+        // One replication slot per participating database, and slots are a
+        // cluster-wide resource with a low default ceiling. Warn rather than
+        // refuse: the slot is created by a worker, not here, and refusing on a
+        // count that may have changed by then would be guessing. A database that
+        // does not get its slot reads as INCOHERENT rather than healthy, so the
+        // failure is safe either way -- it is just easier to fix if somebody is
+        // told about it at the moment they ask for it.
+        if let Some(short) = replication_slots_short() {
+            warning!(
+                "pg_keyspace: {short}. The row cache needs one replication slot per \
+                 database that registers a table, and a database that cannot get one is \
+                 marked incoherent and served from the heap instead of the cache."
+            );
         }
         // The catalogue is created by a background worker, so between cluster
         // start and that worker's first pass -- and after a DROP/CREATE
@@ -4920,9 +5966,26 @@ mod supacache {
                JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1)",
             Some(vec![(PgBuiltInOids::OIDOID.oid(), relid.into_datum())]),
         );
-        rowcache_view()
+        let dropped = rowcache_view()
             .map(|v| rowcache_write(&v, &rc_reg_key(relid.as_u32()), || v.del(&rc_reg_key(relid.as_u32())), false))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        // Tell the directory straight away when that was the last one, rather
+        // than waiting for a pool worker's next probe to notice. Retiring a
+        // database is not tidiness: its slot retains WAL until it is consumed,
+        // and one kept for a database nobody caches any more pins WAL for the
+        // whole cluster with nothing to show for it. The worker still does the
+        // dropping -- this only shortens how long it takes to find out.
+        let left = Spi::get_one::<i64>("SELECT count(*) FROM supacache.rowcache_reg")
+            .ok()
+            .flatten()
+            .unwrap_or(1);
+        if left == 0 {
+            if let Some(s) = rcdb_find(rc_db()) {
+                s.registrations.store(0, Ordering::Release);
+                s.state.store(DB_IDLE, Ordering::Release);
+            }
+        }
+        dropped
     }
 
     /// Reload registrations from `supacache.rowcache_reg` into the row-cache
@@ -5071,18 +6134,31 @@ mod supacache {
         }
     }
 
-    /// Whether the row cache is currently trusted, and how stale its
-    /// invalidation worker's heartbeat is.
+    /// Whether the row cache is currently trusted **in this database**, and how
+    /// long it has been since anything invalidated it.
     ///
     /// The point of #39 was that a stopped invalidation worker left the cache
     /// serving stale rows "indefinitely with no alarm". Reads now fail closed on
     /// their own, but an operator still needs to be able to see it, and a test
-    /// needs to be able to wait for the worker to come up rather than sleep and
-    /// hope.
+    /// needs to be able to wait for invalidation to come up rather than sleep
+    /// and hope.
     ///
-    /// `coherent` is false while invalidation is configured but not beating;
-    /// `beat_age_ms` is NULL when it has never beaten (nothing has started yet)
-    /// and when invalidation is switched off, where there is nothing to beat.
+    /// One row, for the database you are connected to (#120). That is not a
+    /// simplification: coherence IS per-database now, because each database has
+    /// its own slot and its own turn, and the answer for one says nothing about
+    /// another. One database's stalled worker must not read as the whole cache
+    /// being incoherent, nor a healthy pool as every database being current.
+    /// `supacache.pg_stat_keyspace_rowcache_databases` is the cluster-wide view.
+    ///
+    /// `beat_age_ms` is how long since this database was last drained, and is
+    /// NULL when it never has been -- nothing has started yet, or this database
+    /// has no registrations and so gets no slot and no turn. `stale_after_ms` is
+    /// the window it is judged against, which grows with the number of
+    /// participating databases when they outnumber the pool, because a database
+    /// waiting its turn is behind by the cycle time BY DESIGN. `slot_lost` is
+    /// the other way to be incoherent: the server cut this database's slot loose
+    /// for retaining too much WAL, so an unknown set of invalidations was never
+    /// delivered.
     #[pg_extern]
     fn rowcache_coherence() -> TableIterator<
         'static,
@@ -5091,23 +6167,115 @@ mod supacache {
             name!(decode_enabled, bool),
             name!(beat_age_ms, Option<i64>),
             name!(stale_after_ms, i64),
+            name!(datname, String),
+            name!(slot_lost, bool),
+            name!(participating_databases, i64),
         ),
     > {
         let decode = GUC_ROWCACHE_DECODE.get();
-        let age = health_slot(health_invalidation_slot()).and_then(|sl| {
-            let last = sl.last_seen_us.load(Ordering::Acquire);
+        let me = rcdb_find(rc_db());
+        let age = me.and_then(|s| {
+            let last = s.last_drained_us.load(Ordering::Acquire);
             if last == 0 {
                 None
             } else {
                 Some(store::now_micros().saturating_sub(last) / 1000)
             }
         });
+        let datname = Spi::get_one::<String>("SELECT current_database()::text")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         TableIterator::once((
             rowcache_coherent(),
             decode,
             age,
-            health_stale_us() / 1000,
+            rcdb_stale_us() / 1000,
+            datname,
+            me.map(|s| s.slot_lost.load(Ordering::Acquire) != 0).unwrap_or(false),
+            rcdb_participating() as i64,
         ))
+    }
+
+    /// One row per database the row cache knows about (#120).
+    ///
+    /// `supacache.rowcache_coherence()` answers for the database you happen to
+    /// be connected to. This answers for the cluster, which is the question an
+    /// operator actually has once more than one database is served: **which**
+    /// database is incoherent, and why.
+    ///
+    /// It is not a dashboard nicety. The cache fails closed on incoherence, so
+    /// "which database is incoherent" decides which queries are served from the
+    /// cache at all. A single arbitrary database's numbers reported as the
+    /// cluster's would be worse than no numbers.
+    ///
+    /// `state` is `participating` (has registrations, needs a slot and a turn),
+    /// `idle` (probed, no registrations, deliberately gets neither), or
+    /// `unknown` (not probed yet). `worker_pid` is the pool worker holding this
+    /// database right now, and is NULL while it waits its turn -- which is
+    /// normal under cycling, not a fault.
+    #[pg_extern]
+    fn rowcache_databases() -> TableIterator<
+        'static,
+        (
+            name!(datoid, i64),
+            name!(datname, String),
+            name!(state, String),
+            name!(registrations, i64),
+            name!(coherent, bool),
+            name!(slot_lost, bool),
+            name!(beat_age_ms, Option<i64>),
+            name!(stale_after_ms, i64),
+            name!(slot_name, String),
+            name!(worker_pid, Option<i32>),
+        ),
+    > {
+        let now = store::now_micros();
+        let stale = rcdb_stale_us();
+        let base = rowcache_slot_base();
+        let decode = GUC_ROWCACHE_DECODE.get();
+        let mut rows = Vec::new();
+        for i in 0..rcdb_count() {
+            let s = match rcdb_at(i) {
+                Some(s) => s,
+                None => continue,
+            };
+            let oid = s.datoid.load(Ordering::Acquire);
+            if oid == 0 {
+                continue;
+            }
+            let state = match s.state.load(Ordering::Acquire) {
+                DB_PARTICIPATING => "participating",
+                DB_IDLE => "idle",
+                _ => "unknown",
+            };
+            let lost = s.slot_lost.load(Ordering::Acquire) != 0;
+            let last = s.last_drained_us.load(Ordering::Acquire);
+            let age = if last == 0 {
+                None
+            } else {
+                Some(now.saturating_sub(last) / 1000)
+            };
+            let pid = s.owner_pid.load(Ordering::Acquire);
+            rows.push((
+                oid as i64,
+                rcdb_name(s),
+                state.to_string(),
+                s.registrations.load(Ordering::Acquire),
+                // The same test `rowcache_coherent()` applies, evaluated for a
+                // database other than the caller's. Written once here rather
+                // than duplicated, so the view can never disagree with what the
+                // planner hook actually does.
+                !decode || (!lost && last != 0 && now.saturating_sub(last) < stale),
+                lost,
+                age,
+                stale / 1000,
+                slot_name_for(&base, oid),
+                if pid == 0 { None } else { Some(pid as i32) },
+            ));
+        }
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        TableIterator::new(rows)
     }
 
     /// Row-cache occupancy: entries (registrations + rows), bytes used/cap.
@@ -5352,7 +6520,12 @@ mod supacache {
             } else if i == health_expiry_slot() {
                 ("expiry", None)
             } else {
-                ("invalidation", None)
+                // A member of the invalidation pool (#120), numbered so a crash
+                // loop can be attributed to one of them. Which DATABASE it is
+                // draining is not here on purpose -- it changes over the
+                // worker's life, and the per-database answer lives in
+                // `supacache.pg_stat_keyspace_rowcache_databases`.
+                ("invalidation", Some((i - health_expiry_slot() - 1) as i32))
             };
             let sl = match health_slot(i) {
                 Some(sl) => sl,
@@ -5403,46 +6576,79 @@ mod supacache {
     fn invalidation_stats() -> TableIterator<
         'static,
         (
+            name!(datid, i64),
+            name!(datname, Option<String>),
             name!(slot_name, String),
             name!(active, bool),
+            name!(wal_status, Option<String>),
             name!(confirmed_flush_lsn, Option<String>),
             name!(restart_lsn, Option<String>),
             name!(current_lsn, Option<String>),
             name!(decode_lag_bytes, Option<i64>),
             name!(retained_bytes, Option<i64>),
+            name!(max_slot_wal_keep_size, Option<String>),
         ),
     > {
         let mut rows = Vec::new();
         if !GUC_ROWCACHE_DECODE.get() {
             return TableIterator::new(rows);
         }
-        // The slot this database decodes through. Named for the database rather
-        // than for the configuration (#120), so reading the GUC verbatim would
-        // resolve nothing.
-        let slot = slot_name_for(&rowcache_slot_base(), rc_db());
-        let found = Spi::connect(|client| {
-            let t = client.select(
-                "SELECT s.active, s.confirmed_flush_lsn::text, s.restart_lsn::text, \
+        // ONE ROW PER DATABASE (#120). Resolving a single slot name and
+        // returning at most one row was correct while there was one slot; with
+        // one per participating database it would show an operator a single
+        // arbitrary database's decode lag and let them believe it was the
+        // cluster's -- which is worse than showing nothing, because the number
+        // looks right.
+        //
+        // No cross-database query is needed for this and that is not luck:
+        // replication slots are CLUSTER-WIDE objects and `pg_replication_slots`
+        // carries the database each one belongs to, so the whole picture is
+        // readable from wherever this happens to be called.
+        //
+        // Matched on the output plugin as well as the name, so a slot somebody
+        // else created that happens to share the prefix is not reported as ours.
+        let prefix = format!("{}\\_%", rowcache_slot_base());
+        let keep = pg_setting(c"max_slot_wal_keep_size");
+        let found: Vec<_> = Spi::connect(|client| {
+            let mut out = Vec::new();
+            let t = match client.select(
+                "SELECT COALESCE(d.oid, 0)::int8, d.datname::text, s.slot_name::text, s.active, \
+                        s.wal_status::text, \
+                        s.confirmed_flush_lsn::text, s.restart_lsn::text, \
                         pg_current_wal_lsn()::text, \
                         (pg_current_wal_lsn() - s.confirmed_flush_lsn)::bigint, \
                         (pg_current_wal_lsn() - s.restart_lsn)::bigint \
-                 FROM pg_replication_slots s WHERE s.slot_name = $1",
+                 FROM pg_replication_slots s \
+                 LEFT JOIN pg_database d ON d.datname = s.database \
+                 WHERE s.plugin = 'supacache_keys' AND s.slot_name LIKE $1 \
+                 ORDER BY d.datname",
                 None,
-                Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.clone().into_datum())]),
-            )
-            .ok()?;
-            let row = t.into_iter().next()?;
-            Some((
-                row.get::<bool>(1).ok().flatten().unwrap_or(false),
-                row.get::<String>(2).ok().flatten(),
-                row.get::<String>(3).ok().flatten(),
-                row.get::<String>(4).ok().flatten(),
-                row.get::<i64>(5).ok().flatten(),
-                row.get::<i64>(6).ok().flatten(),
-            ))
+                Some(vec![(PgBuiltInOids::TEXTOID.oid(), prefix.into_datum())]),
+            ) {
+                Ok(t) => t,
+                Err(_) => return out,
+            };
+            for row in t {
+                out.push((
+                    row.get::<i64>(1).ok().flatten().unwrap_or(0),
+                    row.get::<String>(2).ok().flatten(),
+                    row.get::<String>(3).ok().flatten().unwrap_or_default(),
+                    row.get::<bool>(4).ok().flatten().unwrap_or(false),
+                    row.get::<String>(5).ok().flatten(),
+                    row.get::<String>(6).ok().flatten(),
+                    row.get::<String>(7).ok().flatten(),
+                    row.get::<String>(8).ok().flatten(),
+                    row.get::<i64>(9).ok().flatten(),
+                    row.get::<i64>(10).ok().flatten(),
+                ));
+            }
+            out
         });
-        if let Some((active, flush, restart, cur, lag, retained)) = found {
-            rows.push((slot, active, flush, restart, cur, lag, retained));
+        for (oid, name, slot, active, status, flush, restart, cur, lag, retained) in found {
+            rows.push((
+                oid, name, slot, active, status, flush, restart, cur, lag, retained,
+                keep.clone(),
+            ));
         }
         TableIterator::new(rows)
     }
@@ -5624,7 +6830,13 @@ CREATE VIEW supacache.pg_stat_keyspace_tenants AS
 SELECT tenant, arena_bytes, entries
 FROM supacache.tenant_stats();
 
--- Row cache: occupancy, coherence, and whether registrations are resident.
+-- Row cache: segment-wide occupancy, and coherence FOR THIS DATABASE.
+--
+-- The occupancy columns are the whole segment, which is cluster-wide and shared
+-- by every database the cache serves. The coherence columns are this database's
+-- alone, because coherence is per-database (#120) -- so the view names the
+-- database it is describing rather than leaving a reader to assume. Which
+-- databases are incoherent, and why, is pg_stat_keyspace_rowcache_databases.
 CREATE VIEW supacache.pg_stat_keyspace_rowcache AS
 SELECT s.entries, s.hits, s.misses, s.data_used AS arena_used_bytes,
        s.data_cap AS arena_capacity_bytes,
@@ -5632,15 +6844,38 @@ SELECT s.entries, s.hits, s.misses, s.data_used AS arena_used_bytes,
             THEN round(s.hits::numeric * 100 / (s.hits + s.misses), 2)
        END                                       AS hit_pct,
        c.coherent, c.decode_enabled, c.beat_age_ms, c.stale_after_ms,
-       g.registered AS registrations, g.loaded AS registrations_loaded
+       g.registered AS registrations, g.loaded AS registrations_loaded,
+       c.datname, c.slot_lost, c.participating_databases,
+       (SELECT count(*) FROM supacache.rowcache_databases()
+         WHERE state = 'participating' AND NOT coherent)::bigint
+                                                 AS incoherent_databases
 FROM supacache.rowcache_stats() s
 CROSS JOIN supacache.rowcache_coherence() c
 CROSS JOIN supacache.rowcache_registration_status() g;
 
--- Empty when decoding is off or the slot has not been created yet.
+-- One row per database the row cache knows about.
+--
+-- The cache FAILS CLOSED on incoherence, so which database is incoherent
+-- decides which queries are served from the cache at all -- this is load-bearing
+-- for correctness, not only for dashboards. `stale_after_ms` is the window each
+-- database is judged against, and it grows with the number of participating
+-- databases once they outnumber pg_keyspace.rowcache_invalidation_workers,
+-- because a database waiting its turn is behind by the cycle time by design.
+CREATE VIEW supacache.pg_stat_keyspace_rowcache_databases AS
+SELECT datoid, datname, state, registrations, coherent, slot_lost,
+       beat_age_ms, stale_after_ms, slot_name, worker_pid
+FROM supacache.rowcache_databases();
+
+-- One row PER DATABASE with a row-cache slot. Empty when decoding is off or no
+-- slot has been created yet.
+--
+-- Keyed by database because there is one slot per participating database: a
+-- single row would show one arbitrary database's decode lag, and an operator
+-- watching it would believe it was the cluster's.
 CREATE VIEW supacache.pg_stat_keyspace_invalidation AS
-SELECT slot_name, active, confirmed_flush_lsn, restart_lsn, current_lsn,
-       decode_lag_bytes, retained_bytes
+SELECT datid, datname, slot_name, active, wal_status,
+       confirmed_flush_lsn, restart_lsn, current_lsn,
+       decode_lag_bytes, retained_bytes, max_slot_wal_keep_size
 FROM supacache.invalidation_stats();
 
 CREATE VIEW supacache.pg_stat_keyspace_pubsub AS
@@ -5675,6 +6910,7 @@ GRANT EXECUTE ON FUNCTION
     supacache.rowcache_registration_status(),
     supacache.rowcache_stats(),
     supacache.rowcache_coherence(),
+    supacache.rowcache_databases(),
     supacache.pubsub_stats(),
     supacache.topology_change(),
     supacache.slot_ranges()
@@ -5687,6 +6923,7 @@ GRANT SELECT ON
     supacache.pg_stat_keyspace_persist_total,
     supacache.pg_stat_keyspace_tenants,
     supacache.pg_stat_keyspace_rowcache,
+    supacache.pg_stat_keyspace_rowcache_databases,
     supacache.pg_stat_keyspace_invalidation,
     supacache.pg_stat_keyspace_pubsub,
     supacache.pg_stat_keyspace_topology
@@ -5705,9 +6942,11 @@ COMMENT ON VIEW supacache.pg_stat_keyspace_persist_total IS
 COMMENT ON VIEW supacache.pg_stat_keyspace_tenants IS
   'pg_keyspace: measured arena occupancy per tenant (gauges). Scans live entries, so cost is O(entries) per call.';
 COMMENT ON VIEW supacache.pg_stat_keyspace_rowcache IS
-  'pg_keyspace: Mode B row cache occupancy and coherence. coherent=false means invalidation is configured but not beating; reads fail closed.';
+  'pg_keyspace: Mode B row cache occupancy (segment-wide) and coherence (for datname, the database you are connected to). coherent=false means invalidation is configured but not current for THIS database; reads fail closed. incoherent_databases counts them cluster-wide.';
+COMMENT ON VIEW supacache.pg_stat_keyspace_rowcache_databases IS
+  'pg_keyspace: one row per database the row cache knows about. state=participating has registrations and needs a slot; idle has none and deliberately gets neither. stale_after_ms grows with participating databases once they outnumber rowcache_invalidation_workers, because a database waiting its turn is behind by the cycle time by design.';
 COMMENT ON VIEW supacache.pg_stat_keyspace_invalidation IS
-  'pg_keyspace: WAL decode lag for the row cache. Empty when decoding is off. retained_bytes is WAL the slot is pinning on disk.';
+  'pg_keyspace: WAL decode lag for the row cache, one row per database with a slot. Empty when decoding is off. retained_bytes is WAL that database''s slot is pinning on disk; wal_status=lost means the server cut it loose for exceeding max_slot_wal_keep_size, and that database is then marked incoherent and rebuilt.';
 COMMENT ON VIEW supacache.pg_stat_keyspace_pubsub IS
   'pg_keyspace: pub/sub messages NOT delivered. Every column is a cumulative loss counter; PUBLISH cannot report these to the client.';
 COMMENT ON VIEW supacache.pg_stat_keyspace_topology IS

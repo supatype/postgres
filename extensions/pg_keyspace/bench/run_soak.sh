@@ -51,6 +51,12 @@ SECRET=${SECRET:-soakpw}
 OUT=${OUT:-/tmp/pgks-soak-out}
 K6=${K6:-$(command -v k6 || echo "$HOME/go/bin/k6")}
 NO_FAULTS=${NO_FAULTS:-}
+# Extra row-cache databases beyond `postgres` (#120). 0 keeps the original
+# single-database shape. Above 0, each gets its own registered table, its own
+# slot and its own turn in the invalidation pool -- which is the drift this
+# design actually puts at risk: slot growth, retained WAL, and cycle-time
+# invalidation latency.
+SOAK_DATABASES=${SOAK_DATABASES:-0}
 pass=0; fail=0
 chk() {
   if [ "$2" = "$3" ]; then echo "PASS  $1"; pass=$((pass+1));
@@ -89,6 +95,11 @@ su postgres -c "$PGBIN/initdb -D $PGDATA -U postgres" >/dev/null 2>&1
   echo "pg_keyspace.rowcache_decode = on"
   echo "pg_keyspace.rowcache_readthrough = on"
   echo "pg_keyspace.rowcache_decode_ms = 200"
+  # Deliberately SMALLER than the number of databases when SOAK_DATABASES is
+  # set, so the run exercises CYCLING rather than a worker per database. A pool
+  # large enough to avoid cycling would soak the easy case.
+  echo "pg_keyspace.rowcache_invalidation_workers = 2"
+  echo "pg_keyspace.rowcache_lease_ms = 3000"
   # Deliberately small, so the cold set does not fit and eviction runs for the
   # whole soak. A cache that never evicts is not being soaked -- at 120000 the
   # cache was still filling when a 4-minute run ended -- entries reached 34k of
@@ -101,7 +112,17 @@ su postgres -c "$PGBIN/initdb -D $PGDATA -U postgres" >/dev/null 2>&1
   echo "pg_keyspace.tenant_arena_pct = 60"
   echo "pg_keyspace.ttl_bucket_secs = 10"
   echo "wal_level = logical"
-  echo "max_replication_slots = 8"
+  # One slot per participating database (#120), plus headroom.
+  echo "max_replication_slots = 24"
+  # The invalidation pool comes out of this budget alongside the RESP,
+  # persistence and expiry workers; the default 8 leaves no room.
+  echo "max_worker_processes = 16"
+  # THE mitigation for one-slot-per-database: a slot retains WAL until it is
+  # consumed, so without a bound one stalled database pins WAL for the whole
+  # cluster. Bounded, the server invalidates the slot instead and pg_keyspace
+  # marks that database incoherent and rebuilds it -- which the drift judge
+  # asserts never had to happen.
+  echo "max_slot_wal_keep_size = 2GB"
   echo "max_wal_senders = 8"
 } >> $PGDATA/postgresql.conf
 chown -R postgres:postgres $PGDATA
@@ -138,6 +159,45 @@ chk "the row cache registers the table" "t" "$(Q "SELECT supacache.rowcache_regi
 for _ in $(seq 1 60); do [ "$(Q "SELECT coherent FROM supacache.pg_stat_keyspace_rowcache")" = "t" ] && break; sleep 1; done
 chk "the row cache is coherent before load" "t" "$(Q "SELECT coherent FROM supacache.pg_stat_keyspace_rowcache")"
 
+# Extra databases, each a tenant with its own row cache. This is what turns the
+# soak into a test of #120 rather than of the single-database path: N slots, N
+# turns in the cycle, and N chances for one database's invalidation to stall and
+# pin WAL for the whole cluster.
+SOAK_DBS=""
+if [ "${SOAK_DATABASES:-0}" -gt 0 ]; then
+  for i in $(seq 1 "$SOAK_DATABASES"); do
+    d="soak_$i"
+    Q "CREATE DATABASE $d" >/dev/null
+    QD() { $PGBIN/psql -h /tmp -p $PORT -U postgres -d "$d" -tAc "$1" 2>&1; }
+    QD "CREATE EXTENSION pg_keyspace" >/dev/null
+    QD "CREATE TABLE profiles(id bigint primary key, payload text NOT NULL)" >/dev/null
+    QD "INSERT INTO profiles SELECT g, md5(g::text)||repeat('p',200) FROM generate_series(1,20000) g" >/dev/null
+    chk "  $d registers its table" "t" "$(QD "SELECT supacache.rowcache_register('public.profiles')")"
+    SOAK_DBS="$SOAK_DBS $d"
+  done
+  for d in $SOAK_DBS; do
+    for _ in $(seq 1 120); do
+      [ "$($PGBIN/psql -h /tmp -p $PORT -U postgres -d "$d" -tAc \
+            "SELECT coherent FROM supacache.rowcache_coherence()" 2>&1)" = "t" ] && break
+      sleep 1
+    done
+    chk "  $d is coherent before load" "t" \
+        "$($PGBIN/psql -h /tmp -p $PORT -U postgres -d "$d" -tAc \
+           "SELECT coherent FROM supacache.rowcache_coherence()" 2>&1)"
+  done
+  chk "every soak database is participating" "$SOAK_DATABASES" \
+      "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases
+            WHERE state='participating' AND datname LIKE 'soak\\_%'")"
+  cat > "$OUT/rowcache_db.sql" <<'PG'
+\set id random(1, 20000)
+SELECT payload FROM profiles WHERE id = :id;
+PG
+  cat > "$OUT/rowwrite_db.sql" <<'PG'
+\set id random(1, 20000)
+UPDATE profiles SET payload = md5(random()::text) || repeat('p',200) WHERE id = :id;
+PG
+fi
+
 cat > "$OUT/rowcache.sql" <<'PG'
 \set id random(1, 50000)
 SELECT payload FROM profiles WHERE id = :id;
@@ -149,7 +209,10 @@ PG
 
 echo
 echo "########## 0. preconditions ##########"
-chk "$WORKERS RESP workers and $SHARDS persist shards are up" "$((WORKERS+SHARDS+2))" \
+# RESP + persist + expiry + the invalidation POOL (#120), which is sized by its
+# own GUC rather than being a single worker.
+SOAK_POOL=$(Q "SHOW pg_keyspace.rowcache_invalidation_workers"); SOAK_POOL=${SOAK_POOL:-1}
+chk "$WORKERS RESP workers and $SHARDS persist shards are up" "$((WORKERS+SHARDS+1+SOAK_POOL))" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE alive")"
 chk "the durable tier is actually configured" "durable" "$(Q "SELECT tier FROM supacache.replication_status()")"
 # A tenant must be able to AUTH, or mixed.js measures nothing but auth failures.
@@ -194,6 +257,16 @@ $PGBIN/pgbench -h /tmp -p $PORT -U postgres -n -c 4 -j 2 -T "$SECS" \
   -f "$OUT/rowcache.sql"@8 -f "$OUT/rowwrite.sql"@2 postgres \
   > "$OUT/pgbench.log" 2>&1 &
 PGBENCH_PID=$!
+# One generator per extra database, so every participating database is producing
+# invalidations for the whole run. A database that is registered but idle would
+# never stall its slot, and the WAL-retention hazard would go untested.
+DB_PIDS=""
+for d in $SOAK_DBS; do
+  $PGBIN/pgbench -h /tmp -p $PORT -U postgres -n -c 2 -j 1 -T "$SECS" \
+    -f "$OUT/rowcache_db.sql"@8 -f "$OUT/rowwrite_db.sql"@2 "$d" \
+    > "$OUT/pgbench_$d.log" 2>&1 &
+  DB_PIDS="$DB_PIDS $!"
+done
 
 # Each worker kill drops every connection that worker was holding, so a run with
 # fault injection has a floor of real errors that is a property of the faults,
@@ -212,6 +285,7 @@ LABEL="soak-${DURATION}" SUMMARY_JSON="$OUT/k6.json" \
 K6_RC=${PIPESTATUS[0]}
 
 wait $PGBENCH_PID 2>/dev/null
+for pid in $DB_PIDS; do wait "$pid" 2>/dev/null; done
 # Stop injecting first, then keep SAMPLING through a quiet drain window. The
 # last drift sample is then taken against an idle cluster, which is the only
 # condition under which "batches still uncommitted" means "never committed"

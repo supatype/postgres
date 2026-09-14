@@ -33,7 +33,8 @@ Q() { $PGBIN/psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDB" -tAF, -c "$1
 COLS="t_s,rss_kb,entries,hits,misses,evictions,sets,arena_used,arena_cap,\
 persist_lag,persist_backlog,persist_dropped,persist_failed,\
 decode_lag,retained_wal,wal_bytes,rowcache_entries,rowcache_coherent,\
-ttl_partitions,kv_rows,slot_count"
+ttl_partitions,kv_rows,slot_count,\
+rc_databases,rc_incoherent,rc_lost_slots,rc_worst_beat_ms"
 
 sample() {
   local out=$1
@@ -72,8 +73,18 @@ sample() {
                        WHERE c.relname='kv_ttl'),
                      (SELECT count(*) FROM supacache.kv),
                      (SELECT count(*) FROM pg_replication_slots)")
+    # Per-database row-cache drift (#120). One slot per participating database
+    # and cycle-time invalidation latency are exactly what this design puts at
+    # risk, and a cluster-wide max hides which database is the one falling
+    # behind -- or that one has been cut loose entirely.
+    local rcdb
+    rcdb=$(Q "SELECT count(*) FILTER (WHERE state='participating'),
+                     count(*) FILTER (WHERE state='participating' AND NOT coherent),
+                     count(*) FILTER (WHERE slot_lost),
+                     COALESCE(max(beat_age_ms) FILTER (WHERE state='participating'), -1)
+              FROM supacache.pg_stat_keyspace_rowcache_databases")
 
-    sample_line="$(( $(date +%s) - t0 )),${rss:-0},${ks:-,,,,,,},${pers:-,,,},${inval:-,},${misc:-,,,,,}"
+    sample_line="$(( $(date +%s) - t0 )),${rss:-0},${ks:-,,,,,,},${pers:-,,,},${inval:-,},${misc:-,,,,,},${rcdb:-,,,}"
     echo "$sample_line" >> "$out"
     sleep "$SAMPLE_SECS"
   done
@@ -134,6 +145,7 @@ judge() {
     NR==1 { next }
     { rss[n+1]=$2; ent[n+1]=$3; evi[n+1]=$6; arena[n+1]=$8; lag[n+1]=$10;
       drop[n+1]=$12; failed[n+1]=$13; dec[n+1]=$14; wal[n+1]=$16; coh[n+1]=$18;
+      dbs[n+1]=$22; dbi[n+1]=$23; dbl[n+1]=$24; beat[n+1]=$25;
       ts[n+1]=$1; n++ }
     function half_avg(a, lo, hi,   s,c,i) { s=0; c=0; for(i=lo;i<=hi;i++){s+=a[i];c++} return c?s/c:0 }
     function grow_pct(a,   f,l) { f=half_avg(a,1,int(n/2)); l=half_avg(a,int(n/2)+1,n);
@@ -177,6 +189,14 @@ judge() {
       printf "wal %d %d %d\n",     wal[1], wal[n], (ts[n]-ts[1] > 0 ? ts[n]-ts[1] : 1)
       inco=0; for(i=1;i<=n;i++) if (coh[i]!=1 && coh[i]!="") inco++
       printf "incoherent %d\n",    inco
+      # Per-database row-cache drift (#120). The cluster-wide `coherent` above
+      # answers for the database the sampler is connected to; these answer for
+      # every database being served, which is the question once there is more
+      # than one. A database quietly falling out of coherence is the cache
+      # switching itself off for one tenant while everything else looks fine.
+      dbinco=0; dblost=0;
+      for(i=1;i<=n;i++) { if (dbi[i]>0) dbinco++; if (dbl[i]>0) dblost++ }
+      printf "dbincoherent %d %d %d %d\n", dbinco, dblost, dbs[n], maxof(beat)
     }' "$csv")
 
   local rss_pct rss_a rss_b ent_pct ent_a ent_b arena_a arena_b evi_a evi_b
@@ -192,6 +212,7 @@ judge() {
   read -r _ unc_med unc_last          <<< "$(grep '^uncommitted ' <<< "$verdicts")"
   read -r _ wal_a wal_b wal_secs      <<< "$(grep '^wal '        <<< "$verdicts")"
   read -r _ incoh                     <<< "$(grep '^incoherent ' <<< "$verdicts")"
+  read -r _ dbinco dblost dbs_final dbbeat_max <<< "$(grep '^dbincoherent ' <<< "$verdicts")"
 
   # Bytes per second of WAL actually generated, which is what a decode lag in
   # bytes has to be divided by before it means anything.
@@ -268,6 +289,22 @@ judge() {
     chk "the row cache stayed coherent for every sample" \
         "$([ "${incoh:-0}" -eq 0 ] && echo pass || echo fail)" \
         "$incoh of $n samples reported coherent=false"
+    # Per-database (#120). A cluster-wide verdict cannot see one database
+    # falling behind while the rest are fine, and the cache FAILS CLOSED per
+    # database -- so that is one tenant's cache silently switching itself off.
+    chk "every served database stayed coherent (${dbs_final:-0} database(s) at the end)" \
+        "$([ "${dbinco:-0}" -eq 0 ] && echo pass || echo fail)" \
+        "$dbinco of $n samples had at least one participating database incoherent"
+    # A slot the server cut loose for retaining too much WAL is the hazard one
+    # slot per database creates. It is recoverable and handled, but during a
+    # soak it should never happen at all: if it does, the run was retaining more
+    # WAL than the bound and the design's sizing advice is wrong.
+    chk "no database's slot was invalidated during the run" \
+        "$([ "${dblost:-0}" -eq 0 ] && echo pass || echo fail)" \
+        "$dblost of $n samples had a lost slot"
+    if [ "${dbbeat_max:-0}" -ge 0 ]; then
+      echo "worst per-database invalidation age: ${dbbeat_max}ms"
+    fi
   else
     echo "SKIP  WAL decode lag (rowcache_decode is off in this run)"
   fi

@@ -347,6 +347,43 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_rowcache_concurrency.sh
 
+      # The row cache in EVERY database (#120). Three databases cloned from one
+      # template so their relids collide, each registered, each with its own
+      # slot: asserts that a write in a secondary database is actually
+      # invalidated (the assertion the whole issue turns on), that no database
+      # is served another's rows, that a database with no registrations gets no
+      # slot, and that the worker pool stays bounded by its GUC while every
+      # database is still invalidated.
+      - name: Row cache across databases
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_rowcache_multidb.sh
+
+      # One slot per database means one database can pin WAL for the cluster.
+      # max_slot_wal_keep_size is the mitigation, and this asserts the trade was
+      # actually made: a slot the server invalidates must mark THAT database
+      # incoherent, drop its cached rows, and rebuild -- never resume over the
+      # gap, which would serve a stale row as truth at the moment everything
+      # reports healthy again.
+      - name: Row-cache slot invalidation and recovery
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_rowcache_slot_invalidation.sh
+
+      # The #130 shape, with real entrants: concurrent registrations into
+      # databases that have no catalogue yet, while a pool of workers probes the
+      # same databases and races to create the same slots.
+      - name: Row-cache registration and slot creation races
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_rowcache_registration_race.sh
+
       # The row-cache writer lock, partitioned per store partition (#120).
       # Asserts that partitioning does not reopen #127 -- a lock chosen for one
       # partition while the write lands in another is the same corruption with

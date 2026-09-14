@@ -18,8 +18,14 @@
 # RLS does not save you: it is re-applied above the cache, so the second
 # database's policies are evaluated against the first database's row.
 #
-# Keys now carry the database oid and a tag byte. A foreign database finds no
-# registration, so it plans an ordinary index scan.
+# Keys now carry the database oid and a tag byte. A database that has not
+# registered the table finds no registration and plans an ordinary index scan.
+#
+# Since #120 the row cache serves EVERY database, so section 4's assertion is
+# inverted: registering from a second database now succeeds. Sections 1-3 are
+# unchanged and matter more than they did, not less -- cross-database isolation
+# was a latent hazard when only one database was ever served and is a live one
+# now that several are.
 #
 # Self-contained. Override PGBIN, PGDATA, PGKS_PG_PORT, PGKS_RESP_PORT.
 set -uo pipefail
@@ -61,9 +67,16 @@ su postgres -c "$PGBIN/initdb -D $PGDATA -U postgres" >/dev/null 2>&1
   echo "pg_keyspace.require_mask = off"
   echo "pg_keyspace.rowcache_decode = on"
   echo "pg_keyspace.rowcache_decode_ms = 500"
+  # Two databases are served here (section 4), so give each one its own pool
+  # worker: cycling is a different property and has its own harness
+  # (run_rowcache_multidb.sh section 9).
+  echo "pg_keyspace.rowcache_invalidation_workers = 2"
   echo "wal_level = logical"
+  # One slot per participating database, plus the legacy slot section 1b
+  # creates by hand.
   echo "max_replication_slots = 8"
   echo "max_wal_senders = 8"
+  echo "max_worker_processes = 12"
 } >> $PGDATA/postgresql.conf
 chown -R postgres:postgres $PGDATA
 start_pg; wait_ready || { echo "NO START"; exit 1; }
@@ -78,7 +91,8 @@ Q "CREATE DATABASE proj_a TEMPLATE tmpl" >/dev/null
 Q "CREATE DATABASE proj_b TEMPLATE tmpl" >/dev/null
 Q "INSERT INTO public.orders VALUES (1,'SECRET-OF-PROJECT-A')" proj_a >/dev/null
 Q "INSERT INTO public.orders VALUES (1,'project-b-own-row')" proj_b >/dev/null
-# The worker serves proj_a, so that is where registration is allowed.
+# pg_keyspace.database is still where the RESP keyspace and persistence live;
+# since #120 it no longer decides which database the ROW CACHE serves.
 echo "pg_keyspace.database = 'proj_a'" >> $PGDATA/postgresql.conf
 restart
 Q "CREATE EXTENSION pg_keyspace" proj_a >/dev/null
@@ -159,17 +173,58 @@ chk "proj_b never saw proj_a's value at all" "0" \
     "$(Q "SELECT count(*) FROM public.orders WHERE v LIKE 'SECRET%'" proj_b)"
 
 echo
-echo "########## 4. registering outside the worker's database is refused ##########"
-# Previously this failed with `relation "supacache.rowcache_reg" does not exist`,
-# which named the symptom rather than the reason (#118).
+echo "########## 4. registering outside pg_keyspace.database now WORKS ##########"
+# This assertion is inverted from what it used to be, and deliberately so.
+#
+# It used to check that registration here was REFUSED, and the refusal was
+# right at the time: there was one invalidation slot and it lived in
+# pg_keyspace.database, so a table registered anywhere else would be cached and
+# then never invalidated -- stale indefinitely, with coherence still reporting
+# healthy because it described the worker rather than your table (#118).
+#
+# #120 removed the cause rather than the symptom: every database with
+# registrations gets its own slot and its own turn in a bounded pool. So the
+# refusal goes, and what replaces it is the stronger claim -- proj_b is served
+# from the cache AND still cannot see proj_a's rows.
+#
+# Sections 1-3 above are untouched and matter MORE than they did, not less:
+# cross-database isolation was a latent hazard when only one database was ever
+# served, and is a live one now that both are.
 Q "CREATE EXTENSION pg_keyspace" proj_b >/dev/null 2>&1
-REG_B=$(Q "SELECT supacache.rowcache_register('public.orders')" proj_b)
-chk "registration from the wrong database returns false, not an error" "f" \
-    "$(echo "$REG_B" | grep -o '^[ft]$' | head -1)"
-chk "and says why, naming pg_keyspace.database" "1" \
-    "$(echo "$REG_B" | grep -c "pg_keyspace.database" || true)"
-chk "proj_b still reads its own row afterwards" "project-b-own-row" \
+chk "registration from a second database succeeds" "t" \
+    "$(Q "SELECT supacache.rowcache_register('public.orders')" proj_b)"
+for _ in $(seq 1 90); do
+  [ "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" proj_b)" = "t" ] && break
+  sleep 1
+done
+chk "proj_b becomes coherent under its own slot" "t" \
+    "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" proj_b)"
+B_DBOID=$(Q "SELECT oid FROM pg_database WHERE datname='proj_b'")
+chk "and that slot is proj_b's own, not proj_a's" "proj_b" \
+    "$(Q "SELECT database FROM pg_replication_slots WHERE slot_name='supacache_rowcache_$B_DBOID'")"
+chk "proj_b is now served from the cache" "1" \
+    "$(Q "SELECT supacache.rowcache_put('public.orders', 1)" proj_b >/dev/null;
+        Q "EXPLAIN SELECT v FROM public.orders WHERE id=1" proj_b | grep -c pg_keyspace_rowcache)"
+# The #117 assertion, repeated under the regime that makes it live. Identical
+# relids, both databases cached, one shared segment -- and still each reads only
+# its own row.
+chk "and STILL reads its own row, not proj_a's" "project-b-own-row" \
     "$(Q "SELECT v FROM public.orders WHERE id=1" proj_b)"
+chk "proj_a is likewise unaffected" "SECRET-OF-PROJECT-A" \
+    "$(Q "SELECT v FROM public.orders WHERE id=1" proj_a)"
+chk "neither database ever saw the other's value" "0" \
+    "$(Q "SELECT count(*) FROM public.orders WHERE v LIKE 'SECRET%'" proj_b)"
+# Invalidation is per-database too: a write in proj_b must not disturb proj_a's
+# cached row, and must reach proj_b's.
+Q "UPDATE public.orders SET v='project-b-updated' WHERE id=1" proj_b >/dev/null
+OKB=timeout
+for _ in $(seq 1 90); do
+  [ "$(Q "SELECT v FROM public.orders WHERE id=1" proj_b)" = "project-b-updated" ] && { OKB=ok; break; }
+  sleep 1
+done
+chk "a write in proj_b is invalidated in proj_b" "ok" "$OKB"
+chk "and proj_a's cached row is untouched by it" "SECRET-OF-PROJECT-A" \
+    "$(Q "SELECT v FROM public.orders WHERE id=1" proj_a)"
 
 stop_pg
 echo
