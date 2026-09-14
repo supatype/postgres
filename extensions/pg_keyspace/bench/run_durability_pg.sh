@@ -1178,7 +1178,7 @@ if [ "$PLUGIN_OK" = "1" ]; then
   # decisive rather than vacuous: the changes really were read before they were
   # lost.
   psql_ "UPDATE public.inv66 SET v='v2'" >/dev/null
-  ( psql_ "BEGIN; LOCK TABLE public.inv66 IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(45); COMMIT" >/dev/null 2>&1 ) &
+  ( psql_ "BEGIN; LOCK TABLE public.inv66 IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(20); COMMIT" >/dev/null 2>&1 ) &
   LOCKER=$!
 
   # The lock must actually be GRANTED before any of this means anything. Sleeping
@@ -1201,8 +1201,20 @@ if [ "$PLUGIN_OK" = "1" ]; then
   # #120 removed that margin: a pool worker that ERRORs is relaunched promptly
   # and drains on connect instead of waiting out an interval. Several decode
   # intervals have passed by now, so the apply has failed repeatedly, and the
-  # lock is still held for ~20s more while the three assertions below read.
-  sleep 24
+  # lock is still held for ~8s more while the three assertions below read.
+  #
+  # Twelve seconds into a TWENTY second lock, not twenty-four into a forty-five.
+  # Lengthening the lock to buy margin backfired: each failed apply ERRORs the
+  # worker, and rowcache_pool_relaunch launches the replacement with
+  # load_dynamic(), which can fail while the dying worker's slot is still held.
+  # That path is handled -- the heartbeat is backdated so health_watchdog retries
+  # -- but on the STALE timescale, tens of seconds, not the 4s decode interval.
+  # Forty-five seconds of churn is ~11 deaths instead of ~5, which is a real
+  # chance of ending the lock with nothing alive to apply, and the run then fails
+  # the LAST assertion of this section instead of serving anything stale.
+  # Measuring earlier is strictly better than locking longer: three failed
+  # attempts at a 4s interval is already decisive.
+  sleep 12
   ERRS=$(tail -n +$((LOG0+1)) $PGDATA/log | grep -c "rowcache invalidation worker.*exit code 1" || true)
   PMT1=$(psql_ "SELECT pg_postmaster_start_time()")
   LSN1=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='$SLOT'")
@@ -1227,12 +1239,21 @@ if [ "$PLUGIN_OK" = "1" ]; then
 UNION ALL SELECT v FROM public.inv66 WHERE id=99 UNION ALL SELECT v FROM public.inv66 WHERE id=150 \
 UNION ALL SELECT v FROM public.inv66 WHERE id=200"
   STALE=""
+  # Both halves, because the value alone does not distinguish them. An
+  # INCOHERENT cache falls back to the heap and returns 'v2' too, so polling only
+  # on the value passes just as readily when the cache has given up as when the
+  # invalidation was applied -- which is exactly what it did on PG17 in the run
+  # that caught the churn above, reporting success two lines before the slot
+  # assertion revealed nothing had run at all.
+  COH=""
   for _ in $(seq 1 20); do
     STALE=$(psql_ "SELECT count(*) FROM ($SAMPLE) s WHERE v <> 'v2'")
-    [ "$STALE" = "0" ] && break
+    COH=$(psql_ "SELECT coherent FROM supacache.rowcache_coherence()")
+    [ "$STALE" = "0" ] && [ "$COH" = "t" ] && break
     sleep 2
   done
   chk "the cache is coherent once the apply can run again" "0" "$STALE"
+  chk "...and coherent, not merely falling back to the heap" "t" "$COH"
 
   # And the slot must move once a batch really has been applied, or the fix
   # would trade lost invalidations for unbounded WAL retention.
