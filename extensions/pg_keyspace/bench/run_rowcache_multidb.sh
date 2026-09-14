@@ -370,6 +370,12 @@ echo "########## 10. a database that cannot get a slot is INCOHERENT, not health
 for d in $DBS; do Q "SELECT pg_drop_replication_slot('$(slot_of $d)')" postgres >/dev/null 2>&1; done
 set_conf "max_replication_slots" "4"
 restart
+# Mark the log HERE. The death check below is titled "over it" -- over the
+# exhaustion this section arranges -- but it grepped the whole file, so a worker
+# that died in any earlier section (which unregister tables, drop slots and
+# restart) was reported as this section's failure. Scope it, or the assertion
+# claims more than it measures.
+LOG10=$(wc -l < $PGDATA/log)
 for i in 1 2 3; do Q "SELECT pg_create_physical_replication_slot('hog_$i')" postgres >/dev/null; done
 chk "(setup) three of the four slots are taken by something else" "3" \
     "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'hog\\_%'")"
@@ -413,8 +419,21 @@ chk "the database that did get a slot is still served" "t" \
                WHERE state='participating' AND coherent")" -ge 1 ] && echo t || echo f)"
 # And no crash loop: catching exhaustion by ASKING FIRST rather than by letting
 # the ERROR longjmp out of SPI is what keeps the worker alive to log it (#130).
-chk "no invalidation worker died over it" "0" \
-    "$(grep -ciE 'rowcache invalidation worker.*(exit code 1|terminated by signal)' $PGDATA/log || true)"
+DEATHS=$(tail -n +$((LOG10+1)) $PGDATA/log | grep -ciE 'rowcache invalidation worker.*(exit code 1|terminated by signal)' || true)
+chk "no invalidation worker died over it" "0" "$DEATHS"
+# Which death, and next to which slot error, decides whether the guard has a
+# hole or something outside this section killed the worker. A count says neither.
+[ "${DEATHS:-0}" != "0" ] && {
+  echo "--- worker deaths in this section ---"
+  tail -n +$((LOG10+1)) $PGDATA/log \
+    | grep -iE 'rowcache invalidation|replication slot|all replication slots|max_replication_slots' \
+    | tail -25 | sed 's/^/  /'
+  echo "--- slots now ---"
+  Q "SELECT slot_name, database, plugin, active, wal_status FROM pg_replication_slots ORDER BY slot_name" \
+    | sed 's/^/  /'
+  echo "  max_replication_slots: $(Q "SHOW max_replication_slots")"
+  echo "---"
+}
 
 stop_pg
 echo
