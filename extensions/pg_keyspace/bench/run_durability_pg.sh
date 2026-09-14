@@ -65,7 +65,23 @@ rcli()  { timeout "$RCLI_TIMEOUT" redis-cli -p $RESP "$@" 2>&1; }
 # ARG_MAX. redis-cli -x appends stdin as the final argument.
 rcli_x() { local f="$1"; shift; timeout "$RCLI_TIMEOUT" redis-cli -p $RESP -x "$@" < "$f" 2>&1; }
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
-stop_pg()  { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop" >/dev/null 2>&1; }
+# `pg_ctl -w stop` gives up after its own timeout and returns non-zero with the
+# postmaster STILL shutting down. Discarding that status and starting another one
+# a second later starts it on top of a live postmaster: that start fails, and
+# every readiness poll then reads `FATAL: the database system is shutting down`
+# until the loop expires -- surfacing as whichever assertion came next, pointing
+# at the feature under test and nothing to do with it (#120). Shutdown length
+# tracks how much the persistence worker has to flush, so it bites after a heavy
+# section and passes everywhere else. Verify it rather than assume it.
+stop_pg() {
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 120 stop -m fast" >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    su postgres -c "$PGBIN/pg_ctl -D $PGDATA status" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 60 stop -m immediate" >/dev/null 2>&1
+  return 0
+}
 wait_ready() { for _ in $(seq 1 30); do psql_ "SELECT 1" | grep -q "^1$" && return 0; sleep 1; done; return 1; }
 # The row cache is only served while its invalidation worker is beating (#39),
 # so anything asserting the cache is used has to wait for that rather than sleep
@@ -612,7 +628,18 @@ SBPORT=$((PORT + 10))
 # build default and every psql -h /tmp against it fails, which looks exactly
 # like a standby that never started.
 sb_start() { su postgres -c "$PGBIN/pg_ctl -D $SBDATA -l $SBDATA/log -o \"-p $SBPORT -k /tmp\" -w start" >/dev/null 2>&1; }
-sb_stop()  { su postgres -c "$PGBIN/pg_ctl -D $SBDATA -m fast -w stop" >/dev/null 2>&1; }
+# Verified like stop_pg above: this standby is stopped in section T and started
+# again a few assertions later, so a stop that had not finished would start on
+# top of a live postmaster (#120).
+sb_stop() {
+  su postgres -c "$PGBIN/pg_ctl -D $SBDATA -m fast -w -t 120 stop" >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    su postgres -c "$PGBIN/pg_ctl -D $SBDATA status" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  su postgres -c "$PGBIN/pg_ctl -D $SBDATA -m immediate -w -t 60 stop" >/dev/null 2>&1
+  return 0
+}
 
 stop_pg; sleep 1
 set_conf "wal_level" "replica"
