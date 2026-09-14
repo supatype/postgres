@@ -1178,20 +1178,48 @@ if [ "$PLUGIN_OK" = "1" ]; then
   # decisive rather than vacuous: the changes really were read before they were
   # lost.
   psql_ "UPDATE public.inv66 SET v='v2'" >/dev/null
-  ( psql_ "BEGIN; LOCK TABLE public.inv66 IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(20); COMMIT" >/dev/null 2>&1 ) &
+  ( psql_ "BEGIN; LOCK TABLE public.inv66 IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(45); COMMIT" >/dev/null 2>&1 ) &
   LOCKER=$!
-  sleep 22
-  wait $LOCKER 2>/dev/null
 
+  # The lock must actually be GRANTED before any of this means anything. Sleeping
+  # and hoping is how a precondition gets reproduced by luck rather than by
+  # construction, so wait for it in pg_locks and fail loudly if it never lands.
+  LOCKED=0
+  for _ in $(seq 1 20); do
+    LOCKED=$(psql_ "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid=l.relation \
+                    WHERE c.relname='inv66' AND l.mode='AccessExclusiveLock' AND l.granted")
+    [ "${LOCKED:-0}" -ge 1 ] && break
+    sleep 1
+  done
+  chk "the apply-blocking lock was actually granted" "1" \
+      "$([ "${LOCKED:-0}" -ge 1 ] && echo 1 || echo 0)"
+
+  # Measure INSIDE the lock, not after it. Once the lock goes away the batch
+  # applies for real and the slot advances legitimately, so a reading taken
+  # afterwards cannot tell "never applied" from "applied a moment ago" -- it only
+  # ever passed on the margin between a 20s lock and a 4s decode interval, and
+  # #120 removed that margin: a pool worker that ERRORs is relaunched promptly
+  # and drains on connect instead of waiting out an interval. Several decode
+  # intervals have passed by now, so the apply has failed repeatedly, and the
+  # lock is still held for ~20s more while the three assertions below read.
+  sleep 24
   ERRS=$(tail -n +$((LOG0+1)) $PGDATA/log | grep -c "rowcache invalidation worker.*exit code 1" || true)
   PMT1=$(psql_ "SELECT pg_postmaster_start_time()")
   LSN1=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='$SLOT'")
+  STILL=$(psql_ "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid=l.relation \
+                 WHERE c.relname='inv66' AND l.mode='AccessExclusiveLock' AND l.granted")
+  chk "and it was still held when the slot was read" "1" \
+      "$([ "${STILL:-0}" -ge 1 ] && echo 1 || echo 0)"
 
   chk "the apply failed while the lock was held" "1" "$([ "${ERRS:-0}" -ge 1 ] && echo 1 || echo 0)"
   chk "the cluster stayed up, so the row cache survived the failure" "$PMT0" "$PMT1"
   # The assertion this section exists for. Consuming before applying moved the
   # slot here, and those invalidations were never seen again.
   chk "the slot did not advance past changes that were never applied" "$LSN0" "$LSN1"
+
+  # Only now let the lock go, so the replay below is the FIRST chance the batch
+  # has had to apply.
+  wait $LOCKER 2>/dev/null
 
   # With the lock gone the same batch is re-read and applied. Both terminal
   # actions are idempotent, so the replay converges rather than double-applying.
