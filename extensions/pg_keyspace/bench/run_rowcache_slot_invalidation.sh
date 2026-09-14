@@ -298,8 +298,22 @@ chk "the log says the cached rows were dropped rather than resumed over" "t" \
 
 echo
 echo "########## 6. the slot is rebuilt and the database is served again ##########"
+# Raise the bound FIRST. This section is about recovery, not about the bound, and
+# leaving it at the hostile 128MB that caused the loss makes the rebuild a race
+# against a cluster that has just churned most of a gigabyte of WAL: the new slot
+# can be invalidated again before it ever reserves any -- observed one second
+# after a rebuild with restart_lsn still null. Raising it is also exactly what an
+# operator does to recover, so this models the real remedy rather than hoping the
+# WAL rate happens to fall. SIGHUP-able, so no restart.
+set_conf "max_slot_wal_keep_size" "-1"
+su postgres -c "$PGBIN/pg_ctl -D $PGDATA reload" >/dev/null 2>&1
+sleep 1
+# Poll on BOTH: coherence alone was satisfied while the slot sat there lost,
+# because rowcache_coherence() judges the directory and never the slot.
 for _ in $(seq 1 120); do
-  [ "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" victim)" = "t" ] && break
+  [ "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" victim)" = "t" ] \
+    && [ "$(Q "SELECT count(*) FROM pg_replication_slots
+                WHERE slot_name='$VS' AND wal_status <> 'lost'")" = "1" ] && break
   sleep 1
 done
 chk "the victim is coherent again" "t" \
@@ -323,7 +337,7 @@ chk "a healthy slot exists for it once more" "1" "$HEALTHY"
   echo "  LSN0 (where the lost one stopped): $LSN0"
   echo "--- per-database view ---"
   Q "SELECT datname, state, registrations, coherent, slot_lost, slot_name,
-            last_drained_ms_ago, stale_after_ms
+            beat_age_ms, stale_after_ms
        FROM supacache.pg_stat_keyspace_rowcache_databases ORDER BY datname" | sed 's/^/  /'
   echo "--- recovery lines in the log ---"
   grep -E "rebuilt|cannot recreate|cannot drop lost|has been invalidated" $PGDATA/log | tail -6 | sed 's/^/  /'

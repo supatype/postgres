@@ -4350,6 +4350,27 @@ fn recover_lost_slot(datoid: u32, slot: &str) {
         log!("pg_keyspace invalidation: cannot recreate slot '{slot}': {why}");
         return;
     }
+    // A rebuilt slot can be invalidated again before it ever reserves WAL.
+    // Observed one second after the rebuild with `restart_lsn` still null, on a
+    // cluster whose max_slot_wal_keep_size cannot cover its own WAL rate.
+    //
+    // Clearing `slot_lost` anyway reports this database COHERENT with a dead
+    // slot, which is the failure this whole path exists to prevent, reached from
+    // the other side: the cache was purged moments ago, so read-through refills
+    // it with rows nothing will ever invalidate, and `rowcache_coherence()` --
+    // which judges on this flag and the heartbeat, never on the slot -- says
+    // everything is fine. Leave it marked and let the next pass retry. A
+    // database whose slot cannot survive is exactly the case that must fail
+    // closed.
+    if slot_wal_status(slot).as_deref() == Some("lost") {
+        log!(
+            "pg_keyspace invalidation: slot '{slot}' was invalidated again as soon as it \
+             was rebuilt, so this database stays incoherent and its reads keep falling \
+             back to the heap. max_slot_wal_keep_size is too small for this cluster's \
+             WAL rate; raise it, or this database cannot hold a cache at all."
+        );
+        return;
+    }
     // The registrations were deliberately not purged, but the marker may have
     // been lost with the segment at some earlier point; reloading is O(1) when
     // there is nothing to do.
