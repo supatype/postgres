@@ -3507,31 +3507,38 @@ fn ensure_decode_slot(slot: &str) -> Result<(), String> {
     // participating database, so running out is an ordinary misconfiguration
     // rather than an exotic failure. Asking first turns it into a returned
     // error, a log line naming the database, and a cache that fails closed.
-    let room = BackgroundWorker::transaction(AssertUnwindSafe(|| {
-        Spi::get_one::<bool>(
-            "SELECT (SELECT count(*) FROM pg_replication_slots) \
-                  < current_setting('max_replication_slots')::int",
-        )
-        .ok()
-        .flatten()
-        .unwrap_or(true) // a failed read must not block slot creation
-    }));
-    if !room {
-        return Err(
-            "every replication slot is in use; raise max_replication_slots. The row \
-             cache needs one slot per database that registers a table, on top of \
-             whatever replication this cluster already does"
-                .to_string(),
-        );
-    }
+    // ONE lock for all row-cache slot creation, not one per slot name, and the
+    // capacity check INSIDE it.
+    //
+    // Keying the lock on the slot name only serialises creators of the SAME
+    // slot, which is the wrong race. Slots are a CLUSTER-wide resource: the
+    // contention that matters is several databases -- different slot names, so
+    // different locks -- reaching for the last free slot at once. Each passes a
+    // capacity check taken outside any lock, one wins, and the losers get
+    // `all replication slots are in use` from
+    // pg_create_logical_replication_slot. That is a Postgres ERROR inside SPI:
+    // it longjmps out, the `map_err` below never sees it (#130), and the worker
+    // dies. Checking first turned the crash LOOP into a single death per
+    // starved database; it could not remove the death, because a check outside
+    // the lock is not a guard.
+    //
+    // Holding one lock across check-capacity/check-exists/create makes the
+    // losers observe the full cluster and return the operator-facing error
+    // instead of raising. Slot creation happens once per database lifetime, so
+    // serialising it cluster-wide costs nothing.
+    //
+    // This does not make exhaustion impossible -- a slot can still be taken by
+    // something outside pg_keyspace between the check and the create -- but it
+    // removes the self-inflicted race, which is the one this design creates by
+    // needing a slot per database.
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
-        Spi::connect(|client| {
+        let outcome: Result<Result<(), String>, pgrx::spi::Error> = Spi::connect(|client| {
             client.select(
-                "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                "SELECT pg_advisory_xact_lock($1, $2)",
                 None,
                 Some(vec![
                     (PgBuiltInOids::INT4OID.oid(), SLOT_ADVISORY_NS.into_datum()),
-                    (PgBuiltInOids::TEXTOID.oid(), slot.into_datum()),
+                    (PgBuiltInOids::INT4OID.oid(), SLOT_ADVISORY_KEY.into_datum()),
                 ]),
             )?;
             let taken = client
@@ -3546,17 +3553,38 @@ fn ensure_decode_slot(slot: &str) -> Result<(), String> {
                 .flatten()
                 .unwrap_or(false);
             if taken {
-                return Ok(());
+                return Ok(Ok(()));
             }
-            client
+            let room = client
                 .select(
-                    "SELECT pg_create_logical_replication_slot($1, 'supacache_keys')",
+                    "SELECT (SELECT count(*) FROM pg_replication_slots) \
+                          < current_setting('max_replication_slots')::int",
                     None,
-                    Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())]),
-                )
-                .map(|_| ())
-        })
-        .map_err(|e| e.to_string())
+                    None,
+                )?
+                .first()
+                .get::<bool>(1)
+                .ok()
+                .flatten()
+                .unwrap_or(true); // a failed read must not block slot creation
+            if !room {
+                return Ok(Err("every replication slot is in use; raise \
+                     max_replication_slots. The row cache needs one slot per database \
+                     that registers a table, on top of whatever replication this \
+                     cluster already does"
+                    .to_string()));
+            }
+            client.select(
+                "SELECT pg_create_logical_replication_slot($1, 'supacache_keys')",
+                None,
+                Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())]),
+            )?;
+            Ok(Ok(()))
+        });
+        match outcome {
+            Ok(inner) => inner,
+            Err(e) => Err(e.to_string()),
+        }
     }))
 }
 
@@ -3564,6 +3592,11 @@ fn ensure_decode_slot(slot: &str) -> Result<(), String> {
 /// `pg_advisory_xact_lock(ns, key)` partitions the advisory space by its first
 /// argument, so this only has to not collide with another caller's choice.
 const SLOT_ADVISORY_NS: i32 = 0x7073_6b73; // "pgks"
+
+/// The single key within that namespace. Fixed rather than derived from the
+/// slot name, because slots are a cluster-wide resource and the race worth
+/// serialising is between DIFFERENT databases competing for the last one.
+const SLOT_ADVISORY_KEY: i32 = 1;
 
 /// How much WAL one drain pass consumes at most.
 ///
