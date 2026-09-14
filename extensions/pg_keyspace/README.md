@@ -1384,7 +1384,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
 | `pg_keyspace.max_value_bytes` | 536870912 | largest value accepted from a client; matches Valkey/Redis `proto-max-bulk-len` |
 | `pg_keyspace.durability` | `ephemeral` | `ephemeral` \| `relaxed` \| `durable` \| `replicated` |
-| `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables, **and the only database the row cache serves** |
+| `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables (Mode A), and the one worker 0 auto-upgrades. Since #120 it does **not** bound the row cache: Mode B serves every database that registers a table |
 | `pg_keyspace.persist_workers` | 1 | persist workers/rings draining in parallel |
 | `pg_keyspace.ring_mb` | 64 | per-worker RESP→persist ring size (burst absorption) |
 | `pg_keyspace.ttl_bucket_secs` | 10 | TTL time-bucket width (range-partitioned `supacache.kv_ttl`) |
@@ -1580,8 +1580,8 @@ records 44 worker deaths in a minute; with it, none.
 `run_extension_upgrade.sh` builds a genuine 0.1.0 install from the archived
 release schema, runs `ALTER EXTENSION pg_keyspace UPDATE`, and requires the
 result to be **identical** to a fresh `CREATE EXTENSION` — signatures, argument
-names, ACLs, comments and view definitions, all 46 objects. That equivalence is
-what keeps `sql/pg_keyspace--0.1.0--0.2.0.sql` from drifting away from
+names, ACLs, comments and view definitions, all 48 objects. That equivalence is
+what keeps the upgrade scripts from drifting away from
 `lib.rs`: delete one `COMMENT ON VIEW` from the upgrade script and it fails on
 that comment; delete the `pg_monitor` grant and it fails on ten ACLs and on the
 `pg_monitor` read. It also records the pre-upgrade symptoms, including the quiet
@@ -1589,11 +1589,11 @@ one — see below.
 
 `run_extension_autoupgrade.sh` covers the other half: that nobody has to run the
 command. It creates a genuine 0.1.0 install, restarts, and asserts the catalogue
-reached 0.2.0 with no `ALTER EXTENSION` anywhere in the test — then that a second
+reached 0.3.0 with no `ALTER EXTENSION` anywhere in the test — then that a second
 restart is a silent no-op, that `pg_keyspace.auto_upgrade = off` leaves the
 version where it is while still reporting the skew, and that turning it back on
 repairs the same cluster. Section 6 is the one that earns its place: it removes
-the upgrade script, so the update *cannot* succeed, and requires the worker to
+the **last hop** of the chain, so the update can start and *cannot* finish, and requires the worker to
 log one warning, start exactly once, and go on serving its segment — a worker
 that died there would crash-loop, which is #130's failure mode, not a new one.
 
@@ -1630,7 +1630,7 @@ compares the installed extension against the library's `default_version` and, if
 they differ, runs the update itself:
 
 ```
-LOG:  pg_keyspace worker: upgraded the extension catalogue 0.1.0 -> 0.2.0
+LOG:  pg_keyspace worker: upgraded the extension catalogue 0.1.0 -> 0.3.0
 ```
 
 So taking a newer `pg_keyspace.so` and restarting is the whole procedure. This
@@ -1643,7 +1643,24 @@ Three things bound it, all deliberate:
 
 - **It applies to the database named by `pg_keyspace.database`.** A background
   worker connects to one database. Any *other* database holding the extension is
-  still yours to update by hand.
+  still yours to update by hand — and since #120 that is no longer a corner case.
+  Using the row cache in a database means creating the extension there, so a
+  cluster with ten tenant databases has ten catalogues, of which worker 0
+  upgrades one. `pg_extension` is per-database, so no single query finds the
+  rest: list the candidates and run the update in each.
+
+  ```bash
+  for d in $(psql -At -c "SELECT datname FROM pg_database
+                           WHERE datallowconn AND NOT datistemplate"); do
+    psql -d "$d" -c 'ALTER EXTENSION pg_keyspace UPDATE' 2>/dev/null
+  done
+  ```
+
+  It is a no-op where the version already matches, and errors harmlessly where
+  the extension is not installed.
+
+  A stale catalogue in a tenant database fails the way described above: missing
+  objects announce themselves, a stale *signature* does not.
 - **It never runs on a standby.** A replica's catalogue is replayed from the
   primary, so the check reports the skew and leaves it alone; upgrade the primary.
 - **It cannot take the worker down.** `ALTER EXTENSION` raises for reasons that
@@ -1659,16 +1676,22 @@ you the command instead of running it:
 
 ```sql
 ALTER EXTENSION pg_keyspace UPDATE;
-SELECT extversion FROM pg_extension WHERE extname = 'pg_keyspace';  -- 0.2.0
+SELECT extversion FROM pg_extension WHERE extname = 'pg_keyspace';  -- 0.3.0
 ```
 
-`0.1.0 -> 0.2.0` adds seventeen functions and the ten `pg_stat_keyspace*` views,
-and replaces `ring_stats()`, which went from three columns to seven.
+The path is a **chain** — `0.1.0 -> 0.2.0 -> 0.3.0` — and Postgres walks it on
+its own from a single `ALTER EXTENSION`. `0.1.0 -> 0.2.0` adds seventeen
+functions and ten `pg_stat_keyspace*` views, and replaces `ring_stats()`, which
+went from three columns to seven. `0.2.0 -> 0.3.0` is #120: `invalidation_stats()`
+and `rowcache_coherence()` change their **return type**, which `CREATE OR REPLACE`
+cannot do, so both are dropped and recreated along with the two views that select
+from them; `rowcache_databases()` and
+`supacache.pg_stat_keyspace_rowcache_databases` are new, making eleven views.
 
 That last one is worth knowing because of how it fails without the update.
 Missing objects announce themselves — `supacache.pg_stat_keyspace` simply does
 not exist. A *stale* entry does not: the 0.1.0 catalogue still describes
-`ring_stats()` as three columns, so calling it against the 0.2.0 library raises
+`ring_stats()` as three columns, so calling it against a newer library raises
 nothing and returns `pushed`, `dropped`, `backlog_bytes` exactly as before.
 `committed`, `lag`, `failed_batches` and `unresolved` are not absent so much as
 invisible. Nothing in the logs marks the difference.
