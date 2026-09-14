@@ -347,6 +347,13 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_extension_upgrade.sh
 
+      - name: Extension catalogue self-upgrade
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_extension_autoupgrade.sh
+
       - name: Row-cache crash regressions
         env:
           PGKS_BUILD_PROFILE: debug

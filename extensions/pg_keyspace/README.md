@@ -1398,6 +1398,16 @@ that comment; delete the `pg_monitor` grant and it fails on ten ACLs and on the
 `pg_monitor` read. It also records the pre-upgrade symptoms, including the quiet
 one — see below.
 
+`run_extension_autoupgrade.sh` covers the other half: that nobody has to run the
+command. It creates a genuine 0.1.0 install, restarts, and asserts the catalogue
+reached 0.2.0 with no `ALTER EXTENSION` anywhere in the test — then that a second
+restart is a silent no-op, that `pg_keyspace.auto_upgrade = off` leaves the
+version where it is while still reporting the skew, and that turning it back on
+repairs the same cluster. Section 6 is the one that earns its place: it removes
+the upgrade script, so the update *cannot* succeed, and requires the worker to
+log one warning, start exactly once, and go on serving its segment — a worker
+that died there would crash-loop, which is #130's failure mode, not a new one.
+
 ---
 
 ## Backup, restore and upgrade
@@ -1426,7 +1436,37 @@ cluster that takes a newer image keeps whatever catalogue it had when the
 extension was first created, so fixes that live in the shared library arrive on
 their own and SQL objects never do.
 
-So after upgrading the image, run this once per database that has the extension:
+**In the normal case you do not have to do anything.** At start-up worker 0
+compares the installed extension against the library's `default_version` and, if
+they differ, runs the update itself:
+
+```
+LOG:  pg_keyspace worker: upgraded the extension catalogue 0.1.0 -> 0.2.0
+```
+
+So taking a newer `pg_keyspace.so` and restarting is the whole procedure. This
+lives in the extension rather than in any image's bootstrap on purpose:
+pg_keyspace runs standalone on plain Postgres, an AMI, bare metal or someone
+else's container, and a fix wired into one project's init scripts would reach
+none of them.
+
+Three things bound it, all deliberate:
+
+- **It applies to the database named by `pg_keyspace.database`.** A background
+  worker connects to one database. Any *other* database holding the extension is
+  still yours to update by hand.
+- **It never runs on a standby.** A replica's catalogue is replayed from the
+  primary, so the check reports the skew and leaves it alone; upgrade the primary.
+- **It cannot take the worker down.** `ALTER EXTENSION` raises for reasons that
+  are not emergencies — no update path between two versions, an upgrade script
+  missing from the install — and a worker that died on one would take the
+  keyspace out of service on a relaunch loop. The statement runs inside a
+  `DO ... EXCEPTION` block, so a failure is a `WARNING` in the log and start-up
+  continues on the old catalogue.
+
+Set `pg_keyspace.auto_upgrade = off` to keep the catalogue under your own
+control. The version check still runs and still reports a skew — it just tells
+you the command instead of running it:
 
 ```sql
 ALTER EXTENSION pg_keyspace UPDATE;

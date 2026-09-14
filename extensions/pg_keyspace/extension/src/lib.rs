@@ -132,6 +132,11 @@ static GUC_ROWCACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 /// either way.
 static GUC_REQUIRE_MASK: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// Keep the extension's SQL catalogue in step with the library that is running
+/// (#136). On by default: the failure it prevents is silent, and the operator
+/// who most needs the fix is the one who does not know to run the command.
+static GUC_AUTO_UPGRADE: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 /// TLS for the RESP wire: when both a cert and key file are set, every
 /// RESP connection is wrapped in TLS, so the AUTH password and values are
 /// encrypted in transit. Empty (default) = plaintext (put TLS termination in
@@ -1134,6 +1139,23 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_bool_guc(
+        "pg_keyspace.auto_upgrade",
+        "Bring the extension's SQL catalogue up to the running library at worker start",
+        "On (default): worker 0 runs ALTER EXTENSION pg_keyspace UPDATE when it finds the \
+         installed extension older than the library's default_version. Postgres runs an \
+         extension's SQL only at CREATE EXTENSION, so a cluster that takes a newer \
+         pg_keyspace.so otherwise keeps the catalogue it was created with: functions and \
+         views the library provides are absent, and a signature that gained columns reports \
+         the old shape without raising -- a failure with no error and no log line. Applies \
+         to the database named by pg_keyspace.database; a background worker connects to one \
+         database, so any other database holding the extension is still upgraded by hand. \
+         Off: the catalogue is the operator's to update, and the version skew is reported \
+         at start rather than repaired.",
+        &GUC_AUTO_UPGRADE,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
         "pg_keyspace.require_mask",
         "Require supatype_mask to be loaded (and outermost) before serving",
         "Off (default): pg_keyspace runs standalone, no supatype_mask dependency. \
@@ -1613,6 +1635,11 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         // Only worker 0 runs the (idempotent) DDL, so N workers do not race on
         // concurrent CREATE ... IF NOT EXISTS at startup.
         if w == 0 {
+            // Before the schema DDL, not after: everything below this point --
+            // the stats views, the registration catalogue, the functions the
+            // worker itself calls -- is the catalogue the library expects, and
+            // repairing it first means the rest of startup runs against it.
+            pg_catalogue_upgrade();
             pg_ensure_schema();
         }
     } else if persisted {
@@ -2114,6 +2141,99 @@ fn extension_installed() -> bool {
             .flatten()
             .unwrap_or(false)
     })
+}
+
+/// Bring the extension's SQL catalogue up to the running library (#136).
+///
+/// Postgres executes an extension's SQL exactly once, at CREATE EXTENSION. Take
+/// a newer pg_keyspace.so and the catalogue does not move with it: functions and
+/// views the library provides are simply absent, and -- worse, because it is
+/// quiet -- a function whose result columns changed keeps describing the old
+/// shape, so a call returns the old columns and raises nothing. Nothing in the
+/// logs marks the difference. The operator most exposed to that is the one who
+/// never learned there was a command to run, which is why this is on by default.
+///
+/// Deliberately cannot kill the worker. ALTER EXTENSION raises for reasons that
+/// are not emergencies -- no update path between two versions, an upgrade script
+/// that is absent from this install -- and a worker that dies on one would take
+/// the keyspace out of service on a five-second relaunch loop (#130). The
+/// statement runs inside a DO block with an exception handler, so a failure
+/// becomes a WARNING in the server log and this function returns normally.
+fn pg_catalogue_upgrade() {
+    // The version skew is worth reporting either way, so the check runs even
+    // when the repair does not.
+    let (installed, available) = match BackgroundWorker::transaction(|| {
+        (
+            Spi::get_one::<String>(
+                "SELECT extversion FROM pg_extension WHERE extname = 'pg_keyspace'",
+            )
+            .ok()
+            .flatten(),
+            Spi::get_one::<String>(
+                "SELECT default_version FROM pg_available_extensions WHERE name = 'pg_keyspace'",
+            )
+            .ok()
+            .flatten(),
+        )
+    }) {
+        (Some(i), Some(a)) => (i, a),
+        // No extension, or a library whose control file this cluster cannot see.
+        // Neither is this function's business to report on.
+        _ => return,
+    };
+    if installed == available {
+        return;
+    }
+
+    if !GUC_AUTO_UPGRADE.get() {
+        log!(
+            "pg_keyspace worker: the installed extension is version {installed} but this \
+             library ships {available}, and pg_keyspace.auto_upgrade is off. Objects added \
+             since {installed} are missing, and a function whose columns changed reports the \
+             old shape without raising. Run: ALTER EXTENSION pg_keyspace UPDATE"
+        );
+        return;
+    }
+
+    // A standby replays its catalogue from the primary. ALTER EXTENSION there
+    // fails as a read-only transaction, and it would fail again at every start.
+    if unsafe { pg_sys::RecoveryInProgress() } {
+        log!(
+            "pg_keyspace worker: the installed extension is version {installed} and this \
+             library ships {available}, but this cluster is in recovery. The catalogue \
+             follows the primary; upgrade there."
+        );
+        return;
+    }
+
+    BackgroundWorker::transaction(|| {
+        let _ = Spi::run(
+            "DO $ks_upgrade$ BEGIN \
+               ALTER EXTENSION pg_keyspace UPDATE; \
+             EXCEPTION WHEN OTHERS THEN \
+               RAISE WARNING 'pg_keyspace: automatic catalogue upgrade failed: % (%). \
+Run ALTER EXTENSION pg_keyspace UPDATE by hand to see the full error.', SQLERRM, SQLSTATE; \
+             END $ks_upgrade$",
+        );
+    });
+
+    // Reported from the catalogue rather than from having asked for it, so the
+    // log says what is true and not what was attempted.
+    let now = BackgroundWorker::transaction(|| {
+        Spi::get_one::<String>("SELECT extversion FROM pg_extension WHERE extname = 'pg_keyspace'")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string())
+    });
+    if now == available {
+        log!("pg_keyspace worker: upgraded the extension catalogue {installed} -> {now}");
+    } else {
+        log!(
+            "pg_keyspace worker: the extension catalogue is still {now} and this library \
+             ships {available}; see the warning above. Objects added since {now} are \
+             missing until ALTER EXTENSION pg_keyspace UPDATE succeeds."
+        );
+    }
 }
 
 /// Whether a relation exists, by name, without naming it in a statement that
