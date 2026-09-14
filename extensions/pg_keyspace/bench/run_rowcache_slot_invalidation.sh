@@ -247,22 +247,21 @@ chk "and the log names the victim's slot, not the bystander's" "t" \
 chk "its reads fall back to an ordinary index scan while the cache is empty" "0" \
     "$(Q "EXPLAIN (COSTS OFF) SELECT v FROM public.t WHERE id=1" victim | grep -c pg_keyspace_rowcache)"
 
-# The bystander is the non-racy half: it must be unaffected throughout, and
-# nothing about it changes, so this is a live check rather than a log one.
-chk "the bystander is still coherent" "t" \
-    "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" bystander)"
-chk "the bystander's slot was never invalidated" "0" \
-    "$(grep -c "slot '$BS' has been invalidated" $PGDATA/log || true)"
-# Re-warmed first. Several minutes of WAL went by during section 3, and the
-# bystander's own decoder will have caught up with the INSERT that predates its
-# cached copy and dropped it -- correctly, since that change is older than the
-# entry. Asserting on the pre-outage entry would be testing decode latency
-# rather than isolation.
-Q "SELECT supacache.rowcache_put('public.t', 1)" bystander >/dev/null
-chk "and it is still served from the cache" "1" \
-    "$(Q "EXPLAIN (COSTS OFF) SELECT v FROM public.t WHERE id=1" bystander | grep -c pg_keyspace_rowcache)"
-chk "the bystander still reads its own value" "v1-bystander" \
-    "$(Q "SELECT v FROM public.t WHERE id=1" bystander)"
+# NOTHING is asserted about the bystander here, and that is deliberate.
+#
+# `max_slot_wal_keep_size` bounds the CLUSTER, not one database against another.
+# A healthy decoder still retains WAL between advances, and that WAL is whatever
+# the whole cluster generated -- so the flood above can legitimately invalidate
+# a database that did nothing wrong. Measured: it does, at 32MB and at 128MB.
+#
+# Asserting "the bystander was untouched" here would be asserting a guarantee
+# the design does not make, and a test that demands one is a test that will be
+# quietly weakened later to make it pass. The property IS worth testing, so it
+# is tested in section 7 -- where the victim's slot is stalled WITHOUT a flood,
+# which is the condition under which isolation actually holds.
+chk "the per-database view names the victim" "1" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases
+          WHERE datname='victim'")"
 
 echo
 echo "########## 5. THE ASSERTION: no stale row survives the gap ##########"
@@ -308,6 +307,47 @@ chk "and invalidation works again afterwards" "t" \
          [ "$(Q "SELECT v FROM public.t WHERE id=1" victim)" = "after-recovery" ] && { ok=t; break; }; sleep 1; done; echo $ok)"
 chk "the bystander's slot was never touched" "1" \
     "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$BS' AND wal_status <> 'lost'")"
+
+echo
+echo "########## 7. ISOLATION: a stalled database does not stall its neighbour ##########"
+# "One database's stalled worker must not read as the whole cache being
+# incoherent, nor the reverse" -- the half a single-slot design could never have
+# got wrong, and the half that matters most now that the cache fails closed PER
+# DATABASE.
+#
+# No WAL flood this time: the victim's slot is simply stalled by an apply it
+# cannot complete, and left there. That isolates the property being tested from
+# the cluster-wide WAL bound, which is a different mechanism with a different
+# answer (see section 4).
+for d in victim bystander; do wait_coherent $d 120 >/dev/null; done
+Q "SELECT supacache.rowcache_put('public.t', 1)" bystander >/dev/null
+chk "(setup) both databases start coherent" "0" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases
+          WHERE state='participating' AND NOT coherent")"
+Q "UPDATE public.t SET v='stall-again' WHERE id=1" victim >/dev/null
+( Q "BEGIN; LOCK TABLE public.t IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(200); COMMIT" victim >/dev/null 2>&1 ) &
+L2=$!
+for _ in $(seq 1 30); do
+  [ "$(Q "SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid=l.database
+          WHERE l.mode='AccessExclusiveLock' AND l.granted AND d.datname='victim'")" -ge 1 ] && break
+  sleep 1
+done
+# Wait out the victim's staleness window, then check BOTH. The victim must have
+# gone stale and the bystander must not -- either half failing is the bug.
+STALE_MS=$(Q "SELECT stale_after_ms FROM supacache.rowcache_coherence()" victim)
+sleep $(( ${STALE_MS:-30000} / 1000 + 15 ))
+chk "the victim reads as incoherent, having gone undrained" "f" \
+    "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" victim)"
+chk "the bystander is unaffected and still coherent" "t" \
+    "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" bystander)"
+chk "and is still served from its cache" "1" \
+    "$(Q "EXPLAIN (COSTS OFF) SELECT v FROM public.t WHERE id=1" bystander | grep -c pg_keyspace_rowcache)"
+chk "the bystander reads its own value, not the victim's" "v1-bystander" \
+    "$(Q "SELECT v FROM public.t WHERE id=1" bystander)"
+chk "the per-database view names exactly one incoherent database" "victim" \
+    "$(Q "SELECT datname FROM supacache.pg_stat_keyspace_rowcache_databases
+          WHERE state='participating' AND NOT coherent")"
+kill $L2 2>/dev/null; wait $L2 2>/dev/null
 
 stop_pg
 echo
