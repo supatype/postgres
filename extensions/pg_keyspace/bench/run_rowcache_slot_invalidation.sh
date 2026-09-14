@@ -153,7 +153,7 @@ for d in victim bystander; do
       "$(Q "EXPLAIN (COSTS OFF) SELECT v FROM public.t WHERE id=1" $d | grep -c pg_keyspace_rowcache)"
   chk "  $d reads the right value" "v1-$d" "$(Q "SELECT v FROM public.t WHERE id=1" $d)"
 done
-chk "the bound is now reported as set" "32MB" \
+chk "the bound is now reported as set" "128MB" \
     "$(Q "SELECT DISTINCT max_slot_wal_keep_size FROM supacache.pg_stat_keyspace_invalidation" victim)"
 
 echo
