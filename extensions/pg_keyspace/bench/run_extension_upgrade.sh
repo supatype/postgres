@@ -154,7 +154,13 @@ echo "########## 1. an install as the shipped images left it ##########"
 # Preconditions. If this section does not describe a real 0.1.0 install then
 # everything below measures the wrong thing -- an upgrade from a catalogue that
 # already had the views would pass section 3 while proving nothing.
-chk "both versions are offered to CREATE EXTENSION" "$OLD_VER $NEW_VER" \
+# Every version in the chain is offerable, not just its ends: each upgrade
+# script makes its own target installable directly. Derived from CHAIN so that
+# adding a step does not need this line edited -- and so a step that failed to
+# package shows up here as a missing version rather than as a puzzle in
+# section 3.
+CHAIN_VERS=$(printf '%s\n' $CHAIN | tr -- '--' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')
+chk "every version in the chain is offered to CREATE EXTENSION" "$CHAIN_VERS" \
     "$(Q "SELECT string_agg(version, ' ' ORDER BY version) FROM pg_available_extension_versions WHERE name='pg_keyspace'")"
 Q "CREATE EXTENSION pg_keyspace VERSION '$OLD_VER'" upgraded >/dev/null
 chk "the extension installs at $OLD_VER" "$OLD_VER" \
