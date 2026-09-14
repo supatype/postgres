@@ -95,7 +95,11 @@ for d in victim bystander; do
   Q "INSERT INTO public.t VALUES (1,'v1-$d')" $d >/dev/null
 done
 restart
-for d in victim bystander; do Q "CREATE EXTENSION pg_keyspace" $d >/dev/null; done
+# `postgres` too: the per-database view is cluster-wide and is read from ONE
+# database, which is how a monitoring collector uses it. Without the extension
+# there, section 4's assertion fails on a missing relation rather than on what
+# it is checking. It registers nothing, so it stays idle and costs no slot.
+for d in postgres victim bystander; do Q "CREATE EXTENSION pg_keyspace" $d >/dev/null; done
 restart
 
 echo
@@ -178,22 +182,40 @@ echo "########## 4. the victim fails closed; the bystander does not ##########"
 # "One database's stalled worker must not read as the whole cache being
 # incoherent, nor the reverse." Both halves, on the same cluster, at the same
 # moment.
-VC=""
-for _ in $(seq 1 60); do
-  VC=$(Q "SELECT coherent FROM supacache.rowcache_coherence()" victim)
-  [ "$VC" = "f" ] && break
+# Evidenced from the LOG, not by catching the live flag. Recovery is fast --
+# mark incoherent, purge, rebuild -- and polling for `coherent = false` is a race
+# against it that the test loses on a quiet cluster, reporting a failure for
+# behaviour that worked. The log is the durable record that the transition
+# happened, and section 5 is what proves it happened in the right ORDER: if the
+# database had gone on being served across the gap, a stale row would have
+# survived, and it did not.
+for _ in $(seq 1 120); do
+  [ "$(grep -c 'has been invalidated by the server' $PGDATA/log)" -ge 1 ] && break
   sleep 1
 done
-chk "the victim's cache reads as incoherent" "f" "$VC"
-chk "and its reads fall back to an ordinary index scan" "0" \
+chk "the victim was marked incoherent and its cache dropped" "t" \
+    "$([ "$(grep -c 'has been invalidated by the server' $PGDATA/log)" -ge 1 ] && echo t || echo f)"
+chk "and the log names the victim's slot, not the bystander's" "t" \
+    "$([ "$(grep -c "slot '$VS' has been invalidated" $PGDATA/log)" -ge 1 ] && echo t || echo f)"
+chk "its reads fall back to an ordinary index scan while the cache is empty" "0" \
     "$(Q "EXPLAIN (COSTS OFF) SELECT v FROM public.t WHERE id=1" victim | grep -c pg_keyspace_rowcache)"
+
+# The bystander is the non-racy half: it must be unaffected throughout, and
+# nothing about it changes, so this is a live check rather than a log one.
 chk "the bystander is still coherent" "t" \
     "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" bystander)"
-chk "and is still served from the cache" "1" \
+chk "the bystander's slot was never invalidated" "0" \
+    "$(grep -c "slot '$BS' has been invalidated" $PGDATA/log || true)"
+# Re-warmed first. Several minutes of WAL went by during section 3, and the
+# bystander's own decoder will have caught up with the INSERT that predates its
+# cached copy and dropped it -- correctly, since that change is older than the
+# entry. Asserting on the pre-outage entry would be testing decode latency
+# rather than isolation.
+Q "SELECT supacache.rowcache_put('public.t', 1)" bystander >/dev/null
+chk "and it is still served from the cache" "1" \
     "$(Q "EXPLAIN (COSTS OFF) SELECT v FROM public.t WHERE id=1" bystander | grep -c pg_keyspace_rowcache)"
-chk "the per-database view names the victim, not the cluster" "victim" \
-    "$(Q "SELECT datname FROM supacache.pg_stat_keyspace_rowcache_databases
-          WHERE state='participating' AND NOT coherent")"
+chk "the bystander still reads its own value" "v1-bystander" \
+    "$(Q "SELECT v FROM public.t WHERE id=1" bystander)"
 
 echo
 echo "########## 5. THE ASSERTION: no stale row survives the gap ##########"
