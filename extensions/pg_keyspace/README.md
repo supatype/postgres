@@ -1006,6 +1006,24 @@ WAL from its `restart_lsn`: set `max_slot_wal_keep_size`. And if the slot is
 lost, the worker exits and the cache keeps serving whatever it holds with no
 further invalidation, so alert on the worker being alive rather than assuming.
 
+##### Removing it from a database
+
+`supacache.rowcache_reg` is created the first time you register a table in a
+database, and it is **not** an extension member — like `supacache.kv` and
+`supacache.acl`, it holds configuration you entered, so `DROP EXTENSION` must
+not quietly take it with them. The consequence is that a database with
+registrations needs
+
+```sql
+SELECT supacache.rowcache_unregister('public.orders');  -- or: DROP TABLE supacache.rowcache_reg;
+DROP EXTENSION pg_keyspace;
+```
+
+rather than `DROP EXTENSION` alone (`CASCADE` also works and takes the
+registrations with it). That was always true of `pg_keyspace.database`; since
+[#120](https://github.com/supatype/postgres/issues/120) it is true of any
+database you register a table in.
+
 ##### The slot is named for the database, not for the configuration
 
 `pg_keyspace.rowcache_slot` is the **stem** of the slot name; the slot itself is

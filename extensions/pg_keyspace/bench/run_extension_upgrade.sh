@@ -26,7 +26,12 @@ PORT=${PGKS_PG_PORT:-5469}
 RESP=${PGKS_RESP_PORT:-6469}
 PROFILE=${PGKS_BUILD_PROFILE:-release}
 OLD_VER=0.1.0
-NEW_VER=0.2.0
+NEW_VER=0.3.0
+# The upgrade is a CHAIN now: 0.1.0 -> 0.2.0 -> 0.3.0, with a script per step.
+# Postgres walks it on its own, so ALTER EXTENSION ... UPDATE TO the newest
+# version is still one statement -- but every step has to be packaged, which is
+# what section 0 checks. Add a step here when you add a script.
+CHAIN="0.1.0--0.2.0 0.2.0--0.3.0"
 pass=0; fail=0
 chk() {
   if [ "$2" = "$3" ]; then echo "PASS  $1"; pass=$((pass+1));
@@ -103,11 +108,15 @@ chk "the control file declares $NEW_VER" "$NEW_VER" \
     "$(grep -oP "(?<=^default_version = ')[^']+" $SHAREDIR/pg_keyspace.control)"
 chk "the $NEW_VER schema was installed" "1" \
     "$([ -f "$SHAREDIR/pg_keyspace--$NEW_VER.sql" ] && echo 1 || echo 0)"
-chk "the $OLD_VER -> $NEW_VER upgrade script was installed" "1" \
-    "$([ -f "$SHAREDIR/pg_keyspace--$OLD_VER--$NEW_VER.sql" ] && echo 1 || echo 0)"
-chk "it is the one from the source tree, byte for byte" "same" \
-    "$(cmp -s "$EXT_DIR/sql/pg_keyspace--$OLD_VER--$NEW_VER.sql" \
-              "$SHAREDIR/pg_keyspace--$OLD_VER--$NEW_VER.sql" && echo same || echo differs)"
+# Every step of the chain, not just the last one: a missing intermediate script
+# breaks the walk for exactly the installs that need it most -- the oldest ones.
+for step in $CHAIN; do
+  chk "  the $step upgrade script was installed" "1" \
+      "$([ -f "$SHAREDIR/pg_keyspace--$step.sql" ] && echo 1 || echo 0)"
+  chk "  and it is the one from the source tree, byte for byte" "same" \
+      "$(cmp -s "$EXT_DIR/sql/pg_keyspace--$step.sql" \
+                "$SHAREDIR/pg_keyspace--$step.sql" && echo same || echo differs)"
+done
 # Test data, not a shipped artefact: pgrx copies only the --old--new form and
 # does not recurse, so the archived release schema must NOT have been installed.
 chk "the archived $OLD_VER schema is not shipped by the install" "0" \
@@ -196,7 +205,7 @@ chk "a fresh CREATE EXTENSION gets $NEW_VER" "$NEW_VER" \
 Q "$CATALOGUE_SQL" upgraded > /tmp/pgks_cat_upgraded.txt
 Q "$CATALOGUE_SQL" fresh    > /tmp/pgks_cat_fresh.txt
 # Guard: an empty or error-filled dump would make the diff below pass vacuously.
-chk "the upgraded catalogue dumped $((35 + 10 + 1)) objects" "46" \
+chk "the upgraded catalogue dumped $((36 + 11 + 1)) objects" "48" \
     "$(grep -c '^\(function\|relation\|schema\)|' /tmp/pgks_cat_upgraded.txt)"
 chk "the fresh catalogue dumped the same number" \
     "$(grep -c '^\(function\|relation\|schema\)|' /tmp/pgks_cat_upgraded.txt)" \
@@ -217,7 +226,7 @@ for v in $VIEWS; do
   out=$(Q "SELECT count(*) >= 0 FROM supacache.$v" upgraded)
   [ "$out" = "t" ] || BAD="$BAD $v[$out]"
 done
-chk "all ten views are readable after the upgrade" "" "$BAD"
+chk "every view is readable after the upgrade" "" "$BAD"
 # #111's point: a pg_monitor member needs no grant beyond the role itself. The
 # upgrade script carries those grants, so this fails if it dropped them.
 BADM=""
@@ -254,7 +263,7 @@ ZERO_ARG=$(Q "SELECT p.proname FROM pg_proc p JOIN pg_depend d ON d.classid='pg_
 # An exact count, in the same spirit as the 18 above: a sweep that quietly
 # stopped finding functions would probe nothing and pass. Bump it deliberately
 # when a zero-argument function is added.
-chk "the sweep found all 16 zero-argument functions" "16" \
+chk "the sweep found all 17 zero-argument functions" "17" \
     "$(echo "$ZERO_ARG" | grep -c .)"
 for f in $ZERO_ARG; do probe "SELECT * FROM supacache.$f()" "$f()"; done
 # The rest take arguments, so they are named with values that are safe to pass:
@@ -271,9 +280,23 @@ echo
 echo "########## 5. the upgraded install is still a clean extension ##########"
 # A script that created objects outside the extension would look fine above and
 # leave debris behind on DROP -- and would go missing from pg_dump.
-chk "every view belongs to the extension" "10" \
+chk "every view belongs to the extension" "11" \
     "$(Q "SELECT count(*) FROM pg_class c JOIN pg_depend d ON d.classid='pg_class'::regclass AND d.objid=c.oid JOIN pg_extension e ON e.oid=d.refobjid WHERE e.extname='pg_keyspace' AND d.deptype='e' AND c.relkind='v'" upgraded)"
-Q "DROP EXTENSION pg_keyspace" upgraded >/dev/null
+# `supacache.rowcache_reg` is created at RUNTIME, by rowcache_register, in
+# whichever database it is called in -- section 4's probe calls it here. It is
+# deliberately NOT an extension member, for the same reason supacache.kv and
+# supacache.acl are not: it holds configuration an operator entered, so DROP
+# EXTENSION must not silently take it. That does mean a database with
+# registrations needs it dropped (or CASCADE) before the extension will go, and
+# since #120 that is any database, not just pg_keyspace.database.
+#
+# Dropped here so the assertions below stay about what this section is for: that
+# the UPGRADE SCRIPT created only extension members, and left no debris of its
+# own that would go missing from pg_dump.
+Q "DROP TABLE IF EXISTS supacache.rowcache_reg" upgraded >/dev/null
+DROPX=$(Q "DROP EXTENSION pg_keyspace" upgraded)
+chk "the extension drops cleanly once its runtime data is gone" "" \
+    "$(echo "$DROPX" | grep -i error)"
 chk "dropping it leaves no views behind" "0" \
     "$(Q "SELECT count(*) FROM pg_views WHERE schemaname='supacache'" upgraded)"
 chk "and no functions behind" "0" \

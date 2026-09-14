@@ -27,7 +27,7 @@ PORT=${PGKS_PG_PORT:-5471}
 RESP=${PGKS_RESP_PORT:-6471}
 PROFILE=${PGKS_BUILD_PROFILE:-release}
 OLD_VER=0.1.0
-NEW_VER=0.2.0
+NEW_VER=0.3.0
 pass=0; fail=0
 chk() {
   if [ "$2" = "$3" ]; then echo "PASS  $1"; pass=$((pass+1));
