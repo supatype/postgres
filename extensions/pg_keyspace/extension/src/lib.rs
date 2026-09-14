@@ -6757,7 +6757,13 @@ mod supacache {
         // Matched on the output plugin as well as the name, so a slot somebody
         // else created that happens to share the prefix is not reported as ours.
         let prefix = format!("{}\\_%", rowcache_slot_base());
-        let keep = pg_setting(c"max_slot_wal_keep_size");
+        // `current_setting` rather than `GetConfigOption`: the latter returns the
+        // bare number in the GUC's own unit ("32" for 32MB, "-1" for unbounded),
+        // and a column reading "32" tells an operator nothing about what it is
+        // 32 of. This is the one place the value is shown to a person.
+        let keep = Spi::get_one::<String>("SELECT current_setting('max_slot_wal_keep_size')")
+            .ok()
+            .flatten();
         let found: Vec<_> = Spi::connect(|client| {
             let mut out = Vec::new();
             let t = match client.select(
