@@ -66,9 +66,15 @@ set_partitions() {
   sed -i "/^pg_keyspace.rowcache_partitions/d" $PGDATA/postgresql.conf
   echo "pg_keyspace.rowcache_partitions = $1" >> $PGDATA/postgresql.conf
   stop_pg; sleep 1; start_pg; wait_ready || return 1
-  # The invalidation worker has to be beating before the cache is served at
-  # all: reads fail closed while it is not.
-  for _ in $(seq 1 60); do
+  return 0
+}
+
+# Coherence is waited for AFTER registering, not before. A database with no
+# registrations gets no slot and no worker (#120), so it never becomes coherent
+# and a wait placed ahead of registration can only ever time out -- which is
+# what it did, taking every round with it.
+wait_coherent() {
+  for _ in $(seq 1 "${1:-90}"); do
     [ "$(Q "SELECT coherent FROM supacache.rowcache_coherence()")" = "t" ] && return 0
     sleep 1
   done
@@ -128,8 +134,12 @@ PG
 # One measured run at a given partition count. Prints "tps waits data_cap".
 run_round() {
   local parts=$1
-  set_partitions "$parts" || { echo "0 0 0"; return 1; }
-  Q "SELECT supacache.rowcache_register('public.profiles')" >/dev/null
+  printf "0 0 0\n" > /tmp/rclock_round_$parts   # so a failed round cannot leave §3 reading an unset variable
+  set_partitions "$parts" || { chk "  the cluster restarts at $parts partition(s)" "t" "f"; return 1; }
+  chk "  the table registers at $parts partition(s)" "t" \
+      "$(Q "SELECT supacache.rowcache_register('public.profiles')")"
+  chk "  and the cache becomes coherent at $parts partition(s)" "t" \
+      "$(wait_coherent 120 && echo t || echo f)"
   # Warm, so the run is steady-state rather than mostly cold-start.
   Q "SELECT supacache.rowcache_put('public.profiles', g) FROM generate_series(1,2000) g" >/dev/null
   local cap; cap=$(Q "SELECT data_cap FROM supacache.rowcache_stats()")
@@ -187,12 +197,14 @@ run_round() {
 echo
 echo "########## 1. one lock for the whole segment (the #127 shape) ##########"
 run_round 1
-read -r TPS1 WAIT1 CAP1 < /tmp/rclock_round_1
+read -r TPS1 WAIT1 CAP1 < /tmp/rclock_round_1 || true
+TPS1=${TPS1:-0}; WAIT1=${WAIT1:-0}; CAP1=${CAP1:-0}
 
 echo
 echo "########## 2. one lock per partition (#120) ##########"
 run_round $PARTS
-read -r TPSN WAITN CAPN < /tmp/rclock_round_$PARTS
+read -r TPSN WAITN CAPN < /tmp/rclock_round_$PARTS || true
+TPSN=${TPSN:-0}; WAITN=${WAITN:-0}; CAPN=${CAPN:-0}
 
 echo
 echo "########## 3. partitioning must not multiply shared memory ##########"
