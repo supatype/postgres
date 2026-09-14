@@ -188,7 +188,15 @@ chk "every persisted slot sits in its worker's range" "0" \
 
 # --- restart: the real test ------------------------------------------------
 echo "# restarting the cluster..."
-runuser -u "$PGUSER" -- $PGBIN/pg_ctl -D "$PGDATA" -w stop >/dev/null 2>&1
+runuser -u "$PGUSER" -- $PGBIN/pg_ctl -D "$PGDATA" -w -t 120 stop >/dev/null 2>&1
+# Verify the postmaster is gone. pg_ctl -w gives up after its own timeout and
+# returns with it still shutting down; starting on top of that fails (#120), and
+# here the restart IS the test, so a start that never happened would read as
+# recovery losing data.
+for _ in $(seq 1 120); do
+  runuser -u "$PGUSER" -- $PGBIN/pg_ctl -D "$PGDATA" status >/dev/null 2>&1 || break
+  sleep 1
+done
 runuser -u "$PGUSER" -- $PGBIN/pg_ctl -D "$PGDATA" -l "$PGDATA/server.log" -w start >/dev/null 2>&1
 for _ in $(seq 1 60); do timeout 2 redis-cli $T -p "$BASE" PING >/dev/null 2>&1 && break; sleep 0.5; done
 sleep 2  # let every worker finish its recovery scan

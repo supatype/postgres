@@ -15,7 +15,13 @@ mkdir -p "$OUT"
 
 restart_with() {
   local tier=$1
-  runuser -u postgres -- $PGBIN/pg_ctl -D "$DATA" -w stop >/dev/null 2>&1
+  runuser -u postgres -- $PGBIN/pg_ctl -D "$DATA" -w -t 120 stop >/dev/null 2>&1
+  # Verify the postmaster is gone. pg_ctl -w gives up after its own timeout and
+  # returns with it still shutting down; starting on top of that fails (#120).
+  for _ in $(seq 1 120); do
+    runuser -u postgres -- $PGBIN/pg_ctl -D "$DATA" status >/dev/null 2>&1 || break
+    sleep 1
+  done
   $P -c "ALTER SYSTEM SET pg_keyspace.durability='$tier';" >/dev/null 2>&1 || true
   # ALTER SYSTEM needs a running server; instead edit conf directly for robustness.
   sed -i "s/^pg_keyspace.durability = .*/pg_keyspace.durability = '$tier'/" "$DATA/postgresql.conf"

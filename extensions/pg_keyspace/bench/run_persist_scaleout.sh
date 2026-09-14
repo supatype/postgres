@@ -13,7 +13,13 @@ mkdir -p "$OUT"
 
 restart_with_workers() {
   local w=$1
-  runuser -u postgres -- $PGBIN/pg_ctl -D "$DATA" -w stop >/dev/null 2>&1
+  runuser -u postgres -- $PGBIN/pg_ctl -D "$DATA" -w -t 120 stop >/dev/null 2>&1
+  # Verify the postmaster is gone. pg_ctl -w gives up after its own timeout and
+  # returns with it still shutting down; starting on top of that fails (#120).
+  for _ in $(seq 1 120); do
+    runuser -u postgres -- $PGBIN/pg_ctl -D "$DATA" status >/dev/null 2>&1 || break
+    sleep 1
+  done
   sed -i "s/^pg_keyspace.persist_workers = .*/pg_keyspace.persist_workers = $w/" "$DATA/postgresql.conf"
   runuser -u postgres -- $PGBIN/pg_ctl -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
   for _ in $(seq 1 30); do redis-cli -p 6380 ping >/dev/null 2>&1 && break; sleep 0.3; done

@@ -39,7 +39,23 @@ chk() {
 }
 Q() { $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tAc "$1" 2>&1; }
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
-stop_pg()  { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop -m fast" >/dev/null 2>&1; }
+# `pg_ctl -w stop` gives up after its own timeout and returns non-zero with the
+# postmaster STILL shutting down. Discarding that status and starting another one
+# a second later starts it on top of a live postmaster: that start fails, and
+# every readiness poll then reads `FATAL: the database system is shutting down`
+# until the loop expires -- surfacing as whichever assertion came next, pointing
+# at the feature under test and nothing to do with it (#120). Shutdown length
+# tracks how much the persistence worker has to flush, so it bites after a heavy
+# section and passes everywhere else. Verify it rather than assume it.
+stop_pg() {
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 120 stop -m fast" >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    su postgres -c "$PGBIN/pg_ctl -D $PGDATA status" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 60 stop -m immediate" >/dev/null 2>&1
+  return 0
+}
 wait_ready() { for _ in $(seq 1 60); do Q "SELECT 1" | grep -q "^1$" && return 0; sleep 1; done; return 1; }
 restart() { stop_pg; sleep 1; start_pg; wait_ready; sleep 2; }
 log_lines() { wc -l < $PGDATA/log 2>/dev/null || echo 0; }
@@ -105,7 +121,13 @@ wait
 sleep 3
 
 CRASHES=$(since $N0 | grep -c "persistence worker.*exited with exit code")
-DUPES=$(since $N0 | grep -c 'relation "kv_ttl_b[0-9]*" already exists')
+# BOTH forms. Creating a partition also creates its composite type, and a racing
+# loser can fail at the TYPE rather than at the relation -- `type "kv_ttl_b123"
+# already exists` is duplicate_object (42710), not duplicate_table (42P07).
+# Grepping only for `relation ...` made this harness blind to precisely the
+# escape it exists to catch, which is how the gap survived #130 (found in #120,
+# on the row-cache catalogue, where the same handler had the same hole).
+DUPES=$(since $N0 | grep -cE '(relation|type) "kv_ttl_b[0-9]*" already exists')
 BUCKETS1=$(Q "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhparent WHERE c.relname='kv_ttl'")
 ROLLOVERS=$(( BUCKETS1 - BUCKETS0 ))
 
@@ -115,6 +137,13 @@ chk "the run crossed enough bucket rollovers to race ($ROLLOVERS)" "t" \
     "$([ "$ROLLOVERS" -ge 5 ] && echo t || echo f)"
 chk "no persistence worker died" "0" "$CRASHES"
 chk "no worker lost a partition-creation race" "0" "$DUPES"
+# Which object raced decides whether the hole is in the handler's exception list
+# or somewhere with no guard at all, so print it rather than only counting it.
+[ "${DUPES:-0}" != "0" ] && {
+  echo "--- partition-race evidence ---"
+  since $N0 | grep -E '(relation|type) "kv_ttl_b[0-9]*" already exists' | head -10
+  echo "---"
+}
 chk "the cluster is still up" "1" "$(Q "SELECT 1")"
 
 echo

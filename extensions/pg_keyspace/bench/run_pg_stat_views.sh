@@ -48,13 +48,30 @@ Q()  { $PGBIN/psql -h /tmp -p $PORT -U postgres -d "${2:-postgres}" -tAc "$1" 2>
 QM() { $PGBIN/psql -h /tmp -p $PORT -U metrics  -d "${2:-postgres}" -tAc "$1" 2>&1; }
 QP() { $PGBIN/psql -h /tmp -p $PORT -U plainuser -d "${2:-postgres}" -tAc "$1" 2>&1; }
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
-stop_pg()  { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop" >/dev/null 2>&1; }
+# `pg_ctl -w stop` gives up after its own timeout and returns non-zero with the
+# postmaster STILL shutting down. Discarding that status and starting another one
+# a second later starts it on top of a live postmaster: that start fails, and
+# every readiness poll then reads `FATAL: the database system is shutting down`
+# until the loop expires -- surfacing as whichever assertion came next, pointing
+# at the feature under test and nothing to do with it (#120). Shutdown length
+# tracks how much the persistence worker has to flush, so it bites after a heavy
+# section and passes everywhere else. Verify it rather than assume it.
+stop_pg() {
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 120 stop -m fast" >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    su postgres -c "$PGBIN/pg_ctl -D $PGDATA status" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 60 stop -m immediate" >/dev/null 2>&1
+  return 0
+}
 wait_ready() { for _ in $(seq 1 60); do Q "SELECT 1" | grep -q "^1$" && return 0; sleep 1; done; return 1; }
 restart() { stop_pg; sleep 1; start_pg; wait_ready; sleep 2; }
 
 VIEWS="pg_stat_keyspace pg_stat_keyspace_workers pg_stat_keyspace_activity \
 pg_stat_keyspace_persist pg_stat_keyspace_persist_total pg_stat_keyspace_tenants \
-pg_stat_keyspace_rowcache pg_stat_keyspace_invalidation pg_stat_keyspace_pubsub \
+pg_stat_keyspace_rowcache pg_stat_keyspace_rowcache_databases \
+pg_stat_keyspace_invalidation pg_stat_keyspace_pubsub \
 pg_stat_keyspace_topology"
 
 echo "=== build + install ==="
@@ -92,10 +109,14 @@ if [ "$(Q "SELECT count(*) FROM pg_settings WHERE name='output_plugin_libraries'
 fi
 Q "CREATE EXTENSION pg_keyspace" >/dev/null
 restart
+# The invalidation POOL is sized by its own GUC (#120), so the expected worker
+# count is RESP + persist + expiry + pool rather than a fixed +2.
+POOL=$(Q "SHOW pg_keyspace.rowcache_invalidation_workers")
+POOL=${POOL:-1}
 # A persisted worker serves nothing until startup recovery finishes, and the
 # decoder has to claim its slot; wait for both rather than sleeping and hoping.
 for _ in $(seq 1 60); do
-  [ "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE alive")" = "$((WORKERS+SHARDS+2))" ] && break
+  [ "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE alive")" = "$((WORKERS+SHARDS+1+POOL))" ] && break
   sleep 1
 done
 
@@ -126,7 +147,7 @@ MEMBERS=$(Q "SELECT count(*) FROM pg_depend d
              JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE d.deptype='e' AND n.nspname='supacache' AND c.relkind='v'
                AND c.relname LIKE 'pg\_stat\_keyspace%'")
-chk "all 10 views are owned by the extension" "10" "$MEMBERS"
+chk "all 11 views are owned by the extension" "11" "$MEMBERS"
 
 echo
 echo "########## 3. a pg_monitor member scrapes with NO other grant ##########"
@@ -138,7 +159,7 @@ for v in $VIEWS; do
   out=$(QM "SELECT count(*) >= 0 FROM supacache.$v")
   if [ "$out" = "t" ]; then MON_OK=$((MON_OK+1)); else MON_BAD="$MON_BAD $v:[$out]"; fi
 done
-chk "pg_monitor reads all 10 views${MON_BAD:+ -- failed:$MON_BAD}" "10" "$MON_OK"
+chk "pg_monitor reads all 11 views${MON_BAD:+ -- failed:$MON_BAD}" "11" "$MON_OK"
 
 # The negative control. If this passed, the grants above would be proving
 # nothing: everything would be world-readable and "monitoring role" would be a
@@ -152,7 +173,7 @@ for v in $VIEWS; do
   out=$(QP "SELECT count(*) FROM supacache.$v")
   case "$out" in *"permission denied"*) DENIED=$((DENIED+1));; *) ALLOWED="$ALLOWED $v";; esac
 done
-chk "a role WITHOUT pg_monitor is refused all 10 views${ALLOWED:+ -- allowed:$ALLOWED}" "10" "$DENIED"
+chk "a role WITHOUT pg_monitor is refused all 11 views${ALLOWED:+ -- allowed:$ALLOWED}" "11" "$DENIED"
 
 echo
 echo "########## 4. hardening the install does not break the collector ##########"
@@ -269,7 +290,7 @@ chk "acme's entry count matches what was written" "300" \
 
 echo
 echo "########## 9. every background worker is visible and beating ##########"
-chk "one activity row per tracked worker" "$((WORKERS+SHARDS+2))" \
+chk "one activity row per tracked worker" "$((WORKERS+SHARDS+1+POOL))" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity")"
 chk "$WORKERS resp rows" "$WORKERS" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE role='resp'")"
@@ -277,8 +298,14 @@ chk "$SHARDS persist rows" "$SHARDS" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE role='persist'")"
 chk "one expiry row" "1" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE role='expiry'")"
-chk "one invalidation row" "1" \
+# One per POOL MEMBER (#120), which is what pg_keyspace.rowcache_invalidation_
+# workers sets. Not one per database: a pool worker's identity is its slot in
+# the pool, and which database it is draining changes over its life.
+chk "$POOL invalidation row(s), one per pool member" "$POOL" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE role='invalidation'")"
+chk "each pool member is numbered" "0" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity
+          WHERE role='invalidation' AND worker IS NULL")"
 chk "every worker is alive" "0" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE NOT alive")"
 chk "every live worker reports a pid" "0" \
@@ -286,10 +313,21 @@ chk "every live worker reports a pid" "0" \
 # A pid that is not a running process would make this view decorative.
 LIVE_PIDS=$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity a
                 WHERE a.alive AND EXISTS (SELECT 1 FROM pg_stat_activity p WHERE p.pid = a.pid)")
-chk "every reported pid is a real backend" "$((WORKERS+SHARDS+2))" "$LIVE_PIDS"
+chk "every reported pid is a real backend" "$((WORKERS+SHARDS+1+POOL))" "$LIVE_PIDS"
 
 echo
 echo "########## 10. WAL decode lag ##########"
+# A database gets a decode slot only once it has registrations (#120): they are
+# picked up LAZILY, so one that caches nothing costs no slot, no worker and no
+# WAL. Section 11 registers a table and checks occupancy; the slot has to exist
+# before that to be reported here, so register the first one now.
+Q "CREATE TABLE IF NOT EXISTS slotmaker(id bigint primary key, v text)" >/dev/null
+chk "(setup) a registration exists, so this database has a slot at all" "t" \
+    "$(Q "SELECT supacache.rowcache_register('public.slotmaker')")"
+for _ in $(seq 1 90); do
+  [ "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation")" = "1" ] && break
+  sleep 1
+done
 chk "the invalidation view has a row while decoding is on" "1" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation")"
 chk "it names the slot the decoder uses" "1" \
@@ -313,6 +351,22 @@ chk "decode lag is reported, not null" "0" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation WHERE decode_lag_bytes IS NULL")"
 chk "retained WAL is reported, not null" "0" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation WHERE retained_bytes IS NULL")"
+# Keyed by database (#120). There is one slot per participating database, so a
+# view that returned a single row would show one arbitrary database's decode lag
+# and an operator watching it would believe it was the cluster's.
+chk "every row names the database its slot belongs to" "0" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation WHERE datname IS NULL")"
+chk "and the datid matches that database" "0" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation i
+          WHERE i.datid <> (SELECT oid FROM pg_database d WHERE d.datname = i.datname)")"
+chk "wal_status is reported, so a lost slot is visible" "0" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation WHERE wal_status IS NULL")"
+# The row cache holds one slot per database and a slot retains WAL until it is
+# consumed, so whether that is bounded is load-bearing operational state, not
+# trivia. Surfacing it here is what lets it be alerted on rather than remembered.
+chk "the WAL retention bound is reported" "0" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation
+          WHERE max_slot_wal_keep_size IS NULL")"
 # Generating WAL the decoder has not consumed yet must show up as lag. Without
 # this, a view returning a constant zero would pass everything above.
 Q "CREATE TABLE lagmaker(id int primary key, pad text)" >/dev/null
@@ -329,8 +383,17 @@ Q "INSERT INTO things VALUES (1,'one'),(2,'two')" >/dev/null
 # the first version passed 'id' as the attnum, which ERRORed, and the section
 # then reported "0 registrations" as though the view were wrong.
 chk "the table registers" "t" "$(Q "SELECT supacache.rowcache_register('public.things')")"
-chk "the registration is counted" "1" \
+# TWO: `slotmaker` from section 10, which had to register something to give this
+# database a slot at all (databases are picked up lazily since #120), and
+# `things` just now. Counted against the catalogue rather than hardcoded, so
+# this does not have to be re-edited every time an earlier section registers
+# something -- and so it still fails if the view and the catalogue disagree,
+# which is the thing being tested.
+chk "the registration is counted" \
+    "$(Q "SELECT count(*) FROM supacache.rowcache_reg")" \
     "$(Q "SELECT registrations FROM supacache.pg_stat_keyspace_rowcache")"
+chk "and there are the two this run registered" "2" \
+    "$(Q "SELECT count(*) FROM supacache.rowcache_reg")"
 chk "registrations are resident in the segment" "t" \
     "$(Q "SELECT registrations_loaded FROM supacache.pg_stat_keyspace_rowcache")"
 for _ in $(seq 1 40); do [ "$(Q "SELECT coherent FROM supacache.pg_stat_keyspace_rowcache")" = "t" ] && break; sleep 1; done
@@ -341,6 +404,38 @@ chk "decode is reported as enabled" "t" \
 Q "SELECT supacache.rowcache_put('things', 1::bigint)" >/dev/null
 chk "a cached row shows up in the row-cache entry count" "t" \
     "$(Q "SELECT entries > 0 FROM supacache.pg_stat_keyspace_rowcache")"
+
+echo
+echo "########## 11b. coherence is per-database ##########"
+# The cache FAILS CLOSED on incoherence, so which database is incoherent decides
+# which queries are served from the cache at all -- load-bearing for
+# correctness, not only for dashboards.
+chk "the rowcache view names the database it describes" "postgres" \
+    "$(Q "SELECT datname FROM supacache.pg_stat_keyspace_rowcache")"
+chk "the per-database view has a row for it" "1" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases
+          WHERE datname = current_database()")"
+chk "it reads as participating, having a registration" "participating" \
+    "$(Q "SELECT state FROM supacache.pg_stat_keyspace_rowcache_databases
+          WHERE datname = current_database()")"
+chk "and as coherent" "t" \
+    "$(Q "SELECT coherent FROM supacache.pg_stat_keyspace_rowcache_databases
+          WHERE datname = current_database()")"
+chk "with no lost slot" "f" \
+    "$(Q "SELECT slot_lost FROM supacache.pg_stat_keyspace_rowcache_databases
+          WHERE datname = current_database()")"
+# The window each database is judged against is reported rather than left to be
+# derived, because it GROWS with the number of participating databases once they
+# outnumber the pool -- which is the headline trade this design makes.
+chk "the staleness window is reported and positive" "t" \
+    "$([ "$(Q "SELECT stale_after_ms FROM supacache.pg_stat_keyspace_rowcache_databases
+               WHERE datname = current_database()")" -gt 0 ] && echo t || echo f)"
+chk "the slot it names is the one that exists" "1" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases d
+          JOIN pg_replication_slots s ON s.slot_name = d.slot_name
+          WHERE d.datname = current_database()")"
+chk "no participating database is incoherent" "0" \
+    "$(Q "SELECT incoherent_databases FROM supacache.pg_stat_keyspace_rowcache")"
 
 echo
 echo "########## 12. topology ##########"
@@ -361,6 +456,18 @@ chk "decoding off => the invalidation view is empty" "0" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation")"
 chk "...and the row cache view says so rather than vanishing" "f" \
     "$(Q "SELECT decode_enabled FROM supacache.pg_stat_keyspace_rowcache")"
+# The per-database view follows the same rule, and for the same reason: with no
+# decoder there is no pool, so no database is being invalidated and none is
+# listed. An empty list is "nothing is being kept coherent", which is what an
+# alert needs to be able to see.
+chk "decoding off => no database is listed as served" "0" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases")"
+# But the cache is still SERVED, because with decoding off coherence is the
+# operator's own business -- they warm it by hand and keep it current by hand.
+# Failing closed here would break a deliberate configuration rather than protect
+# anyone.
+chk "...and the cache is still trusted, because coherence is manual then" "t" \
+    "$(Q "SELECT coherent FROM supacache.pg_stat_keyspace_rowcache")"
 sed -i "s/^pg_keyspace.rowcache_decode = off/pg_keyspace.rowcache_decode = on/" $PGDATA/postgresql.conf
 restart
 
@@ -389,7 +496,7 @@ restart
 
 echo
 echo "########## 15. the views survive a restart and drop with the extension ##########"
-chk "all 10 views are still present after a restart" "10" \
+chk "all 11 views are still present after a restart" "11" \
     "$(Q "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
           WHERE n.nspname='supacache' AND c.relkind='v' AND c.relname LIKE 'pg\_stat\_keyspace%'")"
 # pg_dump reproduces an extension as CREATE EXTENSION, so what is dumped is

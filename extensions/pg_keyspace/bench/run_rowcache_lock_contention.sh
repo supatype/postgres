@@ -54,7 +54,28 @@ chk() {
 }
 Q() { $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tAc "$1" 2>&1; }
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
-stop_pg()  { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop -m fast" >/dev/null 2>&1; }
+# `pg_ctl -w stop` gives up after its own timeout and returns non-zero with the
+# postmaster STILL shutting down. Discarding that status and starting a new one a
+# second later starts it on top of a live postmaster: the start fails, and every
+# wait_ready poll then reads `FATAL: the database system is shutting down` until
+# the loop expires -- which is how this harness reported "the cluster restarts at
+# 8 partition(s): expected t, actual f" with 14GB of memory free and nothing at
+# all wrong with the partition count.
+#
+# Intermittent because shutdown length tracks how much the persistence worker has
+# to flush, and section 1 writes 50000 rows immediately before the first restart.
+# Verify the postmaster is really gone rather than assuming the stop took.
+stop_pg() {
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 120 stop -m fast" >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    su postgres -c "$PGBIN/pg_ctl -D $PGDATA status" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  # Still up after two minutes: take it down hard rather than starting on top.
+  echo "  (shutdown exceeded 120s, escalating to immediate)"
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 60 stop -m immediate" >/dev/null 2>&1
+  return 0
+}
 wait_ready() { for _ in $(seq 1 60); do Q "SELECT 1" | grep -q "^1$" && return 0; sleep 1; done; return 1; }
 log_lines() { wc -l < $PGDATA/log 2>/dev/null || echo 0; }
 crashes_since() { tail -n +"${1:-0}" $PGDATA/log 2>/dev/null | grep -c "signal 11"; }
@@ -65,10 +86,29 @@ crashes_since() { tail -n +"${1:-0}" $PGDATA/log 2>/dev/null | grep -c "signal 1
 set_partitions() {
   sed -i "/^pg_keyspace.rowcache_partitions/d" $PGDATA/postgresql.conf
   echo "pg_keyspace.rowcache_partitions = $1" >> $PGDATA/postgresql.conf
-  stop_pg; sleep 1; start_pg; wait_ready || return 1
-  # The invalidation worker has to be beating before the cache is served at
-  # all: reads fail closed while it is not.
-  for _ in $(seq 1 60); do
+  stop_pg; sleep 1; start_pg
+  wait_ready && return 0
+  # A postmaster that will not come back says why in its own log, and this is
+  # the one place that knows the setting it was asked to come back with. Without
+  # it the failure reads as "the cluster restarts at 8 partition(s): expected t,
+  # actual f" -- true, useless, and indistinguishable between a shared-memory
+  # request the machine would not grant, a GUC out of range, and a runner that
+  # was simply slow.
+  echo "--- postmaster did not come up at $1 partition(s) ---"
+  tail -40 "$PGDATA/log" 2>/dev/null
+  echo "--- shared memory / limits ---"
+  ipcs -m 2>/dev/null | head -8
+  free -m 2>/dev/null | head -3
+  echo "---"
+  return 1
+}
+
+# Coherence is waited for AFTER registering, not before. A database with no
+# registrations gets no slot and no worker (#120), so it never becomes coherent
+# and a wait placed ahead of registration can only ever time out -- which is
+# what it did, taking every round with it.
+wait_coherent() {
+  for _ in $(seq 1 "${1:-90}"); do
     [ "$(Q "SELECT coherent FROM supacache.rowcache_coherence()")" = "t" ] && return 0
     sleep 1
   done
@@ -128,8 +168,12 @@ PG
 # One measured run at a given partition count. Prints "tps waits data_cap".
 run_round() {
   local parts=$1
-  set_partitions "$parts" || { echo "0 0 0"; return 1; }
-  Q "SELECT supacache.rowcache_register('public.profiles')" >/dev/null
+  printf "0 0 0\n" > /tmp/rclock_round_$parts   # so a failed round cannot leave §3 reading an unset variable
+  set_partitions "$parts" || { chk "  the cluster restarts at $parts partition(s)" "t" "f"; return 1; }
+  chk "  the table registers at $parts partition(s)" "t" \
+      "$(Q "SELECT supacache.rowcache_register('public.profiles')")"
+  chk "  and the cache becomes coherent at $parts partition(s)" "t" \
+      "$(wait_coherent 120 && echo t || echo f)"
   # Warm, so the run is steady-state rather than mostly cold-start.
   Q "SELECT supacache.rowcache_put('public.profiles', g) FROM generate_series(1,2000) g" >/dev/null
   local cap; cap=$(Q "SELECT data_cap FROM supacache.rowcache_stats()")
@@ -187,12 +231,14 @@ run_round() {
 echo
 echo "########## 1. one lock for the whole segment (the #127 shape) ##########"
 run_round 1
-read -r TPS1 WAIT1 CAP1 < /tmp/rclock_round_1
+read -r TPS1 WAIT1 CAP1 < /tmp/rclock_round_1 || true
+TPS1=${TPS1:-0}; WAIT1=${WAIT1:-0}; CAP1=${CAP1:-0}
 
 echo
 echo "########## 2. one lock per partition (#120) ##########"
 run_round $PARTS
-read -r TPSN WAITN CAPN < /tmp/rclock_round_$PARTS
+read -r TPSN WAITN CAPN < /tmp/rclock_round_$PARTS || true
+TPSN=${TPSN:-0}; WAITN=${WAITN:-0}; CAPN=${CAPN:-0}
 
 echo
 echo "########## 3. partitioning must not multiply shared memory ##########"

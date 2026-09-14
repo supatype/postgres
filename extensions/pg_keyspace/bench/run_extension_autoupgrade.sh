@@ -27,7 +27,11 @@ PORT=${PGKS_PG_PORT:-5471}
 RESP=${PGKS_RESP_PORT:-6471}
 PROFILE=${PGKS_BUILD_PROFILE:-release}
 OLD_VER=0.1.0
-NEW_VER=0.2.0
+NEW_VER=0.3.0
+# The upgrade is a chain of scripts (#120 added the second step). Postgres walks
+# it on its own, so the worker still issues one ALTER EXTENSION -- but section 6
+# needs to know which file to remove to break the walk.
+CHAIN="0.1.0--0.2.0 0.2.0--0.3.0"
 pass=0; fail=0
 chk() {
   if [ "$2" = "$3" ]; then echo "PASS  $1"; pass=$((pass+1));
@@ -35,7 +39,23 @@ chk() {
 }
 Q() { $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tAc "$1" 2>&1; }
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
-stop_pg()  { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop" >/dev/null 2>&1; }
+# `pg_ctl -w stop` gives up after its own timeout and returns non-zero with the
+# postmaster STILL shutting down. Discarding that status and starting another one
+# a second later starts it on top of a live postmaster: that start fails, and
+# every readiness poll then reads `FATAL: the database system is shutting down`
+# until the loop expires -- surfacing as whichever assertion came next, pointing
+# at the feature under test and nothing to do with it (#120). Shutdown length
+# tracks how much the persistence worker has to flush, so it bites after a heavy
+# section and passes everywhere else. Verify it rather than assume it.
+stop_pg() {
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 120 stop -m fast" >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    su postgres -c "$PGBIN/pg_ctl -D $PGDATA status" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 60 stop -m immediate" >/dev/null 2>&1
+  return 0
+}
 wait_ready() { for _ in $(seq 1 60); do Q "SELECT 1" | grep -q "^1$" && return 0; sleep 1; done; return 1; }
 # Stop BEFORE truncating, always. Truncating under a running server leaves a
 # window in which a worker can append to the file after the truncate, which is
@@ -118,8 +138,8 @@ echo "########## 2. restarting is the whole procedure ##########"
 # moved it.
 cycle
 chk "after a restart the extension reports $NEW_VER" "$NEW_VER" "$(extver)"
-chk "it now has all 35 functions" "35" "$(nfuncs)"
-chk "and all ten views" "10" "$(nviews)"
+chk "it now has all 36 functions" "36" "$(nfuncs)"
+chk "and every view" "11" "$(nviews)"
 chk "the worker said so in the log, once" "1" \
     "$(logcount "upgraded the extension catalogue $OLD_VER -> $NEW_VER")"
 chk "and warned about nothing" "0" "$(warncount 'automatic catalogue upgrade failed')"
@@ -170,7 +190,7 @@ echo "########## 5. turning it back on repairs the same cluster ##########"
 set_guc on
 cycle
 chk "it upgrades on the next start" "$NEW_VER" "$(extver)"
-chk "with the ten views back" "10" "$(nviews)"
+chk "with every view back" "11" "$(nviews)"
 
 echo
 echo "########## 6. an upgrade that cannot run must not take the worker with it ##########"
@@ -182,7 +202,12 @@ echo "########## 6. an upgrade that cannot run must not take the worker with it 
 # so the failure has to arrive as a warning and startup has to continue.
 reinstall_old
 chk "back to $OLD_VER with no upgrade script present" "$OLD_VER" "$(extver)"
-mv "$SHAREDIR/pg_keyspace--$OLD_VER--$NEW_VER.sql" /tmp/pgks_upgrade_script.bak
+# The LAST step of the chain, not a single old--new file: since #120 the path is
+# 0.1.0 -> 0.2.0 -> 0.3.0, and removing the last hop is what leaves an install
+# that can start walking and cannot finish. ALTER EXTENSION then raises "no
+# update path", which is the non-emergency failure this section is about.
+LAST_STEP=$(printf '%s\n' $CHAIN | tail -1)
+mv "$SHAREDIR/pg_keyspace--$LAST_STEP.sql" /tmp/pgks_upgrade_script.bak
 cycle
 chk "the upgrade fails, and says so once" "1" "$(warncount 'automatic catalogue upgrade failed')"
 chk "the extension is left alone at $OLD_VER" "$OLD_VER" "$(extver)"
@@ -193,7 +218,7 @@ chk "worker 0 started once, so there is no relaunch loop" "1" \
 chk "the worker is alive and serving its segment" "t" \
     "$(Q "SELECT count(*) > 0 FROM supacache.stats()")"
 chk "and the server is serving" "1" "$(Q "SELECT 1")"
-mv /tmp/pgks_upgrade_script.bak "$SHAREDIR/pg_keyspace--$OLD_VER--$NEW_VER.sql"
+mv /tmp/pgks_upgrade_script.bak "$SHAREDIR/pg_keyspace--$LAST_STEP.sql"
 
 stop_pg
 rm -f "$SHAREDIR/pg_keyspace--$OLD_VER.sql"

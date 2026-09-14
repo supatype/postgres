@@ -65,7 +65,23 @@ rcli()  { timeout "$RCLI_TIMEOUT" redis-cli -p $RESP "$@" 2>&1; }
 # ARG_MAX. redis-cli -x appends stdin as the final argument.
 rcli_x() { local f="$1"; shift; timeout "$RCLI_TIMEOUT" redis-cli -p $RESP -x "$@" < "$f" 2>&1; }
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
-stop_pg()  { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop" >/dev/null 2>&1; }
+# `pg_ctl -w stop` gives up after its own timeout and returns non-zero with the
+# postmaster STILL shutting down. Discarding that status and starting another one
+# a second later starts it on top of a live postmaster: that start fails, and
+# every readiness poll then reads `FATAL: the database system is shutting down`
+# until the loop expires -- surfacing as whichever assertion came next, pointing
+# at the feature under test and nothing to do with it (#120). Shutdown length
+# tracks how much the persistence worker has to flush, so it bites after a heavy
+# section and passes everywhere else. Verify it rather than assume it.
+stop_pg() {
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 120 stop -m fast" >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    su postgres -c "$PGBIN/pg_ctl -D $PGDATA status" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 60 stop -m immediate" >/dev/null 2>&1
+  return 0
+}
 wait_ready() { for _ in $(seq 1 30); do psql_ "SELECT 1" | grep -q "^1$" && return 0; sleep 1; done; return 1; }
 # The row cache is only served while its invalidation worker is beating (#39),
 # so anything asserting the cache is used has to wait for that rather than sleep
@@ -612,7 +628,18 @@ SBPORT=$((PORT + 10))
 # build default and every psql -h /tmp against it fails, which looks exactly
 # like a standby that never started.
 sb_start() { su postgres -c "$PGBIN/pg_ctl -D $SBDATA -l $SBDATA/log -o \"-p $SBPORT -k /tmp\" -w start" >/dev/null 2>&1; }
-sb_stop()  { su postgres -c "$PGBIN/pg_ctl -D $SBDATA -m fast -w stop" >/dev/null 2>&1; }
+# Verified like stop_pg above: this standby is stopped in section T and started
+# again a few assertions later, so a stop that had not finished would start on
+# top of a live postmaster (#120).
+sb_stop() {
+  su postgres -c "$PGBIN/pg_ctl -D $SBDATA -m fast -w -t 120 stop" >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    su postgres -c "$PGBIN/pg_ctl -D $SBDATA status" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  su postgres -c "$PGBIN/pg_ctl -D $SBDATA -m immediate -w -t 60 stop" >/dev/null 2>&1
+  return 0
+}
 
 stop_pg; sleep 1
 set_conf "wal_level" "replica"
@@ -1180,12 +1207,48 @@ if [ "$PLUGIN_OK" = "1" ]; then
   psql_ "UPDATE public.inv66 SET v='v2'" >/dev/null
   ( psql_ "BEGIN; LOCK TABLE public.inv66 IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(20); COMMIT" >/dev/null 2>&1 ) &
   LOCKER=$!
-  sleep 22
-  wait $LOCKER 2>/dev/null
 
+  # The lock must actually be GRANTED before any of this means anything. Sleeping
+  # and hoping is how a precondition gets reproduced by luck rather than by
+  # construction, so wait for it in pg_locks and fail loudly if it never lands.
+  LOCKED=0
+  for _ in $(seq 1 20); do
+    LOCKED=$(psql_ "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid=l.relation \
+                    WHERE c.relname='inv66' AND l.mode='AccessExclusiveLock' AND l.granted")
+    [ "${LOCKED:-0}" -ge 1 ] && break
+    sleep 1
+  done
+  chk "the apply-blocking lock was actually granted" "1" \
+      "$([ "${LOCKED:-0}" -ge 1 ] && echo 1 || echo 0)"
+
+  # Measure INSIDE the lock, not after it. Once the lock goes away the batch
+  # applies for real and the slot advances legitimately, so a reading taken
+  # afterwards cannot tell "never applied" from "applied a moment ago" -- it only
+  # ever passed on the margin between a 20s lock and a 4s decode interval, and
+  # #120 removed that margin: a pool worker that ERRORs is relaunched promptly
+  # and drains on connect instead of waiting out an interval. Several decode
+  # intervals have passed by now, so the apply has failed repeatedly, and the
+  # lock is still held for ~8s more while the three assertions below read.
+  #
+  # Twelve seconds into a TWENTY second lock, not twenty-four into a forty-five.
+  # Lengthening the lock to buy margin backfired: each failed apply ERRORs the
+  # worker, and rowcache_pool_relaunch launches the replacement with
+  # load_dynamic(), which can fail while the dying worker's slot is still held.
+  # That path is handled -- the heartbeat is backdated so health_watchdog retries
+  # -- but on the STALE timescale, tens of seconds, not the 4s decode interval.
+  # Forty-five seconds of churn is ~11 deaths instead of ~5, which is a real
+  # chance of ending the lock with nothing alive to apply, and the run then fails
+  # the LAST assertion of this section instead of serving anything stale.
+  # Measuring earlier is strictly better than locking longer: three failed
+  # attempts at a 4s interval is already decisive.
+  sleep 12
   ERRS=$(tail -n +$((LOG0+1)) $PGDATA/log | grep -c "rowcache invalidation worker.*exit code 1" || true)
   PMT1=$(psql_ "SELECT pg_postmaster_start_time()")
   LSN1=$(psql_ "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='$SLOT'")
+  STILL=$(psql_ "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid=l.relation \
+                 WHERE c.relname='inv66' AND l.mode='AccessExclusiveLock' AND l.granted")
+  chk "and it was still held when the slot was read" "1" \
+      "$([ "${STILL:-0}" -ge 1 ] && echo 1 || echo 0)"
 
   chk "the apply failed while the lock was held" "1" "$([ "${ERRS:-0}" -ge 1 ] && echo 1 || echo 0)"
   chk "the cluster stayed up, so the row cache survived the failure" "$PMT0" "$PMT1"
@@ -1193,18 +1256,31 @@ if [ "$PLUGIN_OK" = "1" ]; then
   # slot here, and those invalidations were never seen again.
   chk "the slot did not advance past changes that were never applied" "$LSN0" "$LSN1"
 
+  # Only now let the lock go, so the replay below is the FIRST chance the batch
+  # has had to apply.
+  wait $LOCKER 2>/dev/null
+
   # With the lock gone the same batch is re-read and applied. Both terminal
   # actions are idempotent, so the replay converges rather than double-applying.
   SAMPLE="SELECT v FROM public.inv66 WHERE id=1 UNION ALL SELECT v FROM public.inv66 WHERE id=37 \
 UNION ALL SELECT v FROM public.inv66 WHERE id=99 UNION ALL SELECT v FROM public.inv66 WHERE id=150 \
 UNION ALL SELECT v FROM public.inv66 WHERE id=200"
   STALE=""
+  # Both halves, because the value alone does not distinguish them. An
+  # INCOHERENT cache falls back to the heap and returns 'v2' too, so polling only
+  # on the value passes just as readily when the cache has given up as when the
+  # invalidation was applied -- which is exactly what it did on PG17 in the run
+  # that caught the churn above, reporting success two lines before the slot
+  # assertion revealed nothing had run at all.
+  COH=""
   for _ in $(seq 1 20); do
     STALE=$(psql_ "SELECT count(*) FROM ($SAMPLE) s WHERE v <> 'v2'")
-    [ "$STALE" = "0" ] && break
+    COH=$(psql_ "SELECT coherent FROM supacache.rowcache_coherence()")
+    [ "$STALE" = "0" ] && [ "$COH" = "t" ] && break
     sleep 2
   done
   chk "the cache is coherent once the apply can run again" "0" "$STALE"
+  chk "...and coherent, not merely falling back to the heap" "t" "$COH"
 
   # And the slot must move once a batch really has been applied, or the fix
   # would trade lost invalidations for unbounded WAL retention.

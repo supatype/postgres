@@ -748,14 +748,100 @@ is whatever `pg_index` says it is, single-column or composite. `rowcache_registe
 still exists and is still single-column only. `rowcache_registration(tbl)` reports
 which columns a table is registered with, in key order.
 
-**The row cache serves one database — the one named by `pg_keyspace.database`.**
-Not a choice but a consequence of logical decoding: the invalidation worker's
-replication slot belongs to that database, and a logical slot only ever decodes
-changes from the database it was created in. A table registered anywhere else
-would be cached and then *never invalidated* — stale indefinitely, while
-`rowcache_coherence()` still reported healthy, because coherence describes the
-worker rather than your table. `rowcache_register` therefore refuses from any
-other database and says so.
+**The row cache serves every database that registers a table.** Register from
+wherever the table is; there is nothing else to configure.
+
+It did not always. Until [#120](https://github.com/supatype/postgres/issues/120)
+it served exactly one database — the one named by `pg_keyspace.database` — and
+`rowcache_register` refused from anywhere else. That refusal was right at the
+time, and the reason is worth keeping in view because it still shapes the
+design. It was never the catalogue and never the keys: it was **invalidation**. A
+logical replication slot belongs to the database it was created in and only ever
+decodes changes from that database, so with one slot in one database, a table
+registered anywhere else would be cached and then *never invalidated* — stale
+indefinitely, while `rowcache_coherence()` still reported healthy, because
+coherence described the worker rather than your table.
+
+So the fix was not to relax the check. Every database with registrations gets
+**its own replication slot**, and a **bounded pool** of invalidation workers
+drains them:
+
+```ini
+pg_keyspace.rowcache_invalidation_workers = 1   # the pool size — YOU set this
+pg_keyspace.rowcache_lease_ms = 5000            # a turn, when databases outnumber workers
+pg_keyspace.rowcache_max_databases = 32         # directory size; 128 bytes each
+```
+
+The pool is bounded by that setting and **not** by how many databases exist —
+the same trade the autovacuum launcher makes, and the reason this is a pool
+rather than a worker per database: otherwise a cluster's process count becomes a
+function of its tenant count, which is the thing per-project-database
+provisioning can least afford. Databases are picked up **lazily**: one with no
+registrations gets no slot, no worker and no turn, so a cluster with fifty
+databases and two that cache pays for two.
+
+`supacache.pg_stat_keyspace_rowcache_databases` is where this is visible — one
+row per database, with its state, its slot, how long since it was last
+invalidated, and the window it is judged against.
+
+##### What it costs, per database that registers a table
+
+| | cost |
+|---|---|
+| replication slots | 1 |
+| worker processes | 0 — the pool is shared and bounded |
+| WAL retained | bounded by `max_slot_wal_keep_size`, once you set it |
+
+`max_replication_slots` (default 10) has to cover one slot per participating
+database **plus** whatever replication the cluster already does.
+`max_worker_processes` (default 8) has to cover the pool **plus** the RESP,
+persistence and expiry workers. A database that cannot get a slot is marked
+**incoherent** rather than served — it fails closed, like every other way of not
+being invalidated.
+
+##### The hazard, and why `max_slot_wal_keep_size` is not optional
+
+**A replication slot retains WAL until it is consumed.** With one slot the risk
+was singular and visible. One per database means **any single database's stalled
+invalidation pins WAL for the whole cluster** — one slow tenant can fill the WAL
+volume for everyone.
+
+Postgres already solves this and the solution is off by default. Set
+`max_slot_wal_keep_size`, and a slot reserving more than that is invalidated by
+the server instead of being allowed to pin WAL indefinitely. pg_keyspace logs a
+warning at startup when it is unset, and reports it as a column on
+`pg_stat_keyspace_invalidation`.
+
+**Size the bound against the decode interval, not just against the disk.** It
+bounds the *cluster*, not one database against another. A healthy decoder still
+retains up to one `rowcache_decode_ms` worth of WAL between advances, and that
+WAL is whatever the whole cluster generated — so a bound tight enough to catch a
+stalled database can also cut loose a perfectly healthy one that simply had a
+busy neighbour. Observed while building
+`bench/run_rowcache_slot_invalidation.sh`: at `max_slot_wal_keep_size = 32MB`, a
+flood in one database invalidated the *other* database's slot, which was doing
+nothing wrong. Nothing was served stale — the recovery below is the same either
+way — but that database lost its cache and had to rebuild it. Leave room for
+`decode interval × peak cluster WAL rate` above whatever a stall would reserve.
+
+When the server does invalidate a slot, that is a **gap**: the changes it had not
+yet delivered are gone, and there is no way to tell which rows they were. So
+pg_keyspace marks that database incoherent (its reads fall back to the heap
+immediately), **drops its cached rows**, rebuilds the slot, and only then serves
+it again. Resuming over the gap would mean serving a stale row as truth at the
+exact moment everything reported healthy — the worst failure this system can
+produce. Its registrations are kept: they are configuration, not cache content,
+and dropping them would silently stop caching the tables you asked for on top of
+the outage. Asserted end to end by
+`bench/run_rowcache_slot_invalidation.sh`.
+
+##### Worth comparing against: one cluster per project
+
+One database per project is what this work makes possible. One **cluster** per
+project maps onto the original design with no code at all, no extra slots and no
+shared WAL hazard. The cost is density — a postmaster each. If you are choosing
+between them, that is the trade; this section exists so the comparison is a fair
+one rather than an implicit vote for the thing that was built.
 
 Keys carry the database oid for the same reason. The segment is cluster-wide and
 `shared_preload_libraries` installs the planner hook in *every* database, so an
@@ -875,6 +961,31 @@ with a bound, not read-your-writes**:
 > and no more than `pg_keyspace.rowcache_decode_ms` (default **200 ms**) plus
 > decode time behind the current committed state.
 
+**That bound holds per database while the pool is big enough.** With no more
+participating databases than `pg_keyspace.rowcache_invalidation_workers`, every
+database has a worker to itself, nothing waits for a turn, and the window above
+is exactly what it always was.
+
+Above that, invalidation **cycles**: a worker leases a database, drains it, and
+hands the slot on after `pg_keyspace.rowcache_lease_ms`. The window is then the
+**cycle time**, not the decode interval:
+
+> ⌈participating databases ÷ pool size⌉ × (lease + relaunch)
+
+So it grows linearly with the number of databases you cache and shrinks
+linearly with the pool size. With the defaults — a pool of 1 and a 5 s lease —
+three participating databases put each of them roughly 18 s behind rather than
+200 ms. That is a knob, not a wall: raise the pool (bounded by
+`max_worker_processes`) and the window comes back down.
+
+Two things stop this being a silent degradation. The window is **reported**, per
+database, as `stale_after_ms` on
+`supacache.pg_stat_keyspace_rowcache_databases` — you do not have to derive it.
+And the cache **fails closed** against that same window, per database: a
+database that has not been drained within it stops being served from the cache
+and reads the heap instead. A cycle that cannot keep up costs you the cache, not
+your correctness.
+
 Concretely:
 
 - `INSERT` then `SELECT` is safe. A row not in the cache falls through to the
@@ -894,6 +1005,24 @@ across shutdown** so invalidation can resume, which means a stopped worker pins
 WAL from its `restart_lsn`: set `max_slot_wal_keep_size`. And if the slot is
 lost, the worker exits and the cache keeps serving whatever it holds with no
 further invalidation, so alert on the worker being alive rather than assuming.
+
+##### Removing it from a database
+
+`supacache.rowcache_reg` is created the first time you register a table in a
+database, and it is **not** an extension member — like `supacache.kv` and
+`supacache.acl`, it holds configuration you entered, so `DROP EXTENSION` must
+not quietly take it with them. The consequence is that a database with
+registrations needs
+
+```sql
+SELECT supacache.rowcache_unregister('public.orders');  -- or: DROP TABLE supacache.rowcache_reg;
+DROP EXTENSION pg_keyspace;
+```
+
+rather than `DROP EXTENSION` alone (`CASCADE` also works and takes the
+registrations with it). That was always true of `pg_keyspace.database`; since
+[#120](https://github.com/supatype/postgres/issues/120) it is true of any
+database you register a table in.
 
 ##### The slot is named for the database, not for the configuration
 
@@ -1155,8 +1284,9 @@ to borrow. Living inside Postgres means there is.
 | `pg_stat_keyspace_persist` | (worker, shard) | per-ring `pushed`/`committed`/`lag`/`backlog_bytes`/`dropped`/`uncommitted_batches` |
 | `pg_stat_keyspace_persist_total` | 1 row | the above summed, plus `worst_ring_backlog_bytes` |
 | `pg_stat_keyspace_tenants` | tenant | measured arena bytes and entries per tenant |
-| `pg_stat_keyspace_rowcache` | 1 row | row-cache occupancy, `coherent`, registrations and whether they are resident |
-| `pg_stat_keyspace_invalidation` | 1 row | `decode_lag_bytes` and `retained_bytes` for the WAL decoder |
+| `pg_stat_keyspace_rowcache` | 1 row | row-cache occupancy (segment-wide), plus `coherent` for the database you are connected to |
+| `pg_stat_keyspace_rowcache_databases` | 1/database | per-database `state`, `coherent`, `slot_lost`, `beat_age_ms` and the `stale_after_ms` it is judged against |
+| `pg_stat_keyspace_invalidation` | 1/database | `decode_lag_bytes`, `retained_bytes`, `wal_status` and `max_slot_wal_keep_size`, per decode slot |
 | `pg_stat_keyspace_pubsub` | 1 row | messages **not** delivered: `dropped`, `route_full`, `name_too_long` |
 | `pg_stat_keyspace_topology` | 1 row | recorded vs running worker count, and what a change between them costs |
 
@@ -1201,7 +1331,9 @@ Three things worth alerting on, in order of how quietly they fail:
 
 | condition | means |
 |---|---|
-| `pg_stat_keyspace_rowcache.coherent = false` | invalidation is configured but not beating. Reads fail closed, so this is an availability signal, not a correctness one |
+| `pg_stat_keyspace_rowcache.coherent = false` | invalidation is configured but not current **for this database**. Reads fail closed, so this is an availability signal, not a correctness one |
+| `pg_stat_keyspace_rowcache.incoherent_databases > 0` | some database is not being invalidated. `pg_stat_keyspace_rowcache_databases` says which, and whether it is a stall or a `slot_lost` |
+| `pg_stat_keyspace_invalidation.wal_status = 'lost'` | the server cut that database's slot loose for exceeding `max_slot_wal_keep_size`. pg_keyspace purges and rebuilds; a slot that keeps being lost means the bound is too small for the write rate |
 | `pg_stat_keyspace_persist.lag` climbing and not returning | persistence is falling behind; `dropped > 0` next means acknowledged writes are being discarded |
 | `pg_stat_keyspace_activity.alive = false`, flapping | a worker is crash-looping. The watchdog relaunches it every time, so from outside it looks like a worker that is running |
 
@@ -1252,7 +1384,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
 | `pg_keyspace.max_value_bytes` | 536870912 | largest value accepted from a client; matches Valkey/Redis `proto-max-bulk-len` |
 | `pg_keyspace.durability` | `ephemeral` | `ephemeral` \| `relaxed` \| `durable` \| `replicated` |
-| `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables, **and the only database the row cache serves** |
+| `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables (Mode A), and the one worker 0 auto-upgrades. Since #120 it does **not** bound the row cache: Mode B serves every database that registers a table |
 | `pg_keyspace.persist_workers` | 1 | persist workers/rings draining in parallel |
 | `pg_keyspace.ring_mb` | 64 | per-worker RESP→persist ring size (burst absorption) |
 | `pg_keyspace.ttl_bucket_secs` | 10 | TTL time-bucket width (range-partitioned `supacache.kv_ttl`) |
@@ -1261,6 +1393,9 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.tls_use_postgres_cert` | `off` | with those unset, serve RESP with the cluster's `ssl_cert_file`/`ssl_key_file` (needs `ssl = on`) |
 | `pg_keyspace.rowcache_mb` | 64 | Mode B row-cache segment size (never RESP-addressable) |
 | `pg_keyspace.rowcache_partitions` | 8 | partitions the row-cache segment is carved into, and writer locks it has; divides `rowcache_mb`, does not multiply it |
+| `pg_keyspace.rowcache_invalidation_workers` | 1 | bounded pool draining the per-database decode slots; below the number of participating databases, invalidation cycles |
+| `pg_keyspace.rowcache_lease_ms` | 5000 | how long one pooled worker holds a database before handing it on (only bites when cycling) |
+| `pg_keyspace.rowcache_max_databases` | 32 | databases the row cache can serve at once; registration is refused rather than uninvalidated beyond it |
 | `pg_keyspace.rowcache_decode` | `off` | keys-only Mode B invalidation worker (needs `wal_level=logical`) |
 | `pg_keyspace.rowcache_refill` | `off` | on: re-cache a changed hot key; off: drop-only (lazy) |
 | `pg_keyspace.rowcache_readthrough` | `off` | on: a pk lookup that misses caches the row it read (ignored unless `rowcache_decode` is on) |
@@ -1357,7 +1492,12 @@ against a real Redis 8 in Docker reply for reply (`run_bloom.sh`,
 `run_cuckoo.sh`) — security
 (`run_hardening.sh`, `run_tls.sh`, `run_threats.sh`, `run_security.sh`), Mode B
 row-cache coherence for int/uuid/text/TOAST PKs (`run_rowcache.sh`,
-`run_nonint_pk.sh`, `run_toast.sh`, `run_invalidation.sh`), tenant-scoped pub/sub
+`run_nonint_pk.sh`, `run_toast.sh`, `run_invalidation.sh`), the row cache across
+databases — per-database slots, bounded cycling and no cross-database leak
+(`run_rowcache_database_scope.sh`, `run_rowcache_multidb.sh`), what happens when
+a slot is invalidated (`run_rowcache_slot_invalidation.sh`) and the races a pool
+creates (`run_rowcache_registration_race.sh`,
+`run_rowcache_lock_contention.sh`), tenant-scoped pub/sub
 (`run_pubsub_tenant.sh`) and the per-tenant ring share
 (`run_tenant_fairness.sh`), RESP3 typed replies and every `CLIENT TRACKING` mode
 (`run_resp3.sh`) including cross-worker invalidation (`run_tracking_xworker.sh`),
@@ -1440,8 +1580,8 @@ records 44 worker deaths in a minute; with it, none.
 `run_extension_upgrade.sh` builds a genuine 0.1.0 install from the archived
 release schema, runs `ALTER EXTENSION pg_keyspace UPDATE`, and requires the
 result to be **identical** to a fresh `CREATE EXTENSION` — signatures, argument
-names, ACLs, comments and view definitions, all 46 objects. That equivalence is
-what keeps `sql/pg_keyspace--0.1.0--0.2.0.sql` from drifting away from
+names, ACLs, comments and view definitions, all 48 objects. That equivalence is
+what keeps the upgrade scripts from drifting away from
 `lib.rs`: delete one `COMMENT ON VIEW` from the upgrade script and it fails on
 that comment; delete the `pg_monitor` grant and it fails on ten ACLs and on the
 `pg_monitor` read. It also records the pre-upgrade symptoms, including the quiet
@@ -1449,11 +1589,11 @@ one — see below.
 
 `run_extension_autoupgrade.sh` covers the other half: that nobody has to run the
 command. It creates a genuine 0.1.0 install, restarts, and asserts the catalogue
-reached 0.2.0 with no `ALTER EXTENSION` anywhere in the test — then that a second
+reached 0.3.0 with no `ALTER EXTENSION` anywhere in the test — then that a second
 restart is a silent no-op, that `pg_keyspace.auto_upgrade = off` leaves the
 version where it is while still reporting the skew, and that turning it back on
 repairs the same cluster. Section 6 is the one that earns its place: it removes
-the upgrade script, so the update *cannot* succeed, and requires the worker to
+the **last hop** of the chain, so the update can start and *cannot* finish, and requires the worker to
 log one warning, start exactly once, and go on serving its segment — a worker
 that died there would crash-loop, which is #130's failure mode, not a new one.
 
@@ -1490,7 +1630,7 @@ compares the installed extension against the library's `default_version` and, if
 they differ, runs the update itself:
 
 ```
-LOG:  pg_keyspace worker: upgraded the extension catalogue 0.1.0 -> 0.2.0
+LOG:  pg_keyspace worker: upgraded the extension catalogue 0.1.0 -> 0.3.0
 ```
 
 So taking a newer `pg_keyspace.so` and restarting is the whole procedure. This
@@ -1503,7 +1643,24 @@ Three things bound it, all deliberate:
 
 - **It applies to the database named by `pg_keyspace.database`.** A background
   worker connects to one database. Any *other* database holding the extension is
-  still yours to update by hand.
+  still yours to update by hand — and since #120 that is no longer a corner case.
+  Using the row cache in a database means creating the extension there, so a
+  cluster with ten tenant databases has ten catalogues, of which worker 0
+  upgrades one. `pg_extension` is per-database, so no single query finds the
+  rest: list the candidates and run the update in each.
+
+  ```bash
+  for d in $(psql -At -c "SELECT datname FROM pg_database
+                           WHERE datallowconn AND NOT datistemplate"); do
+    psql -d "$d" -c 'ALTER EXTENSION pg_keyspace UPDATE' 2>/dev/null
+  done
+  ```
+
+  It is a no-op where the version already matches, and errors harmlessly where
+  the extension is not installed.
+
+  A stale catalogue in a tenant database fails the way described above: missing
+  objects announce themselves, a stale *signature* does not.
 - **It never runs on a standby.** A replica's catalogue is replayed from the
   primary, so the check reports the skew and leaves it alone; upgrade the primary.
 - **It cannot take the worker down.** `ALTER EXTENSION` raises for reasons that
@@ -1519,16 +1676,22 @@ you the command instead of running it:
 
 ```sql
 ALTER EXTENSION pg_keyspace UPDATE;
-SELECT extversion FROM pg_extension WHERE extname = 'pg_keyspace';  -- 0.2.0
+SELECT extversion FROM pg_extension WHERE extname = 'pg_keyspace';  -- 0.3.0
 ```
 
-`0.1.0 -> 0.2.0` adds seventeen functions and the ten `pg_stat_keyspace*` views,
-and replaces `ring_stats()`, which went from three columns to seven.
+The path is a **chain** — `0.1.0 -> 0.2.0 -> 0.3.0` — and Postgres walks it on
+its own from a single `ALTER EXTENSION`. `0.1.0 -> 0.2.0` adds seventeen
+functions and ten `pg_stat_keyspace*` views, and replaces `ring_stats()`, which
+went from three columns to seven. `0.2.0 -> 0.3.0` is #120: `invalidation_stats()`
+and `rowcache_coherence()` change their **return type**, which `CREATE OR REPLACE`
+cannot do, so both are dropped and recreated along with the two views that select
+from them; `rowcache_databases()` and
+`supacache.pg_stat_keyspace_rowcache_databases` are new, making eleven views.
 
 That last one is worth knowing because of how it fails without the update.
 Missing objects announce themselves — `supacache.pg_stat_keyspace` simply does
 not exist. A *stale* entry does not: the 0.1.0 catalogue still describes
-`ring_stats()` as three columns, so calling it against the 0.2.0 library raises
+`ring_stats()` as three columns, so calling it against a newer library raises
 nothing and returns `pushed`, `dropped`, `backlog_bytes` exactly as before.
 `committed`, `lag`, `failed_batches` and `unresolved` are not absent so much as
 invisible. Nothing in the logs marks the difference.
