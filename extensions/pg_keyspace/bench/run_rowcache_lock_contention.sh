@@ -54,7 +54,28 @@ chk() {
 }
 Q() { $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -tAc "$1" 2>&1; }
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
-stop_pg()  { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop -m fast" >/dev/null 2>&1; }
+# `pg_ctl -w stop` gives up after its own timeout and returns non-zero with the
+# postmaster STILL shutting down. Discarding that status and starting a new one a
+# second later starts it on top of a live postmaster: the start fails, and every
+# wait_ready poll then reads `FATAL: the database system is shutting down` until
+# the loop expires -- which is how this harness reported "the cluster restarts at
+# 8 partition(s): expected t, actual f" with 14GB of memory free and nothing at
+# all wrong with the partition count.
+#
+# Intermittent because shutdown length tracks how much the persistence worker has
+# to flush, and section 1 writes 50000 rows immediately before the first restart.
+# Verify the postmaster is really gone rather than assuming the stop took.
+stop_pg() {
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 120 stop -m fast" >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    su postgres -c "$PGBIN/pg_ctl -D $PGDATA status" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  # Still up after two minutes: take it down hard rather than starting on top.
+  echo "  (shutdown exceeded 120s, escalating to immediate)"
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w -t 60 stop -m immediate" >/dev/null 2>&1
+  return 0
+}
 wait_ready() { for _ in $(seq 1 60); do Q "SELECT 1" | grep -q "^1$" && return 0; sleep 1; done; return 1; }
 log_lines() { wc -l < $PGDATA/log 2>/dev/null || echo 0; }
 crashes_since() { tail -n +"${1:-0}" $PGDATA/log 2>/dev/null | grep -c "signal 11"; }
