@@ -1388,6 +1388,26 @@ check — and the loser used to die with `duplicate_table`, taking its shard out
 of service until the watchdog returned it (#130). With the fix reverted the test
 records 44 worker deaths in a minute; with it, none.
 
+`run_extension_upgrade.sh` builds a genuine 0.1.0 install from the archived
+release schema, runs `ALTER EXTENSION pg_keyspace UPDATE`, and requires the
+result to be **identical** to a fresh `CREATE EXTENSION` — signatures, argument
+names, ACLs, comments and view definitions, all 46 objects. That equivalence is
+what keeps `sql/pg_keyspace--0.1.0--0.2.0.sql` from drifting away from
+`lib.rs`: delete one `COMMENT ON VIEW` from the upgrade script and it fails on
+that comment; delete the `pg_monitor` grant and it fails on ten ACLs and on the
+`pg_monitor` read. It also records the pre-upgrade symptoms, including the quiet
+one — see below.
+
+`run_extension_autoupgrade.sh` covers the other half: that nobody has to run the
+command. It creates a genuine 0.1.0 install, restarts, and asserts the catalogue
+reached 0.2.0 with no `ALTER EXTENSION` anywhere in the test — then that a second
+restart is a silent no-op, that `pg_keyspace.auto_upgrade = off` leaves the
+version where it is while still reporting the skew, and that turning it back on
+repairs the same cluster. Section 6 is the one that earns its place: it removes
+the upgrade script, so the update *cannot* succeed, and requires the worker to
+log one warning, start exactly once, and go on serving its segment — a worker
+that died there would crash-loop, which is #130's failure mode, not a new one.
+
 ---
 
 ## Backup, restore and upgrade
@@ -1405,6 +1425,68 @@ cache is disposable, exclude it:
 ```bash
 pg_dump --exclude-schema=supacache ...
 ```
+
+#### How the extension catalogue evolves
+
+Two independent things change across a release, and only one of them looks after
+itself. The persisted tables converge on the running binary at every worker
+start (below). The extension's **catalogue** — its functions and views — does
+not: Postgres runs an extension's SQL exactly once, at `CREATE EXTENSION`. A
+cluster that takes a newer image keeps whatever catalogue it had when the
+extension was first created, so fixes that live in the shared library arrive on
+their own and SQL objects never do.
+
+**In the normal case you do not have to do anything.** At start-up worker 0
+compares the installed extension against the library's `default_version` and, if
+they differ, runs the update itself:
+
+```
+LOG:  pg_keyspace worker: upgraded the extension catalogue 0.1.0 -> 0.2.0
+```
+
+So taking a newer `pg_keyspace.so` and restarting is the whole procedure. This
+lives in the extension rather than in any image's bootstrap on purpose:
+pg_keyspace runs standalone on plain Postgres, an AMI, bare metal or someone
+else's container, and a fix wired into one project's init scripts would reach
+none of them.
+
+Three things bound it, all deliberate:
+
+- **It applies to the database named by `pg_keyspace.database`.** A background
+  worker connects to one database. Any *other* database holding the extension is
+  still yours to update by hand.
+- **It never runs on a standby.** A replica's catalogue is replayed from the
+  primary, so the check reports the skew and leaves it alone; upgrade the primary.
+- **It cannot take the worker down.** `ALTER EXTENSION` raises for reasons that
+  are not emergencies — no update path between two versions, an upgrade script
+  missing from the install — and a worker that died on one would take the
+  keyspace out of service on a relaunch loop. The statement runs inside a
+  `DO ... EXCEPTION` block, so a failure is a `WARNING` in the log and start-up
+  continues on the old catalogue.
+
+Set `pg_keyspace.auto_upgrade = off` to keep the catalogue under your own
+control. The version check still runs and still reports a skew — it just tells
+you the command instead of running it:
+
+```sql
+ALTER EXTENSION pg_keyspace UPDATE;
+SELECT extversion FROM pg_extension WHERE extname = 'pg_keyspace';  -- 0.2.0
+```
+
+`0.1.0 -> 0.2.0` adds seventeen functions and the ten `pg_stat_keyspace*` views,
+and replaces `ring_stats()`, which went from three columns to seven.
+
+That last one is worth knowing because of how it fails without the update.
+Missing objects announce themselves — `supacache.pg_stat_keyspace` simply does
+not exist. A *stale* entry does not: the 0.1.0 catalogue still describes
+`ring_stats()` as three columns, so calling it against the 0.2.0 library raises
+nothing and returns `pushed`, `dropped`, `backlog_bytes` exactly as before.
+`committed`, `lag`, `failed_batches` and `unresolved` are not absent so much as
+invisible. Nothing in the logs marks the difference.
+
+Version `0.1.0` is what the v17.2.4 and v17.2.5 images shipped, and both shipped
+the same catalogue — their generated schemas differ only in pgrx's deliberately
+unstable statement ordering — so one script covers either.
 
 #### How the persisted schema evolves
 
