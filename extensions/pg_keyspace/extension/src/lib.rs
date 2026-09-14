@@ -3353,6 +3353,37 @@ fn ensure_decode_slot(slot: &str) -> Result<(), String> {
     // one -- and a `DO` block is a utility statement that read-only SPI will not
     // run. Advisory locks are not heap writes, so they assign no xid either, and
     // the check and the create can finally sit in one transaction.
+    // Capacity is checked BEFORE attempting, not caught afterwards.
+    //
+    // `pg_create_logical_replication_slot` answers exhaustion with a Postgres
+    // ERROR, and an ERROR inside SPI longjmps out and aborts the transaction,
+    // which pgrx surfaces as a panic that takes the worker with it -- the
+    // `map_err` below would never see it (#130). The worker would then die, be
+    // relaunched a second later, and die again, for as long as the cluster was
+    // short of slots: a crash loop in place of the one clear line an operator
+    // needs.
+    //
+    // Slots are a cluster-wide resource and this design needs one per
+    // participating database, so running out is an ordinary misconfiguration
+    // rather than an exotic failure. Asking first turns it into a returned
+    // error, a log line naming the database, and a cache that fails closed.
+    let room = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::get_one::<bool>(
+            "SELECT (SELECT count(*) FROM pg_replication_slots) \
+                  < current_setting('max_replication_slots')::int",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(true) // a failed read must not block slot creation
+    }));
+    if !room {
+        return Err(
+            "every replication slot is in use; raise max_replication_slots. The row \
+             cache needs one slot per database that registers a table, on top of \
+             whatever replication this cluster already does"
+                .to_string(),
+        );
+    }
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
         Spi::connect(|client| {
             client.select(

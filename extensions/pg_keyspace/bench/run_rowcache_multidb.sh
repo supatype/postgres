@@ -346,33 +346,48 @@ echo "########## 10. a database that cannot get a slot is INCOHERENT, not health
 # per participating database. A database that cannot get one is not being
 # invalidated -- so it must fail closed, exactly as a stalled one does. Reporting
 # it healthy would be the original bug reached by a different road.
-# Three participating databases and room for two slots, so one of them cannot
-# be served however long it waits. Existing slots are dropped first, or the
-# cluster would simply keep the ones it already had.
+# Deterministic rather than a race: `max_replication_slots` is raised to 4 and
+# three of those are taken by hand, leaving pg_keyspace exactly ONE for three
+# participating databases. Waiting for the pool to cycle its way into exhaustion
+# would make this timing-dependent, and a run where the exhaustion never
+# happened would pass while testing nothing.
 for d in $DBS; do Q "SELECT pg_drop_replication_slot('$(slot_of $d)')" postgres >/dev/null 2>&1; done
-set_conf "max_replication_slots" "2"
+set_conf "max_replication_slots" "4"
 restart
-sleep 20
+for i in 1 2 3; do Q "SELECT pg_create_physical_replication_slot('hog_$i')" postgres >/dev/null; done
+chk "(setup) three of the four slots are taken by something else" "3" \
+    "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'hog\\_%'")"
+
+# Wait for the pool to have tried every database at least once, so the
+# assertions below are about a settled state rather than a moment mid-cycle.
+for _ in $(seq 1 120); do
+  [ "$(grep -c 'every replication slot is in use' $PGDATA/log)" -ge 1 ] && break
+  sleep 1
+done
 SLOTS=$(Q "SELECT count(*) FROM pg_replication_slots WHERE plugin='supacache_keys'")
-chk "three databases want a slot and the cluster allows two (got $SLOTS)" "t" \
-    "$([ "${SLOTS:-0}" -le 2 ] && echo t || echo f)"
-# The decisive assertion. Whichever database missed out is NOT being invalidated,
-# so it must NOT be serving cached rows -- `coherent` false is what makes its
-# reads fall back to the heap. Reporting it healthy would be the original bug
-# reached by a different road: cached, never invalidated, and saying it is fine.
-chk "a database without a slot never reads as coherent" "0" \
+chk "pg_keyspace got the one slot left and no more (got $SLOTS)" "1" "$SLOTS"
+# The failure is LOUD. A database that cannot be invalidated and says nothing is
+# the shape of the bug this whole issue is about, reached by a different road.
+chk "and the log says every slot is in use, naming the setting to raise" "t" \
+    "$([ "$(grep -c 'every replication slot is in use' $PGDATA/log)" -ge 1 ] && echo t || echo f)"
+chk "...and names the database that went without" "t" \
+    "$([ "$(grep -c 'cannot create slot' $PGDATA/log)" -ge 1 ] && echo t || echo f)"
+# THE assertion. A database nobody is invalidating must NOT be serving cached
+# rows. Reporting it healthy would be the original bug with a different cause.
+chk "no database without a slot ever reads as coherent" "0" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases d
           WHERE d.state='participating' AND d.coherent
             AND NOT EXISTS (SELECT 1 FROM pg_replication_slots s
                              WHERE s.slot_name = d.slot_name)")"
-# And the failure is loud rather than silent.
-chk "and the log says which database could not get one" "t" \
-    "$([ "$(grep -c 'cannot create slot' $PGDATA/log)" -ge 1 ] && echo t || echo f)"
-# A starved database must not starve the healthy ones: the pool has to keep
-# cycling rather than retrying the one it cannot serve.
-chk "the databases that did get slots are still served" "t" \
+# A starved database must not starve the healthy one: the pool has to keep
+# cycling rather than wedging on the database it cannot serve.
+chk "the database that did get a slot is still served" "t" \
     "$([ "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases
                WHERE state='participating' AND coherent")" -ge 1 ] && echo t || echo f)"
+# And no crash loop: catching exhaustion by ASKING FIRST rather than by letting
+# the ERROR longjmp out of SPI is what keeps the worker alive to log it (#130).
+chk "no invalidation worker died over it" "0" \
+    "$(grep -ciE 'rowcache invalidation worker.*(exit code 1|terminated by signal)' $PGDATA/log || true)"
 
 stop_pg
 echo
