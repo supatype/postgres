@@ -87,8 +87,16 @@ fi
 # From here on the allowlist (if this build has one) is in place, so truncate:
 # the guard below is about whether the worker crash-loops from now on, and the
 # first start before the setting was applied would otherwise count against it.
+#
+# Stop FIRST, then truncate. Truncating under a running server leaves a window
+# in which the still-running pre-allowlist worker -- which relaunches on a
+# five-second loop -- can append one more "may not be used as an output plugin"
+# line after the truncate, and the guard below then fails for a setup artefact
+# rather than a crash loop. That race is why this test was intermittent.
+stop_pg
 : > $PGDATA/log; chown postgres:postgres $PGDATA/log
-restart
+start_pg; wait_ready || { echo "NO START"; exit 1; }
+sleep 2
 # The pool is up, which is not the same as the cache being SERVED. Databases are
 # picked up lazily since #120: one with no registrations gets no slot, no worker
 # and no turn, so it correctly reads as not coherent until something is
