@@ -45,6 +45,11 @@ PEAK=${PEAK:-24}
 TENANTS=${TENANTS:-3}
 WORKERS=${WORKERS:-2}
 SHARDS=${PGKS_PERSIST_WORKERS:-2}
+# The invalidation POOL (#120). One variable, because the conf below and three
+# separate worker-count assertions have to agree on it, and when they did not
+# the soak waited out a 60s readiness loop that could never succeed and then
+# failed its own end-of-run check.
+POOL=${POOL:-2}
 FAULT_EVERY=${FAULT_EVERY:-45}
 export SAMPLE_SECS=${SAMPLE_SECS:-5}
 SECRET=${SECRET:-soakpw}
@@ -114,7 +119,7 @@ su postgres -c "$PGBIN/initdb -D $PGDATA -U postgres" >/dev/null 2>&1
   # Deliberately SMALLER than the number of databases when SOAK_DATABASES is
   # set, so the run exercises CYCLING rather than a worker per database. A pool
   # large enough to avoid cycling would soak the easy case.
-  echo "pg_keyspace.rowcache_invalidation_workers = 2"
+  echo "pg_keyspace.rowcache_invalidation_workers = $POOL"
   echo "pg_keyspace.rowcache_lease_ms = 3000"
   # Deliberately small, so the cold set does not fit and eviction runs for the
   # whole soak. A cache that never evicts is not being soaked -- at 120000 the
@@ -149,7 +154,7 @@ fi
 Q "CREATE EXTENSION pg_keyspace" >/dev/null
 restart
 for _ in $(seq 1 60); do
-  [ "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE alive")" = "$((WORKERS+SHARDS+2))" ] && break
+  [ "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE alive")" = "$((WORKERS+SHARDS+1+POOL))" ] && break
   sleep 1
 done
 
@@ -228,7 +233,8 @@ echo "########## 0. preconditions ##########"
 # RESP + persist + expiry + the invalidation POOL (#120), which is sized by its
 # own GUC rather than being a single worker.
 SOAK_POOL=$(Q "SHOW pg_keyspace.rowcache_invalidation_workers"); SOAK_POOL=${SOAK_POOL:-1}
-chk "$WORKERS RESP workers and $SHARDS persist shards are up" "$((WORKERS+SHARDS+1+SOAK_POOL))" \
+chk "the server runs the pool size this soak asked for ($POOL)" "$POOL" "$SOAK_POOL"
+chk "$WORKERS RESP workers and $SHARDS persist shards are up" "$((WORKERS+SHARDS+1+POOL))" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE alive")"
 chk "the durable tier is actually configured" "durable" "$(Q "SELECT tier FROM supacache.replication_status()")"
 # A tenant must be able to AUTH, or mixed.js measures nothing but auth failures.
@@ -394,7 +400,11 @@ chk "...and the check would catch a corrupted one" "1" \
 
 echo
 echo "########## 4. the cluster survived ##########"
-chk "every worker is alive at the end" "$((WORKERS+SHARDS+2))" \
+# RESP + persist + expiry + the pool. The old "+2" assumed a single
+# invalidation worker, which #120 replaced with a pool sized by its GUC -- so a
+# multi-database soak, the one shape this file exists to exercise, reported
+# 7 alive against an expected 6 and failed while nothing was wrong.
+chk "every worker is alive at the end" "$((WORKERS+SHARDS+1+POOL))" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_activity WHERE alive")"
 chk "the row cache is coherent at the end" "t" \
     "$(Q "SELECT coherent FROM supacache.pg_stat_keyspace_rowcache")"
