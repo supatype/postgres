@@ -2760,14 +2760,26 @@ fn table_exists(qualified: &str) -> bool {
 /// register in a database that has no catalogue yet at the same moment.
 fn rowcache_catalogue_ddl() -> Vec<String> {
     vec![
+        // duplicate_object and unique_violation alongside duplicate_schema for the
+        // same reason as the table below: a concurrent loser does not reliably
+        // reach the check that raises the tidy, specific error.
         "DO $rc$ BEGIN CREATE SCHEMA supacache; \
-         EXCEPTION WHEN duplicate_schema THEN NULL; END $rc$"
+         EXCEPTION WHEN duplicate_schema OR duplicate_object OR unique_violation \
+         THEN NULL; END $rc$"
             .to_string(),
+        // CREATE TABLE also creates the relation's composite type, and a racing
+        // loser can fail at the TYPE rather than at the relation: `type
+        // "rowcache_reg" already exists` is duplicate_object (42710), not
+        // duplicate_table (42P07). Catching only the latter left the #130 hole
+        // open in the one place this whole design most expects a crowd --
+        // several backends registering in a fresh database while the pool probes
+        // it. Measured: one escape in four storms of 8 databases x 20 racers.
         "DO $rc$ BEGIN \
            CREATE TABLE supacache.rowcache_reg (\
              tbl text PRIMARY KEY, attnums smallint[] NOT NULL, \
              registered_at timestamptz NOT NULL DEFAULT now()); \
-         EXCEPTION WHEN duplicate_table OR unique_violation THEN NULL; END $rc$"
+         EXCEPTION WHEN duplicate_table OR duplicate_object OR unique_violation \
+         THEN NULL; END $rc$"
             .to_string(),
         // #111: the stats functions read this over SPI, and SPI inside a
         // function runs as the CALLER -- the view owner's privileges do not
