@@ -3880,26 +3880,55 @@ fn rcdb_discover() {
     }
     // Forget databases that no longer exist. Not housekeeping: a directory entry
     // for a dropped database is one a pool worker will lease and then fail to
-    // connect to, dying and being restarted a second later, forever. Only
-    // entries nobody holds are cleared, so this can never pull a database out
-    // from under the worker currently draining it.
+    // connect to, dying and being restarted a second later, forever.
+    //
+    // Each candidate is re-checked against `pg_database` on its own before it is
+    // cleared. The list above is a snapshot, and a database CREATED after it was
+    // taken -- and published by a registration in the meantime -- would look
+    // missing and have its entry taken away, leaving it registered and never
+    // invalidated until something published it again. The re-check is a query
+    // per dropped database, which is as rare as dropping databases.
     let now = store::now_micros();
-    for i in 0..rcdb_count() {
-        let s = match rcdb_at(i) {
-            Some(s) => s,
-            None => continue,
-        };
-        let oid = s.datoid.load(Ordering::Acquire);
-        if oid == 0 || rows.iter().any(|(o, _)| *o == oid) {
+    let me = unsafe { pg_sys::MyProcPid } as u32;
+    let candidates: Vec<u32> = (0..rcdb_count())
+        .filter_map(rcdb_at)
+        .filter_map(|s| {
+            let oid = s.datoid.load(Ordering::Acquire);
+            if oid == 0 || rows.iter().any(|(o, _)| *o == oid) {
+                return None;
+            }
+            // Never pull a database out from under the worker draining it.
+            if !rcdb_free(s, me, now) {
+                return None;
+            }
+            Some(oid)
+        })
+        .collect();
+    for oid in candidates {
+        let still_there = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            Spi::get_one_with_args::<bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE oid = $1)",
+                vec![(PgBuiltInOids::OIDOID.oid(), pg_sys::Oid::from(oid).into_datum())],
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(true) // a failed read must never be read as "it is gone"
+        }));
+        if still_there {
             continue;
         }
-        let owner = s.owner_pid.load(Ordering::Acquire);
-        if owner != 0 && pid_alive(owner) && s.lease_until_us.load(Ordering::Acquire) > now {
-            continue;
+        if let Some(s) = rcdb_find(oid) {
+            // Re-checked, because the entry may have been reused for another
+            // database between the scan above and here.
+            if s.datoid.load(Ordering::Acquire) == oid && rcdb_free(s, me, store::now_micros()) {
+                s.state.store(DB_IDLE, Ordering::Release);
+                s.datoid.store(0, Ordering::Release);
+                log!(
+                    "pg_keyspace invalidation: database oid {oid} is gone; freed its \
+                     directory entry"
+                );
+            }
         }
-        s.state.store(DB_IDLE, Ordering::Release);
-        s.datoid.store(0, Ordering::Release);
-        log!("pg_keyspace invalidation: database oid {oid} is gone; freed its directory entry");
     }
     let full = rows.len();
     let mut recorded = 0usize;
