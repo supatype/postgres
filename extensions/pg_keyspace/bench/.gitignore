@@ -1,0 +1,4 @@
+# Scratch copies. The harnesses are run from a copy because bash reads a script
+# by byte offset as it executes, so editing one mid-run corrupts that run.
+.*_run.sh
+.sv_*.sh
