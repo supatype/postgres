@@ -71,6 +71,15 @@ su postgres -c "$PGBIN/initdb -D $PGDATA -U postgres" >/dev/null 2>&1
   echo "pg_keyspace.require_mask = off"
   echo "pg_keyspace.rowcache_decode = on"
   echo "pg_keyspace.rowcache_decode_ms = 200"
+  # REFILL ON is what makes section 3 work rather than hope. With refill off the
+  # apply phase is a shared-memory delete that touches no table, so the ACCESS
+  # EXCLUSIVE lock blocks nothing and the slot only stalls if the WAL flood
+  # happens to outrun the decoder -- which it did on one run and not the next.
+  # With refill on, applying a change RE-READS the row, so the lock stops the
+  # apply outright and the slot cannot advance. That is the deliberate design
+  # being exercised: a change that cannot be applied blocks the channel instead
+  # of being consumed and forgotten.
+  echo "pg_keyspace.rowcache_refill = on"
   echo "pg_keyspace.rowcache_invalidation_workers = 2"
   echo "wal_level = logical"
   echo "max_replication_slots = 16"
@@ -111,6 +120,13 @@ echo "########## 1. an unbounded max_slot_wal_keep_size is called out ##########
 chk "the log warns that slots can retain WAL without bound" "t" \
     "$([ "$(grep -c 'max_slot_wal_keep_size is unset' $PGDATA/log)" -ge 1 ] && echo t || echo f)"
 chk "and the cluster serves anyway rather than refusing to start" "1" "$(Q "SELECT 1")"
+# Registration first: a database with no registrations gets no slot (databases
+# are picked up lazily since #120), and with no slot there is no row in the
+# invalidation view to report the setting on.
+for d in victim bystander; do
+  chk "  $d registers" "t" "$(Q "SELECT supacache.rowcache_register('public.t')" $d)"
+done
+for d in victim bystander; do wait_coherent $d >/dev/null; done
 chk "the view reports the setting, so it is visible without reading logs" "-1" \
     "$(Q "SELECT DISTINCT max_slot_wal_keep_size FROM supacache.pg_stat_keyspace_invalidation" victim)"
 
@@ -118,9 +134,6 @@ echo
 echo "########## 2. both databases cache and are coherent ##########"
 set_conf "max_slot_wal_keep_size" "32MB"
 restart
-for d in victim bystander; do
-  chk "  $d registers" "t" "$(Q "SELECT supacache.rowcache_register('public.t')" $d)"
-done
 for d in victim bystander; do
   chk "  $d is coherent" "ok" "$(wait_coherent $d && echo ok || echo timeout)"
   chk "  $d caches its row" "t" "$(Q "SELECT supacache.rowcache_put('public.t', 1)" $d)"
@@ -145,9 +158,15 @@ chk "(setup) the victim has a slot named for its database" "1" \
     "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$VS'")"
 LSN0=$(Q "SELECT restart_lsn FROM pg_replication_slots WHERE slot_name='$VS'")
 
-( Q "BEGIN; LOCK TABLE public.t IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(120); COMMIT" victim >/dev/null 2>&1 ) &
+( Q "BEGIN; LOCK TABLE public.t IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(300); COMMIT" victim >/dev/null 2>&1 ) &
 LOCKER=$!
 sleep 3
+# The lock only stalls the slot once there is a change to APPLY: the apply
+# re-reads the row and blocks on the lock, and the slot cannot advance past a
+# batch that was never applied. Without this first write the worker has nothing
+# to apply, drains cleanly, and the slot keeps up with everything below.
+Q "UPDATE public.t SET v='stall-me' WHERE id=1" victim >/dev/null 2>&1 &
+sleep 2
 # Generate far more WAL than the bound, and force segment recycling, which is
 # what actually invalidates an over-reserving slot.
 for i in $(seq 1 14); do
