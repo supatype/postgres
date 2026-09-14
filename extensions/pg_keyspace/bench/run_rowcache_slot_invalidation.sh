@@ -70,7 +70,11 @@ su postgres -c "$PGBIN/initdb -D $PGDATA -U postgres" >/dev/null 2>&1
   echo "pg_keyspace.port = $RESP"
   echo "pg_keyspace.require_mask = off"
   echo "pg_keyspace.rowcache_decode = on"
-  echo "pg_keyspace.rowcache_decode_ms = 200"
+  # A LONG decode interval, so section 3 can get its lock in place between the
+  # write committing and the worker trying to apply it. At 200ms that window is
+  # a coin flip; at 10s it is not. Everything else here is bounded by
+  # stale_after_ms (30s floor), so a 10s interval still reads as coherent.
+  echo "pg_keyspace.rowcache_decode_ms = 10000"
   # REFILL ON is what makes section 3 work rather than hope. With refill off the
   # apply phase is a shared-memory delete that touches no table, so the ACCESS
   # EXCLUSIVE lock blocks nothing and the slot only stalls if the WAL flood
@@ -158,15 +162,31 @@ chk "(setup) the victim has a slot named for its database" "1" \
     "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$VS'")"
 LSN0=$(Q "SELECT restart_lsn FROM pg_replication_slots WHERE slot_name='$VS'")
 
+# ORDER MATTERS, and getting it wrong is why an earlier version of this section
+# reported SKIP on half its runs.
+#
+# The write has to COMMIT first: the slot stalls on a change it cannot apply, so
+# there must be a decodable change, on a row that is currently CACHED (the
+# worker skips changes to uncached rows entirely). Issuing it after the lock is
+# taken means it blocks instead of committing, and the worker then has nothing
+# to apply and drains cleanly past everything below.
+#
+# Then the lock goes on, inside the decode interval, so the worker's next pass
+# tries to refill the changed row, blocks, and the slot stops advancing while
+# WAL piles up behind it.
+Q "UPDATE public.t SET v='stall-me' WHERE id=1" victim >/dev/null
 ( Q "BEGIN; LOCK TABLE public.t IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(300); COMMIT" victim >/dev/null 2>&1 ) &
 LOCKER=$!
-sleep 3
-# The lock only stalls the slot once there is a change to APPLY: the apply
-# re-reads the row and blocks on the lock, and the slot cannot advance past a
-# batch that was never applied. Without this first write the worker has nothing
-# to apply, drains cleanly, and the slot keeps up with everything below.
-Q "UPDATE public.t SET v='stall-me' WHERE id=1" victim >/dev/null 2>&1 &
-sleep 2
+# Wait for the lock to actually be held, rather than guessing at it.
+for _ in $(seq 1 30); do
+  [ "$(Q "SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid=l.database
+          WHERE l.mode='AccessExclusiveLock' AND l.granted AND d.datname='victim'")" -ge 1 ] && break
+  sleep 1
+done
+chk "(setup) the victim's table is locked, so the apply cannot complete" "t" \
+    "$([ "$(Q "SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid=l.database
+              WHERE l.mode='AccessExclusiveLock' AND l.granted AND d.datname='victim'")" -ge 1 ] \
+        && echo t || echo f)"
 # Generate far more WAL than the bound, and force segment recycling, which is
 # what actually invalidates an over-reserving slot.
 for i in $(seq 1 14); do
