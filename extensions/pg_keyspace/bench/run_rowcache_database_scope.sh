@@ -97,7 +97,6 @@ echo "pg_keyspace.database = 'proj_a'" >> $PGDATA/postgresql.conf
 restart
 Q "CREATE EXTENSION pg_keyspace" proj_a >/dev/null
 restart
-for _ in $(seq 1 40); do [ "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" proj_a)" = "t" ] && break; sleep 1; done
 
 echo
 echo "########## 1. the precondition: two databases, one relid ##########"
@@ -106,7 +105,17 @@ A_OID=$(Q "SELECT 'public.orders'::regclass::oid" proj_a)
 B_OID=$(Q "SELECT 'public.orders'::regclass::oid" proj_b)
 chk "the cloned databases really share a relid ($A_OID / $B_OID)" "same" \
     "$([ "$A_OID" = "$B_OID" ] && echo same || echo different)"
-chk "the invalidation worker is up, so the cache is served at all" "t" \
+
+# Databases are picked up LAZILY since #120: one with no registrations gets no
+# slot, no worker and no turn, and therefore reads as NOT coherent. That is the
+# design, not a fault -- there is nothing to keep coherent -- so registration
+# has to come before any assertion about slots or coherence.
+chk "with nothing registered, proj_a has no slot and is not served" "f" \
+    "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" proj_a)"
+chk "registering in proj_a succeeds" "t" \
+    "$(Q "SELECT supacache.rowcache_register('public.orders')" proj_a)"
+for _ in $(seq 1 90); do [ "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" proj_a)" = "t" ] && break; sleep 1; done
+chk "and a pool worker then picks it up, so the cache is served at all" "t" \
     "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" proj_a)"
 
 echo
@@ -153,9 +162,7 @@ chk "and invalidation is still healthy afterwards" "t" \
 
 echo
 echo "########## 2. proj_a caches its own row ##########"
-chk "registering in the worker's database succeeds" "t" \
-    "$(Q "SELECT supacache.rowcache_register('public.orders')" proj_a)"
-chk "and the row caches" "t" "$(Q "SELECT supacache.rowcache_put('public.orders', 1)" proj_a)"
+chk "the row caches" "t" "$(Q "SELECT supacache.rowcache_put('public.orders', 1)" proj_a)"
 chk "proj_a is served from the cache" "1" \
     "$(Q "EXPLAIN SELECT v FROM public.orders WHERE id=1" proj_a | grep -c pg_keyspace_rowcache)"
 chk "and reads its own row" "SECRET-OF-PROJECT-A" \

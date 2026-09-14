@@ -3693,6 +3693,66 @@ fn drop_legacy_decode_slot(base: &str, in_use: &str) {
     }
 }
 
+/// Hand pool slot `k` to a fresh worker, then let this one exit.
+///
+/// A pool member changes database by being REBORN -- a background worker binds
+/// to one database for its life -- so every hand-over is an exit, and something
+/// has to bring the replacement back. That something cannot be Postgres's own
+/// `bgw_restart_time`: measured, a pool worker that exits CLEANLY is not
+/// restarted at all, so the first hand-over ended with the pool empty, no slot
+/// ever created, and every database reading incoherent. It was not a subtle
+/// failure -- it was the whole feature not running -- and it took a real cluster
+/// to see, because nothing errors and the logs just stop.
+///
+/// Nor can it be `health_watchdog`: the outgoing worker releases its health slot
+/// so the replacement can claim it, and a released slot reads as "never started"
+/// rather than as a gap to fill.
+///
+/// So the outgoing worker launches its own replacement, the way `health_relaunch`
+/// launches any other worker. Ordering matters: the health slot is released
+/// FIRST, or the replacement's `health_claim` would find this process still
+/// alive and holding it, refuse, and exit -- leaving the pool slot empty for
+/// good. And if Postgres does also restart the old registration, `health_claim`
+/// is what makes the duplicate exit harmlessly.
+fn rowcache_pool_relaunch(k: usize) {
+    let health = health_invalidation_slot(k);
+    // Released before the launch, never after: the replacement's `health_claim`
+    // would otherwise find this process still alive and holding the slot,
+    // refuse, and exit -- leaving the pool slot empty for good.
+    health_release(health);
+    let name = format!("pg_keyspace: rowcache invalidation worker {k}");
+    let built = BackgroundWorkerBuilder::new(&name)
+        .set_library("pg_keyspace")
+        .set_function("pg_keyspace_invalidation_main")
+        .set_argument((k as i32).into_datum())
+        .set_restart_time(Some(Duration::from_secs(1)))
+        .enable_spi_access()
+        .set_notify_pid(0)
+        .load_dynamic();
+    if built.is_err() {
+        // Hand the slot to the watchdog rather than leaving it empty. A released
+        // slot reads as "never started", which `health_watchdog` deliberately
+        // skips -- so without this the one case where the relaunch is most
+        // likely to fail (`max_worker_processes` exhausted, which is a
+        // transient thing an operator fixes) would also be the one case nothing
+        // ever retried. Backdating the heartbeat makes it look like the gap it
+        // actually is.
+        if let Some(sl) = health_slot(health) {
+            sl.last_seen_us.store(
+                store::now_micros().saturating_sub(health_stale_us() * 2),
+                Ordering::Release,
+            );
+        }
+        log!(
+            "pg_keyspace invalidation {k}: could not launch a replacement worker \
+             (max_worker_processes reached?). This pool slot is empty, so the \
+             databases it was serving are not being invalidated and their caches \
+             fail closed. The watchdog will retry in {}s.",
+            GUC_WATCHDOG_SECS.get()
+        );
+    }
+}
+
 /// Take a turn on a database, if one is free.
 ///
 /// Called BEFORE connecting, which is the constraint the whole pool design is
@@ -4206,7 +4266,11 @@ pub extern "C" fn pg_keyspace_invalidation_main(arg: pg_sys::Datum) {
             }
             std::thread::sleep(idle_poll);
         }
-        health_release(health);
+        if BackgroundWorker::sigterm_received() {
+            health_release(health);
+        } else {
+            rowcache_pool_relaunch(k);
+        }
         return;
     }
 
@@ -4283,7 +4347,11 @@ pub extern "C" fn pg_keyspace_invalidation_main(arg: pg_sys::Datum) {
                 // throughout, which is the part that matters: `last_drained_us`
                 // was never set, so its cache is not served.
                 std::thread::sleep(idle_poll);
-                health_release(health);
+                if BackgroundWorker::sigterm_received() {
+                    health_release(health);
+                } else {
+                    rowcache_pool_relaunch(k);
+                }
                 return;
             }
             serving = true;
@@ -4384,7 +4452,13 @@ pub extern "C" fn pg_keyspace_invalidation_main(arg: pg_sys::Datum) {
     // Released so the replacement can claim it immediately rather than waiting
     // out a staleness window; the slot itself is retained, so the next worker on
     // this database resumes where this one stopped.
-    health_release(health);
+    // Only relaunch when this is a hand-over. On SIGTERM the cluster is going
+    // down and a replacement would just have to be shut down again.
+    if BackgroundWorker::sigterm_received() {
+        health_release(health);
+    } else {
+        rowcache_pool_relaunch(k);
+    }
     log!(
         "pg_keyspace invalidation {k}: stopping (slot '{slot}' for database '{dbname}' \
          retained for resume)"

@@ -301,6 +301,17 @@ chk "every reported pid is a real backend" "$((WORKERS+SHARDS+1+POOL))" "$LIVE_P
 
 echo
 echo "########## 10. WAL decode lag ##########"
+# A database gets a decode slot only once it has registrations (#120): they are
+# picked up LAZILY, so one that caches nothing costs no slot, no worker and no
+# WAL. Section 11 registers a table and checks occupancy; the slot has to exist
+# before that to be reported here, so register the first one now.
+Q "CREATE TABLE IF NOT EXISTS slotmaker(id bigint primary key, v text)" >/dev/null
+chk "(setup) a registration exists, so this database has a slot at all" "t" \
+    "$(Q "SELECT supacache.rowcache_register('public.slotmaker')")"
+for _ in $(seq 1 90); do
+  [ "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation")" = "1" ] && break
+  sleep 1
+done
 chk "the invalidation view has a row while decoding is on" "1" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation")"
 chk "it names the slot the decoder uses" "1" \
