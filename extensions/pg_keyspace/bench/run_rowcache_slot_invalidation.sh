@@ -304,9 +304,31 @@ for _ in $(seq 1 120); do
 done
 chk "the victim is coherent again" "t" \
     "$(Q "SELECT coherent FROM supacache.rowcache_coherence()" victim)"
-chk "a healthy slot exists for it once more" "1" \
-    "$(Q "SELECT count(*) FROM pg_replication_slots
-          WHERE slot_name='$VS' AND plugin='supacache_keys' AND wal_status <> 'lost'")"
+HEALTHY=$(Q "SELECT count(*) FROM pg_replication_slots
+             WHERE slot_name='$VS' AND plugin='supacache_keys' AND wal_status <> 'lost'")
+chk "a healthy slot exists for it once more" "1" "$HEALTHY"
+# 0 here has TWO readings and they are different bugs: no slot at all (the
+# rebuild failed), or a slot that exists and is ALREADY lost again (rebuilt, then
+# invalidated before the worker's next pass noticed). The count cannot tell them
+# apart, and `coherent` reading true alongside it is the part that matters --
+# a database reading healthy while its slot cannot deliver anything is the
+# failure this whole file exists to catch. Print the state rather than infer it.
+[ "${HEALTHY:-0}" != "1" ] && {
+  echo "--- victim slot state ---"
+  Q "SELECT slot_name, plugin, active, wal_status, restart_lsn, confirmed_flush_lsn,
+            pg_current_wal_lsn() AS current_lsn
+       FROM pg_replication_slots WHERE slot_name='$VS'" | sed 's/^/  /'
+  echo "  (no row above = the slot genuinely does not exist)"
+  echo "  max_slot_wal_keep_size: $(Q "SHOW max_slot_wal_keep_size")"
+  echo "  LSN0 (where the lost one stopped): $LSN0"
+  echo "--- per-database view ---"
+  Q "SELECT datname, state, registrations, coherent, slot_lost, slot_name,
+            last_drained_ms_ago, stale_after_ms
+       FROM supacache.pg_stat_keyspace_rowcache_databases ORDER BY datname" | sed 's/^/  /'
+  echo "--- recovery lines in the log ---"
+  grep -E "rebuilt|cannot recreate|cannot drop lost|has been invalidated" $PGDATA/log | tail -6 | sed 's/^/  /'
+  echo "---"
+}
 chk "and it advanced past where the lost one stopped" "t" \
     "$([ "$(Q "SELECT (restart_lsn > '$LSN0'::pg_lsn)::int FROM pg_replication_slots WHERE slot_name='$VS'")" = "1" ] && echo t || echo f)"
 # The registrations are configuration, not cache content. Dropping them on top
