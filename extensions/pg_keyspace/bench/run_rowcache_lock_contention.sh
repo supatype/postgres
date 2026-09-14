@@ -65,8 +65,21 @@ crashes_since() { tail -n +"${1:-0}" $PGDATA/log 2>/dev/null | grep -c "signal 1
 set_partitions() {
   sed -i "/^pg_keyspace.rowcache_partitions/d" $PGDATA/postgresql.conf
   echo "pg_keyspace.rowcache_partitions = $1" >> $PGDATA/postgresql.conf
-  stop_pg; sleep 1; start_pg; wait_ready || return 1
-  return 0
+  stop_pg; sleep 1; start_pg
+  wait_ready && return 0
+  # A postmaster that will not come back says why in its own log, and this is
+  # the one place that knows the setting it was asked to come back with. Without
+  # it the failure reads as "the cluster restarts at 8 partition(s): expected t,
+  # actual f" -- true, useless, and indistinguishable between a shared-memory
+  # request the machine would not grant, a GUC out of range, and a runner that
+  # was simply slow.
+  echo "--- postmaster did not come up at $1 partition(s) ---"
+  tail -40 "$PGDATA/log" 2>/dev/null
+  echo "--- shared memory / limits ---"
+  ipcs -m 2>/dev/null | head -8
+  free -m 2>/dev/null | head -3
+  echo "---"
+  return 1
 }
 
 # Coherence is waited for AFTER registering, not before. A database with no
