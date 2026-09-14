@@ -131,6 +131,14 @@ sleep 5
 
 DUP=$(since $N0 | grep -ciE "duplicate_table|duplicate_object|duplicate_schema|already exists" || true)
 chk "no duplicate-object error was raised" "0" "$DUP"
+# An assertion that only says a race leaked is an assertion you cannot act on:
+# which object raced decides whether the hole is in the catalogue DDL, the slot's
+# advisory lock, or somewhere with no guard at all. Print the evidence.
+[ "${DUP:-0}" != "0" ] && {
+  echo "--- duplicate-object evidence ---"
+  since $N0 | grep -iE "duplicate_table|duplicate_object|duplicate_schema|already exists" | head -20
+  echo "---"
+}
 DEAD=$(since $N0 | grep -ciE "pg_keyspace.*(exit code 1|was terminated|FATAL)" || true)
 chk "no pg_keyspace worker died" "0" "$DEAD"
 chk "no backend segfaulted" "0" "$(since $N0 | grep -c 'signal 11')"
