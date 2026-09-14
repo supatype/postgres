@@ -358,10 +358,14 @@ for i in 1 2 3; do Q "SELECT pg_create_physical_replication_slot('hog_$i')" post
 chk "(setup) three of the four slots are taken by something else" "3" \
     "$(Q "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'hog\\_%'")"
 
-# Wait for the pool to have tried every database at least once, so the
-# assertions below are about a settled state rather than a moment mid-cycle.
-for _ in $(seq 1 120); do
-  [ "$(grep -c 'every replication slot is in use' $PGDATA/log)" -ge 1 ] && break
+# Wait for the pool to have probed EVERY database, not just for the first
+# exhaustion to be logged. Those are different moments: the first failure
+# arrives while other databases are still unprobed, and checking then measures
+# where the cycle happened to be rather than where it settles.
+for _ in $(seq 1 180); do
+  [ "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases
+          WHERE state='participating' AND datname LIKE 'proj\\_%'")" = "3" ] \
+    && [ "$(grep -c 'every replication slot is in use' $PGDATA/log)" -ge 1 ] && break
   sleep 1
 done
 SLOTS=$(Q "SELECT count(*) FROM pg_replication_slots WHERE plugin='supacache_keys'")
