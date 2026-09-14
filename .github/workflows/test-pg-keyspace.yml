@@ -361,6 +361,20 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_rowcache_concurrency.sh
 
+      # The row-cache writer lock, partitioned per store partition (#120).
+      # Asserts that partitioning does not reopen #127 -- a lock chosen for one
+      # partition while the write lands in another is the same corruption with
+      # a lock in front of it -- and that raising the partition count divides
+      # the arena rather than multiplying the shared-memory request. Also
+      # prints the contention numbers at 1 vs 8 partitions, which are
+      # measurement rather than a gate.
+      - name: Row-cache writer lock contention
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_rowcache_lock_contention.sh
+
       # Four persistence workers contending over TTL bucket partitions. With
       # the fix reverted this kills 44 workers in a minute; with it, none.
       - name: TTL partition creation race

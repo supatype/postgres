@@ -39,6 +39,8 @@ mod resp;
 mod batcher;
 #[path = "../../core/src/ring.rs"]
 mod ring;
+#[path = "../../core/src/rowcache_key.rs"]
+mod rowcache_key;
 #[path = "../../core/src/prob.rs"]
 mod prob;
 #[path = "../../core/src/pubsub.rs"]
@@ -82,7 +84,9 @@ static RING_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static ROWCACHE_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // The LWLock serialising row-cache WRITES (#127). Resolved once per process in
 // the shmem startup hook and inherited by every forked backend.
-static ROWCACHE_LOCK: AtomicPtr<pg_sys::LWLock> = AtomicPtr::new(std::ptr::null_mut());
+/// Base of the row-cache writer-lock tranche: one `LWLockPadded` per row-cache
+/// partition, indexed by `Store::partition_of` (#127, partitioned for #120).
+static ROWCACHE_LOCKS: AtomicPtr<pg_sys::LWLockPadded> = AtomicPtr::new(std::ptr::null_mut());
 // Base of the cross-process pub/sub segment.
 static PUBSUB_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // Base of the worker liveness table.
@@ -122,6 +126,9 @@ static GUC_TTL_BUCKET_SECS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static GUC_TTL_SWEEP_SECS: GucSetting<i32> = GucSetting::<i32>::new(5);
 // Mode B row cache segment size.
 static GUC_ROWCACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
+/// How many partitions the Mode B row-cache segment is carved into, which is
+/// also how many writer locks it has (#120).
+static GUC_ROWCACHE_PARTITIONS: GucSetting<i32> = GucSetting::<i32>::new(8);
 
 /// Whether the RESP worker requires `supatype_mask` to be loaded (and outermost)
 /// before it will serve. Default OFF: pg_keyspace runs standalone as a
@@ -193,17 +200,27 @@ static GUC_TENANT_OPS_PER_SEC: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 /// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
 /// values are raw heap-tuple bytes.
+/// One megabyte, the smallest a row-cache partition is allowed to be. Each
+/// partition is a separate arena with its own CLOCK eviction, so one too small
+/// to hold a working set evicts continuously and caches nothing.
+const RC_MIN_PARTITION_BYTES: u64 = 1024 * 1024;
+
 fn rowcache_config() -> Config {
-    let mb = GUC_ROWCACHE_MB.get().max(1) as u64;
-    let bytes = mb * 1024 * 1024;
-    let entries = 200_000u32;
-    let buckets = (entries * 2).next_power_of_two();
-    Config {
-        num_partitions: 1,
-        buckets_per_part: buckets,
-        entries_per_part: entries,
-        data_bytes_per_part: bytes,
-    }
+    // `rowcache_mb` is the size of the WHOLE segment and always has been, so
+    // the partitions divide it. `Config::partitioned` is what enforces that,
+    // and the count it returns can be lower than asked for on a small segment.
+    Config::partitioned(
+        GUC_ROWCACHE_MB.get().max(1) as u64 * 1024 * 1024,
+        200_000,
+        GUC_ROWCACHE_PARTITIONS.get().clamp(1, 64) as u32,
+        RC_MIN_PARTITION_BYTES,
+    )
+}
+
+/// How many partitions the row-cache segment has, which is also how many
+/// writer locks its tranche needs (#120).
+fn rowcache_partitions() -> u32 {
+    rowcache_config().num_partitions
 }
 
 /// Whether read-through warming is both enabled and safe to act on.
@@ -248,7 +265,8 @@ fn rowcache_coherent() -> bool {
 }
 
 /// A row-cache Store view over the Mode B segment (any backend).
-/// Run `f` as the only writer to the row-cache segment (#127).
+/// Run `f` as the only writer to `key`'s partition of the row-cache segment
+/// (#127, partitioned for #120).
 ///
 /// `Store`'s public API is documented as "called only by the owning worker for
 /// partition p", and every RESP keyspace segment honours that: one worker
@@ -272,15 +290,29 @@ fn rowcache_coherent() -> bool {
 /// The lock lives here rather than in `core/` deliberately: `core/` is shared
 /// with the standalone daemon, which has no Postgres LWLocks and does not have
 /// this problem, because there every segment has exactly one writing process.
+///
+/// ONE lock for the whole segment was right while the segment served one
+/// database. #120 makes every database read-through into it, and a single lock
+/// would then be a cluster-wide serialisation point for row-cache writes: one
+/// database with a cold cache and heavy read-through would stall caching for
+/// every other one. So the lock follows the segment's own partitioning —
+/// `Store::partition_of` names the partition, and each partition has its own
+/// lock. Two writers in different partitions never wait on each other, and a
+/// writer still cannot race another writer in the arena it is mutating, which
+/// is the whole of what #127 needed.
 #[inline]
-fn rowcache_write<T>(f: impl FnOnce() -> T, default: T) -> T {
-    let lock = ROWCACHE_LOCK.load(Ordering::Acquire);
-    if lock.is_null() {
+fn rowcache_write<T>(view: &Store, key: &[u8], f: impl FnOnce() -> T, default: T) -> T {
+    let base = ROWCACHE_LOCKS.load(Ordering::Acquire);
+    if base.is_null() {
         // No lock means the shmem startup hook did not run, which means there
         // is no segment to write either. Refusing is right: writing unguarded
         // is what this function exists to prevent.
         return default;
     }
+    // The partition comes from the same view the closure writes through, so the
+    // lock and the arena cannot come from different geometries.
+    let p = view.partition_of(key) as usize;
+    let lock = unsafe { std::ptr::addr_of_mut!((*base.add(p)).lock) };
     unsafe {
         pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE);
     }
@@ -303,18 +335,22 @@ fn rowcache_view() -> Option<Store> {
     Some(unsafe { Store::from_raw(base, &rowcache_config(), false) })
 }
 
-/// Row-cache key = relid (u32 LE) ++ canonical pk bytes. The pk part is a type's
-/// output-function text (the "canonical" form): identical bytes are produced by
-/// the planner hook (from the query Const), by `rowcache_put`/refill (from the
-/// heap tuple), and by the `supacache_keys` decode plugin (from the WAL change),
-/// so all three agree for the same logical row regardless of the pk's type —
-/// int, uuid, text, etc. (Integers are still their decimal text, e.g. `1`.)
-/// Tag byte distinguishing the three kinds of row-cache key. Without it a row
-/// key whose leading bytes happened to match could collide with a registration
-/// key -- a latent hazard in the original `relid`-first scheme, and a real one
-/// once a database oid sits in front.
-const RC_TAG_ROW: u8 = 0x00;
-const RC_TAG_REG: u8 = 0xff;
+// Row-cache key layout, and the decode-slot name derived from a database oid.
+//
+// A key is `tag ++ datoid ++ relid ++ canonical pk bytes`. The pk part is the
+// type's output-function text (the "canonical" form): identical bytes are
+// produced by the planner hook (from the query Const), by `rowcache_put`/refill
+// (from the heap tuple), and by the `supacache_keys` decode plugin (from the WAL
+// change), so all three agree for the same logical row regardless of the pk's
+// type — int, uuid, text, etc. (Integers are still their decimal text, e.g. `1`.)
+//
+// The layout itself lives in `core/rowcache_key.rs`, where it can be unit-tested
+// without standing up a cluster. #117 was a key-layout bug, and a layout that
+// can only be checked by running Postgres is one that reaches production.
+use rowcache_key::{
+    loaded_key as rc_loaded_key_for, reg_key as rc_reg_key_for, row_key as rc_key_for,
+    slot_name_for,
+};
 
 /// The database this backend is connected to, as row-cache key bytes.
 ///
@@ -326,17 +362,12 @@ const RC_TAG_REG: u8 = 0xff;
 /// certain rather than unlikely in the per-project-database pattern, and served
 /// one database's rows to another (#117).
 #[inline]
-fn rc_db() -> [u8; 4] {
-    unsafe { pg_sys::MyDatabaseId.as_u32().to_le_bytes() }
+fn rc_db() -> u32 {
+    unsafe { pg_sys::MyDatabaseId.as_u32() }
 }
 
 fn rc_key(relid: u32, pk: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(9 + pk.len());
-    k.push(RC_TAG_ROW);
-    k.extend_from_slice(&rc_db());
-    k.extend_from_slice(&relid.to_le_bytes());
-    k.extend_from_slice(pk);
-    k
+    rc_key_for(rc_db(), relid, pk)
 }
 
 /// Canonical pk bytes for a datum of `typoid`: the type's output-function text.
@@ -1193,6 +1224,25 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_int_guc(
+        "pg_keyspace.rowcache_partitions",
+        "How many partitions the Mode B row-cache segment is carved into",
+        "Also the number of writer locks it has: row-cache writers take one \
+         exclusive LWLock per partition, so two backends writing different \
+         partitions never wait on each other. It matters because the writers \
+         are ordinary BACKENDS -- rowcache_put, registration, and above all \
+         read-through, which makes a writer of every backend that misses -- and \
+         with the row cache serving every database, one lock for the whole \
+         segment would be a cluster-wide serialisation point. Each partition is \
+         a separate arena carved out of `pg_keyspace.rowcache_mb`, which still \
+         means the size of the WHOLE segment, so raising this divides the \
+         segment rather than growing it. Rounded up to a power of two.",
+        &GUC_ROWCACHE_PARTITIONS,
+        1,
+        64,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
         "pg_keyspace.tenant_ops_per_sec",
         "Commands per second one tenant may issue (0 = no limit)",
         "Bounds how much of a worker's event loop one tenant can ask for. The \
@@ -1367,10 +1417,12 @@ extern "C" fn ks_shmem_request() {
         pg_sys::RequestAddinShmemSpace(rowcache_config().total_bytes());
         pg_sys::RequestAddinShmemSpace(pubsub_bytes());
         pg_sys::RequestAddinShmemSpace(health_bytes());
-        // One LWLock to serialise row-cache writers (#127). Requested here
-        // because RequestNamedLWLockTranche is only legal from the shmem
-        // request hook; resolved to a pointer in the startup hook.
-        pg_sys::RequestNamedLWLockTranche(RC_LOCK_NAME.as_ptr(), 1);
+        // One LWLock per row-cache partition, to serialise row-cache writers
+        // without serialising them against each other across the whole segment
+        // (#127, partitioned for #120). Requested here because
+        // RequestNamedLWLockTranche is only legal from the shmem request hook;
+        // resolved to a pointer in the startup hook.
+        pg_sys::RequestNamedLWLockTranche(RC_LOCK_NAME.as_ptr(), rowcache_partitions() as i32);
     }
 }
 
@@ -1438,12 +1490,14 @@ extern "C" fn ks_shmem_startup() {
             }
             ROWCACHE_BASE.store(rcptr, Ordering::Release);
         }
-        // Resolve the row-cache writer lock (#127). GetNamedLWLockTranche must
+        // Resolve the row-cache writer locks (#127). GetNamedLWLockTranche must
         // run with AddinShmemInitLock held, which is exactly this hook; every
-        // backend then inherits the pointer across the fork.
+        // backend then inherits the pointer across the fork. The tranche is
+        // `rowcache_partitions()` locks laid out contiguously, so only the base
+        // is stored and `rowcache_write` indexes it.
         let tranche = pg_sys::GetNamedLWLockTranche(RC_LOCK_NAME.as_ptr());
         if !tranche.is_null() {
-            ROWCACHE_LOCK.store(std::ptr::addr_of_mut!((*tranche).lock), Ordering::Release);
+            ROWCACHE_LOCKS.store(tranche, Ordering::Release);
         }
         // The TTL clock anchor (#110), shared so every process agrees.
         //
@@ -2254,6 +2308,70 @@ fn table_exists(qualified: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// The row-cache registration catalogue, as statements that can be run in ANY
+/// database and by any number of callers at once (#120).
+///
+/// A registration is configuration, not cache content, and shared memory is the
+/// wrong home for configuration: a segment reinitialisation (watchdog relaunch,
+/// crash-restart, a terminated worker) took the pinned entry with it, and the
+/// table then silently stopped being cached, with no error and a healthy-looking
+/// coherence check (#103). This table is the source of truth; the pinned
+/// shared-memory entry is a cache of it, reloaded whenever the segment turns out
+/// to be empty. Keyed by name rather than by oid, so a dump/restore or a table
+/// recreated by a migration keeps its registration; the oid is resolved afresh
+/// on every reload.
+///
+/// Every statement is wrapped in a plpgsql `EXCEPTION` handler rather than left
+/// as a bare `IF NOT EXISTS`, because `IF NOT EXISTS` is NOT race-free: two
+/// sessions can both pass the existence check before either inserts its
+/// catalogue row, and the loser raises `duplicate_schema`/`duplicate_table`.
+/// That killed 44 persistence workers a minute under load in #130 -- a Postgres
+/// ERROR inside SPI longjmps out and aborts the transaction, which pgrx surfaces
+/// as a panic that takes the worker with it, so the discarded `Result` never
+/// sees it. `let _ =` was never protection.
+///
+/// The handler opens an implicit subtransaction, so the duplicate is caught and
+/// rolled back without touching the caller's transaction. Here the entrants are
+/// real: registration runs in ordinary backends, and several of them can
+/// register in a database that has no catalogue yet at the same moment.
+fn rowcache_catalogue_ddl() -> Vec<String> {
+    vec![
+        "DO $rc$ BEGIN CREATE SCHEMA supacache; \
+         EXCEPTION WHEN duplicate_schema THEN NULL; END $rc$"
+            .to_string(),
+        "DO $rc$ BEGIN \
+           CREATE TABLE supacache.rowcache_reg (\
+             tbl text PRIMARY KEY, attnums smallint[] NOT NULL, \
+             registered_at timestamptz NOT NULL DEFAULT now()); \
+         EXCEPTION WHEN duplicate_table OR unique_violation THEN NULL; END $rc$"
+            .to_string(),
+        // #111: the stats functions read this over SPI, and SPI inside a
+        // function runs as the CALLER -- the view owner's privileges do not
+        // reach down into it -- so a pg_monitor member needs these directly.
+        // Guarded like the rest: a concurrent GRANT of the same privilege is
+        // harmless, but the role may not exist on an exotic install.
+        "DO $rc$ BEGIN GRANT USAGE ON SCHEMA supacache TO pg_monitor; \
+           GRANT SELECT ON supacache.rowcache_reg TO pg_monitor; \
+         EXCEPTION WHEN undefined_object OR undefined_table THEN NULL; END $rc$"
+            .to_string(),
+    ]
+}
+
+/// Ensure this database has a row-cache registration catalogue.
+///
+/// Callable from an ordinary backend with SPI already connected -- which is
+/// where it matters, because registration is the act that makes a database
+/// participate, and until #120 the catalogue only ever existed in
+/// `pg_keyspace.database` because only a worker there created it.
+fn ensure_rowcache_catalogue() -> bool {
+    for stmt in rowcache_catalogue_ddl() {
+        if Spi::run(&stmt).is_err() {
+            return false;
+        }
+    }
+    table_exists("supacache.rowcache_reg")
+}
+
 /// Create the `supacache` schema and the hash-partitioned `supacache.kv`
 /// backing table if absent. Idempotent; runs in one transaction.
 fn pg_ensure_schema() {
@@ -2313,23 +2431,14 @@ fn pg_ensure_schema() {
              id int PRIMARY KEY DEFAULT 1 CHECK (id = 1), workers int NOT NULL, \
              updated_at timestamptz NOT NULL DEFAULT now())",
         );
-        // Row-cache registrations. A registration is configuration, not cache
-        // content, and shared memory is the wrong home for configuration: a
-        // segment reinitialisation (watchdog relaunch, crash-restart, a
-        // terminated worker) took the pinned entry with it, and the table then
-        // silently stopped being cached with no error and a healthy-looking
-        // coherence check (#103). This table is the source of truth; the pinned
-        // shared-memory entry is a cache of it, reloaded whenever the segment
-        // turns out to be empty.
-        //
-        // Keyed by name rather than by oid so a dump/restore or a table
-        // recreated by a migration keeps its registration; the oid is resolved
-        // afresh on every reload.
-        let _ = Spi::run(
-            "CREATE TABLE IF NOT EXISTS supacache.rowcache_reg (\
-             tbl text PRIMARY KEY, attnums smallint[] NOT NULL, \
-             registered_at timestamptz NOT NULL DEFAULT now())",
-        );
+        // Row-cache registrations. Created here too, so a cluster that only
+        // ever uses `pg_keyspace.database` has them at startup exactly as
+        // before; the shared definition lives in `rowcache_catalogue_ddl`
+        // because every other database has to be able to create the same thing
+        // for itself (#120).
+        for stmt in rowcache_catalogue_ddl() {
+            let _ = Spi::run(&stmt);
+        }
         // Crash recovery in a multi-worker cluster reads one contiguous slot
         // range per worker (see pg_recover), so index the column it ranges over.
         // Single-worker recovery scans unfiltered and ignores these.
@@ -2896,6 +3005,14 @@ fn parse_change(line: &str) -> Option<(char, u32, Vec<u8>)> {
     Some((action, relid, compose_pk(&parts)))
 }
 
+/// The configured stem every row-cache decode slot name is built from.
+fn rowcache_slot_base() -> String {
+    GUC_ROWCACHE_SLOT
+        .get()
+        .and_then(|c| c.to_str().ok().map(|s| s.to_string()))
+        .unwrap_or_else(|| "supacache_rowcache".to_string())
+}
+
 /// Create the keys-only replication slot if it does not exist yet. Requires
 /// `wal_level = logical`; returns Err with the reason otherwise.
 fn ensure_decode_slot(slot: &str) -> Result<(), String> {
@@ -2915,12 +3032,47 @@ fn ensure_decode_slot(slot: &str) -> Result<(), String> {
     if exists {
         return Ok(());
     }
-    // Run the create through the READ-ONLY SPI path: pg_create_logical_
-    // replication_slot refuses once the transaction has an xid, and the
-    // read-write path assigns one. Slot creation is not a heap write, so it is
-    // permitted read-only.
+    // Create under an advisory lock, re-checking existence while holding it.
+    //
+    // `IF NOT EXISTS` has no equivalent here and the check above is not a
+    // guard: two workers can both pass it before either creates, and the loser
+    // gets `duplicate_object` -- the #130 shape, where a Postgres ERROR inside
+    // SPI longjmps out and takes the worker with it, with the discarded
+    // `Result` never seeing it. A pool of invalidation workers probing the same
+    // database at once (#120) makes that a race with real entrants rather than
+    // a theoretical one.
+    //
+    // An advisory lock rather than the plpgsql `EXCEPTION WHEN duplicate_object`
+    // handler used for TTL partitions, because this whole call has to run
+    // through the READ-ONLY SPI path -- pg_create_logical_replication_slot
+    // refuses once the transaction has an xid and the read-write path assigns
+    // one -- and a `DO` block is a utility statement that read-only SPI will not
+    // run. Advisory locks are not heap writes, so they assign no xid either, and
+    // the check and the create can finally sit in one transaction.
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
         Spi::connect(|client| {
+            client.select(
+                "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                None,
+                Some(vec![
+                    (PgBuiltInOids::INT4OID.oid(), SLOT_ADVISORY_NS.into_datum()),
+                    (PgBuiltInOids::TEXTOID.oid(), slot.into_datum()),
+                ]),
+            )?;
+            let taken = client
+                .select(
+                    "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+                    None,
+                    Some(vec![(PgBuiltInOids::TEXTOID.oid(), slot.into_datum())]),
+                )?
+                .first()
+                .get::<bool>(1)
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            if taken {
+                return Ok(());
+            }
             client
                 .select(
                     "SELECT pg_create_logical_replication_slot($1, 'supacache_keys')",
@@ -2932,6 +3084,11 @@ fn ensure_decode_slot(slot: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
     }))
 }
+
+/// Advisory-lock namespace for row-cache slot creation. Arbitrary, but fixed:
+/// `pg_advisory_xact_lock(ns, key)` partitions the advisory space by its first
+/// argument, so this only has to not collide with another caller's choice.
+const SLOT_ADVISORY_NS: i32 = 0x7073_6b73; // "pgks"
 
 /// How much WAL one drain pass consumes at most.
 ///
@@ -3104,10 +3261,10 @@ fn drain_invalidations(slot: &str) -> Drain {
                 // The worker is the only process that deletes, but it shares the
                 // segment with every backend that writes, so it takes the same
                 // lock; a lock one writer skips protects nothing (#127).
-                rowcache_write(|| view.del(&key), false); // gone/unresolvable -> invalidate
+                rowcache_write(&view, &key, || view.del(&key), false); // gone/unresolvable -> invalidate
             }
         } else {
-            rowcache_write(|| view.del(&key), false);
+            rowcache_write(&view, &key, || view.del(&key), false);
         }
         reconciled += 1;
     }
@@ -3154,6 +3311,68 @@ fn advance_decode_slot(slot: &str, upto: &str) {
     }
 }
 
+/// Drop the pre-#120 slot named for the configuration rather than the database.
+///
+/// Before slots were per-database there was exactly one, named
+/// `pg_keyspace.rowcache_slot` verbatim. After an upgrade nothing consumes it,
+/// and an unconsumed slot pins WAL from its `restart_lsn` **forever** — the
+/// single worst operational failure this subsystem has, and it would arrive
+/// silently, on a cluster that had done nothing but upgrade.
+///
+/// Dropping it loses nothing. The row cache is empty after the restart an
+/// upgrade requires, so there is no cached row whose invalidation could be
+/// missed; the new slot starts from the current WAL position and is correct
+/// from its first pass.
+///
+/// Narrow on purpose: only a slot with exactly the configured name, only if it
+/// is ours by output plugin, and never the one now in use. Anything else is
+/// somebody's replication slot and is left alone.
+fn drop_legacy_decode_slot(base: &str, in_use: &str) {
+    use std::panic::AssertUnwindSafe;
+    if base == in_use {
+        return;
+    }
+    let found = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots \
+             WHERE slot_name = $1 AND plugin = 'supacache_keys' AND NOT active)",
+            vec![(PgBuiltInOids::TEXTOID.oid(), base.into_datum())],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    }));
+    if !found {
+        return;
+    }
+    let res: Result<(), String> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT pg_drop_replication_slot($1)",
+                    None,
+                    Some(vec![(PgBuiltInOids::TEXTOID.oid(), base.into_datum())]),
+                )
+                .map(|_| ())
+        })
+        .map_err(|e| e.to_string())
+    }));
+    match res {
+        Ok(()) => log!(
+            "pg_keyspace invalidation: dropped the pre-per-database slot '{base}'; \
+             this database now decodes through '{in_use}'. Nothing was lost -- the \
+             row cache is empty after a restart -- and leaving it would have pinned \
+             WAL with nothing consuming it."
+        ),
+        Err(why) => log!(
+            "pg_keyspace invalidation: could not drop the pre-per-database slot \
+             '{base}': {why}. It is no longer consumed and will retain WAL from its \
+             restart_lsn until it is dropped by hand: \
+             SELECT pg_drop_replication_slot('{base}')."
+        ),
+    }
+}
+
 #[no_mangle]
 #[pg_guard]
 pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
@@ -3164,10 +3383,12 @@ pub extern "C" fn pg_keyspace_invalidation_main(_arg: pg_sys::Datum) {
         .unwrap_or("postgres")
         .to_string();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
-    let slot = GUC_ROWCACHE_SLOT
-        .get()
-        .and_then(|c| c.to_str().ok().map(|s| s.to_string()))
-        .unwrap_or_else(|| "supacache_rowcache".to_string());
+    // Per-database from here on (#120). One database today, but the slot is
+    // named for the database it decodes rather than for the configuration,
+    // because a logical slot has never been able to mean anything else.
+    let base = rowcache_slot_base();
+    let slot = slot_name_for(&base, rc_db());
+    drop_legacy_decode_slot(&base, &slot);
 
     if let Err(why) = ensure_decode_slot(&slot) {
         log!(
@@ -3348,23 +3569,31 @@ fn rowcache_planner_init() {
 }
 
 fn rc_reg_key(relid: u32) -> [u8; 9] {
-    let mut k = [0u8; 9];
-    k[0] = RC_TAG_REG;
-    k[1..5].copy_from_slice(&rc_db());
-    k[5..].copy_from_slice(&relid.to_le_bytes());
-    k
+    rc_reg_key_for(rc_db(), relid)
 }
 
-/// Marks that this instance of the row-cache segment has had the registrations
-/// in `supacache.rowcache_reg` loaded into it.
+/// Marks that this instance of the row-cache segment has had ONE DATABASE's
+/// registrations, the ones in that database's `supacache.rowcache_reg`, loaded
+/// into it.
 ///
-/// A distinct first byte from `rc_reg_key`, so it can never collide with a
-/// registration for some relid. Pinned like the registrations it vouches for,
-/// so its absence means exactly one thing: this is a *fresh* segment, and
-/// whatever was pinned into the previous one is gone.
-const RC_LOADED_KEY: [u8; 5] = [0xfe, 0xfe, 0xfe, 0xfe, 0xfe];
+/// A distinct tag byte from `rc_key`/`rc_reg_key`, so it can never collide with
+/// a row or a registration. Pinned like the registrations it vouches for, so
+/// its absence means exactly one thing: this is a *fresh* segment as far as
+/// this database is concerned, and whatever was pinned into the previous one is
+/// gone.
+///
+/// Per-database (#120), and that is load-bearing rather than tidy. The marker
+/// used to be one fixed constant for the whole segment. With several databases
+/// loading into one segment, the first to finish would mark the segment loaded
+/// for all of them, and every other database's registrations would never be
+/// loaded at all -- their tables silently not cached, with a healthy-looking
+/// coherence check, which is exactly the failure #103 was about.
+fn rc_loaded_key() -> [u8; 5] {
+    rc_loaded_key_for(rc_db())
+}
 
-/// Have the registrations been loaded into the segment currently mapped?
+/// Have THIS database's registrations been loaded into the segment currently
+/// mapped?
 ///
 /// O(1), so the invalidation worker can ask on every pass. It deliberately
 /// tests the marker rather than tracking a generation number in worker-local
@@ -3372,7 +3601,7 @@ const RC_LOADED_KEY: [u8; 5] = [0xfe, 0xfe, 0xfe, 0xfe, 0xfe];
 /// was reinitialised underneath it.
 fn registrations_loaded() -> bool {
     match rowcache_view() {
-        Some(v) => matches!(v.get(&RC_LOADED_KEY), Lookup::Hit(_)),
+        Some(v) => matches!(v.get(&rc_loaded_key()), Lookup::Hit(_)),
         // No segment at all: nothing to load into, and nothing to report.
         None => true,
     }
@@ -3419,13 +3648,14 @@ fn load_registrations_spi() -> i64 {
     let mut n = 0i64;
     for (relid, attnums) in rows {
         let packed: Vec<u8> = attnums.iter().flat_map(|a| a.to_le_bytes()).collect();
-        if rowcache_write(|| view.set_pinned(&rc_reg_key(relid), &packed), false) {
+        if rowcache_write(&view, &rc_reg_key(relid), || view.set_pinned(&rc_reg_key(relid), &packed), false) {
             n += 1;
         }
     }
     // Last, and only on the same view: a marker written before the
     // registrations would claim a segment was loaded that is not.
-    rowcache_write(|| view.set_pinned(&RC_LOADED_KEY, b"1"), false);
+    let marker = rc_loaded_key();
+    rowcache_write(&view, &marker, || view.set_pinned(&marker, b"1"), false);
     n
 }
 
@@ -3854,7 +4084,7 @@ unsafe extern "C" fn rc_access(ss: *mut pg_sys::ScanState) -> *mut pg_sys::Tuple
                         // THE #127 CRASH SITE. This runs in an ordinary backend,
                         // and every backend that misses reaches it, so without
                         // the lock this is N concurrent writers into one arena.
-                        rowcache_write(|| view.set(&rc_key(relid, pk), &raw, 0), false);
+                        rowcache_write(&view, &rc_key(relid, pk), || view.set(&rc_key(relid, pk), &raw, 0), false);
                     }
                     fallback = raw;
                     &fallback[..]
@@ -4081,7 +4311,7 @@ unsafe fn rowcache_refill_locked(relid: pg_sys::Oid, pk_lookup: &[u8]) -> Refill
     }
     match fetch_row_and_pk(&meta, &parts, false) {
         Some((raw, canon)) if !canon.is_empty() => {
-            rowcache_write(|| view.set(&rc_key(relid.as_u32(), &canon), &raw, 0), false);
+            rowcache_write(&view, &rc_key(relid.as_u32(), &canon), || view.set(&rc_key(relid.as_u32(), &canon), &raw, 0), false);
             Refill::Stored
         }
         _ => Refill::Gone,
@@ -4717,6 +4947,20 @@ mod supacache {
             );
             return false;
         }
+        // The catalogue is created by a background worker, so between cluster
+        // start and that worker's first pass -- and after a DROP/CREATE
+        // EXTENSION -- there is a window where it is absent and registration
+        // failed with `relation "supacache.rowcache_reg" does not exist`.
+        // Creating it here closes that window, and is race-safe (#130).
+        if !ensure_rowcache_catalogue() {
+            warning!(
+                "pg_keyspace: could not create supacache.rowcache_reg in this database, \
+                 so the registration cannot be recorded durably and is refused. A \
+                 registration that lives only in shared memory is lost by the next \
+                 segment reinitialisation, with the table then silently not cached (#103)."
+            );
+            return false;
+        }
         // The catalogue first, and a failure here fails the call. Pinning
         // succeeds far more often than it survives: a segment reinitialisation
         // takes the pinned entry with it, and before #103 the caller was told
@@ -4744,7 +4988,7 @@ mod supacache {
             return false;
         }
         let packed: Vec<u8> = attnums.iter().flat_map(|a| a.to_le_bytes()).collect();
-        if !rowcache_write(|| view.set_pinned(&rc_reg_key(relid.as_u32()), &packed), false) {
+        if !rowcache_write(&view, &rc_reg_key(relid.as_u32()), || view.set_pinned(&rc_reg_key(relid.as_u32()), &packed), false) {
             return false;
         }
         // Read it back rather than trusting the write. set_pinned already
@@ -4797,7 +5041,7 @@ mod supacache {
             Some(vec![(PgBuiltInOids::OIDOID.oid(), relid.into_datum())]),
         );
         rowcache_view()
-            .map(|v| rowcache_write(|| v.del(&rc_reg_key(relid.as_u32())), false))
+            .map(|v| rowcache_write(&v, &rc_reg_key(relid.as_u32()), || v.del(&rc_reg_key(relid.as_u32())), false))
             .unwrap_or(false)
     }
 
@@ -4843,6 +5087,8 @@ mod supacache {
                 Some((raw, canon)) if !canon.is_empty() => {
                     if let Some(view) = rowcache_view() {
                         return rowcache_write(
+                            &view,
+                            &rc_key(relid.as_u32(), &canon),
                             || view.set(&rc_key(relid.as_u32(), &canon), &raw, 0),
                             false,
                         );
@@ -4885,7 +5131,7 @@ mod supacache {
             match fetch_row_and_pk(&meta, &parts, false) {
                 Some((raw, canon)) if !canon.is_empty() => rowcache_view()
                     .map(|v| {
-                        rowcache_write(|| v.set(&rc_key(relid.as_u32(), &canon), &raw, 0), false)
+                        rowcache_write(&v, &rc_key(relid.as_u32(), &canon), || v.set(&rc_key(relid.as_u32(), &canon), &raw, 0), false)
                     })
                     .unwrap_or(false),
                 _ => false,
@@ -4998,14 +5244,22 @@ mod supacache {
     > {
         let mut rows = Vec::new();
         if let Some(view) = rowcache_view() {
-            let s = view.stats(0);
-            rows.push((
-                s.entries as i64,
-                s.hits as i64,
-                s.misses as i64,
-                s.data_used as i64,
-                s.data_cap as i64,
-            ));
+            // Summed across partitions, not read from partition 0. The segment
+            // is carved into `pg_keyspace.rowcache_partitions` of them so that
+            // writers can take one lock each (#120), and reading a single one
+            // would report a fraction of the cache as the whole of it -- an
+            // arena that looks 8x too small, a hit rate computed from an eighth
+            // of the traffic, and `data_used` that never approaches `data_cap`.
+            let (mut entries, mut hits, mut misses, mut used, mut cap) = (0i64, 0i64, 0i64, 0i64, 0i64);
+            for p in 0..view.num_partitions() {
+                let s = view.stats(p);
+                entries += s.entries as i64;
+                hits += s.hits as i64;
+                misses += s.misses as i64;
+                used += s.data_used as i64;
+                cap += s.data_cap as i64;
+            }
+            rows.push((entries, hits, misses, used, cap));
         }
         TableIterator::new(rows)
     }
@@ -5282,10 +5536,10 @@ mod supacache {
         if !GUC_ROWCACHE_DECODE.get() {
             return TableIterator::new(rows);
         }
-        let slot = GUC_ROWCACHE_SLOT
-            .get()
-            .and_then(|c| c.to_str().ok().map(|s| s.to_string()))
-            .unwrap_or_else(|| "supacache_rowcache".to_string());
+        // The slot this database decodes through. Named for the database rather
+        // than for the configuration (#120), so reading the GUC verbatim would
+        // resolve nothing.
+        let slot = slot_name_for(&rowcache_slot_base(), rc_db());
         let found = Spi::connect(|client| {
             let t = client.select(
                 "SELECT s.active, s.confirmed_flush_lsn::text, s.restart_lsn::text, \

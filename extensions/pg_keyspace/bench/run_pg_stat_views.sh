@@ -295,6 +295,20 @@ chk "the invalidation view has a row while decoding is on" "1" \
 chk "it names the slot the decoder uses" "1" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation i
           JOIN pg_replication_slots s ON s.slot_name = i.slot_name")"
+# The slot is named for the DATABASE, not for the configuration (#120):
+# `pg_keyspace.rowcache_slot` is the stem and the database oid is the suffix.
+# A logical slot only ever decodes changes from the database it belongs to, so
+# a view that resolved the configured name verbatim would name a slot that does
+# not exist -- and would go empty, which is the signal for "decoding is off".
+chk "the slot it names belongs to THIS database" "1" \
+    "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation i
+          JOIN pg_replication_slots s ON s.slot_name = i.slot_name
+          WHERE s.database = current_database()")"
+chk "and carries this database's oid in its name" "1" \
+    "$(Q "SELECT (slot_name = current_setting('pg_keyspace.rowcache_slot')
+                               || '_' || (SELECT oid FROM pg_database
+                                           WHERE datname = current_database()))::int
+          FROM supacache.pg_stat_keyspace_invalidation")"
 chk "decode lag is reported, not null" "0" \
     "$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_invalidation WHERE decode_lag_bytes IS NULL")"
 chk "retained WAL is reported, not null" "0" \

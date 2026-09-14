@@ -23,6 +23,7 @@ pub mod pubsub_shm;
 pub mod repl;
 pub mod resp;
 pub mod ring;
+pub mod rowcache_key;
 pub mod server;
 pub mod share;
 pub mod shmem;
