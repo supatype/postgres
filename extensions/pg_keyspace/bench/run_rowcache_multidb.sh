@@ -366,6 +366,13 @@ for _ in $(seq 1 120); do
 done
 SLOTS=$(Q "SELECT count(*) FROM pg_replication_slots WHERE plugin='supacache_keys'")
 chk "pg_keyspace got the one slot left and no more (got $SLOTS)" "1" "$SLOTS"
+# Load-bearing, and it was NOT true the first time this section ran. The
+# assertion below filters on state='participating', so a database the pool never
+# got round to probing is excluded from it -- and would make the whole check pass
+# while testing nothing. All three have to be known participants first.
+PART=$(Q "SELECT count(*) FROM supacache.pg_stat_keyspace_rowcache_databases
+          WHERE state='participating' AND datname LIKE 'proj\\_%'")
+chk "all three databases were actually probed and are participating" "3" "$PART"
 # The failure is LOUD. A database that cannot be invalidated and says nothing is
 # the shape of the bug this whole issue is about, reached by a different road.
 chk "and the log says every slot is in use, naming the setting to raise" "t" \

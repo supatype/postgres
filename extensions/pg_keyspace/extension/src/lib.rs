@@ -3814,14 +3814,29 @@ fn rcdb_lease() -> Option<(u32, String)> {
             st == DB_PARTICIPATING || st == DB_UNKNOWN
         })
         .min_by_key(|s| {
-            // Participating first, then least-recently-attempted, then least
-            // recently drained. The attempt is what makes the cycle turn even
-            // when a database can never be served: see `last_attempt_us`.
+            // LEAST RECENTLY ATTEMPTED first. Round-robin, and the ordering is
+            // load-bearing rather than a preference.
+            //
+            // Ranking participating databases ahead of unprobed ones seems
+            // obviously right and is not: a database that is already
+            // participating has just been drained, so it would outrank every
+            // unprobed database FOREVER. The worker took its turn on the one
+            // database it knew about, handed over because others were waiting,
+            // and its replacement picked the same database again -- measured,
+            // seven turns in twenty seconds, with two other databases never
+            // probed at all. After any restart, when the directory is empty and
+            // every database starts unprobed, exactly one would ever be served.
+            //
+            // Attempt time is what makes the cycle actually turn: every lease
+            // stamps it, so nothing can be picked twice while something else
+            // waits. It also handles the database that can NEVER be served --
+            // one that cannot get a replication slot drains never, so ordering
+            // by drain time would put it first every single time.
             let st = s.state.load(Ordering::Acquire);
             let rank = if st == DB_PARTICIPATING { 0i64 } else { 1 };
             (
-                rank,
                 s.last_attempt_us.load(Ordering::Acquire),
+                rank,
                 s.last_drained_us.load(Ordering::Acquire),
             )
         });
