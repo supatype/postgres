@@ -127,7 +127,13 @@ for d in $DBS proj_d; do
   Q "INSERT INTO public.byuuid VALUES ('11111111-1111-1111-1111-111111111111','uuid-of-$d')" $d >/dev/null
 done
 restart
-for d in $DBS proj_d; do Q "CREATE EXTENSION pg_keyspace" $d >/dev/null; done
+# `postgres` gets the extension too, and not for symmetry: the cluster-wide
+# views are read from ONE database by a monitoring collector, which is how an
+# operator actually uses them. Without it every assertion below that omits a
+# database argument hits `postgres` and fails on a missing relation rather than
+# on the thing it is checking. `postgres` registers nothing, so it stays idle
+# and costs no slot -- which section 3 relies on for proj_d anyway.
+for d in postgres $DBS proj_d; do Q "CREATE EXTENSION pg_keyspace" $d >/dev/null; done
 restart
 
 echo
@@ -299,8 +305,12 @@ for _ in $(seq 1 20); do
   [ "$W" -gt "$MAXW" ] 2>/dev/null && MAXW=$W
   sleep 0.5
 done
-chk "never more than 1 invalidation worker, with 3 databases to serve (max $MAXW)" "t" \
-    "$([ "$MAXW" -le 1 ] && echo t || echo f)"
+# Bounded by the GUC, not by the number of databases -- that is the claim. The
+# bound is `pool + 1` rather than `pool` because a hand-over is an exit and a
+# relaunch, and for a moment the outgoing worker and its replacement both exist.
+# With three databases to serve, a design that scaled with them would show three.
+chk "never more than 2 invalidation workers (pool of 1 + hand-over), with 3 databases (max $MAXW)" "t" \
+    "$([ "$MAXW" -le 2 ] && echo t || echo f)"
 chk "...and at least one really was running" "t" \
     "$([ "$MAXW" -ge 1 ] && echo t || echo f)"
 
