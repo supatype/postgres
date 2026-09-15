@@ -101,20 +101,50 @@ docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
 | `applied_at` | When this database ran it |
 | `backfilled` | `true` if it was *assumed* applied rather than observed running — see below |
 
-### Volumes created before the ledger existed
+### Volumes created before this change
 
-A cluster that predates `supatype_migrations.applied` has no record of what it ran, and there is no way to work it out after the fact. On first sight of such a volume the entrypoint creates the ledger and marks every shipped migration as applied **without running it**, and says so loudly in the container log.
+Clusters created by an earlier image have no ledger, and nothing on disk records which migrations they ran. **On the first start under a ledger-carrying image, such a volume gets a ledger in which every shipped migration is marked applied without being run** (`backfilled = true`). This happens once per database, and the container log says so.
 
-That is correct for a cluster that was already up to date, and wrong for one that was behind. Nothing distinguishes the two, so the migrations are left alone rather than replayed against live data. New migrations are applied normally from then on.
+That choice is deliberate: marking them applied never replays DDL against live data. Replaying all 52 instead would repair a volume that was behind, but only if every one of them is safe to re-run against a populated database — which has not been established, so it is not the default.
 
-If a volume was behind, run the migrations it missed by hand:
+What it costs:
+
+- A volume that was **already up to date** is now tracked correctly. Nothing further to do.
+- A volume that was **behind stays behind**. The migrations it never ran are recorded as applied and will not run on their own.
+
+Nothing distinguishes those two cases after the fact, so check directly.
+
+#### Check whether your volume was behind
+
+Run this against the migrated database (`supatype_admin` by default). Every row should read `t`:
+
+```sql
+SELECT 'pg_guard preloaded for authenticator' AS check,
+       EXISTS (SELECT 1 FROM pg_roles
+                WHERE rolname = 'authenticator'
+                  AND array_to_string(rolconfig, ',') LIKE '%pg_guard%') AS ok
+UNION ALL
+SELECT 'supatype_mask extension',
+       EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'supatype_mask')
+UNION ALL
+SELECT 'supatype_privileged_role',
+       EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supatype_privileged_role');
+```
+
+Any `f` means that migration never ran on this volume. Replay it:
+
+| Row that reads `f` | Migration to replay | What is broken until you do |
+|---|---|---|
+| `pg_guard preloaded for authenticator` | `20260810150000_authenticator_session_preload.sql` | **`pg_guard` does not load for PostgREST sessions.** The `authenticator` role keeps an inherited `session_preload_libraries` naming only `safeupdate`, so privilege enforcement is off across the whole API surface — silently, with no error |
+| `supatype_mask extension` | `20260809214500_supatype_mask.sql` | A masked-write rejection raises `supatype_mask.deny() is not available` instead of a permission error |
+| `supatype_privileged_role` | `20260211120934_supabase_privileged_role.sql` | The `supatype_privileged_role` role does not exist |
 
 ```bash
 docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
   supatype-postgres supatype-migrate replay 20260810150000_authenticator_session_preload.sql
 ```
 
-`status` lists every migration flagged `backfilled`, which is the set to review.
+`supatype-migrate status` lists every migration flagged `backfilled`, which is the full set this applies to. These three are the ones with known consequences.
 
 ### Notes
 

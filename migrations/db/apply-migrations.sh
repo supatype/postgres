@@ -137,13 +137,13 @@ create_ledger() {
 
 # Adopting a cluster that predates the ledger.
 #
-# There is no way to ask an existing database which of these 53 files it has
-# run, so the choice is to assume all of them (and leave a cluster that is
-# genuinely behind still behind) or to replay all of them (and hope every one is
-# idempotent against a populated database). This takes the first: it never
-# replays DDL against live data, and it is honest about what it did -- every row
-# it writes is flagged `backfilled`, so `status` shows exactly which migrations
-# were assumed rather than observed, and `replay` can run any of them on demand.
+# There is no way to ask an existing database which of these files it has run, so
+# the choice is to assume all of them (and leave a cluster that is genuinely
+# behind still behind) or to replay all of them (and hope every one is idempotent
+# against a populated database). This takes the first: it never replays DDL
+# against live data, and it is honest about what it did -- every row it writes is
+# flagged `backfilled`, so `status` shows exactly which migrations were assumed
+# rather than observed, and `replay` can run any of them on demand.
 backfill_ledger() {
 	new_tmp; tmpsql=$NEW_TMP
 	count=0
@@ -168,18 +168,27 @@ backfill_ledger() {
 	psql_admin --single-transaction -f "$tmpsql" > /dev/null
 
 	echo "$PROG: ------------------------------------------------------------------" >&2
-	echo "$PROG: WARNING: this database had no migration ledger, so all $count shipped" >&2
-	echo "$PROG:          migrations were marked applied WITHOUT being run." >&2
+	echo "$PROG: WARNING: '$PGDATABASE' had no migration ledger, so all $count shipped" >&2
+	echo "$PROG:          migrations have been marked applied WITHOUT being run." >&2
 	echo "$PROG:" >&2
-	echo "$PROG:          That is correct for a cluster already up to date, and wrong" >&2
-	echo "$PROG:          for one created before a migration was added -- nothing" >&2
-	echo "$PROG:          distinguishes the two after the fact. From here on, new" >&2
-	echo "$PROG:          migrations are applied normally." >&2
+	echo "$PROG:          Correct if this cluster was already up to date. If it was" >&2
+	echo "$PROG:          BEHIND, it stays behind: the migrations it never ran are now" >&2
+	echo "$PROG:          recorded as applied and will not run on their own. Nothing on" >&2
+	echo "$PROG:          disk distinguishes the two cases, so check for yourself." >&2
 	echo "$PROG:" >&2
-	echo "$PROG:          If this volume predates any of them, list what was assumed" >&2
-	echo "$PROG:          and run the ones you need by hand:" >&2
-	echo "$PROG:            supatype-migrate status" >&2
-	echo "$PROG:            supatype-migrate replay <filename>" >&2
+	echo "$PROG:          This affects THIS START ONLY. New migrations from here on are" >&2
+	echo "$PROG:          applied normally." >&2
+	echo "$PROG:" >&2
+	echo "$PROG:          Most important to verify -- if pg_guard is missing here, it is" >&2
+	echo "$PROG:          not loading for PostgREST sessions and privilege enforcement is" >&2
+	echo "$PROG:          off across the API surface:" >&2
+	echo "$PROG:" >&2
+	echo "$PROG:            SELECT rolconfig FROM pg_roles WHERE rolname = 'authenticator';" >&2
+	echo "$PROG:" >&2
+	echo "$PROG:          Then: supatype-migrate status   (what was assumed)" >&2
+	echo "$PROG:                supatype-migrate replay <filename>" >&2
+	echo "$PROG:          See the Migrations and upgrades section of the README for the" >&2
+	echo "$PROG:          full check." >&2
 	echo "$PROG: ------------------------------------------------------------------" >&2
 }
 
