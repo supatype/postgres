@@ -31,6 +31,23 @@ if [ "$#" -ne 0 ]; then
 fi
 
 db=$( cd -- "$( dirname -- "$0" )" > /dev/null 2>&1 && pwd )
+
+# Applying migrations is apply-migrations.sh's job, here and at start-up, so that
+# both paths write the same ledger and agree on what "already applied" means.
+#
+# In the Docker image it is reached as `supatype migrate`: this script lives in
+# /docker-entrypoint-initdb.d/ and cannot have a sibling there, because the stock
+# entrypoint executes everything in that directory. The AMI and native builds copy
+# migrations/db/ wholesale, so there it is simply next door.
+if [ -x "$db/apply-migrations.sh" ]; then
+    run_migrate() { "$db/apply-migrations.sh" "$@"; }
+elif command -v supatype > /dev/null 2>&1; then
+    run_migrate() { supatype migrate "$@"; }
+else
+    echo "$0: cannot find apply-migrations.sh, and no supatype command on PATH" >&2
+    exit 1
+fi
+
 if [ -z "${USE_DBMATE:-}" ]; then
     psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin <<EOSQL
 do \$\$
@@ -49,10 +66,12 @@ EOSQL
     done
     psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U postgres -c "ALTER USER supatype_admin WITH PASSWORD '$PGPASSWORD'"
     # run migrations as super user - postgres user demoted in post-setup
-    for sql in "$db"/migrations/*.sql; do
-        echo "$0: running $sql"
-        psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin -f "$sql"
-    done
+    #
+    # `bootstrap`, not `sync`: this only ever runs against a database being
+    # created, so an absent ledger means nothing has run yet rather than nothing
+    # was recorded. Getting that distinction wrong in the other direction is the
+    # whole of #138.
+    SUPATYPE_MIGRATIONS_DIR="$db/migrations" run_migrate bootstrap
 else
     psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin <<EOSQL
   create role postgres superuser login password '$PGPASSWORD';
@@ -62,6 +81,10 @@ EOSQL
     DBMATE_MIGRATIONS_DIR="$db/init-scripts" DATABASE_URL="postgres://postgres:$connect" dbmate --no-dump-schema migrate
     psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U postgres -c "ALTER USER supatype_admin WITH PASSWORD '$PGPASSWORD'"
     # run migrations as super user - postgres user demoted in post-setup
+    #
+    # dbmate keeps its own schema_migrations table, so this branch does not write
+    # the ledger apply-migrations.sh uses. A cluster bootstrapped this way is
+    # adopted by the start-up sync the same way any pre-ledger cluster is.
     DBMATE_MIGRATIONS_DIR="$db/migrations" DATABASE_URL="postgres://supatype_admin:$connect" dbmate --no-dump-schema migrate
 fi
 

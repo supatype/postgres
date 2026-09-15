@@ -125,24 +125,57 @@ RUN apt-get purge -y build-essential git postgresql-server-dev-17 pkg-config lib
 RUN mkdir -p /etc/postgresql-custom/extension-custom-scripts
 COPY config/postgresql.conf /etc/postgresql/postgresql.conf
 COPY config/pg_hba.conf /etc/postgresql/pg_hba.conf
+COPY config/pg_hba.migrate.conf /etc/postgresql/pg_hba.migrate.conf
 COPY config/pg_ident.conf /etc/postgresql/pg_ident.conf
 COPY config/pg_guard.conf /etc/postgresql-custom/pg_guard.conf
 COPY config/supatype_mask.conf /etc/postgresql-custom/supatype_mask.conf
 COPY config/pg_keyspace.conf /etc/postgresql-custom/pg_keyspace.conf
 COPY config/extension-custom-scripts/ /etc/postgresql-custom/extension-custom-scripts/
 
-# Bootstrap migrations: the stock postgres entrypoint only runs *.sh / *.sql in this
-# directory itself — not in subfolders. migrate.sh applies init-scripts/ + migrations/.
+# Bootstrap: the stock postgres entrypoint only runs *.sh / *.sql in this
+# directory itself — not in subfolders — and only when it has just created the
+# data directory. migrate.sh applies init-scripts/ + migrations/.
 COPY migrations/db/init-scripts/ /docker-entrypoint-initdb.d/init-scripts/
 COPY migrations/db/migrations/    /docker-entrypoint-initdb.d/migrations/
-COPY migrations/db/migrate.sh /docker-entrypoint-initdb.d/99-supatype-migrate.sh
-RUN chmod +x /docker-entrypoint-initdb.d/99-supatype-migrate.sh
+# `00-`, not `99-`: the entrypoint runs this directory in glob order, and it is
+# also where users mount their own init scripts. Running the image's bootstrap
+# LAST meant a user's 01-seed.sql executed against a database with no auth
+# schema, no extensions and none of the grants this creates. It has to go first.
+#
+# `bootstrap`, not `migrate`: this creates the postgres role, runs init-scripts/,
+# sets the role passwords and resets stats, then hands the migrations themselves
+# to `supatype migrate`. The old name described a fraction of it, and sat one
+# character away from the command below.
+COPY migrations/db/migrate.sh /docker-entrypoint-initdb.d/00-supatype-bootstrap.sh
+RUN chmod +x /docker-entrypoint-initdb.d/00-supatype-bootstrap.sh
+
+# `supatype <command>` resolves subcommands out of libexec, so a later
+# `supatype keyspace` is a file dropped in beside `migrate` rather than another
+# top-level binary. Nothing in /docker-entrypoint-initdb.d/ can hold a tool like
+# this: everything in that directory is executed on first boot.
+COPY scripts/supatype /usr/local/bin/supatype
+COPY migrations/db/apply-migrations.sh /usr/local/libexec/supatype/migrate
+
+# Wraps the stock entrypoint to apply migrations to a data directory that already
+# exists, which the stock entrypoint skips -- see the script, and #138.
+COPY scripts/supatype-entrypoint.sh /usr/local/bin/supatype-entrypoint.sh
+RUN chmod +x /usr/local/bin/supatype \
+             /usr/local/libexec/supatype/migrate \
+             /usr/local/bin/supatype-entrypoint.sh
 
 ENV POSTGRES_USER=supatype_admin
 
+# Over TCP, not the socket: the entrypoint applies pending migrations against a
+# temporary server that listens on the Unix socket alone, so a socket probe
+# reports healthy mid-migration and dependents wired to `service_healthy` would
+# start and fail to connect. A TCP answer means the real server is up.
 HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
-  CMD pg_isready -U supatype_admin
+  CMD pg_isready -h 127.0.0.1 -U supatype_admin
 
 EXPOSE 5432
+
+# Overrides the base image's ENTRYPOINT ["docker-entrypoint.sh"]; the wrapper
+# execs into that same script once it has dealt with pending migrations.
+ENTRYPOINT ["/usr/local/bin/supatype-entrypoint.sh"]
 
 CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]

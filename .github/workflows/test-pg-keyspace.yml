@@ -1,15 +1,23 @@
 name: pg_keyspace tests
 
+# No `paths:` filter. `unit tests + extension build (PG17)` and `RESP
+# conformance (daemon + redis)` are REQUIRED checks on develop, and GitHub never
+# queues a workflow whose path filter does not match -- so on a PR that touches
+# no pg_keyspace file those two checks sat at "Expected" forever and the PR could
+# never merge. The filtering moved into the `changes` job below, which every job
+# keys off, so the required checks always report while the expensive work still
+# only runs when pg_keyspace actually changed.
+#
+# Deliberately NOT the companion `paths-ignore` workflow that GitHub's docs
+# suggest: `paths-ignore` skips only when EVERY changed file matches, so a PR
+# touching both pg_keyspace and anything else would run both workflows and
+# produce two check runs with the same name -- one of them unconditionally
+# green. A required check that can be satisfied while the real suite fails is
+# worse than no check.
 on:
   pull_request:
-    paths:
-      - 'extensions/pg_keyspace/**'
-      - '.github/workflows/test-pg-keyspace.yml'
   push:
     branches: [main, develop]
-    paths:
-      - 'extensions/pg_keyspace/**'
-      - '.github/workflows/test-pg-keyspace.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,19 +25,57 @@ env:
   PGRX_VERSION: '0.12.9'
 
 jobs:
+  # Which half of the repository this commit touched. Fails safe: if the base
+  # ref is missing or unusable (a brand-new branch, a shallow fetch), it reports
+  # a change and everything runs, because skipping the suite on a guess is the
+  # expensive mistake.
+  changes:
+    name: detect pg_keyspace changes
+    runs-on: ubuntu-latest
+    outputs:
+      pgks: ${{ steps.filter.outputs.pgks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: filter
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE:-}" ] \
+             || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "no usable base ref ($BASE); running the full suite"
+            echo "pgks=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE" "$HEAD")
+          echo "changed files:"; echo "$changed" | sed 's/^/  /'
+          if echo "$changed" | grep -qE '^(extensions/pg_keyspace/|\.github/workflows/test-pg-keyspace\.yml$)'; then
+            echo "pgks=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pgks=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # Job 1 (highest priority): fast, self-contained. Rust unit tests need no
   # Postgres; the extension build catches compile breaks in the pgrx crate.
   unit-and-build:
     name: unit tests + extension build (PG${{ matrix.pg }})
     runs-on: ubuntu-latest
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
         pg: [17]
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.pgks == 'true'
 
       - name: Cache cargo
+        if: needs.changes.outputs.pgks == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -41,11 +87,13 @@ jobs:
 
       # ---- core unit tests: pure Rust, no Postgres needed --------------------
       - name: Unit tests (core)
+        if: needs.changes.outputs.pgks == 'true'
         working-directory: extensions/pg_keyspace/core
         run: cargo test --locked
 
       # ---- extension build: needs PG17 headers + libclang (pgrx bindgen) -----
       - name: Add the PostgreSQL apt repository
+        if: needs.changes.outputs.pgks == 'true'
         run: |
           sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
           sudo install -d /usr/share/postgresql-common/pgdg
@@ -55,6 +103,7 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
 
       - name: Install PostgreSQL ${{ matrix.pg }} + build deps
+        if: needs.changes.outputs.pgks == 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -63,24 +112,37 @@ jobs:
             clang libclang-dev llvm-dev
 
       - name: Install cargo-pgrx ${{ env.PGRX_VERSION }}
+        if: needs.changes.outputs.pgks == 'true'
         run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
 
       - name: Initialise pgrx against the system PostgreSQL ${{ matrix.pg }}
+        if: needs.changes.outputs.pgks == 'true'
         run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
 
       - name: Build the extension (compile check)
+        if: needs.changes.outputs.pgks == 'true'
         working-directory: extensions/pg_keyspace/extension
         run: cargo build --locked --no-default-features --features pg${{ matrix.pg }}
+
+      - name: pg_keyspace untouched
+        if: needs.changes.outputs.pgks != 'true'
+        run: |
+          echo "No file under extensions/pg_keyspace/ changed in this commit."
+          echo "The suite has nothing to test; reporting success so this"
+          echo "required check does not block the pull request."
 
   # Job 2: RESP conformance + integration. Drives the standalone daemon and a
   # real redis-server the way the bench harnesses do — no Postgres required.
   integration:
     name: RESP conformance (daemon + redis)
     runs-on: ubuntu-latest
+    needs: changes
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.pgks == 'true'
 
       - name: Cache cargo
+        if: needs.changes.outputs.pgks == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -90,27 +152,32 @@ jobs:
           key: pgks-core-${{ runner.os }}-${{ hashFiles('extensions/pg_keyspace/core/Cargo.lock') }}
 
       - name: Install redis (server + tools)
+        if: needs.changes.outputs.pgks == 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends redis-server redis-tools
 
       - name: Build daemon + standby binaries
+        if: needs.changes.outputs.pgks == 'true'
         working-directory: extensions/pg_keyspace/core
         run: cargo build --locked --release --bins
 
       - name: Start redis (reference for parity checks)
+        if: needs.changes.outputs.pgks == 'true'
         run: |
           redis-server --port 6379 --daemonize yes --save '' --appendonly no
           for _ in $(seq 1 20); do redis-cli -p 6379 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
           redis-cli -p 6379 PING
 
       - name: Start redis 8 (bloom/cuckoo parity reference)
+        if: needs.changes.outputs.pgks == 'true'
         run: |
           docker run --rm -d --name redis8 -p 6380:6379 redis:8.10.1
           for _ in $(seq 1 30); do redis-cli -p 6380 PING 2>/dev/null | grep -q PONG && break; sleep 0.5; done
           redis-cli -p 6380 PING
 
       - name: Run conformance + integration benches
+        if: needs.changes.outputs.pgks == 'true'
         working-directory: extensions/pg_keyspace
         env:
           DAEMON: ${{ github.workspace }}/extensions/pg_keyspace/core/target/release/pgkeyspaced
@@ -148,6 +215,13 @@ jobs:
           [ "$fail" -eq 0 ] && echo "all benches passed" || echo "some benches FAILED"
           exit $fail
 
+      - name: pg_keyspace untouched
+        if: needs.changes.outputs.pgks != 'true'
+        run: |
+          echo "No file under extensions/pg_keyspace/ changed in this commit."
+          echo "The suite has nothing to test; reporting success so this"
+          echo "required check does not block the pull request."
+
   # Job 3: macOS. Proves the readiness loop builds and runs on kqueue (mio's
   # macOS backend) and the cross-worker wake self-pipe works, so the darwin
   # native archive can bundle pg_keyspace. No Postgres — just the core crate,
@@ -155,6 +229,8 @@ jobs:
   macos:
     name: macOS build + kqueue event loop
     runs-on: macos-14
+    needs: changes
+    if: needs.changes.outputs.pgks == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -231,6 +307,8 @@ jobs:
   durability-in-postgres:
     name: durability + fault injection (in PG${{ matrix.pg }})
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.pgks == 'true'
     strategy:
       fail-fast: false
       matrix:

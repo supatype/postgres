@@ -1,0 +1,76 @@
+#!/bin/sh
+set -eu
+
+#######################################
+# The image's command line.
+#
+# Subcommands are executables in libexec, resolved by name, so adding one --
+# `supatype keyspace`, `supatype backup` -- means dropping a file in beside
+# `migrate` and nothing here changes. Same shape as git, and the reason this
+# exists rather than a `supatype-migrate` binary: a flat name per tool means a
+# new tool is a new binary, a new PATH entry and a new thing to discover.
+#
+# A subcommand is an ordinary program. It gets SUPATYPE_CMD so its own messages
+# can say "supatype migrate" rather than whatever its file happens to be called,
+# and it can still be run directly (the AMI and native builds do) with no
+# dispatcher present.
+#
+# Env vars:
+#   SUPATYPE_LIBEXEC  where subcommands live (default /usr/local/libexec/supatype)
+#######################################
+
+PROG=$(basename "$0")
+LIBEXEC="${SUPATYPE_LIBEXEC:-/usr/local/libexec/supatype}"
+
+# One line per subcommand, taken from the subcommand itself so the list cannot
+# drift from what is installed.
+summary_of() {
+	sed -n 's/^# supatype-summary: //p' "$1" 2> /dev/null | head -1
+}
+
+usage() {
+	echo "usage: $PROG <command> [arguments]"
+	echo
+	echo "Commands:"
+	if [ -d "$LIBEXEC" ]; then
+		for c in "$LIBEXEC"/*; do
+			[ -x "$c" ] || continue
+			printf '  %-10s %s\n' "$(basename "$c")" "$(summary_of "$c")"
+		done
+	else
+		echo "  (none installed: $LIBEXEC does not exist)"
+	fi
+	echo
+	echo "Run '$PROG <command> help' for a command's own options."
+}
+
+cmd="${1:-}"
+case "$cmd" in
+	'' | help | -h | --help)
+		usage
+		exit 0
+		;;
+esac
+shift
+
+# A subcommand name is a name, not a path: without this, `supatype ../../bin/sh`
+# would be a way to run anything as whoever invoked us.
+case "$cmd" in
+	*[!a-z0-9-]* | -*)
+		echo "$PROG: invalid command name '$cmd'" >&2
+		exit 2
+		;;
+esac
+
+target="$LIBEXEC/$cmd"
+if [ ! -x "$target" ]; then
+	echo "$PROG: unknown command '$cmd'" >&2
+	echo >&2
+	usage >&2
+	exit 2
+fi
+
+SUPATYPE_CMD="$PROG $cmd"
+export SUPATYPE_CMD
+
+exec "$target" "$@"
