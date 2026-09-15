@@ -47,9 +47,32 @@ done
 
 echo "Running migrations"
 docker cp ../../migrations/db/migrations "pg_upgrade_test:/docker-entrypoint-initdb.d/"
-docker exec -it pg_upgrade_test bash -c '/docker-entrypoint-initdb.d/migrate.sh > /tmp/migrate.log 2>&1; exit $?'
-if [ $? -ne 0 ]; then
+
+# The image installs migrate.sh as 99-supatype-migrate.sh, so that the stock
+# entrypoint runs it last. Older published images shipped it under its own name,
+# and INITIAL_PG_VERSION decides which one is in this container -- so find it
+# rather than assuming either. Hard-coding the bare name meant this step failed
+# against every image this repository has ever built.
+# `if !` rather than a trailing `$?` test: this script runs under `set -e`, so a
+# failing `docker exec` aborts it before any such test is reached, and the log
+# that would say why is never printed.
+if ! docker exec -i pg_upgrade_test bash -c '
+  set -eu
+  for f in /docker-entrypoint-initdb.d/99-supatype-migrate.sh \
+           /docker-entrypoint-initdb.d/migrate.sh; do
+    if [ -x "$f" ]; then
+      echo "Using $f"
+      "$f" > /tmp/migrate.log 2>&1
+      exit $?
+    fi
+  done
+  echo "No migration script in /docker-entrypoint-initdb.d/ (looked for" \
+       "99-supatype-migrate.sh and migrate.sh):" >&2
+  ls -la /docker-entrypoint-initdb.d/ >&2
+  exit 1
+'; then
   echo "Running migrations failed. Exiting."
+  docker exec -i pg_upgrade_test bash -c 'cat /tmp/migrate.log' || true
   exit 1
 fi
 
