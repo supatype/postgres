@@ -352,8 +352,12 @@ cmd_doctor() {
 			echo "  OK       $description"
 		else
 			failed=$((failed + 1))
+			# Resolved first: it queries the ledger, and doing that between
+			# two echoes leaves a gap for anything else writing to the same
+			# terminal to land in the middle of one finding.
+			note=$(ledger_note "$migration")
 			echo "  MISSING  $description"
-			echo "           migration: $migration$(ledger_note "$migration")"
+			echo "           migration: $migration$note"
 			[ -n "$fix" ] || echo "           fix: $PROG replay $migration"
 		fi
 	done < "$checks"
@@ -365,7 +369,7 @@ cmd_doctor() {
 	fi
 
 	if [ -z "$fix" ]; then
-		echo "$PROG: re-run with --fix to apply the migrations above." >&2
+		echo "$PROG: re-run with --fix to apply the migrations above."
 		return 1
 	fi
 
@@ -405,7 +409,7 @@ cmd_doctor() {
 	done < "$recheck"
 
 	if [ "$still" -ne 0 ]; then
-		echo "$PROG: doctor: $still check(s) still failing after repair." >&2
+		echo "$PROG: doctor: $still check(s) still failing after repair."
 		return 1
 	fi
 	echo "$PROG: doctor: repaired."
