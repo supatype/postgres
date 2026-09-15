@@ -132,23 +132,36 @@ COPY config/supatype_mask.conf /etc/postgresql-custom/supatype_mask.conf
 COPY config/pg_keyspace.conf /etc/postgresql-custom/pg_keyspace.conf
 COPY config/extension-custom-scripts/ /etc/postgresql-custom/extension-custom-scripts/
 
-# Bootstrap migrations: the stock postgres entrypoint only runs *.sh / *.sql in this
-# directory itself — not in subfolders. migrate.sh applies init-scripts/ + migrations/.
+# Bootstrap: the stock postgres entrypoint only runs *.sh / *.sql in this
+# directory itself — not in subfolders — and only when it has just created the
+# data directory. migrate.sh applies init-scripts/ + migrations/.
 COPY migrations/db/init-scripts/ /docker-entrypoint-initdb.d/init-scripts/
 COPY migrations/db/migrations/    /docker-entrypoint-initdb.d/migrations/
-COPY migrations/db/migrate.sh /docker-entrypoint-initdb.d/99-supatype-migrate.sh
-RUN chmod +x /docker-entrypoint-initdb.d/99-supatype-migrate.sh
+# `00-`, not `99-`: the entrypoint runs this directory in glob order, and it is
+# also where users mount their own init scripts. Running the image's bootstrap
+# LAST meant a user's 01-seed.sql executed against a database with no auth
+# schema, no extensions and none of the grants this creates. It has to go first.
+#
+# `bootstrap`, not `migrate`: this creates the postgres role, runs init-scripts/,
+# sets the role passwords and resets stats, then hands the migrations themselves
+# to `supatype migrate`. The old name described a fraction of it, and sat one
+# character away from the command below.
+COPY migrations/db/migrate.sh /docker-entrypoint-initdb.d/00-supatype-bootstrap.sh
+RUN chmod +x /docker-entrypoint-initdb.d/00-supatype-bootstrap.sh
 
-# The migration runner goes on PATH rather than next to migrate.sh: everything in
-# /docker-entrypoint-initdb.d/ itself gets executed on first boot, and this is a
-# tool with subcommands, not an init script. On PATH it is also the operator's
-# handle on migration state (`supatype-migrate status|replay`).
-COPY migrations/db/apply-migrations.sh /usr/local/bin/supatype-migrate
+# `supatype <command>` resolves subcommands out of libexec, so a later
+# `supatype keyspace` is a file dropped in beside `migrate` rather than another
+# top-level binary. Nothing in /docker-entrypoint-initdb.d/ can hold a tool like
+# this: everything in that directory is executed on first boot.
+COPY scripts/supatype /usr/local/bin/supatype
+COPY migrations/db/apply-migrations.sh /usr/local/libexec/supatype/migrate
 
 # Wraps the stock entrypoint to apply migrations to a data directory that already
 # exists, which the stock entrypoint skips -- see the script, and #138.
 COPY scripts/supatype-entrypoint.sh /usr/local/bin/supatype-entrypoint.sh
-RUN chmod +x /usr/local/bin/supatype-migrate /usr/local/bin/supatype-entrypoint.sh
+RUN chmod +x /usr/local/bin/supatype \
+             /usr/local/libexec/supatype/migrate \
+             /usr/local/bin/supatype-entrypoint.sh
 
 ENV POSTGRES_USER=supatype_admin
 

@@ -147,7 +147,7 @@ jobs:
         env:
           PGDATABASE: supatype_admin
         run: |
-          # First boot goes through migrate.sh, which runs every migration and
+          # First boot goes through the bootstrap script, which runs every migration and
           # records each one. Nothing should be flagged `backfilled` here: these
           # were observed running, not assumed.
           run() {
@@ -241,7 +241,7 @@ jobs:
 
           # Stand in for a volume created before the ledger existed: drop it and
           # restart. Nothing may be replayed, and everything must be flagged as
-          # assumed so `supatype-migrate status` can tell an operator the truth.
+          # assumed so `supatype migrate status` can tell an operator the truth.
           psql_in pg_v2 "DROP SCHEMA supatype_migrations CASCADE" > /dev/null
           before=$(psql_in pg_v2 "SELECT count(*) FROM ci_upgrade_probe")
           docker restart pg_v2 > /dev/null
@@ -265,7 +265,7 @@ jobs:
           # process's environment.
           exec_migrate() {
             docker exec -e POSTGRES_PASSWORD=testpassword -e POSTGRES_DB="$PGDATABASE" \
-              pg_v2 supatype-migrate "$@"
+              pg_v2 supatype migrate "$@"
           }
           exec_migrate status | tail -5
           exec_migrate replay 29990101000000_ci_upgrade_probe.sql
@@ -286,7 +286,7 @@ jobs:
           }
           exec_migrate() {
             docker exec -e POSTGRES_PASSWORD=testpassword -e POSTGRES_DB="$PGDATABASE" \
-              pg_v2 supatype-migrate "$@"
+              pg_v2 supatype migrate "$@"
           }
 
           # A healthy container: every check passes and the exit status says so.

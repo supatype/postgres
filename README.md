@@ -83,7 +83,7 @@ PgBouncer session and transaction pooling configs are included in [config/](conf
 
 The image ships a set of SQL migrations in [migrations/db/migrations/](migrations/db/migrations/) and applies them in two places:
 
-- **First boot**, from `migrate.sh`, which the stock Postgres entrypoint runs once against a data directory it has just created.
+- **First boot**, from `00-supatype-bootstrap.sh`, which the stock Postgres entrypoint runs once against a data directory it has just created.
 - **Every subsequent start**, from the image's entrypoint, which applies anything the cluster has not already run before it lets clients connect.
 
 The second one matters when you pull a newer tag over a volume you already have. The stock entrypoint runs `/docker-entrypoint-initdb.d/` **only** on an empty data directory, so without this an in-place update would skip every migration added since that volume was created — silently, with no error.
@@ -92,7 +92,7 @@ Each database records what it has run in `supatype_migrations.applied`:
 
 ```bash
 docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
-  supatype-postgres supatype-migrate status
+  supatype-postgres supatype migrate status
 ```
 
 | Column | Meaning |
@@ -101,7 +101,7 @@ docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
 | `applied_at` | When this database ran it |
 | `backfilled` | `true` if it was *assumed* applied rather than observed running — see below |
 
-`supatype-migrate doctor` checks whether the load-bearing migrations actually took effect, and `doctor --fix` applies any that did not.
+`supatype migrate doctor` checks whether the load-bearing migrations actually took effect, and `doctor --fix` applies any that did not.
 
 ### Volumes created before this change
 
@@ -122,16 +122,16 @@ Nothing distinguishes those two cases after the fact, so check directly.
 
 ```bash
 docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
-  supatype-postgres supatype-migrate doctor
+  supatype-postgres supatype migrate doctor
 ```
 
 ```
   OK       supatype_privileged_role exists
   MISSING  supatype_mask extension present
            migration: 20260809214500_supatype_mask.sql (ledger: assumed applied, never run here)
-           fix: supatype-migrate replay 20260809214500_supatype_mask.sql
+           fix: supatype migrate replay 20260809214500_supatype_mask.sql
   OK       pg_guard preloaded for authenticator
-supatype-migrate: doctor: 3 checks, 1 need attention.
+supatype migrate: doctor: 3 checks, 1 need attention.
 ```
 
 Exit status is 0 when everything checks out, non-zero otherwise, so it drops straight into a health script. The entrypoint runs these same checks automatically after adopting a volume, so the container log already tells you which case you are in.
@@ -140,12 +140,12 @@ Exit status is 0 when everything checks out, non-zero otherwise, so it drops str
 
 ```bash
 docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
-  supatype-postgres supatype-migrate doctor --fix
+  supatype-postgres supatype migrate doctor --fix
 ```
 
 This applies **only** the migrations whose check failed, in filename order, and then re-runs the checks and reports whether it worked. A check that passes is left alone, so this is not a replay of work already done — a failing check means that migration's effect is absent.
 
-`supatype-migrate replay <filename>` remains available for anything outside the checked set; `supatype-migrate status` lists every migration flagged `backfilled`.
+`supatype migrate replay <filename>` remains available for anything outside the checked set; `supatype migrate status` lists every migration flagged `backfilled`.
 
 #### What each one leaves broken
 
@@ -181,9 +181,10 @@ migrations/
   db/
     init-scripts/               Run once on first database initialisation
     migrations/                 Incremental schema migrations
-    migrate.sh                  First-boot bootstrap (called by Docker entrypoint)
-    apply-migrations.sh         Migration runner and ledger (installed as supatype-migrate)
+    migrate.sh                  First-boot bootstrap (installed as 00-supatype-bootstrap.sh)
+    apply-migrations.sh         Migration runner and ledger (installed as `supatype migrate`)
 scripts/
+  supatype                      `supatype <command>` dispatcher (installed on PATH)
   supatype-entrypoint.sh        Image ENTRYPOINT; applies migrations to existing clusters
   build-native.sh               Local native build script (mirrors CI)
 tests/

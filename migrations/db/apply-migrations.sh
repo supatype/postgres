@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+# supatype-summary: apply, inspect and repair the image's SQL migrations
+
 #######################################
 # Applies the migrations this cluster has not already run, and records what it
 # ran so that the next start can tell the difference.
@@ -53,13 +55,16 @@ set -eu
 LC_ALL=C
 export LC_ALL
 
-PROG=$(basename "$0")
+# "supatype migrate" when the dispatcher invoked us, so that every message below
+# names a command the reader can actually type; the bare filename when run
+# directly, which the AMI and native builds do.
+PROG="${SUPATYPE_CMD:-$(basename "$0")}"
 
 MIGRATIONS_DIR="${SUPATYPE_MIGRATIONS_DIR:-/docker-entrypoint-initdb.d/migrations}"
 MIGRATION_ROLE="${SUPATYPE_MIGRATION_ROLE:-supatype_admin}"
 
 # Same rule the stock entrypoint uses (POSTGRES_DB defaults to POSTGRES_USER), so
-# that `docker exec <container> supatype-migrate status` lands in the database the
+# that `docker exec <container> supatype migrate status` lands in the database the
 # migrations were applied to. POSTGRES_DB is only ever set inside the entrypoint's
 # own process; a later `docker exec` sees just the image's POSTGRES_USER.
 export PGDATABASE="${POSTGRES_DB:-${POSTGRES_USER:-postgres}}"
@@ -130,7 +135,7 @@ create_ledger() {
 		COMMENT ON SCHEMA supatype_migrations IS
 		    'Bookkeeping for the image''s own migrations. Not user schema.';
 		COMMENT ON TABLE supatype_migrations.applied IS
-		    'One row per migration this database has run. Written by supatype-migrate.';
+		    'One row per migration this database has run. Written by `supatype migrate`.';
 		COMMENT ON COLUMN supatype_migrations.applied.checksum IS
 		    'sha256 of the file as applied; a mismatch means the migration was edited after the fact.';
 		COMMENT ON COLUMN supatype_migrations.applied.backfilled IS
@@ -212,7 +217,7 @@ backfill_report() {
 	echo "$PROG:    applied but their effect is absent from this database." >&2
 	echo "$PROG:" >&2
 	echo "$PROG:    Repair them (applies only those, nothing else):" >&2
-	echo "$PROG:      supatype-migrate doctor --fix" >&2
+	echo "$PROG:      supatype migrate doctor --fix" >&2
 	echo "$PROG:" >&2
 	echo "$PROG:    Until then, see the Migrations and upgrades section of the README" >&2
 	echo "$PROG:    for what each one leaves broken." >&2
@@ -436,16 +441,36 @@ cmd_replay() {
 	done
 }
 
+usage() {
+	echo "usage: $PROG {bootstrap|sync|status|doctor [--fix]|replay <filename>...}"
+	echo
+	echo "  bootstrap  apply every migration and record it (a database being created)"
+	echo "  sync       apply what this database has not already run"
+	echo "  status     print the ledger"
+	echo "  doctor     check the load-bearing migrations took effect; --fix applies"
+	echo "             the ones that did not"
+	echo "  replay     re-run named migrations and re-record them"
+}
+
 main() {
 	cmd="${1:-sync}"
 	[ "$#" -gt 0 ] && shift || true
 
-	if [ ! -d "$MIGRATIONS_DIR" ]; then
-		echo "$PROG: migrations directory not found: $MIGRATIONS_DIR" >&2
-		return 1
-	fi
+	# Only the commands that read migration files need the directory; `help` and
+	# `status` (which reads the ledger) work without it.
+	case "$cmd" in
+		bootstrap | sync | replay | doctor)
+			if [ ! -d "$MIGRATIONS_DIR" ]; then
+				echo "$PROG: migrations directory not found: $MIGRATIONS_DIR" >&2
+				return 1
+			fi
+			;;
+	esac
 
 	case "$cmd" in
+		help | -h | --help)
+			usage
+			;;
 		bootstrap)
 			# A database being created: an absent ledger means nothing has run.
 			ledger_exists || create_ledger
@@ -472,7 +497,7 @@ main() {
 			;;
 		*)
 			echo "$PROG: unknown command '$cmd'" >&2
-			echo "usage: $PROG {bootstrap|sync|status|doctor [--fix]|replay <filename>...}" >&2
+			usage >&2
 			return 2
 			;;
 	esac

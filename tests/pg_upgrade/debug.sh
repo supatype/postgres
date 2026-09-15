@@ -48,17 +48,19 @@ done
 echo "Running migrations"
 docker cp ../../migrations/db/migrations "pg_upgrade_test:/docker-entrypoint-initdb.d/"
 
-# The image installs migrate.sh as 99-supatype-migrate.sh, so that the stock
-# entrypoint runs it last. Older published images shipped it under its own name,
-# and INITIAL_PG_VERSION decides which one is in this container -- so find it
-# rather than assuming either. Hard-coding the bare name meant this step failed
+# The image installs migrate.sh as 00-supatype-bootstrap.sh, so that the stock
+# entrypoint runs it before anything a user mounts alongside it. It was
+# 99-supatype-migrate.sh before that, and older published images shipped it under
+# its own name; INITIAL_PG_VERSION decides which one is in this container, so find
+# it rather than assuming. Hard-coding the bare name meant this step failed
 # against every image this repository has ever built.
 # `if !` rather than a trailing `$?` test: this script runs under `set -e`, so a
 # failing `docker exec` aborts it before any such test is reached, and the log
 # that would say why is never printed.
 if ! docker exec -i pg_upgrade_test bash -c '
   set -eu
-  for f in /docker-entrypoint-initdb.d/99-supatype-migrate.sh \
+  for f in /docker-entrypoint-initdb.d/00-supatype-bootstrap.sh \
+           /docker-entrypoint-initdb.d/99-supatype-migrate.sh \
            /docker-entrypoint-initdb.d/migrate.sh; do
     if [ -x "$f" ]; then
       echo "Using $f"
@@ -66,8 +68,8 @@ if ! docker exec -i pg_upgrade_test bash -c '
       exit $?
     fi
   done
-  echo "No migration script in /docker-entrypoint-initdb.d/ (looked for" \
-       "99-supatype-migrate.sh and migrate.sh):" >&2
+  echo "No bootstrap script in /docker-entrypoint-initdb.d/ (looked for" \
+       "00-supatype-bootstrap.sh, 99-supatype-migrate.sh, migrate.sh):" >&2
   ls -la /docker-entrypoint-initdb.d/ >&2
   exit 1
 '; then

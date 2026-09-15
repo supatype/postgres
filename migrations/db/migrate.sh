@@ -34,16 +34,17 @@ db=$( cd -- "$( dirname -- "$0" )" > /dev/null 2>&1 && pwd )
 
 # Applying migrations is apply-migrations.sh's job, here and at start-up, so that
 # both paths write the same ledger and agree on what "already applied" means.
-# Installed as `supatype-migrate` in the Docker image, where this script lives in
-# /docker-entrypoint-initdb.d/ and cannot have a sibling (the stock entrypoint
-# would execute it); alongside this script in the AMI and native builds, which
-# copy migrations/db/ wholesale.
+#
+# In the Docker image it is reached as `supatype migrate`: this script lives in
+# /docker-entrypoint-initdb.d/ and cannot have a sibling there, because the stock
+# entrypoint executes everything in that directory. The AMI and native builds copy
+# migrations/db/ wholesale, so there it is simply next door.
 if [ -x "$db/apply-migrations.sh" ]; then
-    migrate_runner="$db/apply-migrations.sh"
-elif command -v supatype-migrate > /dev/null 2>&1; then
-    migrate_runner=supatype-migrate
+    run_migrate() { "$db/apply-migrations.sh" "$@"; }
+elif command -v supatype > /dev/null 2>&1; then
+    run_migrate() { supatype migrate "$@"; }
 else
-    echo "$0: cannot find apply-migrations.sh or supatype-migrate" >&2
+    echo "$0: cannot find apply-migrations.sh, and no supatype command on PATH" >&2
     exit 1
 fi
 
@@ -70,7 +71,7 @@ EOSQL
     # created, so an absent ledger means nothing has run yet rather than nothing
     # was recorded. Getting that distinction wrong in the other direction is the
     # whole of #138.
-    SUPATYPE_MIGRATIONS_DIR="$db/migrations" "$migrate_runner" bootstrap
+    SUPATYPE_MIGRATIONS_DIR="$db/migrations" run_migrate bootstrap
 else
     psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin <<EOSQL
   create role postgres superuser login password '$PGPASSWORD';

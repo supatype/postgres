@@ -5,7 +5,7 @@
 # deliberately does not do.
 #
 # `docker_process_init_files /docker-entrypoint-initdb.d/*` runs only when the
-# data directory is empty. migrate.sh is installed there, so on any cluster that
+# data directory is empty. The bootstrap script is installed there, so on any cluster that
 # already exists it never runs, and every migration added since that volume was
 # created is silently absent -- including the one that keeps pg_guard in
 # `authenticator`'s session_preload_libraries (#138).
@@ -96,7 +96,7 @@ supatype_migrate_existing_cluster() {
 		(
 			unset PGHOST POSTGRES_HOST
 			export POSTGRES_PORT="$port"
-			supatype-migrate sync
+			supatype migrate sync
 		) || rc=$?
 	fi
 
