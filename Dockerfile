@@ -125,6 +125,7 @@ RUN apt-get purge -y build-essential git postgresql-server-dev-17 pkg-config lib
 RUN mkdir -p /etc/postgresql-custom/extension-custom-scripts
 COPY config/postgresql.conf /etc/postgresql/postgresql.conf
 COPY config/pg_hba.conf /etc/postgresql/pg_hba.conf
+COPY config/pg_hba.migrate.conf /etc/postgresql/pg_hba.migrate.conf
 COPY config/pg_ident.conf /etc/postgresql/pg_ident.conf
 COPY config/pg_guard.conf /etc/postgresql-custom/pg_guard.conf
 COPY config/supatype_mask.conf /etc/postgresql-custom/supatype_mask.conf
@@ -138,11 +139,30 @@ COPY migrations/db/migrations/    /docker-entrypoint-initdb.d/migrations/
 COPY migrations/db/migrate.sh /docker-entrypoint-initdb.d/99-supatype-migrate.sh
 RUN chmod +x /docker-entrypoint-initdb.d/99-supatype-migrate.sh
 
+# The migration runner goes on PATH rather than next to migrate.sh: everything in
+# /docker-entrypoint-initdb.d/ itself gets executed on first boot, and this is a
+# tool with subcommands, not an init script. On PATH it is also the operator's
+# handle on migration state (`supatype-migrate status|replay`).
+COPY migrations/db/apply-migrations.sh /usr/local/bin/supatype-migrate
+
+# Wraps the stock entrypoint to apply migrations to a data directory that already
+# exists, which the stock entrypoint skips -- see the script, and #138.
+COPY scripts/supatype-entrypoint.sh /usr/local/bin/supatype-entrypoint.sh
+RUN chmod +x /usr/local/bin/supatype-migrate /usr/local/bin/supatype-entrypoint.sh
+
 ENV POSTGRES_USER=supatype_admin
 
+# Over TCP, not the socket: the entrypoint applies pending migrations against a
+# temporary server that listens on the Unix socket alone, so a socket probe
+# reports healthy mid-migration and dependents wired to `service_healthy` would
+# start and fail to connect. A TCP answer means the real server is up.
 HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
-  CMD pg_isready -U supatype_admin
+  CMD pg_isready -h 127.0.0.1 -U supatype_admin
 
 EXPOSE 5432
+
+# Overrides the base image's ENTRYPOINT ["docker-entrypoint.sh"]; the wrapper
+# execs into that same script once it has dealt with pending migrations.
+ENTRYPOINT ["/usr/local/bin/supatype-entrypoint.sh"]
 
 CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]

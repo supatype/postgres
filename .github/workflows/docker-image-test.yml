@@ -143,10 +143,144 @@ jobs:
             SELECT pg_drop_replication_slot('ci_wal2json_test');
           "
 
+      - name: Verify the migration ledger records the bootstrap
+        env:
+          PGDATABASE: supatype_admin
+        run: |
+          # First boot goes through migrate.sh, which runs every migration and
+          # records each one. Nothing should be flagged `backfilled` here: these
+          # were observed running, not assumed.
+          run() {
+            docker exec -e PGPASSWORD=testpassword -i pg_test \
+              psql -U supatype_admin -d "$PGDATABASE" "$@"
+          }
+          shipped=$(docker exec pg_test sh -c 'ls /docker-entrypoint-initdb.d/migrations/*.sql | wc -l' | tr -d ' ')
+          recorded=$(run -tAc "SELECT count(*) FROM supatype_migrations.applied")
+          assumed=$(run -tAc "SELECT count(*) FROM supatype_migrations.applied WHERE backfilled")
+          echo "shipped=$shipped recorded=$recorded assumed=$assumed"
+          test "$recorded" = "$shipped" || { echo "FAIL: ledger recorded $recorded of $shipped migrations"; exit 1; }
+          test "$assumed" = "0" || { echo "FAIL: $assumed migrations were assumed rather than run on a fresh volume"; exit 1; }
+
+      # The regression in #138: the image was only ever tested with `docker run`
+      # against a fresh container, so the path where a data directory already
+      # exists -- the one every upgrade takes -- was never exercised at all.
+      - name: Restart over an existing volume applies migrations added since
+        env:
+          PGDATABASE: supatype_admin
+        run: |
+          set -euo pipefail
+
+          # Over TCP, deliberately: the temporary server the entrypoint applies
+          # migrations against listens on the Unix socket only (listen_addresses
+          # = ''), so a socket pg_isready goes true while migrations are still
+          # running. A TCP answer means the real server is up, which means the
+          # entrypoint is done.
+          wait_ready() {
+            for i in $(seq 1 90); do
+              docker exec "$1" pg_isready -h 127.0.0.1 -U supatype_admin -q 2>/dev/null && return 0
+              sleep 2
+            done
+            echo "FAIL: $1 never became ready"; docker logs "$1"; exit 1
+          }
+          psql_in() {
+            docker exec -e PGPASSWORD=testpassword -i "$1" \
+              psql -U supatype_admin -d "$PGDATABASE" -tAc "$2"
+          }
+
+          docker volume create pg_upgrade_vol > /dev/null
+
+          # --- the "old image" boot: a volume created before the new migration
+          docker run -d --name pg_v1 -e POSTGRES_PASSWORD=testpassword \
+            -v pg_upgrade_vol:/var/lib/postgresql/data supatype-postgres:test
+          wait_ready pg_v1
+          baseline=$(psql_in pg_v1 "SELECT count(*) FROM supatype_migrations.applied")
+          echo "baseline ledger rows: $baseline"
+          docker rm -f pg_v1 > /dev/null
+
+          # --- the "new image" boot: same volume, one migration the volume has
+          # never seen. docker cp before start stands in for a rebuilt image.
+          cat > /tmp/29990101000000_ci_upgrade_probe.sql <<'SQL'
+          -- migrate:up
+          CREATE TABLE IF NOT EXISTS ci_upgrade_probe (applied_at timestamptz DEFAULT now());
+          INSERT INTO ci_upgrade_probe DEFAULT VALUES;
+          SQL
+          docker create --name pg_v2 -e POSTGRES_PASSWORD=testpassword \
+            -v pg_upgrade_vol:/var/lib/postgresql/data supatype-postgres:test > /dev/null
+          docker cp /tmp/29990101000000_ci_upgrade_probe.sql \
+            pg_v2:/docker-entrypoint-initdb.d/migrations/29990101000000_ci_upgrade_probe.sql
+          docker start pg_v2 > /dev/null
+          wait_ready pg_v2
+
+          probe=$(psql_in pg_v2 "SELECT count(*) FROM ci_upgrade_probe")
+          rows=$(psql_in pg_v2 "SELECT count(*) FROM supatype_migrations.applied")
+          assumed=$(psql_in pg_v2 "SELECT count(*) FROM supatype_migrations.applied WHERE backfilled")
+          echo "probe rows=$probe ledger=$rows assumed=$assumed"
+
+          # The whole point: the new migration ran on a data directory the stock
+          # entrypoint would have skipped entirely.
+          test "$probe" = "1" || { echo "FAIL: migration added after the volume was created did not run"; docker logs pg_v2; exit 1; }
+          # And exactly once -- not replayed on top of what was already applied.
+          test "$rows" = "$((baseline + 1))" || { echo "FAIL: expected $((baseline + 1)) ledger rows, got $rows"; exit 1; }
+          test "$assumed" = "0" || { echo "FAIL: $assumed migrations were assumed on a ledger-bearing volume"; exit 1; }
+
+          # Restarting again must not re-run it.
+          docker restart pg_v2 > /dev/null
+          wait_ready pg_v2
+          probe_again=$(psql_in pg_v2 "SELECT count(*) FROM ci_upgrade_probe")
+          test "$probe_again" = "1" || { echo "FAIL: migration re-ran on restart ($probe_again rows)"; exit 1; }
+
+      - name: Adopting a volume with no ledger backfills without replaying
+        env:
+          PGDATABASE: supatype_admin
+        run: |
+          set -euo pipefail
+          psql_in() {
+            docker exec -e PGPASSWORD=testpassword -i "$1" \
+              psql -U supatype_admin -d "$PGDATABASE" -tAc "$2"
+          }
+
+          # Stand in for a volume created before the ledger existed: drop it and
+          # restart. Nothing may be replayed, and everything must be flagged as
+          # assumed so `supatype-migrate status` can tell an operator the truth.
+          psql_in pg_v2 "DROP SCHEMA supatype_migrations CASCADE" > /dev/null
+          before=$(psql_in pg_v2 "SELECT count(*) FROM ci_upgrade_probe")
+          docker restart pg_v2 > /dev/null
+          for i in $(seq 1 90); do
+            docker exec pg_v2 pg_isready -h 127.0.0.1 -U supatype_admin -q 2>/dev/null && break
+            sleep 2
+          done
+
+          rows=$(psql_in pg_v2 "SELECT count(*) FROM supatype_migrations.applied")
+          assumed=$(psql_in pg_v2 "SELECT count(*) FROM supatype_migrations.applied WHERE backfilled")
+          after=$(psql_in pg_v2 "SELECT count(*) FROM ci_upgrade_probe")
+          echo "ledger=$rows assumed=$assumed probe before=$before after=$after"
+
+          test "$rows" = "$assumed" || { echo "FAIL: $((rows - assumed)) rows were not flagged as assumed"; exit 1; }
+          test "$rows" -gt 0 || { echo "FAIL: ledger was not rebuilt"; exit 1; }
+          test "$after" = "$before" || { echo "FAIL: backfill replayed migrations against live data"; exit 1; }
+
+          # The operator's way back out of an assumed ledger. POSTGRES_PASSWORD
+          # because the shipped pg_hba.conf wants scram for supatype_admin, and
+          # POSTGRES_DB because a `docker exec` does not inherit the entrypoint
+          # process's environment.
+          exec_migrate() {
+            docker exec -e POSTGRES_PASSWORD=testpassword -e POSTGRES_DB="$PGDATABASE" \
+              pg_v2 supatype-migrate "$@"
+          }
+          exec_migrate status | tail -5
+          exec_migrate replay 29990101000000_ci_upgrade_probe.sql
+          replayed=$(psql_in pg_v2 "SELECT count(*) FROM ci_upgrade_probe")
+          test "$replayed" = "$((before + 1))" || { echo "FAIL: replay did not re-run the migration"; exit 1; }
+
       - name: Show logs on failure
         if: failure()
-        run: docker logs pg_test || true
+        run: |
+          docker logs pg_test || true
+          docker logs pg_v2 || true
 
       - name: Cleanup
         if: always()
-        run: docker rm -f pg_test || true
+        run: |
+          docker rm -f pg_test pg_v1 pg_v2 || true
+          docker volume rm pg_upgrade_vol || true
+          exit 0

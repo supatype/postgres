@@ -79,6 +79,51 @@ PgBouncer session and transaction pooling configs are included in [config/](conf
 
 ---
 
+## Migrations and upgrades
+
+The image ships a set of SQL migrations in [migrations/db/migrations/](migrations/db/migrations/) and applies them in two places:
+
+- **First boot**, from `migrate.sh`, which the stock Postgres entrypoint runs once against a data directory it has just created.
+- **Every subsequent start**, from the image's entrypoint, which applies anything the cluster has not already run before it lets clients connect.
+
+The second one matters when you pull a newer tag over a volume you already have. The stock entrypoint runs `/docker-entrypoint-initdb.d/` **only** on an empty data directory, so without this an in-place update would skip every migration added since that volume was created — silently, with no error.
+
+Each database records what it has run in `supatype_migrations.applied`:
+
+```bash
+docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
+  supatype-postgres supatype-migrate status
+```
+
+| Column | Meaning |
+|---|---|
+| `filename` | The migration, named as it ships |
+| `applied_at` | When this database ran it |
+| `backfilled` | `true` if it was *assumed* applied rather than observed running — see below |
+
+### Volumes created before the ledger existed
+
+A cluster that predates `supatype_migrations.applied` has no record of what it ran, and there is no way to work it out after the fact. On first sight of such a volume the entrypoint creates the ledger and marks every shipped migration as applied **without running it**, and says so loudly in the container log.
+
+That is correct for a cluster that was already up to date, and wrong for one that was behind. Nothing distinguishes the two, so the migrations are left alone rather than replayed against live data. New migrations are applied normally from then on.
+
+If a volume was behind, run the migrations it missed by hand:
+
+```bash
+docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
+  supatype-postgres supatype-migrate replay 20260810150000_authenticator_session_preload.sql
+```
+
+`status` lists every migration flagged `backfilled`, which is the set to review.
+
+### Notes
+
+- A failed migration **stops the container** rather than letting clients reach a half-migrated database. Set `SUPATYPE_SKIP_MIGRATIONS=1` to start anyway.
+- Standbys are skipped: a replica gets its schema by replaying the primary's WAL.
+- Migrations run against a temporary server that listens on the Unix socket only, before the real server starts, so nothing outside the container can connect mid-migration.
+
+---
+
 ## Repository structure
 
 ```
@@ -86,6 +131,7 @@ Dockerfile                      Main image build (FROM postgres:17-bookworm)
 config/
   postgresql.conf               PostgreSQL configuration
   pg_hba.conf                   Client authentication rules
+  pg_hba.migrate.conf           Client auth for the migration window only
   pg_guard.conf                 pg_guard GUC settings
   pgbouncer-session.ini         PgBouncer session pooling config
   pgbouncer-transaction.ini     PgBouncer transaction pooling config
@@ -96,8 +142,10 @@ migrations/
   db/
     init-scripts/               Run once on first database initialisation
     migrations/                 Incremental schema migrations
-    migrate.sh                  Migration runner (called by Docker entrypoint)
+    migrate.sh                  First-boot bootstrap (called by Docker entrypoint)
+    apply-migrations.sh         Migration runner and ledger (installed as supatype-migrate)
 scripts/
+  supatype-entrypoint.sh        Image ENTRYPOINT; applies migrations to existing clusters
   build-native.sh               Local native build script (mirrors CI)
 tests/
   pg_upgrade/                   PostgreSQL upgrade regression tests
@@ -110,7 +158,7 @@ tests/
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `build-release.yml` | Push to `main`/`develop`/`release/*`, tag | Builds multi-arch image, pushes to Docker Hub |
-| `docker-image-test.yml` | PRs, push to `develop` | Builds image, verifies extensions load correctly |
+| `docker-image-test.yml` | PRs, push to `develop` | Builds image, verifies extensions load, and that migrations apply on both a fresh volume and an existing one |
 | `native-archives.yml` | Tag push | Builds native PG17 tarballs for all platforms, uploads to CDN and GitHub Release |
 | `test-pg-guard.yml` | PRs touching `extensions/pg_guard/**` | Runs pg_guard regression suite |
 
