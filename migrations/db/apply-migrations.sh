@@ -38,6 +38,9 @@ set -eu
 #               shipped migration as applied *without running it* -- see the
 #               warning in backfill_ledger() for why, and what it costs.
 #   status      print the ledger, newest first.
+#   doctor      check whether the load-bearing migrations actually took effect in
+#               this database, whatever the ledger claims. `--fix` applies the
+#               ones that did not, and only those.
 #   replay <file>...  re-run named migrations and re-record them. The operator
 #               escape hatch for a cluster whose ledger was backfilled.
 #
@@ -173,23 +176,47 @@ backfill_ledger() {
 	echo "$PROG:" >&2
 	echo "$PROG:          Correct if this cluster was already up to date. If it was" >&2
 	echo "$PROG:          BEHIND, it stays behind: the migrations it never ran are now" >&2
-	echo "$PROG:          recorded as applied and will not run on their own. Nothing on" >&2
-	echo "$PROG:          disk distinguishes the two cases, so check for yourself." >&2
+	echo "$PROG:          recorded as applied and will not run on their own." >&2
 	echo "$PROG:" >&2
-	echo "$PROG:          This affects THIS START ONLY. New migrations from here on are" >&2
-	echo "$PROG:          applied normally." >&2
-	echo "$PROG:" >&2
-	echo "$PROG:          Most important to verify -- if pg_guard is missing here, it is" >&2
-	echo "$PROG:          not loading for PostgREST sessions and privilege enforcement is" >&2
-	echo "$PROG:          off across the API surface:" >&2
-	echo "$PROG:" >&2
-	echo "$PROG:            SELECT rolconfig FROM pg_roles WHERE rolname = 'authenticator';" >&2
-	echo "$PROG:" >&2
-	echo "$PROG:          Then: supatype-migrate status   (what was assumed)" >&2
-	echo "$PROG:                supatype-migrate replay <filename>" >&2
-	echo "$PROG:          See the Migrations and upgrades section of the README for the" >&2
-	echo "$PROG:          full check." >&2
+	echo "$PROG:          This affects THIS START ONLY. New migrations from here on" >&2
+	echo "$PROG:          are applied normally." >&2
 	echo "$PROG: ------------------------------------------------------------------" >&2
+}
+
+# Run straight after an adoption. The ledger cannot say whether this volume was
+# behind, so ask the database instead and name what is actually missing -- a
+# warning an operator can act on beats one they have to investigate.
+#
+# Reports only. Repairing is `doctor --fix`, which stays an explicit decision.
+backfill_report() {
+	new_tmp; bf_checks=$NEW_TMP
+	run_health_checks "$bf_checks"
+
+	bf_failed=0
+	while IFS='|' read -r migration description ok; do
+		[ -n "$migration" ] || continue
+		[ "$ok" = 't' ] && continue
+		bf_failed=$((bf_failed + 1))
+		echo "$PROG:   MISSING: $description" >&2
+		echo "$PROG:            $migration" >&2
+	done < "$bf_checks"
+
+	if [ "$bf_failed" -eq 0 ]; then
+		echo "$PROG: checked this database: every load-bearing migration has taken" >&2
+		echo "$PROG: effect, so the adoption above looks correct. Nothing to do." >&2
+		return 0
+	fi
+
+	echo "$PROG:" >&2
+	echo "$PROG: ^^ this volume WAS behind: $bf_failed migration(s) above were marked" >&2
+	echo "$PROG:    applied but their effect is absent from this database." >&2
+	echo "$PROG:" >&2
+	echo "$PROG:    Repair them (applies only those, nothing else):" >&2
+	echo "$PROG:      supatype-migrate doctor --fix" >&2
+	echo "$PROG:" >&2
+	echo "$PROG:    Until then, see the Migrations and upgrades section of the README" >&2
+	echo "$PROG:    for what each one leaves broken." >&2
+	return 0
 }
 
 # Apply one migration and record it in the same transaction, so a ledger row can
@@ -237,6 +264,146 @@ apply_pending() {
 	else
 		echo "$PROG: applied $pending migration(s)."
 	fi
+}
+
+# The image's load-bearing migrations, each paired with a query that says whether
+# its effect is actually present in this database.
+#
+# This is what makes the backfill honest rather than merely cautious. Adoption
+# marks everything applied without running it, so the ledger cannot say whether a
+# volume was behind -- but the database can be asked directly, and a check that
+# comes back false means the migration's effect is absent, so applying it is not
+# a replay of something already done.
+#
+# Not every migration can be verified this way, and most do not need to be: these
+# are the ones whose absence is silent and consequential. A new one joins the
+# list by adding a row, in filename order -- that is the order --fix applies them
+# in, and a migration must not go on before one that precedes it.
+health_checks_sql() {
+	cat <<-'SQL'
+		SELECT * FROM (VALUES
+		  ('20260211120934_supabase_privileged_role.sql',
+		   'supatype_privileged_role exists',
+		   EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supatype_privileged_role')),
+		  ('20260809214500_supatype_mask.sql',
+		   'supatype_mask extension present',
+		   EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'supatype_mask')),
+		  ('20260810150000_authenticator_session_preload.sql',
+		   'pg_guard preloaded for authenticator',
+		   EXISTS (SELECT 1 FROM pg_roles
+		            WHERE rolname = 'authenticator'
+		              AND array_to_string(rolconfig, ',') LIKE '%pg_guard%'))
+		) AS t(migration, description, ok)
+	SQL
+}
+
+# Writes "migration|description|t|f" rows to $1.
+run_health_checks() {
+	health_checks_sql | psql_admin -tA -F '|' > "$1"
+}
+
+# "assumed applied" -- the ledger says this migration was backfilled rather than
+# observed running, which is the usual reason a check below comes back false.
+ledger_note() {
+	if ! ledger_exists; then
+		echo ''
+		return 0
+	fi
+	case "$(psql_value "SELECT coalesce(max(backfilled::text), 'absent')
+	                      FROM supatype_migrations.applied
+	                     WHERE filename = '$(sql_lit "$1")'")" in
+		true)   echo ' (ledger: assumed applied, never run here)' ;;
+		false)  echo ' (ledger: recorded as run)' ;;
+		*)      echo ' (ledger: no record)' ;;
+	esac
+}
+
+# Reports which load-bearing migrations are missing their effect, and with --fix
+# applies exactly those. Nothing else is touched: a check that passes is left
+# alone, so this never replays a migration whose work is already done.
+cmd_doctor() {
+	fix=''
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--fix) fix=1 ;;
+			*)
+				echo "$PROG: doctor: unknown option '$1'" >&2
+				echo "usage: $PROG doctor [--fix]" >&2
+				return 2
+				;;
+		esac
+		shift
+	done
+
+	new_tmp; checks=$NEW_TMP
+	run_health_checks "$checks"
+
+	failed=0
+	total=0
+	while IFS='|' read -r migration description ok; do
+		[ -n "$migration" ] || continue
+		total=$((total + 1))
+		if [ "$ok" = 't' ]; then
+			echo "  OK       $description"
+		else
+			failed=$((failed + 1))
+			echo "  MISSING  $description"
+			echo "           migration: $migration$(ledger_note "$migration")"
+			[ -n "$fix" ] || echo "           fix: $PROG replay $migration"
+		fi
+	done < "$checks"
+
+	echo "$PROG: doctor: $total checks, $failed need attention."
+
+	if [ "$failed" -eq 0 ]; then
+		return 0
+	fi
+
+	if [ -z "$fix" ]; then
+		echo "$PROG: re-run with --fix to apply the migrations above." >&2
+		return 1
+	fi
+
+	# Apply only the migrations whose check failed, in filename order: the list
+	# above is kept that way, and this does not depend on it staying that way.
+	new_tmp; failing=$NEW_TMP
+	while IFS='|' read -r migration description ok; do
+		[ -n "$migration" ] || continue
+		[ "$ok" = 't' ] && continue
+		echo "$migration"
+	done < "$checks" | sort > "$failing"
+
+	while read -r migration; do
+		[ -n "$migration" ] || continue
+		file="$MIGRATIONS_DIR/$migration"
+		if [ ! -e "$file" ]; then
+			echo "$PROG: doctor: $migration is missing from $MIGRATIONS_DIR" >&2
+			return 1
+		fi
+		apply_one "$file"
+	done < "$failing"
+
+	# Say whether it worked, rather than assuming it did.
+	echo "$PROG: doctor: re-checking."
+	new_tmp; recheck=$NEW_TMP
+	run_health_checks "$recheck"
+
+	still=0
+	while IFS='|' read -r migration description ok; do
+		[ -n "$migration" ] || continue
+		if [ "$ok" = 't' ]; then
+			echo "  OK       $description"
+		else
+			still=$((still + 1))
+			echo "  STILL MISSING  $description ($migration)"
+		fi
+	done < "$recheck"
+
+	if [ "$still" -ne 0 ]; then
+		echo "$PROG: doctor: $still check(s) still failing after repair." >&2
+		return 1
+	fi
+	echo "$PROG: doctor: repaired."
 }
 
 cmd_status() {
@@ -290,18 +457,22 @@ main() {
 			if ! ledger_exists; then
 				create_ledger
 				backfill_ledger
+				backfill_report
 			fi
 			apply_pending
 			;;
 		status)
 			cmd_status
 			;;
+		doctor)
+			cmd_doctor "$@"
+			;;
 		replay)
 			cmd_replay "$@"
 			;;
 		*)
 			echo "$PROG: unknown command '$cmd'" >&2
-			echo "usage: $PROG {bootstrap|sync|status|replay <filename>...}" >&2
+			echo "usage: $PROG {bootstrap|sync|status|doctor [--fix]|replay <filename>...}" >&2
 			return 2
 			;;
 	esac

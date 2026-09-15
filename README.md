@@ -101,6 +101,8 @@ docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
 | `applied_at` | When this database ran it |
 | `backfilled` | `true` if it was *assumed* applied rather than observed running — see below |
 
+`supatype-migrate doctor` checks whether the load-bearing migrations actually took effect, and `doctor --fix` applies any that did not.
+
 ### Volumes created before this change
 
 Clusters created by an earlier image have no ledger, and nothing on disk records which migrations they ran. **On the first start under a ledger-carrying image, such a volume gets a ledger in which every shipped migration is marked applied without being run** (`backfilled = true`). This happens once per database, and the container log says so.
@@ -116,35 +118,42 @@ Nothing distinguishes those two cases after the fact, so check directly.
 
 #### Check whether your volume was behind
 
-Run this against the migrated database (`supatype_admin` by default). Every row should read `t`:
-
-```sql
-SELECT 'pg_guard preloaded for authenticator' AS check,
-       EXISTS (SELECT 1 FROM pg_roles
-                WHERE rolname = 'authenticator'
-                  AND array_to_string(rolconfig, ',') LIKE '%pg_guard%') AS ok
-UNION ALL
-SELECT 'supatype_mask extension',
-       EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'supatype_mask')
-UNION ALL
-SELECT 'supatype_privileged_role',
-       EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supatype_privileged_role');
-```
-
-Any `f` means that migration never ran on this volume. Replay it:
-
-| Row that reads `f` | Migration to replay | What is broken until you do |
-|---|---|---|
-| `pg_guard preloaded for authenticator` | `20260810150000_authenticator_session_preload.sql` | **`pg_guard` does not load for PostgREST sessions.** The `authenticator` role keeps an inherited `session_preload_libraries` naming only `safeupdate`, so privilege enforcement is off across the whole API surface — silently, with no error |
-| `supatype_mask extension` | `20260809214500_supatype_mask.sql` | A masked-write rejection raises `supatype_mask.deny() is not available` instead of a permission error |
-| `supatype_privileged_role` | `20260211120934_supabase_privileged_role.sql` | The `supatype_privileged_role` role does not exist |
+`doctor` asks the database rather than the ledger: it verifies that the migrations whose absence is silent and consequential actually took effect.
 
 ```bash
 docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
-  supatype-postgres supatype-migrate replay 20260810150000_authenticator_session_preload.sql
+  supatype-postgres supatype-migrate doctor
 ```
 
-`supatype-migrate status` lists every migration flagged `backfilled`, which is the full set this applies to. These three are the ones with known consequences.
+```
+  OK       supatype_privileged_role exists
+  MISSING  supatype_mask extension present
+           migration: 20260809214500_supatype_mask.sql (ledger: assumed applied, never run here)
+           fix: supatype-migrate replay 20260809214500_supatype_mask.sql
+  OK       pg_guard preloaded for authenticator
+supatype-migrate: doctor: 3 checks, 1 need attention.
+```
+
+Exit status is 0 when everything checks out, non-zero otherwise, so it drops straight into a health script. The entrypoint runs these same checks automatically after adopting a volume, so the container log already tells you which case you are in.
+
+#### Repair
+
+```bash
+docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
+  supatype-postgres supatype-migrate doctor --fix
+```
+
+This applies **only** the migrations whose check failed, in filename order, and then re-runs the checks and reports whether it worked. A check that passes is left alone, so this is not a replay of work already done — a failing check means that migration's effect is absent.
+
+`supatype-migrate replay <filename>` remains available for anything outside the checked set; `supatype-migrate status` lists every migration flagged `backfilled`.
+
+#### What each one leaves broken
+
+| Check | Migration | Until repaired |
+|---|---|---|
+| `pg_guard preloaded for authenticator` | `20260810150000_authenticator_session_preload.sql` | **`pg_guard` does not load for PostgREST sessions.** The `authenticator` role keeps an inherited `session_preload_libraries` naming only `safeupdate`, so privilege enforcement is off across the whole API surface — silently, with no error |
+| `supatype_mask extension present` | `20260809214500_supatype_mask.sql` | A masked-write rejection raises `supatype_mask.deny() is not available` instead of a permission error |
+| `supatype_privileged_role exists` | `20260211120934_supabase_privileged_role.sql` | The `supatype_privileged_role` role does not exist |
 
 ### Notes
 
@@ -188,7 +197,7 @@ tests/
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `build-release.yml` | Push to `main`/`develop`/`release/*`, tag | Builds multi-arch image, pushes to Docker Hub |
-| `docker-image-test.yml` | PRs, push to `develop` | Builds image, verifies extensions load, and that migrations apply on both a fresh volume and an existing one |
+| `docker-image-test.yml` | PRs, push to `develop` | Builds image, verifies extensions load, that migrations apply on both a fresh volume and an existing one, and that `doctor --fix` repairs a migration that never took effect |
 | `native-archives.yml` | Tag push | Builds native PG17 tarballs for all platforms, uploads to CDN and GitHub Release |
 | `test-pg-guard.yml` | PRs touching `extensions/pg_guard/**` | Runs pg_guard regression suite |
 

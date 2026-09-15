@@ -272,6 +272,59 @@ jobs:
           replayed=$(psql_in pg_v2 "SELECT count(*) FROM ci_upgrade_probe")
           test "$replayed" = "$((before + 1))" || { echo "FAIL: replay did not re-run the migration"; exit 1; }
 
+      # The operator path out of an adopted ledger: doctor asks the database
+      # whether the load-bearing migrations took effect, rather than trusting a
+      # ledger that by construction cannot know.
+      - name: doctor detects and repairs a migration that never took effect
+        env:
+          PGDATABASE: supatype_admin
+        run: |
+          set -euo pipefail
+          psql_in() {
+            docker exec -e PGPASSWORD=testpassword -i pg_v2 \
+              psql -U supatype_admin -d "$PGDATABASE" -tAc "$1"
+          }
+          exec_migrate() {
+            docker exec -e POSTGRES_PASSWORD=testpassword -e POSTGRES_DB="$PGDATABASE" \
+              pg_v2 supatype-migrate "$@"
+          }
+
+          # A healthy container: every check passes and the exit status says so.
+          exec_migrate doctor
+          echo "doctor is clean on a healthy container"
+
+          # Now reproduce the failure #138 actually causes: the migration was
+          # marked applied, but its effect is not in the database. This is the
+          # pg_guard case -- without it privilege enforcement is off for every
+          # PostgREST session.
+          psql_in "ALTER ROLE authenticator RESET session_preload_libraries" > /dev/null
+          preload=$(psql_in "SELECT coalesce(array_to_string(rolconfig, ','), '') FROM pg_roles WHERE rolname='authenticator'")
+          echo "after RESET, authenticator rolconfig: [$preload]"
+          case "$preload" in *pg_guard*) echo "FAIL: could not stage the broken state"; exit 1 ;; esac
+
+          rc=0; out=$(exec_migrate doctor 2>&1) || rc=$?
+          echo "$out"
+          test "$rc" -ne 0 || { echo "FAIL: doctor exited 0 with pg_guard missing"; exit 1; }
+          case "$out" in
+            *"MISSING  pg_guard preloaded for authenticator"*) ;;
+            *) echo "FAIL: doctor did not name the missing check"; exit 1 ;;
+          esac
+          case "$out" in
+            *20260810150000_authenticator_session_preload.sql*) ;;
+            *) echo "FAIL: doctor did not name the migration to replay"; exit 1 ;;
+          esac
+
+          # --fix applies exactly that migration and re-verifies.
+          exec_migrate doctor --fix
+          fixed=$(psql_in "SELECT array_to_string(rolconfig, ',') FROM pg_roles WHERE rolname='authenticator'")
+          echo "after --fix, authenticator rolconfig: [$fixed]"
+          case "$fixed" in
+            *pg_guard*) ;;
+            *) echo "FAIL: doctor --fix did not restore pg_guard"; exit 1 ;;
+          esac
+          exec_migrate doctor
+          echo "doctor is clean again"
+
       - name: Show logs on failure
         if: failure()
         run: |
