@@ -242,6 +242,20 @@ static GUC_TENANT_OPS_PER_SEC: GucSetting<i32> = GucSetting::<i32>::new(0);
 static GUC_TENANT: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(None);
 
+/// Channels whose messages are relayed to the peers in `supacache.peer`, as a
+/// comma-separated glob list. Empty (the default) relays nothing.
+///
+/// Opt-in per pattern rather than all-or-nothing, and that is the design rather
+/// than caution. Relaying every channel reproduces the problem redis 7 added
+/// sharded pub/sub to escape: a broadcast whose cost grows with the number of
+/// instances, paid on the highest-volume, lowest-value traffic in most systems
+/// (presence, typing indicators, cursor positions). The channels that genuinely
+/// need to cross an instance boundary -- cache invalidation, session
+/// revocation -- are few and low-rate, and naming them keeps the fan-out bill
+/// proportional to the value.
+static GUC_RELAY_CHANNELS: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+
 /// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
 /// values are raw heap-tuple bytes.
 /// One megabyte, the smallest a row-cache partition is allowed to be. Each
@@ -1715,6 +1729,23 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_string_guc(
+        "pg_keyspace.relay_channels",
+        "Channels relayed to the peers in supacache.peer (comma-separated globs)",
+        "Empty (the default) relays nothing, and cross-instance pub/sub is off. \
+         A channel matching one of these globs is additionally delivered to every \
+         enabled row of supacache.peer, by a background worker over libpq -- so \
+         no WAL, no new protocol, and Postgres's own authentication, TLS and \
+         pg_hba apply to the peer link. Opt in per pattern rather than relaying \
+         everything: a relay whose cost grows with the number of instances is \
+         what sharded pub/sub exists to avoid, and paying it on presence or \
+         typing traffic is the worst version of that. The receiver count \
+         PUBLISH returns stays LOCAL: there is no cheap honest cross-instance \
+         answer, and redis reports per node too.",
+        &GUC_RELAY_CHANNELS,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
         "pg_keyspace.tenant",
         "Tenant a SQL backend acts as, scoping supacache.publish() to {tenant}:",
         "Unset (default) leaves supacache.publish() superuser-only, as it was \
@@ -2917,6 +2948,16 @@ fn pg_ensure_schema() {
             "CREATE TABLE IF NOT EXISTS supacache.resp_credential (\
              username text PRIMARY KEY, secret text NOT NULL, \
              role_name text NOT NULL, tenant text NOT NULL DEFAULT '')",
+        );
+        // Peers this instance relays to. Modelled on Citus's pg_dist_node: the
+        // membership is a table an operator maintains, and the transport is
+        // libpq, so authentication, TLS and pg_hba are Postgres's rather than
+        // something this extension invents and has to be trusted about.
+        let _ = Spi::run(
+            "CREATE TABLE IF NOT EXISTS supacache.peer (\
+             name text PRIMARY KEY, conninfo text NOT NULL, \
+             enabled boolean NOT NULL DEFAULT true, \
+             added_at timestamptz NOT NULL DEFAULT now())",
         );
         let _ = Spi::run(
             "CREATE TABLE IF NOT EXISTS supacache.acl (\
@@ -6104,6 +6145,51 @@ mod supacache {
         // rings this lane uses.
         unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
         let n = bus.publish_external(scoped.as_bytes(), message, |p, c| {
+            server::glob_match(p, c)
+        });
+        unsafe { pg_sys::LWLockRelease(lock) };
+        n.unwrap_or(0) as i64
+    }
+
+    /// The endpoint a peer's relay worker calls. **Not** for applications.
+    ///
+    /// `supacache.publish()` is the front door: it scopes the channel to the
+    /// caller's tenant and, where `pg_keyspace.relay_channels` matches, hands
+    /// the message to the relay worker for the peers. This is the back door a
+    /// peer arrives through, and it differs in exactly two ways, both of which
+    /// are why it is a separate function rather than a flag on the other one:
+    ///
+    /// * the channel arrives **already scoped** -- the publishing instance
+    ///   applied its own tenant prefix, and re-applying this instance's would
+    ///   deliver into the wrong namespace or nowhere;
+    /// * it **never relays onward**. That is what stops A -> B -> A. A message
+    ///   crosses at most one instance boundary, always, and the rule is
+    ///   structural rather than a hop count that has to be right.
+    ///
+    /// Superuser-only, like the relay connection itself. An operator who wants
+    /// a peer link that cannot publish into arbitrary namespaces gives it a
+    /// tenant-scoped role and lets it call `publish()` instead; this function
+    /// is for a trusted relay, and says so.
+    #[pg_extern]
+    fn publish_relayed(channel: &str, message: &[u8]) -> i64 {
+        if !unsafe { pg_sys::superuser() } {
+            error!(
+                "supacache.publish_relayed() is superuser-only: it publishes a \
+                 pre-scoped channel name without applying this instance's tenant \
+                 scope, which is safe only for a peer relay. Applications want \
+                 supacache.publish()"
+            );
+        }
+        let bus = match BUS.get() {
+            Some(b) => b,
+            None => return 0,
+        };
+        let lock = PS_EXT_LOCK.load(Ordering::Acquire);
+        if lock.is_null() {
+            error!("supacache.publish_relayed(): the pub/sub bus is not initialised in this cluster");
+        }
+        unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+        let n = bus.publish_external(channel.as_bytes(), message, |p, c| {
             server::glob_match(p, c)
         });
         unsafe { pg_sys::LWLockRelease(lock) };
