@@ -377,6 +377,39 @@ impl ShmBus {
             .collect()
     }
 
+    /// Every live route: `(name, is_pattern, subscribers across all workers)`.
+    ///
+    /// This is the whole instance's picture, not one worker's, which is what
+    /// makes `PUBSUB` answer for the keyspace a client thinks it is talking to
+    /// rather than for whichever worker its connection landed on.
+    ///
+    /// A name longer than [`MAX_CHAN`] was never recorded here (see
+    /// `subscribe`), so it cannot appear; the caller merges its own local
+    /// subscriptions to cover that.
+    pub fn routes(&self) -> Vec<(Vec<u8>, bool, usize)> {
+        let mut out = Vec::new();
+        self.lock_routes();
+        unsafe {
+            for i in 0..self.max_routes {
+                let r = self.route(i);
+                if (*r).state.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                let n = (*r).key_len as usize;
+                let mut total = 0usize;
+                for w in 0..self.nworkers {
+                    total += (*r).counts[w].load(Ordering::Relaxed) as usize;
+                }
+                if total == 0 {
+                    continue;
+                }
+                out.push(((&(*r).key)[..n].to_vec(), (*r).is_pattern != 0, total));
+            }
+        }
+        self.unlock_routes();
+        out
+    }
+
     // ---- inbox rings ---------------------------------------------------
 
     /// Append a frame to the `from` to `to` ring. False when it would not fit,
@@ -780,6 +813,54 @@ mod tests {
     fn attach_rejects_a_segment_without_the_magic() {
         let mut v = vec![0u8; bytes_for(2, 4, 4096)];
         assert!(unsafe { ShmBus::attach(v.as_mut_ptr()) }.is_none());
+    }
+
+    #[test]
+    fn routes_report_every_worker_holding_a_subscriber() {
+        let (_r, bus) = Region::new(3, 16, 4096);
+        // Two workers on one channel, one on another, and a pattern. This is
+        // the shape PUBSUB has to describe: the numbers are per channel across
+        // the instance, not per worker.
+        bus.subscribe(0, b"news", false);
+        bus.subscribe(2, b"news", false);
+        bus.subscribe(2, b"news", false);
+        bus.subscribe(1, b"sports", false);
+        bus.subscribe(1, b"ne*", true);
+        let mut got = bus.routes();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (b"ne*".to_vec(), true, 1),
+                (b"news".to_vec(), false, 3),
+                (b"sports".to_vec(), false, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn routes_drop_a_channel_once_its_last_subscriber_goes() {
+        let (_r, bus) = Region::new(2, 16, 4096);
+        bus.subscribe(0, b"news", false);
+        bus.subscribe(1, b"news", false);
+        bus.unsubscribe(0, b"news", false);
+        // Still one holder, so the channel is still active.
+        assert_eq!(bus.routes(), vec![(b"news".to_vec(), false, 1)]);
+        bus.unsubscribe(1, b"news", false);
+        // PUBSUB CHANNELS must not report a channel nobody is on: a stale entry
+        // here would be indistinguishable from a live subscriber to a client.
+        assert!(bus.routes().is_empty());
+    }
+
+    #[test]
+    fn routes_omit_a_name_too_long_to_record() {
+        let (_r, bus) = Region::new(2, 16, 4096);
+        let long = vec![b'x'; MAX_CHAN + 1];
+        bus.subscribe(0, &long, false);
+        // subscribe() counts and ignores it rather than truncating, so it was
+        // never routed and cannot be listed. The server merges its own local
+        // subscriptions to cover exactly this case.
+        assert!(bus.routes().is_empty());
     }
 
     #[test]

@@ -201,6 +201,28 @@ impl Bus {
             .or_insert(0) += 1;
     }
 
+    /// Every live route: `(name, is_pattern, subscribers across all workers)`.
+    ///
+    /// What `PUBSUB` answers from. Instance-wide rather than per worker, so a
+    /// client is told about the keyspace it thinks it is talking to instead of
+    /// whichever worker its connection happened to land on.
+    pub fn routes(&self) -> Vec<(Vec<u8>, bool, usize)> {
+        if let Some(shm) = self.shared {
+            return shm.routes();
+        }
+        let r = self.routing.lock().unwrap();
+        let mut out = Vec::new();
+        for (pattern, table) in [(false, &r.channels), (true, &r.patterns)] {
+            for (key, per) in table {
+                let total: usize = per.values().sum();
+                if total > 0 {
+                    out.push((key.clone(), pattern, total));
+                }
+            }
+        }
+        out
+    }
+
     /// Record that worker `wid` lost a subscriber on `key`.
     pub fn unsubscribe(&self, wid: usize, key: &[u8], pattern: bool) {
         if let Some(shm) = self.shared {

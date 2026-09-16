@@ -424,6 +424,18 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_sql_publish.sh
 
+      # PUBSUB introspection on a multi-worker, authenticated cluster: the two
+      # things the conformance harness cannot show, because it runs one worker
+      # with no auth. That the answer covers the instance rather than whichever
+      # worker was asked, and that it does not enumerate another tenant's
+      # channels. Its own cluster and ports.
+      - name: PUBSUB is instance-wide and tenant-scoped
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_pubsub_introspect.sh
+
       - name: pg_basebackup + PITR restores the cache
         env:
           PGKS_BUILD_PROFILE: debug
