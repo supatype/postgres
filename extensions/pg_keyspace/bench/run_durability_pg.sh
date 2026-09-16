@@ -182,6 +182,12 @@ echo "########## B. durable tier actually persists (#44) ##########"
 rcli SET durable:k1 v1 >/dev/null; sleep 1
 chk "row present in supacache.kv" "1"  "$(psql_ "SELECT count(*) FROM supacache.kv WHERE key='durable:k1'::bytea")"
 chk "value correct in kv"         "v1" "$(psql_ "SELECT convert_from(val,'UTF8') FROM supacache.kv WHERE key='durable:k1'::bytea")"
+# A bitmap is a string addressed by bit, so it must reach the same table by the
+# same path with no persistence machinery of its own (#115). Bit 100 is bit 4 of
+# byte 12, so the stored value is twelve zero bytes and 0x08.
+rcli SETBIT durable:bits 100 1 >/dev/null; sleep 1
+chk "bitmap persisted as a string" "00000000000000000000000008" \
+    "$(psql_ "SELECT encode(val,'hex') FROM supacache.kv WHERE key='durable:bits'::bytea")"
 
 echo ""
 echo "########## C. large value by reference (#48) ##########"
@@ -225,6 +231,7 @@ chk "replication_status: durable, no standby, honoured" "durable|false|0|true" \
 echo ""
 echo "########## E. crash recovery: kill -9, restart, values survive ##########"
 rcli SET crash:k1 survive-me >/dev/null
+rcli SETBIT crash:bits 100 1 >/dev/null
 rcli_x /tmp/big.txt SET crash:big >/dev/null
 sleep 3
 # Kill the whole cluster, not just the postmaster: a surviving backend keeps
@@ -240,6 +247,8 @@ if wait_ready; then
   chk "1MiB value survived kill -9"  "1048576"    "$(rcli STRLEN crash:big)"
   chk "6MiB value survived kill -9"  "6291456"    "$(rcli STRLEN big:6m)"
   chk "pre-crash key recovered"      "bar"        "$(rcli GET foo)"
+  chk "bitmap survived kill -9"      "1"          "$(rcli GETBIT crash:bits 100)"
+  chk "and recovered as a string"    "string"     "$(rcli TYPE crash:bits)"
   echo "  recovery log: $(grep -h "recovered .* keys" $PGDATA/log | tail -1)"
 else
   echo "FAIL  cluster did not restart after kill -9"; fail=$((fail+1))

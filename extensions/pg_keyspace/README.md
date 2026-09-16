@@ -83,7 +83,7 @@ ceiling for deep Postgres integration.
 | Column masking / RLS on cached rows | **Yes** — re-applied above the cache | N/A |
 | Durability | Tiered: ephemeral→relaxed→durable(fsync)→replicated; crash-recovers from PG tables | RDB / AOF snapshots & log |
 | Synchronous replication | **Yes** — ack held until standby fsync | Async by default (WAIT for quorum) |
-| Data types | strings, hashes, lists, sets, sorted sets, Bloom filters, Cuckoo filters, pub/sub (+ TTL), transactions | Superset (adds streams, HLL, bitmaps, geo, scripting) |
+| Data types | strings, hashes, lists, sets, sorted sets, bitmaps, Bloom filters, Cuckoo filters, pub/sub (+ TTL), transactions | Superset (adds streams, HLL, geo, scripting) |
 | Raw write ceiling under no-persistence load | Lower (bounded by 1 event loop / worker) | **Higher** — purpose-built |
 | Maturity / ecosystem / ops tooling | New, focused feature set | **Mature**, huge ecosystem |
 
@@ -114,6 +114,7 @@ client-side caching (`invalidate` pushes) in every mode — default, `BCAST`
 | Connection / server | `PING` `ECHO` `AUTH` `HELLO` (2/3) `QUIT` `SELECT` `RESET` `CLIENT` (incl. `TRACKING`) `CONFIG` `COMMAND` `INFO` `TIME` `DBSIZE` `DEBUG` `MEMORY` |
 | Keys / generic | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` `TTL` `PTTL` `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `EXPIRETIME` `PEXPIRETIME` `PERSIST` `RENAME` `RENAMENX` `COPY` `TOUCH` `RANDOMKEY` `OBJECT` `FLUSHDB` `FLUSHALL` |
 | Strings | `GET` `SET` `SETNX` `SETEX` `PSETEX` `GETSET` `GETDEL` `GETEX` `APPEND` `STRLEN` `GETRANGE` `SETRANGE` `MGET` `MSET` `MSETNX` `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` |
+| Bitmaps | `SETBIT` `GETBIT` `BITCOUNT` `BITPOS` `BITOP` `BITFIELD` `BITFIELD_RO` |
 | Hashes | `HSET` `HMSET` `HSETNX` `HGET` `HMGET` `HDEL` `HGETALL` `HKEYS` `HVALS` `HLEN` `HEXISTS` `HSTRLEN` `HINCRBY` `HINCRBYFLOAT` `HRANDFIELD` `HSCAN` |
 | Lists | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP` `LLEN` `LINDEX` `LRANGE` `LSET` `LTRIM` `LINSERT` `LREM` `LPOS` `LMOVE` `RPOPLPUSH` |
 | Sets | `SADD` `SREM` `SCARD` `SISMEMBER` `SMISMEMBER` `SMEMBERS` `SPOP` `SRANDMEMBER` `SMOVE` `SSCAN` `SUNION` `SINTER` `SDIFF` `SUNIONSTORE` `SINTERSTORE` `SDIFFSTORE` `SINTERCARD` |
@@ -124,8 +125,10 @@ client-side caching (`invalidate` pushes) in every mode — default, `BCAST`
 | Cuckoo filter | `CF.RESERVE` `CF.ADD` `CF.ADDNX` `CF.INSERT` `CF.INSERTNX` `CF.EXISTS` `CF.MEXISTS` `CF.DEL` `CF.COUNT` `CF.INFO` `CF.SCANDUMP` `CF.LOADCHUNK` |
 
 **Not yet supported** — scripting (`EVAL`/`FUNCTION`), streams (`XADD`…),
-blocking ops (`BLPOP`/`BRPOP`/`BZPOPMIN`…), HyperLogLog / bitmaps / geo, and
-cluster commands. `CLIENT TRACKING` supports every mode (default, `BCAST` with
+blocking ops (`BLPOP`/`BRPOP`/`BZPOPMIN`…), HyperLogLog, geo, and cluster
+commands. HyperLogLog is not planned (Postgres extensions do it better over the
+same data); geo is declined outright, because PostGIS is one `CREATE EXTENSION`
+away and operates on the same rows. `CLIENT TRACKING` supports every mode (default, `BCAST` with
 `PREFIX`, `OPTIN`/`OPTOUT` with `CLIENT CACHING`, `REDIRECT`). Invalidations are
 delivered as RESP3 pushes, or — for a RESP2 `REDIRECT` target — as
 `__redis__:invalidate` pub/sub messages. `NOLOOP` is accepted and is always in

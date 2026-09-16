@@ -12,6 +12,7 @@
 
 use crate::aggr;
 use crate::batcher::{Batcher, Tier};
+use crate::bitmap;
 use crate::crc16;
 use crate::prob;
 use crate::pubsub;
@@ -98,6 +99,7 @@ struct CmdSpec {
 /// Key at argument 1 — the overwhelming majority of commands.
 const CMD_KEY1_READ: &[&str] = &[
     "GET", "TTL", "PTTL", "TYPE", "STRLEN", "GETRANGE", "EXPIRETIME", "PEXPIRETIME",
+    "GETBIT", "BITCOUNT", "BITPOS", "BITFIELD_RO",
     "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS", "HSTRLEN", "HRANDFIELD",
     "LLEN", "LINDEX", "LRANGE", "LPOS",
     "ZSCORE", "ZMSCORE", "ZCARD", "ZRANK", "ZREVRANK", "ZRANGE", "ZREVRANGE",
@@ -112,6 +114,7 @@ const CMD_KEY1_WRITE: &[&str] = &[
     "SET", "SETNX", "GETSET", "INCR", "DECR", "INCRBY", "DECRBY", "EXPIRE", "PEXPIRE",
     "EXPIREAT", "PEXPIREAT", "PERSIST", "APPEND", "GETDEL", "SETEX", "PSETEX", "GETEX",
     "SETRANGE", "INCRBYFLOAT",
+    "SETBIT", "BITFIELD",
     "HSET", "HMSET", "HSETNX", "HDEL", "HINCRBY", "HINCRBYFLOAT",
     "LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LSET", "LTRIM", "LINSERT", "LREM",
     "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX",
@@ -153,6 +156,9 @@ fn command_specs() -> Vec<CmdSpec> {
     add(CMD_MOVABLE_READ, false, 0, 0, 0, true);
     add(CMD_MOVABLE_WRITE, true, 0, 0, 0, true);
     add(&["OBJECT"], false, 2, 2, 1, false);
+    // BITOP <op> dest src… — the operation name sits where a key usually does,
+    // so the keys start at argument 2 and run to the end.
+    add(&["BITOP"], true, 2, -1, 1, false);
     add(CMD_KEYLESS, false, 0, 0, 0, false);
     v
 }
@@ -925,6 +931,14 @@ impl Worker {
                     .map(|(_, _, blob)| blob.len())
                     .unwrap_or(0);
                 cur + arg_bytes
+            } else if is_bitmap_write(cmd) {
+                // A bitmap write is the one shape whose arguments say nothing
+                // about how much it stores: `SETBIT k 65536 1` is a dozen bytes
+                // of argument and an eight-kilobyte value. Reserve the most a
+                // record can ever inline instead of measuring the arguments,
+                // which would under-reserve and leave the push waiting on a
+                // ring this check had just called roomy.
+                INLINE_MAX
             } else {
                 arg_bytes
             };
@@ -2183,6 +2197,12 @@ impl Worker {
                     return;
                 }
                 let end = off + args[3].len();
+                // Same amplification as SETBIT — `SETRANGE k 536870910 x` is 23
+                // bytes and half a gigabyte — so the same guard, before the
+                // resize below rather than after it.
+                if !fits_arena(&store, end as u64, out) {
+                    return;
+                }
                 if buf.len() < end {
                     buf.resize(end, 0); // zero-pad the gap, as Redis does
                 }
@@ -2195,6 +2215,303 @@ impl Worker {
                 durable_log(&batcher, tier, &args[1], &buf);
                 if persist_on {
                     stages.push((args[1].clone(), buf, if exp > 0 { exp } else { 0 }, b's'));
+                }
+            }
+            // ---- bitmaps -----------------------------------------------------
+            // A bitmap is a string addressed by bit, so every one of these reads
+            // and writes an ordinary `KIND_STR` value and stages exactly what
+            // APPEND/SETRANGE stage: the whole new value, kind `s`, with the
+            // key's existing expiry preserved. Nothing here is a new storage
+            // shape, a new persistence path or a new recovery path.
+            //
+            // Argument validation runs before the WRONGTYPE check throughout,
+            // which is the order Redis uses: `SETBIT hash bogus 1` reports the
+            // bad offset, not the wrong type.
+            b"SETBIT" => {
+                if nargs != 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'setbit'");
+                    return;
+                }
+                let off = match bitmap::bit_offset(&args[2], max_bulk, 1, false) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        resp::error(out, e);
+                        return;
+                    }
+                };
+                let bit = match bitmap::parse_int(&args[3]) {
+                    Some(0) => false,
+                    Some(1) => true,
+                    _ => {
+                        resp::error(out, bitmap::ERR_BIT_VALUE);
+                        return;
+                    }
+                };
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                // Before building the value, not after: see `fits_arena`.
+                if !fits_arena(&store, (off >> 3) + 1, out) {
+                    return;
+                }
+                let (mut buf, exp) = match store.get_typed(&args[1]) {
+                    Some((_, e, v)) => (v.to_vec(), e),
+                    None => (Vec::new(), 0),
+                };
+                let old = bitmap::set_bit(&mut buf, off, bit);
+                let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
+                if !wrote(out, store.set(&args[1], &buf, ttl)) {
+                    return;
+                }
+                resp::integer(out, old);
+                durable_log(&batcher, tier, &args[1], &buf);
+                if persist_on {
+                    stages.push((args[1].clone(), buf, if exp > 0 { exp } else { 0 }, b's'));
+                }
+            }
+            b"GETBIT" => {
+                if nargs != 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'getbit'");
+                    return;
+                }
+                let off = match bitmap::bit_offset(&args[2], max_bulk, 1, false) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        resp::error(out, e);
+                        return;
+                    }
+                };
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                let bit = match store.get(&args[1]) {
+                    Lookup::Hit(v) => bitmap::get_bit(v, off),
+                    Lookup::Miss => 0,
+                };
+                resp::integer(out, bit);
+            }
+            b"BITCOUNT" => {
+                // BITCOUNT key [start end [BYTE|BIT]]
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                // Borrowed, not copied: a read must not duplicate a bitmap
+                // that may be megabytes.
+                let buf = match store.get(&args[1]) {
+                    Lookup::Hit(v) => v,
+                    // A missing key answers 0 before the range is even parsed,
+                    // as Redis does: `BITCOUNT missing garbage` is not an error.
+                    Lookup::Miss => {
+                        resp::integer(out, 0);
+                        return;
+                    }
+                };
+                let (start, end, unit) = if nargs == 2 {
+                    (0, -1, bitmap::Unit::Byte)
+                } else if nargs == 4 || nargs == 5 {
+                    let (s, e) = match (bitmap::parse_int(&args[2]), bitmap::parse_int(&args[3])) {
+                        (Some(s), Some(e)) => (s, e),
+                        _ => {
+                            resp::error(out, bitmap::ERR_NOT_INT);
+                            return;
+                        }
+                    };
+                    let unit = match args.get(4) {
+                        None => bitmap::Unit::Byte,
+                        Some(a) => match bitmap::parse_unit(a) {
+                            Some(u) => u,
+                            None => {
+                                resp::error(out, bitmap::ERR_SYNTAX);
+                                return;
+                            }
+                        },
+                    };
+                    (s, e, unit)
+                } else {
+                    resp::error(out, bitmap::ERR_SYNTAX);
+                    return;
+                };
+                let range = bitmap::resolve_range(buf.len(), start, end, unit);
+                resp::integer(out, bitmap::count(buf, range));
+            }
+            b"BITPOS" => {
+                // BITPOS key bit [start [end [BYTE|BIT]]]
+                if nargs < 3 {
+                    resp::error(out, "ERR wrong number of arguments for 'bitpos'");
+                    return;
+                }
+                // Past the unit argument there is nothing left to mean, and
+                // Redis calls that a syntax error rather than an arity one.
+                if nargs > 6 {
+                    resp::error(out, bitmap::ERR_SYNTAX);
+                    return;
+                }
+                let bit = match bitmap::parse_int(&args[2]) {
+                    Some(0) => false,
+                    Some(1) => true,
+                    _ => {
+                        resp::error(out, bitmap::ERR_BIT_ARG);
+                        return;
+                    }
+                };
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                let buf = match store.get(&args[1]) {
+                    Lookup::Hit(v) => v,
+                    // A missing key is an infinite run of zeros: the first clear
+                    // bit is 0 and there is no set bit. Answered before the
+                    // range is parsed, as Redis does.
+                    Lookup::Miss => {
+                        resp::integer(out, if bit { -1 } else { 0 });
+                        return;
+                    }
+                };
+                let start = match args.get(3) {
+                    None => 0,
+                    Some(a) => match bitmap::parse_int(a) {
+                        Some(v) => v,
+                        None => {
+                            resp::error(out, bitmap::ERR_NOT_INT);
+                            return;
+                        }
+                    },
+                };
+                let end_given = nargs >= 5;
+                let end = match args.get(4) {
+                    None => -1,
+                    Some(a) => match bitmap::parse_int(a) {
+                        Some(v) => v,
+                        None => {
+                            resp::error(out, bitmap::ERR_NOT_INT);
+                            return;
+                        }
+                    },
+                };
+                let unit = match args.get(5) {
+                    None => bitmap::Unit::Byte,
+                    Some(a) => match bitmap::parse_unit(a) {
+                        Some(u) => u,
+                        None => {
+                            resp::error(out, bitmap::ERR_SYNTAX);
+                            return;
+                        }
+                    },
+                };
+                match bitmap::resolve_range(buf.len(), start, end, unit) {
+                    None => resp::integer(out, -1),
+                    Some((first, last)) => match bitmap::pos(buf, bit, first, last) {
+                        Some(p) => resp::integer(out, p as i64),
+                        // Looking for a clear bit and finding none: without an
+                        // explicit end the value is treated as zero-padded on
+                        // the right, so the answer is the first bit past it.
+                        // With one, the range really did hold no clear bit.
+                        None if !bit && !end_given => resp::integer(out, (buf.len() * 8) as i64),
+                        None => resp::integer(out, -1),
+                    },
+                }
+            }
+            b"BITOP" => {
+                // BITOP AND|OR|XOR|NOT destkey srckey [srckey …]
+                if nargs < 4 {
+                    resp::error(out, "ERR wrong number of arguments for 'bitop'");
+                    return;
+                }
+                let op = match bitmap::parse_bitop(&args[1]) {
+                    Some(o) => o,
+                    None => {
+                        resp::error(out, bitmap::ERR_SYNTAX);
+                        return;
+                    }
+                };
+                if op == bitmap::BitOp::Not && nargs != 4 {
+                    resp::error(out, bitmap::ERR_BITOP_NOT);
+                    return;
+                }
+                let mut srcs: Vec<Vec<u8>> = Vec::with_capacity(nargs - 3);
+                for k in &args[3..] {
+                    if !check_string(&store, k, out) {
+                        return;
+                    }
+                    // A missing source is an empty string, which is what makes
+                    // AND against one produce zeros rather than the operand.
+                    srcs.push(match store.get(k) {
+                        Lookup::Hit(v) => v.to_vec(),
+                        Lookup::Miss => Vec::new(),
+                    });
+                }
+                let res = bitmap::apply_bitop(op, &srcs);
+                // An empty result deletes the destination instead of storing a
+                // zero-length value — including when it had a value before.
+                if res.is_empty() {
+                    store.del(&args[2]);
+                    resp::integer(out, 0);
+                    if persist_on {
+                        stages.push((args[2].clone(), Vec::new(), DELETE_TOMBSTONE, b's'));
+                    }
+                    return;
+                }
+                if !wrote(out, store.set(&args[2], &res, 0)) {
+                    return;
+                }
+                resp::integer(out, res.len() as i64);
+                durable_log(&batcher, tier, &args[2], &res);
+                if persist_on {
+                    stages.push((args[2].clone(), res, 0, b's'));
+                }
+            }
+            b"BITFIELD" | b"BITFIELD_RO" => {
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'bitfield'");
+                    return;
+                }
+                let readonly = cmd.as_slice() == b"BITFIELD_RO";
+                // Every operation is parsed before any is applied, so a syntax
+                // error in the last one leaves the value untouched.
+                let ops = match bitmap::parse_bitfield(args, max_bulk, readonly) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        resp::error(out, e);
+                        return;
+                    }
+                };
+                if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                // The farthest byte any write in this command reaches, checked
+                // before the value is grown to reach it: see `fits_arena`.
+                if let Some(end) = ops.iter().filter(|o| o.is_write()).map(|o| o.end_byte()).max() {
+                    if !fits_arena(&store, end, out) {
+                        return;
+                    }
+                }
+                let (mut buf, exp) = match store.get_typed(&args[1]) {
+                    Some((_, e, v)) => (v.to_vec(), e),
+                    None => (Vec::new(), 0),
+                };
+                let results = bitmap::apply_bitfield(&mut buf, &ops);
+                // A command with no write operations never creates or extends
+                // the key, so it stages nothing either.
+                let wrote_any = ops.iter().any(|o| o.is_write());
+                if wrote_any {
+                    let ttl = if exp > 0 { (exp - now_micros()).max(1) } else { 0 };
+                    if !wrote(out, store.set(&args[1], &buf, ttl)) {
+                        return;
+                    }
+                }
+                resp::array_header(out, results.len());
+                for r in &results {
+                    match r {
+                        Some(v) => resp::integer(out, *v),
+                        // OVERFLOW FAIL refused this write; the element is nil.
+                        None => resp::null(out, resp3),
+                    }
+                }
+                if wrote_any {
+                    durable_log(&batcher, tier, &args[1], &buf);
+                    if persist_on {
+                        stages.push((args[1].clone(), buf, if exp > 0 { exp } else { 0 }, b's'));
+                    }
                 }
             }
             b"INCRBYFLOAT" => {
@@ -6139,6 +6456,8 @@ fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
         | b"TTL" | b"PTTL" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"PERSIST"
         | b"TYPE" | b"STRLEN" | b"APPEND" | b"GETDEL" | b"SETEX" | b"PSETEX" | b"GETEX"
         | b"GETRANGE" | b"SETRANGE" | b"INCRBYFLOAT" | b"EXPIRETIME" | b"PEXPIRETIME"
+        // bitmaps: a string addressed by bit, so the key is the first argument
+        | b"SETBIT" | b"GETBIT" | b"BITCOUNT" | b"BITPOS" | b"BITFIELD" | b"BITFIELD_RO"
         // hashes + lists: the key is always the first argument
         | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
         | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY"
@@ -6189,6 +6508,8 @@ fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
                 vec![]
             }
         }
+        // BITOP op dst src … — every argument from 2 on is a key.
+        b"BITOP" => (2..nargs).collect(),
         // ZRANGESTORE dst src … — destination and source keys.
         b"ZRANGESTORE" => {
             if nargs > 2 {
@@ -6231,6 +6552,12 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"GETEX"
             | b"SETRANGE"
             | b"INCRBYFLOAT"
+            // bitmap mutations. BITFIELD counts even when every operation in it
+            // is a GET -- which is exactly why BITFIELD_RO exists and is absent
+            // from this list.
+            | b"SETBIT"
+            | b"BITOP"
+            | b"BITFIELD"
             | b"RENAME"
             | b"RENAMENX"
             | b"COPY"
@@ -6288,6 +6615,37 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"CF.DEL"
             | b"CF.LOADCHUNK"
     )
+}
+
+/// Refuse a write whose *result* would be larger than the store could ever hold,
+/// before the value is built rather than after.
+///
+/// `SETBIT`, `SETRANGE` and `BITFIELD` are the three commands whose arguments
+/// say nothing about how many bytes they produce: an offset is a handful of
+/// characters and the value it implies is `offset/8` bytes of mostly zeros. Left
+/// unchecked, a 25-byte `SETBIT k 4294967295 1` allocates and zeroes 512 MiB on
+/// the event loop, blocks every other connection on the worker for seconds
+/// (measured: 4.2 s, and an unrelated PING going from 6 ms to 4156 ms), and is
+/// then refused by the arena anyway — a ~20-million-fold amplification from one
+/// small command, repeatable, and fatal in a background worker where the OOM
+/// killer takes the whole cluster with it.
+///
+/// The reply is the same `OOM` the allocator would have produced, so this
+/// changes nothing a client can observe except how long it waits for it.
+#[must_use]
+fn fits_arena(store: &Store, needed: u64, out: &mut Vec<u8>) -> bool {
+    if needed > store.max_storable_bytes() as u64 {
+        resp::error(out, OOM_ERR);
+        return false;
+    }
+    true
+}
+
+/// Bitmap mutations. Called out from the other string writes only for the ring
+/// pre-flight, which cannot size them from their arguments; they persist as
+/// ordinary strings like `APPEND` and `SETRANGE` do.
+fn is_bitmap_write(cmd: &[u8]) -> bool {
+    matches!(cmd, b"SETBIT" | b"BITOP" | b"BITFIELD")
 }
 
 /// Aggregate (hash/list/zset) mutations — their whole blob is persisted from the
