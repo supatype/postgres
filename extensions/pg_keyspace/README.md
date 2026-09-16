@@ -1861,8 +1861,19 @@ Scoping for this version — the extension works; these are the edges to know:
   multi-worker deployments are unaffected. Online resharding (live slot
   migration, `ASKING`/`MIGRATE`) is not supported; changing `pg_keyspace.workers`
   is a restart.
-- **Pub/sub is cross-worker within one process** (the scale-out daemon), not yet
-  cross-*process* for N in-PG background workers.
+- **Pub/sub does not cross instances.** Within one instance it *does* cross
+  processes: the routing table and the per-worker inboxes live in Postgres
+  shared memory, so a `SUBSCRIBE` on one worker and a `PUBLISH` on another meet
+  even though the workers are separate processes — asserted in CI by section Q
+  of `bench/run_durability_pg.sh`, which publishes on worker 0 and receives on
+  worker N-1 — and a SQL backend reaches the same subscribers through
+  `supacache.publish()`. What does not cross is the boundary between
+  *instances*: a subscriber connected to one Postgres never sees a `PUBLISH`
+  issued against another, which matters for a primary and its replicas, after a
+  failover, and behind a pooler that spreads clients across nodes. The failure
+  is silent — the subscriber simply never receives a message. `LISTEN`/`NOTIFY`
+  does not close that gap either: it cannot even be registered on a standby, so
+  it does not reach the failover case.
 - **A standby serves no RESP.** Every pg_keyspace background worker uses SPI, so
   Postgres registers it with `BgWorkerStartTime::RecoveryFinished` and does not
   launch it until recovery ends — which on a streaming standby never happens.
