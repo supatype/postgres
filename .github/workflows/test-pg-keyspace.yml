@@ -399,6 +399,19 @@ jobs:
       # the boundary in both directions: everything acknowledged before the
       # target comes back, nothing written after it does, and the table the
       # cache fronts stopped at the same instant. Its own clusters and ports.
+      # Every pg_keyspace worker asks for SPI, so pgrx registers it with
+      # BgWorkerStartTime::RecoveryFinished -- and on a streaming standby
+      # recovery never finishes, so none of them ever start. Nothing errors.
+      # This asserts the cluster says so, that the notice is true (the RESP port
+      # really does not answer), and that the deferral lifts by itself on
+      # promotion. Its own clusters and ports.
+      - name: A standby says its workers are deferred, and serves after promotion
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_standby_notice.sh
+
       - name: pg_basebackup + PITR restores the cache
         env:
           PGKS_BUILD_PROFILE: debug

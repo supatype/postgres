@@ -1116,6 +1116,24 @@ fn resolve_in_datadir(p: &str) -> String {
     }
 }
 
+/// `standby.signal` or `recovery.signal` in the data directory, if either is
+/// present.
+///
+/// Postgres reads these at startup to decide whether to enter recovery, and
+/// unlike `RecoveryInProgress()` they are readable from `_PG_init`, which runs
+/// before the shared memory that call needs exists. The postmaster has already
+/// chdir'd into the data directory by then, so a bare name resolves even when
+/// `data_directory` is unset (started with `-D` rather than from the config).
+fn recovery_signal_file() -> Option<&'static str> {
+    let dir = pg_setting(c"data_directory").unwrap_or_else(|| ".".into());
+    for name in ["standby.signal", "recovery.signal"] {
+        if std::path::Path::new(&format!("{}/{}", dir.trim_end_matches('/'), name)).exists() {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// What the RESP listener should do about TLS.
 enum TlsChoice {
     /// Nothing configured: serve the RESP wire in the clear.
@@ -1804,6 +1822,24 @@ pub extern "C" fn _PG_init() {
                  rebuilds it rather than serving rows it can no longer keep current."
             );
         }
+    }
+
+    // Registered is not started. Every worker above asks for SPI, and
+    // `enable_spi_access()` registers it with `BgWorkerStartTime::RecoveryFinished`
+    // because SPI is not reachable before recovery ends. On a streaming standby
+    // recovery never ends, so Postgres never launches any of them -- and nothing
+    // fails, so the only symptom is a RESP port that never answers and a log with
+    // not one line about it. Say it here, which is the last pg_keyspace code that
+    // runs on a standby.
+    if let Some(sig) = recovery_signal_file() {
+        log!(
+            "pg_keyspace: this cluster is starting in recovery ({sig} present), so its \
+             RESP workers are deferred: they use SPI, and Postgres does not launch such \
+             workers until recovery finishes. The RESP port will NOT answer while this \
+             cluster is a standby. Nothing further is needed -- the workers start on their \
+             own when recovery ends, whether that is a promotion or a point-in-time restore \
+             reaching its target."
+        );
     }
 
     log!("pg_keyspace: initialised (shmem hooks + {nworkers} RESP worker(s) registered)");
