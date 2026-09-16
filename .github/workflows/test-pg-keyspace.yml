@@ -412,6 +412,18 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_standby_notice.sh
 
+      # supacache.publish() from SQL, across three worker PROCESSES -- the case
+      # that would silently deliver nothing if the external lane were wrong.
+      # Includes the security assertion: the superuser restriction must survive
+      # an operator granting USAGE and EXECUTE, because it lives in the function
+      # rather than in a GRANT. Its own cluster and ports.
+      - name: SQL publish reaches RESP subscribers
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_sql_publish.sh
+
       - name: pg_basebackup + PITR restores the cache
         env:
           PGKS_BUILD_PROFILE: debug

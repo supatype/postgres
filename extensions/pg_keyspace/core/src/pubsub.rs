@@ -225,6 +225,24 @@ impl Bus {
     /// for `channel` (directly or via a matching pattern): enqueue it and wake
     /// that worker. Returns the number of remote subscribers it will reach (the
     /// caller adds its own local delivery count).
+    /// Publish from a process that is not a slot worker (a Postgres backend
+    /// calling `supacache.publish()`). Returns None when this bus has no shared
+    /// backing -- the in-process bus belongs to the standalone daemon, where
+    /// there are no backends to publish from.
+    ///
+    /// The caller must serialise concurrent external publishers; see
+    /// [`crate::pubsub_shm::ShmBus::publish_external`] for why that is the only
+    /// lock this path needs.
+    pub fn publish_external<F: Fn(&[u8], &[u8]) -> bool>(
+        &self,
+        channel: &[u8],
+        msg: &[u8],
+        glob: F,
+    ) -> Option<usize> {
+        let shm = self.shared?;
+        Some(shm.publish_external(channel, msg, glob, |w| self.wake(w)))
+    }
+
     pub fn publish<F: Fn(&[u8], &[u8]) -> bool>(
         &self,
         from: usize,
