@@ -175,8 +175,10 @@ echo "########## C. shard channels are routed by slot ##########"
 # Find a channel worker 0 does not own by asking it, which is also the redirect
 # under test rather than a re-implementation of the hash in bash.
 target=""; owner_ep=""
+# Bounded: a successful SSUBSCRIBE blocks redis-cli waiting for messages, so an
+# unbounded probe hangs on the first candidate worker 0 happens to own.
 for cand in sh1 sh2 sh3 sh4 sh5 sh6 sh7 sh8 sh9 sh10 sh11 sh12; do
-  r=$(redis-cli -p $RESP SSUBSCRIBE $cand 2>&1 | head -1)
+  r=$(timeout 3 redis-cli -p $RESP SSUBSCRIBE $cand 2>&1 | head -1)
   case "$r" in
     MOVED*) target=$cand; owner_ep=$(echo "$r" | awk '{print $3}'); break;;
   esac
@@ -218,8 +220,11 @@ echo "########## D. shard channels are scoped per tenant too ##########"
 # are ta:<name> and tb:<name>, which hash differently -- so the tenants can be
 # redirected to DIFFERENT workers for what looks to them like one channel, and
 # neither may see the other's.
-ta_ep=$(redis-cli -p $RESP --user ua -a pw1 --no-auth-warning SSUBSCRIBE tshared 2>&1 | head -1)
-tb_ep=$(redis-cli -p $RESP --user ub -a pw2 --no-auth-warning SSUBSCRIBE tshared 2>&1 | head -1)
+# Bounded for the same reason as the probe above: a subscribe that is NOT
+# redirected succeeds and then blocks, so this asks only where the channel
+# lives and moves on.
+ta_ep=$(timeout 3 redis-cli -p $RESP --user ua -a pw1 --no-auth-warning SSUBSCRIBE tshared 2>&1 | head -1)
+tb_ep=$(timeout 3 redis-cli -p $RESP --user ub -a pw2 --no-auth-warning SSUBSCRIBE tshared 2>&1 | head -1)
 ta_port=$RESP; tb_port=$RESP
 case "$ta_ep" in MOVED*) ta_port=$(echo "$ta_ep" | awk '{print $3}'); ta_port=${ta_port##*:};; esac
 case "$tb_ep" in MOVED*) tb_port=$(echo "$tb_ep" | awk '{print $3}'); tb_port=${tb_port##*:};; esac
