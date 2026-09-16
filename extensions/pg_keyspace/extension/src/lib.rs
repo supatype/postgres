@@ -222,6 +222,26 @@ static GUC_TENANT_ARENA_PCT: GucSetting<i32> = GucSetting::<i32>::new(0);
 /// Per-tenant command rate (#43). 0 = no limit, which is the default.
 static GUC_TENANT_OPS_PER_SEC: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// The tenant a *SQL* backend acts as, which is what lets `supacache.publish()`
+/// scope a channel to `{tenant}:` the way a RESP connection's credential does.
+///
+/// Declared `Suset` for a reason. A `Userset` GUC would be worthless here --
+/// a tenant would simply `SET pg_keyspace.tenant` to somebody else's value and
+/// publish into their channels. `Suset` means only a superuser may `SET` it,
+/// while `ALTER ROLE tenant_a SET pg_keyspace.tenant = 'acme'` still applies at
+/// that role's login and cannot be overridden or `RESET` by the role itself.
+///
+/// That covers both deployments with one mechanism: a cluster-wide value in
+/// `postgresql.conf` for a single-tenant cluster, or a per-role value for a
+/// multi-tenant one, held in Postgres's own `pg_db_role_setting` rather than in
+/// a table this extension would have to define, dump and upgrade.
+///
+/// `Suset` alone is not quite the whole boundary -- `GRANT SET ON PARAMETER`
+/// (PG15+) can hand the right to `SET` it to any role -- so `publish()` also
+/// checks where the value came from. See `tenant_scope()`.
+static GUC_TENANT: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+
 /// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
 /// values are raw heap-tuple bytes.
 /// One megabyte, the smallest a row-cache partition is allowed to be. Each
@@ -1692,6 +1712,23 @@ pub extern "C" fn _PG_init() {
          tenant sharing it.",
         &GUC_TENANT_RING_SHARE,
         GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.tenant",
+        "Tenant a SQL backend acts as, scoping supacache.publish() to {tenant}:",
+        "Unset (default) leaves supacache.publish() superuser-only, as it was \
+         before this setting existed. Set, a non-superuser may publish, and the \
+         channel name is forced to `{tenant}:{channel}` -- the same prefix a RESP \
+         connection's credential forces, so a subscriber authenticated as that \
+         tenant receives it under the name it subscribed to and no other tenant \
+         can be reached. Set it cluster-wide in postgresql.conf for a \
+         single-tenant cluster, or per role with ALTER ROLE ... SET for a \
+         multi-tenant one. A role cannot set or reset it for itself. If an \
+         operator hands that right over with GRANT SET ON PARAMETER, a value the \
+         caller set in its own session is refused rather than trusted.",
+        &GUC_TENANT,
+        GucContext::Suset,
         GucFlags::empty(),
     );
     GucRegistry::define_bool_guc(
@@ -5919,6 +5956,103 @@ mod supacache {
         TableIterator::new(rows)
     }
 
+    /// Source strings `pg_settings.source` reports for a value an *operator*
+    /// put there, as opposed to one the caller asserted about itself.
+    ///
+    /// Deliberately an allow-list. `"session"` (a `SET` in this backend) and
+    /// `"client"` (a connection-string `options=`) are the two a caller can
+    /// drive, but anything unrecognised is refused too rather than assumed
+    /// harmless.
+    const TRUSTED_TENANT_SOURCES: [&str; 6] = [
+        "configuration file",
+        "command line",
+        "environment variable",
+        "database",      // ALTER DATABASE ... SET
+        "user",          // ALTER ROLE ... SET
+        "database user", // ALTER ROLE ... IN DATABASE ... SET
+    ];
+
+    thread_local! {
+        /// Memo of the last `pg_keyspace.tenant` this backend resolved and
+        /// whether its source was trusted.
+        ///
+        /// Keyed on the value, which is what makes it sound: any change of value
+        /// misses the memo, and a change of *source* that leaves the value alone
+        /// cannot change the answer -- a role re-`SET`ting the value it was
+        /// already given publishes to the same place either way.
+        static TENANT_SOURCE_MEMO: std::cell::RefCell<Option<(String, bool)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Whether the current `pg_keyspace.tenant` was put there by an operator.
+    ///
+    /// `Suset` already stops a role setting it for itself, but PG15+
+    /// `GRANT SET ON PARAMETER` can hand that right over -- and a boundary a
+    /// single grant removes is the boundary this function exists to avoid.
+    /// `pg_settings.source` is the only place the provenance is readable from an
+    /// extension: `GetConfigOptionByNum`, which is how `pg_settings` itself gets
+    /// it, stopped being exported in PG16. So it costs one lookup, memoised per
+    /// value above.
+    fn tenant_source_trusted(tenant: &str) -> bool {
+        if let Some(hit) = TENANT_SOURCE_MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .filter(|(v, _)| v == tenant)
+                .map(|(_, t)| *t)
+        }) {
+            return hit;
+        }
+        let src = Spi::get_one::<String>(
+            "SELECT source FROM pg_settings WHERE name = 'pg_keyspace.tenant'",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        let trusted = TRUSTED_TENANT_SOURCES.contains(&src.as_str());
+        TENANT_SOURCE_MEMO.with(|m| *m.borrow_mut() = Some((tenant.to_string(), trusted)));
+        trusted
+    }
+
+    /// The channel `supacache.publish()` may actually publish to, or an error
+    /// saying why this caller may not publish at all.
+    fn publish_scope(channel: &str) -> String {
+        // A superuser is unrestricted here as everywhere else in Postgres, and
+        // publishes the name as given. This is exactly what the function did
+        // before `pg_keyspace.tenant` existed, so nothing that worked stops
+        // working -- and an operator who wants an unscoped admin publish on a
+        // cluster that does set the GUC still has one.
+        if unsafe { pg_sys::superuser() } {
+            return channel.to_string();
+        }
+        let tenant = GUC_TENANT
+            .get()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if tenant.is_empty() {
+            error!(
+                "supacache.publish() is superuser-only until pg_keyspace.tenant is set: RESP \
+                 channels are tenant-scoped, and with no tenant for this backend the function \
+                 cannot scope a channel name. Set it in postgresql.conf for a single-tenant \
+                 cluster, or per role with ALTER ROLE <role> SET pg_keyspace.tenant = '<tenant>'"
+            );
+        }
+        if !tenant_source_trusted(&tenant) {
+            error!(
+                "supacache.publish(): pg_keyspace.tenant was set in this session rather than by \
+                 the operator, so it says nothing about which tenant the caller is. Set it in \
+                 postgresql.conf or with ALTER ROLE ... SET -- a value the caller chooses for \
+                 itself is not a tenant scope"
+            );
+        }
+        if tenant.contains(':') {
+            error!(
+                "supacache.publish(): pg_keyspace.tenant = '{tenant}' contains ':', which is the \
+                 tenant prefix separator, so the scope it would produce is ambiguous"
+            );
+        }
+        format!("{tenant}:{channel}")
+    }
+
     /// Publish to RESP subscribers from SQL.
     ///
     /// The gap this closes: a backend can read and write the keyspace through
@@ -5929,27 +6063,31 @@ mod supacache {
     /// Returns the number of subscribers the message was queued for, the same
     /// count a RESP `PUBLISH` answers with.
     ///
-    /// **Superuser only, checked here rather than left to `GRANT`.** RESP
-    /// channels are force-scoped `{tenant}:` per credential, and a Postgres role
-    /// is not a RESP credential -- there is no mapping between them, so this
-    /// function cannot work out which tenant a caller belongs to and cannot
-    /// force a prefix. Publishing a caller-supplied name unscoped would let
-    /// anyone who could call it inject into any tenant's channels (and count
-    /// their subscribers, which is a read of another tenant's activity through
-    /// a write-only primitive).
+    /// **Who may call it, and under what name.** RESP channels are force-scoped
+    /// `{tenant}:` per credential, so a function that published a
+    /// caller-supplied name unscoped would let anyone who could call it inject
+    /// into any tenant's channels -- and count their subscribers, which is a
+    /// read of another tenant's activity through a write-only primitive.
     ///
-    /// A `GRANT`-based restriction would put that boundary outside the code,
-    /// one well-meaning grant away from being gone. Until a role-to-tenant
-    /// mapping exists, the check lives here where it cannot be granted away.
+    /// A Postgres role is not a RESP credential, so the caller's tenant has to
+    /// come from somewhere else: `pg_keyspace.tenant`, which only an operator
+    /// can set (see that GUC, and `tenant_source_trusted`). Resolved by
+    /// `publish_scope`:
+    ///
+    /// | caller | `pg_keyspace.tenant` | result |
+    /// |---|---|---|
+    /// | superuser | anything | publishes the name as given, unscoped |
+    /// | anyone else | set by the operator | publishes to `{tenant}:{channel}` |
+    /// | anyone else | set in this session | refused -- self-asserted |
+    /// | anyone else | unset | refused |
+    ///
+    /// The checks live here rather than in a `GRANT`, which would put the
+    /// boundary outside the code, one well-meaning grant away from being gone.
     #[pg_extern]
     fn publish(channel: &str, message: &[u8]) -> i64 {
-        if !unsafe { pg_sys::superuser() } {
-            error!(
-                "supacache.publish() is superuser-only: RESP channels are tenant-scoped per \
-                 credential and a Postgres role is not one, so this function cannot scope a \
-                 channel name to the caller's tenant"
-            );
-        }
+        // Before anything else, including the no-bus early return: a caller who
+        // may not publish is told so, not quietly told nobody was listening.
+        let scoped = publish_scope(channel);
         let bus = match BUS.get() {
             Some(b) => b,
             // The in-process bus (standalone daemon) has no shared backing, and
@@ -5965,7 +6103,7 @@ mod supacache {
         // callers and with nothing else: no slot worker ever produces into the
         // rings this lane uses.
         unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
-        let n = bus.publish_external(channel.as_bytes(), message, |p, c| {
+        let n = bus.publish_external(scoped.as_bytes(), message, |p, c| {
             server::glob_match(p, c)
         });
         unsafe { pg_sys::LWLockRelease(lock) };

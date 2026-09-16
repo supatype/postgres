@@ -1184,6 +1184,40 @@ connection's own tenant (an unscoped or exempt connection sees every tenant).
 Measure all of it with `bench/run_tenant_fairness.sh`, which runs the same loads
 with each policy off and on and prints both.
 
+#### Publishing from SQL as a tenant
+
+`supacache.publish(channel text, message bytea) -> bigint` reaches RESP
+subscribers from a backend — a trigger can tell a RESP client something without
+going out through the application and back in over the wire. It returns the
+same receiver count a RESP `PUBLISH` answers with.
+
+A RESP connection's channel names are force-scoped `{tenant}:` by its
+credential. A Postgres role is not a credential, so a SQL caller's tenant comes
+from `pg_keyspace.tenant`:
+
+| caller | `pg_keyspace.tenant` | result |
+|---|---|---|
+| superuser | anything | publishes the name as given, unscoped |
+| anyone else | set by the operator | publishes to `{tenant}:{channel}` |
+| anyone else | set in this session | refused — self-asserted |
+| anyone else | unset | refused |
+
+Set it in `postgresql.conf` for a single-tenant cluster, or per role for a
+multi-tenant one:
+
+```sql
+ALTER ROLE tenant_a SET pg_keyspace.tenant = 'acme';
+```
+
+The setting is `SUSET`, so a role can neither set nor `RESET` it for itself,
+and the per-role value lives in Postgres's own `pg_db_role_setting` rather than
+in a table this extension would have to define, dump and upgrade. Because PG15+
+`GRANT SET ON PARAMETER` can hand over the right to `SET` it, the value's
+source is checked too: one the caller put there in its own session is refused
+rather than believed. A subscriber authenticated as `acme` that subscribed to
+`demo` receives the message under the name `demo`, exactly as it would from a
+RESP `PUBLISH` — asserted end to end by `bench/run_sql_publish.sh`.
+
 
 #### Changing the worker count
 
@@ -1406,6 +1440,7 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.tenant_scoped_eviction` | `on` | evict a tenant's own cold keys before another tenant's |
 | `pg_keyspace.tenant_arena_pct` | 0 | cap one tenant at this % of a partition's entries (0 = off); over-budget tenants are evicted from first |
 | `pg_keyspace.tenant_ops_per_sec` | 0 | commands per second one tenant may issue (0 = no limit) |
+| `pg_keyspace.tenant` | *(unset)* | tenant a SQL backend publishes as, scoping `supacache.publish()` to `{tenant}:`; unset leaves it superuser-only |
 
 ### Sizing
 
