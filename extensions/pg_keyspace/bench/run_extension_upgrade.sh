@@ -26,12 +26,12 @@ PORT=${PGKS_PG_PORT:-5469}
 RESP=${PGKS_RESP_PORT:-6469}
 PROFILE=${PGKS_BUILD_PROFILE:-release}
 OLD_VER=0.1.0
-NEW_VER=0.3.0
-# The upgrade is a CHAIN now: 0.1.0 -> 0.2.0 -> 0.3.0, with a script per step.
+NEW_VER=0.4.0
+# The upgrade is a CHAIN now: 0.1.0 -> 0.2.0 -> 0.3.0 -> 0.4.0, a script per step.
 # Postgres walks it on its own, so ALTER EXTENSION ... UPDATE TO the newest
 # version is still one statement -- but every step has to be packaged, which is
 # what section 0 checks. Add a step here when you add a script.
-CHAIN="0.1.0--0.2.0 0.2.0--0.3.0"
+CHAIN="0.1.0--0.2.0 0.2.0--0.3.0 0.3.0--0.4.0"
 pass=0; fail=0
 chk() {
   if [ "$2" = "$3" ]; then echo "PASS  $1"; pass=$((pass+1));
@@ -227,7 +227,7 @@ chk "a fresh CREATE EXTENSION gets $NEW_VER" "$NEW_VER" \
 Q "$CATALOGUE_SQL" upgraded > /tmp/pgks_cat_upgraded.txt
 Q "$CATALOGUE_SQL" fresh    > /tmp/pgks_cat_fresh.txt
 # Guard: an empty or error-filled dump would make the diff below pass vacuously.
-chk "the upgraded catalogue dumped $((36 + 11 + 1)) objects" "48" \
+chk "the upgraded catalogue dumped $((37 + 11 + 1)) objects" "49" \
     "$(grep -c '^\(function\|relation\|schema\)|' /tmp/pgks_cat_upgraded.txt)"
 chk "the fresh catalogue dumped the same number" \
     "$(grep -c '^\(function\|relation\|schema\)|' /tmp/pgks_cat_upgraded.txt)" \

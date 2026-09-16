@@ -27,11 +27,11 @@ PORT=${PGKS_PG_PORT:-5471}
 RESP=${PGKS_RESP_PORT:-6471}
 PROFILE=${PGKS_BUILD_PROFILE:-release}
 OLD_VER=0.1.0
-NEW_VER=0.3.0
-# The upgrade is a chain of scripts (#120 added the second step). Postgres walks
-# it on its own, so the worker still issues one ALTER EXTENSION -- but section 6
-# needs to know which file to remove to break the walk.
-CHAIN="0.1.0--0.2.0 0.2.0--0.3.0"
+NEW_VER=0.4.0
+# The upgrade is a chain of scripts (#120 added the second step, supacache.publish
+# the third). Postgres walks it on its own, so the worker still issues one ALTER
+# EXTENSION -- but section 6 needs to know which file to remove to break the walk.
+CHAIN="0.1.0--0.2.0 0.2.0--0.3.0 0.3.0--0.4.0"
 pass=0; fail=0
 chk() {
   if [ "$2" = "$3" ]; then echo "PASS  $1"; pass=$((pass+1));
@@ -138,7 +138,7 @@ echo "########## 2. restarting is the whole procedure ##########"
 # moved it.
 cycle
 chk "after a restart the extension reports $NEW_VER" "$NEW_VER" "$(extver)"
-chk "it now has all 36 functions" "36" "$(nfuncs)"
+chk "it now has all 37 functions" "37" "$(nfuncs)"
 chk "and every view" "11" "$(nviews)"
 chk "the worker said so in the log, once" "1" \
     "$(logcount "upgraded the extension catalogue $OLD_VER -> $NEW_VER")"
@@ -202,8 +202,8 @@ echo "########## 6. an upgrade that cannot run must not take the worker with it 
 # so the failure has to arrive as a warning and startup has to continue.
 reinstall_old
 chk "back to $OLD_VER with no upgrade script present" "$OLD_VER" "$(extver)"
-# The LAST step of the chain, not a single old--new file: since #120 the path is
-# 0.1.0 -> 0.2.0 -> 0.3.0, and removing the last hop is what leaves an install
+# The LAST step of the chain, not a single old--new file: the path is
+# 0.1.0 -> 0.2.0 -> 0.3.0 -> 0.4.0, and removing the last hop is what leaves an install
 # that can start walking and cannot finish. ALTER EXTENSION then raises "no
 # update path", which is the non-emergency failure this section is about.
 LAST_STEP=$(printf '%s\n' $CHAIN | tail -1)
