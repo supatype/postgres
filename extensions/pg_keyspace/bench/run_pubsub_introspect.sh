@@ -19,6 +19,13 @@
 #    without receiving a single message. NUMSUB and NUMPAT leak the same way in
 #    numbers rather than names, so all three are asserted.
 #
+# Sections C and D cover sharded pub/sub, which only exists on a cluster: a
+# shard channel hashes to a slot like a key, so it has one owning worker and a
+# client asking anywhere else is redirected there. That is what makes SPUBLISH
+# free of bus traffic, and it is asserted rather than assumed -- including that
+# two tenants using the same client-facing name are routed by their own scoped
+# names and cannot reach each other.
+#
 # Expects cargo, cargo-pgrx, a PGDG PostgreSQL and redis-cli on PATH.
 set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -156,6 +163,81 @@ chk "and includes its own" "1" "$($B PUBSUB NUMPAT 2>&1)"
 # A glob is not a way around the prefix filter.
 chk "a wildcard does not escape the tenant scope" "shared" \
     "$($A PUBSUB CHANNELS '*' 2>&1 | sort | paste -sd,)"
+wait 2>/dev/null
+
+echo ""
+echo "########## C. shard channels are routed by slot ##########"
+# A shard channel hashes to a slot exactly as a key does, so it has ONE owning
+# worker and a client that asks anywhere else is redirected. That is what makes
+# SPUBLISH cost nothing across the bus: every subscriber to a channel a worker
+# owns is on that worker, so there is nobody else to tell.
+#
+# Find a channel worker 0 does not own by asking it, which is also the redirect
+# under test rather than a re-implementation of the hash in bash.
+target=""; owner_ep=""
+for cand in sh1 sh2 sh3 sh4 sh5 sh6 sh7 sh8 sh9 sh10 sh11 sh12; do
+  r=$(redis-cli -p $RESP SSUBSCRIBE $cand 2>&1 | head -1)
+  case "$r" in
+    MOVED*) target=$cand; owner_ep=$(echo "$r" | awk '{print $3}'); break;;
+  esac
+done
+chk "a shard channel owned by another worker exists" "1" "$([ -n "$target" ] && echo 1 || echo 0)"
+
+if [ -n "$target" ]; then
+  owner_port=${owner_ep##*:}
+  chk "SSUBSCRIBE on the wrong worker is redirected" "1" \
+      "$(redis-cli -p $RESP SSUBSCRIBE $target 2>&1 | grep -c '^MOVED')"
+  chk "SPUBLISH on the wrong worker is redirected too" "1" \
+      "$(redis-cli -p $RESP SPUBLISH $target x 2>&1 | grep -c '^MOVED')"
+  chk "the redirect names a worker of this cluster" "1" \
+      "$([ "$owner_port" -ge "$RESP" ] && [ "$owner_port" -lt "$((RESP+WORKERS))" ] && echo 1 || echo 0)"
+  # And the redirect is honest: following it works.
+  rm -f $OUT.sh.out
+  ( timeout 15 redis-cli -p $owner_port SSUBSCRIBE $target > $OUT.sh.out 2>&1 ) &
+  for i in $(seq 1 30); do grep -q ssubscribe $OUT.sh.out 2>/dev/null && break; sleep 0.5; done
+  chk "SSUBSCRIBE on the owner is accepted" "1" "$(grep -c ssubscribe $OUT.sh.out 2>/dev/null)"
+  chk "SPUBLISH on the owner reaches it" "1" \
+      "$(redis-cli -p $owner_port SPUBLISH $target hello-shard 2>&1)"
+  sleep 1
+  chk "and the payload arrived as an smessage" "1" \
+      "$(grep -c 'hello-shard' $OUT.sh.out 2>/dev/null)"
+  # The point of the whole design: no bus traffic. A classic PUBLISH fans out to
+  # every worker's inbox; a shard one must touch none of them.
+  chk "nothing was queued to another worker" "0" \
+      "$(psql_ "SELECT dropped FROM supacache.pubsub_stats()")"
+  chk "and the shard channel is not in the classic listing" "0" \
+      "$(redis-cli -p $owner_port PUBSUB CHANNELS 2>&1 | grep -c "^$target$")"
+  chk "but is in the shard listing, on its owner" "1" \
+      "$(redis-cli -p $owner_port PUBSUB SHARDCHANNELS 2>&1 | grep -c "^$target$")"
+  wait 2>/dev/null
+fi
+
+echo ""
+echo "########## D. shard channels are scoped per tenant too ##########"
+# Two tenants using the SAME client-facing shard channel name. Server-side they
+# are ta:<name> and tb:<name>, which hash differently -- so the tenants can be
+# redirected to DIFFERENT workers for what looks to them like one channel, and
+# neither may see the other's.
+ta_ep=$(redis-cli -p $RESP --user ua -a pw1 --no-auth-warning SSUBSCRIBE tshared 2>&1 | head -1)
+tb_ep=$(redis-cli -p $RESP --user ub -a pw2 --no-auth-warning SSUBSCRIBE tshared 2>&1 | head -1)
+ta_port=$RESP; tb_port=$RESP
+case "$ta_ep" in MOVED*) ta_port=$(echo "$ta_ep" | awk '{print $3}'); ta_port=${ta_port##*:};; esac
+case "$tb_ep" in MOVED*) tb_port=$(echo "$tb_ep" | awk '{print $3}'); tb_port=${tb_port##*:};; esac
+rm -f $OUT.sta.out $OUT.stb.out
+( timeout 15 redis-cli -p $ta_port --user ua -a pw1 --no-auth-warning SSUBSCRIBE tshared > $OUT.sta.out 2>&1 ) &
+( timeout 15 redis-cli -p $tb_port --user ub -a pw2 --no-auth-warning SSUBSCRIBE tshared > $OUT.stb.out 2>&1 ) &
+for i in $(seq 1 30); do
+  [ "$(grep -l ssubscribe $OUT.sta.out $OUT.stb.out 2>/dev/null | wc -l)" = 2 ] && break; sleep 0.5
+done
+chk "both tenants subscribed to the same shard name" "2" \
+    "$(grep -l ssubscribe $OUT.sta.out $OUT.stb.out 2>/dev/null | wc -l | tr -d ' ')"
+chk "tenant A's SPUBLISH reaches exactly one subscriber" "1" \
+    "$(redis-cli -p $ta_port --user ua -a pw1 --no-auth-warning SPUBLISH tshared from-ta 2>&1)"
+sleep 1
+chk "and it was tenant A's" "1" "$(grep -c 'from-ta' $OUT.sta.out 2>/dev/null)"
+chk "tenant B never saw it" "0" "$(grep -c 'from-ta' $OUT.stb.out 2>/dev/null)"
+chk "SHARDNUMSUB counts only the asking tenant" "tshared 1" \
+    "$(redis-cli -p $ta_port --user ua -a pw1 --no-auth-warning PUBSUB SHARDNUMSUB tshared 2>&1 | paste -sd' ')"
 wait 2>/dev/null
 
 echo ""

@@ -159,6 +159,14 @@ fn command_specs() -> Vec<CmdSpec> {
     // BITOP <op> dest src… — the operation name sits where a key usually does,
     // so the keys start at argument 2 and run to the end.
     add(&["BITOP"], true, 2, -1, 1, false);
+    // Sharded pub/sub channels are routed by slot exactly as keys are, and
+    // redis reports first_key = 1 for all three so a cluster client hashes the
+    // channel name. They are NOT in `key_indices`, though: a channel is not a
+    // key for ACL purposes (redis has a separate `&channel` permission class),
+    // and running them through the keyspace ACL would silently give them
+    // different permission semantics from SUBSCRIBE/PUBLISH.
+    add(&["SSUBSCRIBE", "SUNSUBSCRIBE"], false, 1, -1, 1, false);
+    add(&["SPUBLISH"], false, 1, 1, 1, false);
     add(CMD_KEYLESS, false, 0, 0, 0, false);
     v
 }
@@ -543,6 +551,10 @@ struct Conn {
     // to. Non-empty => the connection is in RESP2 subscribe mode.
     subs: HashSet<Vec<u8>>,
     psubs: HashSet<Vec<u8>>,
+    /// Sharded-pub/sub channels (`SSUBSCRIBE`). A separate namespace from
+    /// `subs`, not a subset of it: `PUBLISH` never reaches these and `SPUBLISH`
+    /// never reaches `subs`, and their subscription counters are independent.
+    ssubs: HashSet<Vec<u8>>,
     // transactions: inside MULTI, commands are queued (raw argv) rather than run,
     // then executed atomically on EXEC. `watch` snapshots (scoped key, version)
     // at WATCH time; EXEC aborts (null array) if any snapshot no longer matches.
@@ -625,6 +637,13 @@ pub struct Worker {
     // PUBLISH fans out without scanning every connection. Local to this worker.
     channels: HashMap<Vec<u8>, HashSet<RawFd>>,
     patterns: HashMap<Vec<u8>, HashSet<RawFd>>,
+    /// Sharded channels held on THIS worker, which is all of them for any
+    /// channel this worker owns: a shard channel hashes to a slot like a key,
+    /// and a client that subscribes anywhere else is redirected here. So unlike
+    /// `channels` this needs no cross-worker routing table, and `SPUBLISH` does
+    /// no shared-memory work at all -- which is the whole point of sharded
+    /// pub/sub, and why Redis 7 added it.
+    shard_channels: HashMap<Vec<u8>, HashSet<RawFd>>,
     // cross-worker pub/sub: when workers share a process (the scale-out
     // daemon), a shared Bus routes a PUBLISH to subscribers on *other* workers.
     // `None` for the single-worker in-PG extension (local delivery only).
@@ -681,6 +700,7 @@ impl Worker {
             tls_config: None,
             channels: HashMap::new(),
             patterns: HashMap::new(),
+            shard_channels: HashMap::new(),
             bus: None,
             worker_id: 0,
             tracked: HashMap::new(),
@@ -1115,6 +1135,7 @@ impl Worker {
                     tls,
                     subs: HashSet::new(),
                     psubs: HashSet::new(),
+                    ssubs: HashSet::new(),
                     in_multi: false,
                     queued: Vec::new(),
                     watch: Vec::new(),
@@ -1376,19 +1397,32 @@ impl Worker {
             b"UNSUBSCRIBE" => return self.handle_unsubscribe(fd, args, false),
             b"PUNSUBSCRIBE" => return self.handle_unsubscribe(fd, args, true),
             b"PUBLISH" => return self.handle_publish(fd, args),
+            b"SSUBSCRIBE" => return self.handle_ssubscribe(fd, args),
+            b"SUNSUBSCRIBE" => return self.handle_sunsubscribe(fd, args),
+            b"SPUBLISH" => return self.handle_spublish(fd, args),
             _ => {}
         }
         // In RESP2 subscribe mode only (P)(UN)SUBSCRIBE / PING / QUIT / RESET run.
         let subscribed = self
             .conns
             .get(&fd)
-            .map(|c| !c.subs.is_empty() || !c.psubs.is_empty())
+            .map(|c| !c.subs.is_empty() || !c.psubs.is_empty() || !c.ssubs.is_empty())
             .unwrap_or(false);
         if subscribed && !matches!(cmd.as_slice(), b"PING" | b"QUIT" | b"RESET") {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            // Redis names the S-variants here now that they exist, and so does
+            // this: a client told only about (P)SUBSCRIBE would conclude that
+            // SSUBSCRIBE is what it just got refused for. It also names the
+            // command it refused, `container|subcommand` where there is one --
+            // this string was already being rewritten for the S-variants, and
+            // leaving the other half of the same divergence in place would have
+            // been a choice rather than an omission.
+            let named = refused_name(&cmd, args);
             resp::error(
                 out,
-                "ERR Can't execute command: only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in subscribe context",
+                &format!(
+                    "ERR Can't execute '{named}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+                ),
             );
             return;
         }
@@ -5655,6 +5689,176 @@ impl Worker {
         receivers
     }
 
+    /// Refuse a shard channel this worker does not own, with the `MOVED` a
+    /// cluster client already knows how to follow.
+    ///
+    /// The slot is taken from the TENANT-SCOPED name, matching how keys are
+    /// routed: scoping happens before routing everywhere else in this server,
+    /// and two tenants using the same client-facing channel name must land
+    /// wherever their own scoped name hashes to, not on a shared worker.
+    ///
+    /// Returns false once an error has been written.
+    fn shard_owner_ok(&mut self, fd: RawFd, scoped: &[u8]) -> bool {
+        let Some(r) = &self.routing else {
+            return true; // single worker: it owns everything
+        };
+        let owner = crc16::key_owner(scoped, r.nworkers);
+        if owner == r.index {
+            return true;
+        }
+        let slot = crc16::key_slot(scoped);
+        let ep = r.endpoints.get(owner).cloned().unwrap_or_default();
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::error(out, &format!("MOVED {slot} {ep}"));
+        false
+    }
+
+    /// `SSUBSCRIBE channel [channel ...]`.
+    ///
+    /// The count in each confirmation is the connection's SHARD subscriptions
+    /// only. Redis keeps that counter separate from the channel+pattern one --
+    /// verified against 7.0.15 -- and a client that tracks both would drift if
+    /// we merged them.
+    fn handle_ssubscribe(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        if args.len() < 2 {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, "ERR wrong number of arguments for 'ssubscribe' command");
+            self.flush(fd);
+            return;
+        }
+        if !self.pubsub_authed(fd) {
+            self.flush(fd);
+            return;
+        }
+        for ch in &args[1..] {
+            let eff = self.scope_name(fd, ch);
+            if !self.shard_owner_ok(fd, &eff) {
+                self.flush(fd);
+                return;
+            }
+            self.shard_channels.entry(eff.clone()).or_default().insert(fd);
+            let count = {
+                let c = self.conns.get_mut(&fd).unwrap();
+                c.ssubs.insert(eff);
+                c.ssubs.len()
+            };
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::push_header(out, 3, false);
+            resp::bulk(out, b"ssubscribe");
+            resp::bulk(out, ch);
+            resp::integer(out, count as i64);
+        }
+        self.flush(fd);
+    }
+
+    /// `SUNSUBSCRIBE [channel ...]`; bare form drops every shard subscription.
+    fn handle_sunsubscribe(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        // Named channels are scoped; the bare form takes what this connection
+        // actually holds, which is already scoped.
+        let targets: Vec<(Vec<u8>, Vec<u8>)> = if args.len() > 1 {
+            args[1..]
+                .iter()
+                .map(|ch| (self.scope_name(fd, ch), ch.clone()))
+                .collect()
+        } else {
+            let prefix = self.conn_prefix(fd);
+            self.conns
+                .get(&fd)
+                .map(|c| {
+                    c.ssubs
+                        .iter()
+                        .map(|e| (e.clone(), strip_scope(e, &prefix).to_vec()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // Redis still confirms a bare SUNSUBSCRIBE that had nothing to drop.
+        if targets.is_empty() {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::push_header(out, 3, false);
+            resp::bulk(out, b"sunsubscribe");
+            resp::null(out, false);
+            resp::integer(out, 0);
+            self.flush(fd);
+            return;
+        }
+        for (eff, shown) in targets {
+            if let Some(set) = self.shard_channels.get_mut(&eff) {
+                set.remove(&fd);
+                if set.is_empty() {
+                    self.shard_channels.remove(&eff);
+                }
+            }
+            let count = {
+                let c = self.conns.get_mut(&fd).unwrap();
+                c.ssubs.remove(&eff);
+                c.ssubs.len()
+            };
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::push_header(out, 3, false);
+            resp::bulk(out, b"sunsubscribe");
+            resp::bulk(out, &shown);
+            resp::integer(out, count as i64);
+        }
+        self.flush(fd);
+    }
+
+    /// `SPUBLISH channel message`.
+    ///
+    /// Delivered only to this worker's shard subscribers, and that is complete
+    /// rather than partial: every subscriber to a channel this worker owns is
+    /// on this worker, because `SSUBSCRIBE` anywhere else was redirected here.
+    /// So no bus traffic, no fan-out to N workers, and adding workers does not
+    /// make publishing more expensive -- the scaling problem classic pub/sub
+    /// has, and the reason redis 7 introduced this.
+    fn handle_spublish(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        if args.len() != 3 {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, "ERR wrong number of arguments for 'spublish' command");
+            self.flush(fd);
+            return;
+        }
+        if !self.pubsub_authed(fd) {
+            self.flush(fd);
+            return;
+        }
+        let channel = self.scope_name(fd, &args[1]);
+        if !self.shard_owner_ok(fd, &channel) {
+            self.flush(fd);
+            return;
+        }
+        let msg = args[2].clone();
+        let receivers = self.deliver_shard(&channel, &msg) as i64;
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::integer(out, receivers);
+        self.flush(fd);
+    }
+
+    /// Deliver an `smessage` frame to this worker's shard subscribers.
+    fn deliver_shard(&mut self, channel: &[u8], msg: &[u8]) -> usize {
+        let targets: Vec<RawFd> = match self.shard_channels.get(channel) {
+            Some(set) => set.iter().copied().collect(),
+            None => return 0,
+        };
+        let mut receivers = 0usize;
+        for sfd in &targets {
+            // Each subscriber sees its own unscoped name, as with `message`.
+            let prefix = self.conn_prefix(*sfd);
+            let fch = strip_scope(channel, &prefix);
+            if let Some(c) = self.conns.get_mut(sfd) {
+                resp::push_header(&mut c.wbuf, 3, c.resp3);
+                resp::bulk(&mut c.wbuf, b"smessage");
+                resp::bulk(&mut c.wbuf, fch);
+                resp::bulk(&mut c.wbuf, msg);
+                receivers += 1;
+            }
+        }
+        for sfd in &targets {
+            self.flush(*sfd);
+        }
+        receivers
+    }
+
     /// Every live channel and pattern this instance holds subscribers for, as
     /// `(name, is_pattern, subscribers)`.
     ///
@@ -5706,6 +5910,12 @@ impl Worker {
         let sub = args[1].to_ascii_uppercase();
         let prefix = self.conn_prefix(fd);
         let routes = self.pubsub_routes();
+        let shard: Vec<(Vec<u8>, usize)> = self
+            .shard_channels
+            .iter()
+            .filter(|(_, fds)| !fds.is_empty())
+            .map(|(n, fds)| (n.clone(), fds.len()))
+            .collect();
         // What this connection may see, already stripped back to the name it
         // would itself have subscribed with.
         let visible = |name: &[u8]| -> Option<Vec<u8>> {
@@ -5754,12 +5964,38 @@ impl Worker {
                     .count();
                 resp::integer(out, n as i64);
             }
-            // The HELP text lists what this build actually serves. Redis also
-            // lists SHARDCHANNELS/SHARDNUMSUB; advertising a subcommand that
-            // answers "unknown command" is the exact defect this commit fixes,
-            // so they appear here only once they work.
+            // Shard channels are a separate namespace, so these read the shard
+            // map rather than the routing table. Worker-local is the COMPLETE
+            // answer here, not a partial one: every subscriber to a channel
+            // this worker owns is on this worker.
+            b"SHARDCHANNELS" if args.len() <= 3 => {
+                let mut names: Vec<Vec<u8>> = shard
+                    .iter()
+                    .filter_map(|(n, _)| visible(n))
+                    .filter(|n| args.get(2).map_or(true, |p| glob_match(p, n)))
+                    .collect();
+                names.sort();
+                resp::array_header(out, names.len());
+                for n in &names {
+                    resp::bulk(out, n);
+                }
+            }
+            b"SHARDNUMSUB" => {
+                resp::array_header(out, (args.len() - 2) * 2);
+                for ch in &args[2..] {
+                    let want: Vec<u8> = match &prefix {
+                        Some(p) => [p.as_slice(), ch.as_slice()].concat(),
+                        None => ch.clone(),
+                    };
+                    let n = shard.iter().find(|(name, _)| **name == want).map_or(0, |(_, c)| *c);
+                    resp::bulk(out, ch);
+                    resp::integer(out, n as i64);
+                }
+            }
+            // The HELP text lists what this build actually serves, which is now
+            // all of it.
             b"HELP" => {
-                let lines: [&str; 9] = [
+                let lines: [&str; 13] = [
                     "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
                     "CHANNELS [<pattern>]",
                     "    Return the currently active channels matching a <pattern> (default: '*').",
@@ -5768,6 +6004,10 @@ impl Worker {
                     "NUMSUB [<channel> ...]",
                     "    Return the number of subscribers for the specified channels, excluding",
                     "    pattern subscriptions(default: no channels).",
+                    "SHARDCHANNELS [<pattern>]",
+                    "    Return the currently active shard level channels matching a <pattern> (default: '*').",
+                    "SHARDNUMSUB [<shardchannel> ...]",
+                    "    Return the number of subscribers for the specified shard level channel(s)",
                     "HELP",
                 ];
                 resp::array_header(out, lines.len() + 1);
@@ -5783,7 +6023,7 @@ impl Worker {
                 out,
                 "ERR wrong number of arguments for 'pubsub|numpat' command",
             ),
-            b"CHANNELS" => resp::error(
+            b"SHARDCHANNELS" | b"CHANNELS" => resp::error(
                 out,
                 &format!(
                     "ERR unknown subcommand or wrong number of arguments for '{}'. Try PUBSUB HELP.",
@@ -6039,6 +6279,18 @@ impl Worker {
                 }
             }
         }
+        let ssubs = match self.conns.get_mut(&fd) {
+            Some(c) => std::mem::take(&mut c.ssubs),
+            None => HashSet::new(),
+        };
+        for ch in &ssubs {
+            if let Some(set) = self.shard_channels.get_mut(ch) {
+                set.remove(&fd);
+                if set.is_empty() {
+                    self.shard_channels.remove(ch);
+                }
+            }
+        }
         // Drop this fd from the client-side-caching tracking table (and the BCAST
         // set) so a future connection reusing the fd never inherits a stale
         // invalidation target.
@@ -6075,6 +6327,22 @@ fn strip_scope<'a>(name: &'a [u8], prefix: &Option<Vec<u8>>) -> &'a [u8] {
     match prefix {
         Some(p) if name.starts_with(p) => &name[p.len()..],
         _ => name,
+    }
+}
+
+/// How Redis names a command it refused in subscribe context: lowercase, and
+/// `container|subcommand` for the commands that take one (`client|getname`,
+/// `pubsub|numpat`). Verified against 7.0.15 -- a plain command is named alone.
+fn refused_name(cmd: &[u8], args: &[Vec<u8>]) -> String {
+    const CONTAINERS: &[&[u8]] = &[
+        b"CLIENT", b"CLUSTER", b"COMMAND", b"CONFIG", b"DEBUG", b"MEMORY", b"OBJECT", b"PUBSUB",
+    ];
+    let base = String::from_utf8_lossy(cmd).to_lowercase();
+    match args.get(1) {
+        Some(sub) if CONTAINERS.contains(&cmd) => {
+            format!("{base}|{}", String::from_utf8_lossy(sub).to_lowercase())
+        }
+        _ => base,
     }
 }
 

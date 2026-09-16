@@ -69,11 +69,83 @@ raw() { # reads commands on stdin, returns the multiplexed replies
 }
 out="$(printf 'SUBSCRIBE a b\r\nGET k\r\nPING\r\nUNSUBSCRIBE a\r\n' | raw)"
 chk "SUBSCRIBE confirms running count (2)"       "1" "$(echo "$out" | grep -c ':2')"
-chk "keyed command in subscribe mode is refused" "1" "$(echo "$out" | grep -ci 'subscribe context')"
+chk "keyed command in subscribe mode is refused" "1" \
+    "$(echo "$out" | grep -ci "allowed in this context")"
+chk "and the refusal names the command, as redis does" "1" \
+    "$(echo "$out" | grep -c "Can't execute 'get'")"
 chk "PING still works in subscribe mode"         "1" "$(echo "$out" | grep -ci 'PONG')"
 chk "UNSUBSCRIBE confirms"                        "1" "$(echo "$out" | grep -qi 'unsubscribe' && echo 1 || echo 0)"
 
 # auth gate: with AUTH configured, SUBSCRIBE without auth is refused
+# ---- sharded pub/sub (SSUBSCRIBE / SUNSUBSCRIBE / SPUBLISH) ---------------
+# A separate namespace from classic pub/sub, not a subset: PUBLISH never reaches
+# a shard subscriber and SPUBLISH never reaches a channel or pattern one. That
+# separation is the whole contract, so it is asserted from both directions and
+# compared against a real redis, where the counts are 2 and 1 respectively.
+ssub=$(mktemp); csub=$(mktemp); psub=$(mktemp)
+timeout 6 $SUBCLI SSUBSCRIBE sc  > "$ssub" 2>&1 &
+timeout 6 $SUBCLI SUBSCRIBE  sc  > "$csub" 2>&1 &
+timeout 6 $SUBCLI PSUBSCRIBE 's*' > "$psub" 2>&1 &
+if [ -n "$PARITY" ]; then
+  timeout 6 $R SSUBSCRIBE sc   >/dev/null 2>&1 &
+  timeout 6 $R SUBSCRIBE  sc   >/dev/null 2>&1 &
+  timeout 6 $R PSUBSCRIBE 's*' >/dev/null 2>&1 &
+fi
+sleep 1
+
+chk "PUBLISH reaches the channel and pattern subs, not the shard sub"  "2" "$($CLI PUBLISH sc viaPublish)"
+chk "SPUBLISH reaches only the shard sub"                              "1" "$($CLI SPUBLISH sc viaSpublish)"
+par PUBLISH sc parPublish
+par SPUBLISH sc parSpublish
+chk "SPUBLISH to a shard channel nobody holds -> 0" "0" "$($CLI SPUBLISH nobody x)"
+sleep 1
+chk "the shard subscriber got the SPUBLISH and not the PUBLISH" "1,0" \
+    "$(grep -c viaSpublish "$ssub"),$(grep -c viaPublish "$ssub")"
+chk "the channel subscriber got the PUBLISH and not the SPUBLISH" "1,0" \
+    "$(grep -c viaPublish "$csub"),$(grep -c viaSpublish "$csub")"
+chk "the pattern subscriber likewise" "1,0" \
+    "$(grep -c viaPublish "$psub"),$(grep -c viaSpublish "$psub")"
+# The frame is `smessage`, not `message`: a client demultiplexes on it.
+chk "delivery frame is smessage" "smessage,sc,viaSpublish" \
+    "$(grep -A2 '^smessage$' "$ssub" | head -3 | paste -sd,)"
+
+chk "PUBSUB SHARDCHANNELS lists it" "sc" "$($CLI PUBSUB SHARDCHANNELS | paste -sd,)"
+chk "PUBSUB SHARDNUMSUB counts it"  "sc 1" "$($CLI PUBSUB SHARDNUMSUB sc | paste -sd' ')"
+# Separate namespaces both ways round: a shard channel is not a channel.
+chk "PUBSUB CHANNELS does not list the shard channel" "sc" \
+    "$($CLI PUBSUB CHANNELS | paste -sd,)"
+chk "PUBSUB SHARDCHANNELS does not list the plain channel" "sc" \
+    "$($CLI PUBSUB SHARDCHANNELS | paste -sd,)"
+par PUBSUB SHARDCHANNELS
+par PUBSUB SHARDNUMSUB sc absent
+par PUBSUB SHARDCHANNELS 's*'
+par PUBSUB SHARDCHANNELS 'zz*'
+par PUBSUB HELP
+wait 2>/dev/null
+rm -f "$ssub" "$csub" "$psub"
+
+# Counts, gating and confirmations on ONE connection, driven as raw RESP because
+# redis-cli stops reading stdin once subscribed. The shard counter is separate
+# from the channel+pattern one, which a client tracking both would notice.
+raw() { (printf "$1"; sleep 1) | timeout 4 nc -q1 127.0.0.1 "$2" 2>/dev/null | tr '\r\n' ' '; }
+if command -v nc >/dev/null 2>&1; then
+  RESP_HOST_OK=1
+  got="$(raw 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSUBSCRIBE c\r\n' "$RESP")"
+  chk "shard subscriptions count separately from channel ones" \
+      "*3  \$9  subscribe  \$1  a  :1  *3  \$10  ssubscribe  \$1  b  :1  *3  \$9  subscribe  \$1  c  :2  " "$got"
+  got="$(raw 'SSUBSCRIBE b c\r\nSUNSUBSCRIBE b\r\nSUNSUBSCRIBE\r\n' "$RESP")"
+  chk "SUNSUBSCRIBE confirms named, then the bare form drops the rest" \
+      "*3  \$10  ssubscribe  \$1  b  :1  *3  \$10  ssubscribe  \$1  c  :2  *3  \$12  sunsubscribe  \$1  b  :1  *3  \$12  sunsubscribe  \$1  c  :0  " "$got"
+  # SSUBSCRIBE must be allowed in subscribe context, and the refusal that
+  # follows must name the command redis names.
+  got="$(raw 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSET k v\r\n' "$RESP" | sed 's/.*-ERR/-ERR/')"
+  chk "S-variants allowed in subscribe context, others refused by name" \
+      "-ERR Can't execute 'set': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context  " \
+      "$got"
+else
+  echo "  SKIP  raw-RESP shard assertions (no nc)"
+fi
+
 # ---- PUBSUB introspection -------------------------------------------------
 # Subscribers on BOTH servers, so the parity comparisons below describe the same
 # state rather than two different ones.
