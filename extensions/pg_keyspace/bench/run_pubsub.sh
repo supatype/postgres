@@ -127,24 +127,19 @@ rm -f "$ssub" "$csub" "$psub"
 # Counts, gating and confirmations on ONE connection, driven as raw RESP because
 # redis-cli stops reading stdin once subscribed. The shard counter is separate
 # from the channel+pattern one, which a client tracking both would notice.
-raw() { (printf "$1"; sleep 1) | timeout 4 nc -q1 127.0.0.1 "$2" 2>/dev/null | tr '\r\n' ' '; }
-if command -v nc >/dev/null 2>&1; then
-  RESP_HOST_OK=1
-  got="$(raw 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSUBSCRIBE c\r\n' "$RESP")"
-  chk "shard subscriptions count separately from channel ones" \
-      "*3  \$9  subscribe  \$1  a  :1  *3  \$10  ssubscribe  \$1  b  :1  *3  \$9  subscribe  \$1  c  :2  " "$got"
-  got="$(raw 'SSUBSCRIBE b c\r\nSUNSUBSCRIBE b\r\nSUNSUBSCRIBE\r\n' "$RESP")"
-  chk "SUNSUBSCRIBE confirms named, then the bare form drops the rest" \
-      "*3  \$10  ssubscribe  \$1  b  :1  *3  \$10  ssubscribe  \$1  c  :2  *3  \$12  sunsubscribe  \$1  b  :1  *3  \$12  sunsubscribe  \$1  c  :0  " "$got"
-  # SSUBSCRIBE must be allowed in subscribe context, and the refusal that
-  # follows must name the command redis names.
-  got="$(raw 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSET k v\r\n' "$RESP" | sed 's/.*-ERR/-ERR/')"
-  chk "S-variants allowed in subscribe context, others refused by name" \
-      "-ERR Can't execute 'set': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context  " \
-      "$got"
-else
-  echo "  SKIP  raw-RESP shard assertions (no nc)"
-fi
+flat() { tr '\r\n' ' '; }  # one line, so a whole exchange is one expectation
+got="$(printf 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSUBSCRIBE c\r\n' | raw | flat)"
+chk "shard subscriptions count separately from channel ones" \
+    "*3  \$9  subscribe  \$1  a  :1  *3  \$10  ssubscribe  \$1  b  :1  *3  \$9  subscribe  \$1  c  :2  " "$got"
+got="$(printf 'SSUBSCRIBE b c\r\nSUNSUBSCRIBE b\r\nSUNSUBSCRIBE\r\n' | raw | flat)"
+chk "SUNSUBSCRIBE confirms named, then the bare form drops the rest" \
+    "*3  \$10  ssubscribe  \$1  b  :1  *3  \$10  ssubscribe  \$1  c  :2  *3  \$12  sunsubscribe  \$1  b  :1  *3  \$12  sunsubscribe  \$1  c  :0  " "$got"
+# SSUBSCRIBE must be allowed in subscribe context, and the refusal that
+# follows must name the command redis names.
+got="$(printf 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSET k v\r\n' | raw | flat | sed 's/.*-ERR/-ERR/')"
+chk "S-variants allowed in subscribe context, others refused by name" \
+    "-ERR Can't execute 'set': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context  " \
+    "$got"
 
 # ---- PUBSUB introspection -------------------------------------------------
 # Subscribers on BOTH servers, so the parity comparisons below describe the same

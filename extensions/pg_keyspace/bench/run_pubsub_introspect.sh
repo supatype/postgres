@@ -69,7 +69,12 @@ su postgres -c "$PGBIN/initdb -D $PGDATA -U postgres" >/dev/null 2>&1
   echo "shared_preload_libraries = 'pg_keyspace'"
   echo "pg_keyspace.port = $RESP"
   echo "pg_keyspace.require_mask = off"
-  echo "pg_keyspace.durability = 'ephemeral'"
+  # Durable, not ephemeral, and that is load-bearing for sections C and D:
+  # slot routing is configured only where persistence is on (the
+  # set_slot_routing call lives inside that branch), so an EPHEMERAL
+  # multi-worker cluster never redirects and every worker accepts every shard
+  # channel locally. Sharded pub/sub has something to route only here.
+  echo "pg_keyspace.durability = 'durable'"
   echo "pg_keyspace.workers = $WORKERS"
   echo "pg_keyspace.cluster_announce_host = '127.0.0.1'"
   echo "pg_keyspace.keys = 10000"
@@ -180,10 +185,12 @@ echo "########## C. shard channels are routed by slot ##########"
 # Find a channel worker 0 does not own by asking it, which is also the redirect
 # under test rather than a re-implementation of the hash in bash.
 target=""; owner_ep=""
-# Bounded: a successful SSUBSCRIBE blocks redis-cli waiting for messages, so an
-# unbounded probe hangs on the first candidate worker 0 happens to own.
+# Probe with SPUBLISH, not SSUBSCRIBE. Both route identically, but SPUBLISH
+# ANSWERS -- a count or a MOVED -- while a SSUBSCRIBE that is not redirected
+# succeeds and holds a live subscription, which would both hang the probe and
+# add a phantom subscriber to every count taken afterwards.
 for cand in sh1 sh2 sh3 sh4 sh5 sh6 sh7 sh8 sh9 sh10 sh11 sh12; do
-  r=$(timeout 3 redis-cli -p $RESP SSUBSCRIBE $cand 2>&1 | head -1)
+  r=$(timeout 3 redis-cli -p $RESP SPUBLISH $cand probe 2>&1 | head -1)
   case "$r" in
     MOVED*) target=$cand; owner_ep=$(echo "$r" | awk '{print $3}'); break;;
   esac
@@ -225,11 +232,12 @@ echo "########## D. shard channels are scoped per tenant too ##########"
 # are ta:<name> and tb:<name>, which hash differently -- so the tenants can be
 # redirected to DIFFERENT workers for what looks to them like one channel, and
 # neither may see the other's.
-# Bounded for the same reason as the probe above: a subscribe that is NOT
-# redirected succeeds and then blocks, so this asks only where the channel
-# lives and moves on.
-ta_ep=$(timeout 3 redis-cli -p $RESP --user ua -a pw1 --no-auth-warning SSUBSCRIBE tshared 2>&1 | head -1)
-tb_ep=$(timeout 3 redis-cli -p $RESP --user ub -a pw2 --no-auth-warning SSUBSCRIBE tshared 2>&1 | head -1)
+# SPUBLISH again, for the same reason: it answers where the channel lives
+# without becoming a subscriber to it. The two tenants scope to ta:tshared and
+# tb:tshared, which hash differently, so they may well be told different ports
+# for what looks to them like one channel.
+ta_ep=$(timeout 3 redis-cli -p $RESP --user ua -a pw1 --no-auth-warning SPUBLISH tshared probe 2>&1 | head -1)
+tb_ep=$(timeout 3 redis-cli -p $RESP --user ub -a pw2 --no-auth-warning SPUBLISH tshared probe 2>&1 | head -1)
 ta_port=$RESP; tb_port=$RESP
 case "$ta_ep" in MOVED*) ta_port=$(echo "$ta_ep" | awk '{print $3}'); ta_port=${ta_port##*:};; esac
 case "$tb_ep" in MOVED*) tb_port=$(echo "$tb_ep" | awk '{print $3}'); tb_port=${tb_port##*:};; esac
