@@ -177,6 +177,12 @@ wait 2>/dev/null
 
 echo ""
 echo "########## C. shard channels are routed by slot ##########"
+# Credentials are live from section B onward, so everything here authenticates.
+# An unauthenticated command answers NOAUTH rather than MOVED, which looks
+# exactly like "no channel is owned elsewhere" and is not -- the workers were
+# logging "serving slots ... answer MOVED" the whole time this section claimed
+# nothing was routed.
+AU="--user ua -a pw1 --no-auth-warning"
 # A shard channel hashes to a slot exactly as a key does, so it has ONE owning
 # worker and a client that asks anywhere else is redirected. That is what makes
 # SPUBLISH cost nothing across the bus: every subscriber to a channel a worker
@@ -190,7 +196,7 @@ target=""; owner_ep=""
 # succeeds and holds a live subscription, which would both hang the probe and
 # add a phantom subscriber to every count taken afterwards.
 for cand in sh1 sh2 sh3 sh4 sh5 sh6 sh7 sh8 sh9 sh10 sh11 sh12; do
-  r=$(timeout 3 redis-cli -p $RESP SPUBLISH $cand probe 2>&1 | head -1)
+  r=$(timeout 3 redis-cli -p $RESP $AU SPUBLISH $cand probe 2>&1 | head -1)
   case "$r" in
     MOVED*) target=$cand; owner_ep=$(echo "$r" | awk '{print $3}'); break;;
   esac
@@ -200,18 +206,18 @@ chk "a shard channel owned by another worker exists" "1" "$([ -n "$target" ] && 
 if [ -n "$target" ]; then
   owner_port=${owner_ep##*:}
   chk "SSUBSCRIBE on the wrong worker is redirected" "1" \
-      "$(timeout 3 redis-cli -p $RESP SSUBSCRIBE $target 2>&1 | grep -c '^MOVED')"
+      "$(timeout 3 redis-cli -p $RESP $AU SSUBSCRIBE $target 2>&1 | grep -c '^MOVED')"
   chk "SPUBLISH on the wrong worker is redirected too" "1" \
-      "$(redis-cli -p $RESP SPUBLISH $target x 2>&1 | grep -c '^MOVED')"
+      "$(redis-cli -p $RESP $AU SPUBLISH $target x 2>&1 | grep -c '^MOVED')"
   chk "the redirect names a worker of this cluster" "1" \
       "$([ "$owner_port" -ge "$RESP" ] && [ "$owner_port" -lt "$((RESP+WORKERS))" ] && echo 1 || echo 0)"
   # And the redirect is honest: following it works.
   rm -f $OUT.sh.out
-  ( timeout 15 redis-cli -p $owner_port SSUBSCRIBE $target > $OUT.sh.out 2>&1 ) &
+  ( timeout 15 redis-cli -p $owner_port $AU SSUBSCRIBE $target > $OUT.sh.out 2>&1 ) &
   for i in $(seq 1 30); do grep -q ssubscribe $OUT.sh.out 2>/dev/null && break; sleep 0.5; done
   chk "SSUBSCRIBE on the owner is accepted" "1" "$(grep -c ssubscribe $OUT.sh.out 2>/dev/null)"
   chk "SPUBLISH on the owner reaches it" "1" \
-      "$(redis-cli -p $owner_port SPUBLISH $target hello-shard 2>&1)"
+      "$(redis-cli -p $owner_port $AU SPUBLISH $target hello-shard 2>&1)"
   sleep 1
   chk "and the payload arrived as an smessage" "1" \
       "$(grep -c 'hello-shard' $OUT.sh.out 2>/dev/null)"
@@ -220,9 +226,9 @@ if [ -n "$target" ]; then
   chk "nothing was queued to another worker" "0" \
       "$(psql_ "SELECT dropped FROM supacache.pubsub_stats()")"
   chk "and the shard channel is not in the classic listing" "0" \
-      "$(redis-cli -p $owner_port PUBSUB CHANNELS 2>&1 | grep -c "^$target$")"
+      "$(redis-cli -p $owner_port $AU PUBSUB CHANNELS 2>&1 | grep -c "^$target$")"
   chk "but is in the shard listing, on its owner" "1" \
-      "$(redis-cli -p $owner_port PUBSUB SHARDCHANNELS 2>&1 | grep -c "^$target$")"
+      "$(redis-cli -p $owner_port $AU PUBSUB SHARDCHANNELS 2>&1 | grep -c "^$target$")"
   wait 2>/dev/null
 fi
 
