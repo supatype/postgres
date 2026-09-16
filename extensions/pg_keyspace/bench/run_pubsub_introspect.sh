@@ -128,8 +128,13 @@ psql_ "INSERT INTO supacache.acl(role_name,prefix,can_read,can_write) VALUES
        ON CONFLICT DO NOTHING" >/dev/null
 restart_pg
 chk "workers are back with credentials loaded" "$WORKERS" "$(wait_workers)"
+# Bounded, like every other subscribe used as a question here. This one matters
+# most: it exists to catch credentials that did not load, and an unbounded
+# SUBSCRIBE in exactly that case succeeds and blocks -- so the assertion would
+# hang on the condition it was written to detect, and report as a job timeout
+# rather than as a failure naming the cause.
 chk "AUTH is required, so the credentials really loaded" "1" \
-    "$(redis-cli -p $RESP --no-auth-warning SUBSCRIBE nope 2>&1 | grep -c NOAUTH)"
+    "$(timeout 3 redis-cli -p $RESP --no-auth-warning SUBSCRIBE nope 2>&1 | grep -c NOAUTH)"
 
 rm -f $OUT.ta.out $OUT.tb.out $OUT.tbp.out
 # Both tenants subscribe to the SAME client-facing name. Server-side they are
@@ -188,7 +193,7 @@ chk "a shard channel owned by another worker exists" "1" "$([ -n "$target" ] && 
 if [ -n "$target" ]; then
   owner_port=${owner_ep##*:}
   chk "SSUBSCRIBE on the wrong worker is redirected" "1" \
-      "$(redis-cli -p $RESP SSUBSCRIBE $target 2>&1 | grep -c '^MOVED')"
+      "$(timeout 3 redis-cli -p $RESP SSUBSCRIBE $target 2>&1 | grep -c '^MOVED')"
   chk "SPUBLISH on the wrong worker is redirected too" "1" \
       "$(redis-cli -p $RESP SPUBLISH $target x 2>&1 | grep -c '^MOVED')"
   chk "the redirect names a worker of this cluster" "1" \

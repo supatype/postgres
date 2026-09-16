@@ -226,7 +226,7 @@ restart_pg
 chk "workers are back with credentials loaded" "$WORKERS" "$(wait_workers)"
 # AUTH replies +OK even when no credentials loaded, so prove it the other way.
 chk "AUTH is now required, so the credentials really loaded" "1" \
-    "$(redis-cli -p $RESP --no-auth-warning SUBSCRIBE nope 2>&1 | grep -c NOAUTH)"
+    "$(timeout 3 redis-cli -p $RESP --no-auth-warning SUBSCRIBE nope 2>&1 | grep -c NOAUTH)"
 
 rm -f $OUT.auth_a.out $OUT.auth_b.out
 ( timeout 15 redis-cli -p $RESP       --user sub_a -a pw1 --no-auth-warning SUBSCRIBE demo > $OUT.auth_a.out 2>&1 ) &
