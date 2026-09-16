@@ -1828,6 +1828,13 @@ Scoping for this version — the extension works; these are the edges to know:
   is a restart.
 - **Pub/sub is cross-worker within one process** (the scale-out daemon), not yet
   cross-*process* for N in-PG background workers.
+- **A standby serves no RESP.** Every pg_keyspace background worker uses SPI, so
+  Postgres registers it with `BgWorkerStartTime::RecoveryFinished` and does not
+  launch it until recovery ends — which on a streaming standby never happens.
+  The RESP port on a replica does not answer, and the keyspace is reachable
+  there only through SQL over `supacache.kv`. The cluster says so at startup,
+  and the deferral lifts by itself: promote the standby and the workers start
+  and serve the keyspace they inherited (`bench/run_standby_notice.sh`).
 - **Mode B read-through is opt-in and needs the decode worker.**
   `pg_keyspace.rowcache_readthrough` is off by default and does nothing unless
   `rowcache_decode` is also on — warming a row the cluster cannot invalidate
