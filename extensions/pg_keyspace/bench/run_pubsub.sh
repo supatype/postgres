@@ -127,49 +127,42 @@ rm -f "$ssub" "$csub" "$psub"
 # Counts, gating and confirmations on ONE connection, driven as raw RESP because
 # redis-cli stops reading stdin once subscribed. The shard counter is separate
 # from the channel+pattern one, which a client tracking both would notice.
-raw() { (printf "$1"; sleep 1) | timeout 4 nc -q1 127.0.0.1 "$2" 2>/dev/null | tr '\r\n' ' '; }
-if command -v nc >/dev/null 2>&1; then
-  RESP_HOST_OK=1
-  got="$(raw 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSUBSCRIBE c\r\n' "$RESP")"
-  chk "shard subscriptions count separately from channel ones" \
-      "*3  \$9  subscribe  \$1  a  :1  *3  \$10  ssubscribe  \$1  b  :1  *3  \$9  subscribe  \$1  c  :2  " "$got"
-  got="$(raw 'SSUBSCRIBE b c\r\nSUNSUBSCRIBE b\r\nSUNSUBSCRIBE\r\n' "$RESP")"
-  chk "SUNSUBSCRIBE confirms named, then the bare form drops the rest" \
-      "*3  \$10  ssubscribe  \$1  b  :1  *3  \$10  ssubscribe  \$1  c  :2  *3  \$12  sunsubscribe  \$1  b  :1  *3  \$12  sunsubscribe  \$1  c  :0  " "$got"
-  # The subscribe-context gate, in both protocols. AUTH, HELLO and CLIENT used
-  # to be dispatched above it and so ran anyway; redis refuses all three, and a
-  # client that used CLIENT SETNAME to label a subscriber connection got a
-  # silent +OK here and an error there.
-  for c in 'CLIENT GETNAME' 'CLIENT SETNAME foo' 'CLIENT ID' 'HELLO' 'AUTH x'; do
-    lc=$(echo "$c" | tr 'A-Z' 'a-z' | sed 's/ \([a-z]*\).*/|\1/; s/^auth|x$/auth/; s/^hello$/hello/')
-    got="$(raw "SUBSCRIBE a\r\n$c\r\n" "$RESP" | sed 's/.*-ERR/-ERR/')"
-    chk "RESP2 subscribe mode refuses $c" "1" "$(echo "$got" | grep -c "allowed in this context")"
-  done
-  # RESP3 has no such restriction: pub/sub is out of band there, so redis runs
-  # anything on a subscribed connection and so must this.
-  got="$(raw 'HELLO 3\r\nSUBSCRIBE a\r\nSET gk gv\r\n' "$RESP")"
-  chk "RESP3 subscribe mode runs ordinary commands" "1" "$(echo "$got" | grep -c '+OK')"
-  # PING's reply SHAPE is subscribe-context behaviour: a two-element array in
-  # RESP2 subscribe mode, a bare +PONG everywhere else.
-  chk "RESP2 subscribed PING is an array" \
-      "*2  \$4  pong  \$0    " "$(raw 'SUBSCRIBE a\r\nPING\r\n' "$RESP" | sed 's/.*:1  //')"
-  chk "RESP2 subscribed PING carries its argument" \
-      "*2  \$4  pong  \$2  hi  " "$(raw 'SUBSCRIBE a\r\nPING hi\r\n' "$RESP" | sed 's/.*:1  //')"
-  chk "RESP3 subscribed PING is +PONG" "1" \
-      "$(raw 'HELLO 3\r\nSUBSCRIBE a\r\nPING\r\n' "$RESP" | grep -c '+PONG')"
-  chk "unsubscribed PING is still +PONG" "1" "$(raw 'PING\r\n' "$RESP" | grep -c '+PONG')"
-  chk "CLIENT still works when not subscribed" "1" \
-      "$(raw 'CLIENT SETNAME bar\r\n' "$RESP" | grep -c '+OK')"
-
-  # SSUBSCRIBE must be allowed in subscribe context, and the refusal that
-  # follows must name the command redis names.
-  got="$(raw 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSET k v\r\n' "$RESP" | sed 's/.*-ERR/-ERR/')"
-  chk "S-variants allowed in subscribe context, others refused by name" \
-      "-ERR Can't execute 'set': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context  " \
-      "$got"
-else
-  echo "  SKIP  raw-RESP shard assertions (no nc)"
-fi
+flat() { tr '\r\n' ' '; }  # one line, so a whole exchange is one expectation
+got="$(printf 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSUBSCRIBE c\r\n' | raw | flat)"
+chk "shard subscriptions count separately from channel ones" \
+    "*3  \$9  subscribe  \$1  a  :1  *3  \$10  ssubscribe  \$1  b  :1  *3  \$9  subscribe  \$1  c  :2  " "$got"
+got="$(printf 'SSUBSCRIBE b c\r\nSUNSUBSCRIBE b\r\nSUNSUBSCRIBE\r\n' | raw | flat)"
+chk "SUNSUBSCRIBE confirms named, then the bare form drops the rest" \
+    "*3  \$10  ssubscribe  \$1  b  :1  *3  \$10  ssubscribe  \$1  c  :2  *3  \$12  sunsubscribe  \$1  b  :1  *3  \$12  sunsubscribe  \$1  c  :0  " "$got"
+# The subscribe-context gate, in both protocols. AUTH, HELLO and CLIENT used to
+# be dispatched above it and so ran anyway; redis refuses all three, and a
+# client that used CLIENT SETNAME to label a subscriber connection got a silent
+# +OK here and an error there.
+for c in 'CLIENT GETNAME' 'CLIENT SETNAME foo' 'CLIENT ID' 'HELLO' 'AUTH x'; do
+  got="$(printf "SUBSCRIBE a\r\n$c\r\n" | raw | flat | sed 's/.*-ERR/-ERR/')"
+  chk "RESP2 subscribe mode refuses $c" "1" "$(echo "$got" | grep -c "allowed in this context")"
+done
+# RESP3 has no such restriction: pub/sub is out of band there, so redis runs
+# anything on a subscribed connection and so must this.
+got="$(printf 'HELLO 3\r\nSUBSCRIBE a\r\nSET gk gv\r\n' | raw | flat)"
+chk "RESP3 subscribe mode runs ordinary commands" "1" "$(echo "$got" | grep -c '+OK')"
+# PING's reply SHAPE is subscribe-context behaviour: a two-element array in
+# RESP2 subscribe mode, a bare +PONG everywhere else.
+chk "RESP2 subscribed PING is an array" \
+    "*2  \$4  pong  \$0    " "$(printf 'SUBSCRIBE a\r\nPING\r\n' | raw | flat | sed 's/.*:1  //')"
+chk "RESP2 subscribed PING carries its argument" \
+    "*2  \$4  pong  \$2  hi  " "$(printf 'SUBSCRIBE a\r\nPING hi\r\n' | raw | flat | sed 's/.*:1  //')"
+chk "RESP3 subscribed PING is +PONG" "1" \
+    "$(printf 'HELLO 3\r\nSUBSCRIBE a\r\nPING\r\n' | raw | flat | grep -c '+PONG')"
+chk "unsubscribed PING is still +PONG" "1" "$(printf 'PING\r\n' | raw | flat | grep -c '+PONG')"
+chk "CLIENT still works when not subscribed" "1" \
+    "$(printf 'CLIENT SETNAME bar\r\n' | raw | flat | grep -c '+OK')"
+# SSUBSCRIBE must be allowed in subscribe context, and the refusal that
+# follows must name the command redis names.
+got="$(printf 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSET k v\r\n' | raw | flat | sed 's/.*-ERR/-ERR/')"
+chk "S-variants allowed in subscribe context, others refused by name" \
+    "-ERR Can't execute 'set': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context  " \
+    "$got"
 
 # ---- PUBSUB introspection -------------------------------------------------
 # Subscribers on BOTH servers, so the parity comparisons below describe the same
