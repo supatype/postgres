@@ -1610,6 +1610,64 @@ PITR include them, TTLs survive (they are a column, not runtime state), and a
 restored cluster rebuilds the cache on the next worker start through the same
 path as crash recovery.
 
+### Your existing Postgres backups already cover the cache
+
+This is worth saying out loud, because no other cache offers it.
+
+The keyspace lives in the WAL, inside the same cluster as the data it fronts, so
+`pg_basebackup` plus WAL archiving backs the cache up with everything else — and
+a point-in-time restore brings it back **to an instant consistent with the rows
+it caches**. One backup, one restore procedure, one timeline. Valkey cannot do
+this at any price: RDB and AOF are a separate artefact on a separate schedule
+with a separate restore, and nothing makes the cache and the database agree
+about when "now" was.
+
+`bench/run_pitr_restore.sh` asserts that rather than assuming it. Restoring a
+base backup to a timestamp taken mid-traffic, against a durable-tier cluster:
+
+| asserted | |
+|---|---|
+| every write acknowledged before the target is back | ✓ |
+| nothing written after it is | ✓ |
+| the table the cache fronts stopped at the same instant | ✓ |
+| the worker rebuilt the keyspace from the restored tables | ✓ |
+| a live TTL came back with its remaining expiry | ✓ |
+| an already-expired key was not resurrected | ✓ |
+
+The boundary is exact because the durable tier holds the RESP reply until the
+record commits: a `+OK` is a promise that the row is in `supacache.kv`, so PITR
+has to keep every promise made before the target and none made after it. It
+does, and the recovering worker says how many keys it rebuilt:
+
+```
+LOG:  starting point-in-time recovery to 2026-09-16 09:19:44.246393+00
+LOG:  recovery stopping before commit of transaction 1001
+LOG:  pg_keyspace worker 0: recovered 51 keys (slots 0..16384) from supacache.kv
+```
+
+**One thing to watch when restoring.** `pg_keyspace.workers` comes from the
+restored cluster's `postgresql.conf`, which is usually edited by hand — so a
+restore is a plausible place to change the worker count by accident. A persisted
+tier with more than one worker redirects clients by address and so also needs
+`pg_keyspace.cluster_announce_host`. Without it every worker refuses to start
+and names the setting, rather than coming up and serving an empty keyspace that
+would look exactly like a restore that lost everything:
+
+```
+LOG:  pg_keyspace worker 0: REFUSING to start — a persisted tier with
+      pg_keyspace.workers > 1 redirects clients by address, so
+      pg_keyspace.cluster_announce_host must be set ...
+```
+
+Set it and the restore proceeds. The keyspace is re-sharded across the new
+worker count and says so; nothing is lost, because `supacache.kv.slot` is stable
+and a key simply recovers into a different segment:
+
+```
+LOG:  pg_keyspace worker 0: WORKER COUNT CHANGED 1 -> 3. 10923 of 16384 slots
+      (66.7%) now belong to a different worker ...
+```
+
 The consequence worth knowing: **a dump of a busy cache silently contains the
 whole cache**, which can surprise on both dump size and data retention. If the
 cache is disposable, exclude it:

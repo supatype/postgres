@@ -394,6 +394,18 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_rowcache_registration.sh
 
+      # The claim that your existing Postgres backups already cover the cache
+      # (#112). Restores a base backup to a timestamp mid-traffic and asserts
+      # the boundary in both directions: everything acknowledged before the
+      # target comes back, nothing written after it does, and the table the
+      # cache fronts stopped at the same instant. Its own clusters and ports.
+      - name: pg_basebackup + PITR restores the cache
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_pitr_restore.sh
+
       - name: Probabilistic filter durability
         env:
           PGKS_BUILD_PROFILE: debug
