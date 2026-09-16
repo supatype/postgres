@@ -2197,6 +2197,12 @@ impl Worker {
                     return;
                 }
                 let end = off + args[3].len();
+                // Same amplification as SETBIT — `SETRANGE k 536870910 x` is 23
+                // bytes and half a gigabyte — so the same guard, before the
+                // resize below rather than after it.
+                if !fits_arena(&store, end as u64, out) {
+                    return;
+                }
                 if buf.len() < end {
                     buf.resize(end, 0); // zero-pad the gap, as Redis does
                 }
@@ -2242,6 +2248,10 @@ impl Worker {
                     }
                 };
                 if !check_string(&store, &args[1], out) {
+                    return;
+                }
+                // Before building the value, not after: see `fits_arena`.
+                if !fits_arena(&store, (off >> 3) + 1, out) {
                     return;
                 }
                 let (mut buf, exp) = match store.get_typed(&args[1]) {
@@ -2467,6 +2477,13 @@ impl Worker {
                 };
                 if !check_string(&store, &args[1], out) {
                     return;
+                }
+                // The farthest byte any write in this command reaches, checked
+                // before the value is grown to reach it: see `fits_arena`.
+                if let Some(end) = ops.iter().filter(|o| o.is_write()).map(|o| o.end_byte()).max() {
+                    if !fits_arena(&store, end, out) {
+                        return;
+                    }
                 }
                 let (mut buf, exp) = match store.get_typed(&args[1]) {
                     Some((_, e, v)) => (v.to_vec(), e),
@@ -6598,6 +6615,30 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
             | b"CF.DEL"
             | b"CF.LOADCHUNK"
     )
+}
+
+/// Refuse a write whose *result* would be larger than the store could ever hold,
+/// before the value is built rather than after.
+///
+/// `SETBIT`, `SETRANGE` and `BITFIELD` are the three commands whose arguments
+/// say nothing about how many bytes they produce: an offset is a handful of
+/// characters and the value it implies is `offset/8` bytes of mostly zeros. Left
+/// unchecked, a 25-byte `SETBIT k 4294967295 1` allocates and zeroes 512 MiB on
+/// the event loop, blocks every other connection on the worker for seconds
+/// (measured: 4.2 s, and an unrelated PING going from 6 ms to 4156 ms), and is
+/// then refused by the arena anyway — a ~20-million-fold amplification from one
+/// small command, repeatable, and fatal in a background worker where the OOM
+/// killer takes the whole cluster with it.
+///
+/// The reply is the same `OOM` the allocator would have produced, so this
+/// changes nothing a client can observe except how long it waits for it.
+#[must_use]
+fn fits_arena(store: &Store, needed: u64, out: &mut Vec<u8>) -> bool {
+    if needed > store.max_storable_bytes() as u64 {
+        resp::error(out, OOM_ERR);
+        return false;
+    }
+    true
 }
 
 /// Bitmap mutations. Called out from the other string writes only for the ring

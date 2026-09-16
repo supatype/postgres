@@ -159,6 +159,28 @@ chk "BITFIELD with a truncated op" "1" "$($K BITFIELD bf GET u8 2>&1 | grep -c '
 # A syntax error in the last operation must leave the value untouched.
 chk "a rejected BITFIELD writes nothing" "0" "$($K DEL bf3 >/dev/null; $K BITFIELD bf3 SET u8 0 1 BOGUS >/dev/null 2>&1; $K EXISTS bf3)"
 
+# ---- a huge offset is refused, not allocated -------------------------------
+# SETBIT/SETRANGE/BITFIELD are the three commands whose arguments say nothing
+# about how many bytes they produce. Unguarded, `SETBIT k 4294967295 1` is 25
+# bytes on the wire that allocate and zero 512 MiB on the event loop, block
+# every other connection on the worker for ~4 s, and are then refused by the
+# arena anyway. The reply is the same either way, so the assertion that matters
+# is how long it takes: the guard must answer without building the value.
+#
+# The threshold is deliberately loose. The guarded path is a parse and a
+# comparison -- single-digit milliseconds even on a loaded runner -- while the
+# unguarded one is seconds, so anything in between separates them without being
+# a timing-sensitive test.
+for c in "SETBIT hugebm 4294967295 1" "SETRANGE hugesr 536870910 x" "BITFIELD hugebf SET u8 4294967200 1"; do
+  t0=$(date +%s)
+  r=$($K $c 2>&1 | head -1)
+  t1=$(date +%s)
+  chk "refused: $c" "1" "$(echo "$r" | grep -c 'OOM command not allowed')"
+  chk "and refused without allocating it" "ok" \
+      "$([ $((t1-t0)) -lt 3 ] && echo ok || echo "took $((t1-t0))s")"
+done
+both DEL hugebm hugesr hugebf
+
 # ---- parity vs a real redis ------------------------------------------------
 if [ -z "$PARITY" ]; then
   echo "  SKIP  no redis on :$REDIS for parity"

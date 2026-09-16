@@ -758,6 +758,25 @@ impl Store {
         self.num_partitions
     }
 
+    /// The largest value this store could accept under the most favourable
+    /// conditions: one partition's whole data region, less the 8-byte header an
+    /// oversized block carries. A value lives entirely inside the partition its
+    /// key hashes to, so anything above this can never be stored no matter what
+    /// is evicted first.
+    ///
+    /// This is a *necessary* condition, not a sufficient one — an oversized
+    /// block rounds its capacity up to a power of two, and the partition is
+    /// rarely empty — so a value that passes it may still fail to allocate. Its
+    /// purpose is to let a command that would *construct* a huge value refuse
+    /// before building it: `SETBIT k 4294967295 1` is a 25-byte command that
+    /// otherwise allocates and zeroes half a gigabyte on the event loop, stalls
+    /// every other connection on the worker for seconds, and then throws the
+    /// result away when the allocator says no.
+    #[inline]
+    pub fn max_storable_bytes(&self) -> usize {
+        self.data_bytes.saturating_sub(8).min(usize::MAX as u64) as usize
+    }
+
     /// Which partition `key` lives in.
     ///
     /// Every mutation of a partition — the probe, the slab allocator, and above
@@ -2026,6 +2045,27 @@ mod tests {
     fn store(name: &str) -> Store {
         let cfg = Config::for_capacity(2, 10_000, 128);
         Store::create(name, &cfg).unwrap()
+    }
+
+    /// The ceiling `SETBIT`/`SETRANGE`/`BITFIELD` refuse against before building
+    /// a value must agree with what the allocator will actually take: too low
+    /// and a storable write is refused, too high and the guard lets through the
+    /// enormous allocation it exists to stop.
+    #[test]
+    fn max_storable_bytes_bounds_what_the_arena_accepts() {
+        let s = store("t_max_storable");
+        let ceiling = s.max_storable_bytes();
+        assert!(ceiling > 0);
+        // Anything above the ceiling is unstorable in an empty arena, which is
+        // the most favourable case there is.
+        assert!(!s.set(b"over", &vec![0u8; ceiling + 1], 0));
+        // And the ceiling is one partition's data region, not the whole
+        // segment: a value cannot span partitions.
+        assert!(ceiling < 128 * 1024 * 1024);
+        // A comfortably smaller value goes in, so the guard is not simply
+        // refusing everything.
+        assert!(s.set(b"under", &vec![0u8; ceiling / 4], 0));
+        assert!(matches!(s.get(b"under"), Lookup::Hit(v) if v.len() == ceiling / 4));
     }
 
     #[test]
