@@ -16,6 +16,7 @@
 
 pub mod aggr;
 pub mod batcher;
+pub mod bitmap;
 pub mod crc16;
 pub mod prob;
 pub mod pubsub;
