@@ -5931,7 +5931,7 @@ fn strip_scope<'a>(name: &'a [u8], prefix: &Option<Vec<u8>>) -> &'a [u8] {
 
 /// Redis-style glob match (PSUBSCRIBE / KEYS semantics): `*` any run, `?` one
 /// byte, `[...]` a class (ranges with `-`, negated with `^`), `\` escapes.
-fn glob_match(mut p: &[u8], mut s: &[u8]) -> bool {
+pub fn glob_match(mut p: &[u8], mut s: &[u8]) -> bool {
     while let Some(&pc) = p.first() {
         match pc {
             b'*' => {

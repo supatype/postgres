@@ -475,6 +475,46 @@ impl ShmBus {
         remote
     }
 
+    /// Publish from a process that is not a slot worker -- a Postgres backend
+    /// running `supacache.publish()`, say.
+    ///
+    /// Such a caller has no worker of its own, which is the whole difficulty:
+    /// `publish` excludes `from` (the caller delivers to its own connections
+    /// itself) and every `(from, to)` ring already has a slot worker as its
+    /// single producer, so borrowing one would put two producers on a lock-free
+    /// SPSC ring.
+    ///
+    /// The `(w, w)` rings are the way through. They are allocated and
+    /// initialised like every other ring, and nothing ever uses them: `publish`
+    /// filters them out with `w != from`, `invalidate` and `drain` skip them
+    /// explicitly. So each worker has an idle inbox that no worker writes to,
+    /// and an outside publisher can own it as sole producer without touching a
+    /// ring any worker produces into -- no extra rings, no larger segment, and
+    /// not one lock on the worker hot path.
+    ///
+    /// Concurrent *external* publishers are the one thing this cannot serialise
+    /// by itself; the caller holds a lock across it (in the extension, an
+    /// LWLock), which contends only with other external publishers.
+    pub fn publish_external<F: Fn(&[u8], &[u8]) -> bool>(
+        &self,
+        channel: &[u8],
+        msg: &[u8],
+        glob: F,
+        mut wake: impl FnMut(usize),
+    ) -> usize {
+        let mut total = 0usize;
+        // usize::MAX is not a worker, so the `w != from` filter in `targets`
+        // excludes nothing: an outside publisher reaches every worker holding a
+        // subscriber, including the one it would otherwise have been.
+        for (wid, count) in self.targets(usize::MAX, channel, glob) {
+            if unsafe { self.push(wid, wid, KIND_PUBLISH, channel, msg) } {
+                total += count;
+                wake(wid);
+            }
+        }
+        total
+    }
+
     /// Broadcast an invalidation to every other worker. Unlike `publish` this
     /// ignores the routing table, because tracking tables live per worker.
     pub fn invalidate(&self, from: usize, key: Option<&[u8]>, mut wake: impl FnMut(usize)) {
@@ -493,12 +533,15 @@ impl ShmBus {
     }
 
     /// Drain every frame addressed to `wid`, from all producers.
+    ///
+    /// Including `(wid, wid)`, which no worker produces into: it is this
+    /// worker's inbox from publishers that are not workers at all (see
+    /// [`ShmBus::publish_external`]). Skipping it, as this did when the
+    /// diagonal was genuinely dead, would accept those frames and deliver none
+    /// of them.
     pub fn drain(&self, wid: usize) -> Vec<crate::pubsub::BusMsg> {
         let mut out = Vec::new();
         for from in 0..self.nworkers {
-            if from == wid {
-                continue;
-            }
             while let Some((kind, a, b)) = unsafe { self.pop(from, wid) } {
                 out.push(match kind {
                     KIND_PUBLISH => crate::pubsub::BusMsg::Publish(a, b),
@@ -586,6 +629,68 @@ mod tests {
             _ => panic!("wrong kind"),
         }
         assert!(bus.drain(2).is_empty(), "drained twice");
+    }
+
+    /// An outside publisher reaches EVERY worker holding a subscriber --
+    /// including worker 0, which an ordinary `publish(0, ..)` would have
+    /// excluded as the caller's own. That is the point: a Postgres backend has
+    /// no connections of its own to deliver to, so nothing else would.
+    #[test]
+    fn external_publish_reaches_every_worker() {
+        let (_r, bus) = Region::new(3, 16, 4096);
+        bus.subscribe(0, b"news", false);
+        bus.subscribe(2, b"news", false);
+        let mut woken = Vec::new();
+        let n = bus.publish_external(b"news", b"hello", exact, |w| woken.push(w));
+        assert_eq!(n, 2, "both subscribers counted");
+        woken.sort();
+        assert_eq!(woken, vec![0, 2]);
+        for w in [0usize, 2] {
+            let got = bus.drain(w);
+            assert_eq!(got.len(), 1, "worker {w} got its copy");
+            match &got[0] {
+                BusMsg::Publish(c, m) => {
+                    assert_eq!(c, b"news");
+                    assert_eq!(m, b"hello");
+                }
+                _ => panic!("wrong kind"),
+            }
+        }
+        assert!(bus.drain(1).is_empty(), "no subscriber, no frame");
+    }
+
+    /// The lane an external publisher uses must not disturb the one the workers
+    /// use: a worker-to-worker publish and an external publish land in
+    /// different rings and both arrive.
+    #[test]
+    fn external_and_worker_lanes_are_independent() {
+        let (_r, bus) = Region::new(3, 16, 4096);
+        bus.subscribe(2, b"news", false);
+        assert_eq!(bus.publish(0, b"news", b"from-worker", exact, |_| {}), 1);
+        assert_eq!(bus.publish_external(b"news", b"from-sql", exact, |_| {}), 1);
+        let got = bus.drain(2);
+        assert_eq!(got.len(), 2, "both lanes delivered");
+        let mut msgs: Vec<Vec<u8>> = got
+            .into_iter()
+            .map(|m| match m {
+                BusMsg::Publish(_, m) => m,
+                _ => panic!("wrong kind"),
+            })
+            .collect();
+        msgs.sort();
+        assert_eq!(msgs, vec![b"from-sql".to_vec(), b"from-worker".to_vec()]);
+    }
+
+    /// A publish with nobody listening stays out of the rings entirely, so the
+    /// external lane cannot fill a worker's inbox with frames it did not ask
+    /// for.
+    #[test]
+    fn external_publish_to_an_empty_channel_delivers_nothing() {
+        let (_r, bus) = Region::new(3, 16, 4096);
+        assert_eq!(bus.publish_external(b"quiet", b"x", exact, |_| {}), 0);
+        for w in 0..3 {
+            assert!(bus.drain(w).is_empty());
+        }
     }
 
     #[test]

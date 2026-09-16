@@ -79,6 +79,10 @@ const RC_LOCK_NAME: &CStr = c"pg_keyspace_rowcache_write";
 const RC_DB_NAME: &CStr = c"pg_keyspace_rowcache_dbs";
 // Serialises allocation of a directory entry. Never held across SPI.
 const RC_DB_LOCK_NAME: &CStr = c"pg_keyspace_rowcache_dbs_lock";
+/// Serialises publishers that are not slot workers. Held only by backends
+/// running `supacache.publish()`, never by a worker, so it contends with
+/// nothing on the RESP hot path.
+const PS_EXT_LOCK_NAME: &CStr = c"pg_keyspace_pubsub_external_lock";
 
 // Base address of the Postgres shared-memory segment, published by the startup
 // hook and inherited by every forked backend. Each context rebuilds a cheap
@@ -101,6 +105,8 @@ static HEALTH_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 // of an entry in it (#120).
 static RC_DB_BASE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static RC_DB_LOCK: AtomicPtr<pg_sys::LWLock> = AtomicPtr::new(std::ptr::null_mut());
+// Guards the external pub/sub lane (see PS_EXT_LOCK_NAME).
+static PS_EXT_LOCK: AtomicPtr<pg_sys::LWLock> = AtomicPtr::new(std::ptr::null_mut());
 // The bus itself, built by the postmaster in the shmem startup hook so that the
 // wake descriptors it opens are inherited by every worker that forks from it.
 // Built after the fork, each worker would hold private descriptors and wake
@@ -1867,6 +1873,7 @@ extern "C" fn ks_shmem_request() {
         // guards allocating an entry in it.
         pg_sys::RequestAddinShmemSpace(rcdb_bytes());
         pg_sys::RequestNamedLWLockTranche(RC_DB_LOCK_NAME.as_ptr(), 1);
+        pg_sys::RequestNamedLWLockTranche(PS_EXT_LOCK_NAME.as_ptr(), 1);
     }
 }
 
@@ -1960,6 +1967,10 @@ extern "C" fn ks_shmem_startup() {
         let db_tranche = pg_sys::GetNamedLWLockTranche(RC_DB_LOCK_NAME.as_ptr());
         if !db_tranche.is_null() {
             RC_DB_LOCK.store(std::ptr::addr_of_mut!((*db_tranche).lock), Ordering::Release);
+        }
+        let ps_tranche = pg_sys::GetNamedLWLockTranche(PS_EXT_LOCK_NAME.as_ptr());
+        if !ps_tranche.is_null() {
+            PS_EXT_LOCK.store(std::ptr::addr_of_mut!((*ps_tranche).lock), Ordering::Release);
         }
         // The TTL clock anchor (#110), shared so every process agrees.
         //
@@ -5906,6 +5917,59 @@ mod supacache {
             rows.push((p, d, b, c_, (p - c_).max(0), e, u));
         }
         TableIterator::new(rows)
+    }
+
+    /// Publish to RESP subscribers from SQL.
+    ///
+    /// The gap this closes: a backend can read and write the keyspace through
+    /// `supacache.*`, but until now had no way to reach a subscriber. A trigger
+    /// that wanted to tell a RESP client something had to go out through the
+    /// application and back in over the wire.
+    ///
+    /// Returns the number of subscribers the message was queued for, the same
+    /// count a RESP `PUBLISH` answers with.
+    ///
+    /// **Superuser only, checked here rather than left to `GRANT`.** RESP
+    /// channels are force-scoped `{tenant}:` per credential, and a Postgres role
+    /// is not a RESP credential -- there is no mapping between them, so this
+    /// function cannot work out which tenant a caller belongs to and cannot
+    /// force a prefix. Publishing a caller-supplied name unscoped would let
+    /// anyone who could call it inject into any tenant's channels (and count
+    /// their subscribers, which is a read of another tenant's activity through
+    /// a write-only primitive).
+    ///
+    /// A `GRANT`-based restriction would put that boundary outside the code,
+    /// one well-meaning grant away from being gone. Until a role-to-tenant
+    /// mapping exists, the check lives here where it cannot be granted away.
+    #[pg_extern]
+    fn publish(channel: &str, message: &[u8]) -> i64 {
+        if !unsafe { pg_sys::superuser() } {
+            error!(
+                "supacache.publish() is superuser-only: RESP channels are tenant-scoped per \
+                 credential and a Postgres role is not one, so this function cannot scope a \
+                 channel name to the caller's tenant"
+            );
+        }
+        let bus = match BUS.get() {
+            Some(b) => b,
+            // The in-process bus (standalone daemon) has no shared backing, and
+            // an unconfigured cluster has no bus at all. Either way there is no
+            // subscriber a backend could reach.
+            None => return 0,
+        };
+        let lock = PS_EXT_LOCK.load(Ordering::Acquire);
+        if lock.is_null() {
+            error!("supacache.publish(): the pub/sub bus is not initialised in this cluster");
+        }
+        // Held across the push only. Contends with other `supacache.publish()`
+        // callers and with nothing else: no slot worker ever produces into the
+        // rings this lane uses.
+        unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+        let n = bus.publish_external(channel.as_bytes(), message, |p, c| {
+            server::glob_match(p, c)
+        });
+        unsafe { pg_sys::LWLockRelease(lock) };
+        n.unwrap_or(0) as i64
     }
 
     /// Health of the cross-worker pub/sub bus.
