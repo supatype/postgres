@@ -1369,6 +1369,59 @@ impl Worker {
         let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
         let max_bulk = self.max_value_bytes;
 
+        // ---- pub/sub: handled before keyed-command scoping. Channels
+        // are tenant-scoped for non-exempt authed roles (same `{tenant}:` prefix
+        // as keys); the scoping is transparent — every reply/message frame echoes
+        // the client's own unscoped name. ----
+        match cmd.as_slice() {
+            b"SUBSCRIBE" => return self.handle_subscribe(fd, args, false),
+            b"PSUBSCRIBE" => return self.handle_subscribe(fd, args, true),
+            b"UNSUBSCRIBE" => return self.handle_unsubscribe(fd, args, false),
+            b"PUNSUBSCRIBE" => return self.handle_unsubscribe(fd, args, true),
+            b"PUBLISH" => return self.handle_publish(fd, args),
+            b"SSUBSCRIBE" => return self.handle_ssubscribe(fd, args),
+            b"SUNSUBSCRIBE" => return self.handle_sunsubscribe(fd, args),
+            b"SPUBLISH" => return self.handle_spublish(fd, args),
+            _ => {}
+        }
+        // A RESP2 connection in subscribe mode runs only (P|S)SUBSCRIBE,
+        // (P|S)UNSUBSCRIBE, PING, QUIT and RESET. Everything else is refused,
+        // AUTH, HELLO and CLIENT included -- they used to be dispatched above
+        // this gate and so ran anyway, which is why they now sit below it.
+        //
+        // RESP3 has no such restriction: pub/sub arrives out of band as push
+        // frames, so there is no reply stream to confuse and redis runs any
+        // command on a subscribed RESP3 connection. Verified against 7.0.15,
+        // where `SET k v` after `HELLO 3` + `SUBSCRIBE` answers +OK.
+        let (subscribed, resp3) = self
+            .conns
+            .get(&fd)
+            .map(|c| {
+                (
+                    !c.subs.is_empty() || !c.psubs.is_empty() || !c.ssubs.is_empty(),
+                    c.resp3,
+                )
+            })
+            .unwrap_or((false, false));
+        if subscribed && !resp3 && !matches!(cmd.as_slice(), b"PING" | b"QUIT" | b"RESET") {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            // Redis names the S-variants here now that they exist, and so does
+            // this: a client told only about (P)SUBSCRIBE would conclude that
+            // SSUBSCRIBE is what it just got refused for. It also names the
+            // command it refused, `container|subcommand` where there is one --
+            // this string was already being rewritten for the S-variants, and
+            // leaving the other half of the same divergence in place would have
+            // been a choice rather than an omission.
+            let named = refused_name(&cmd, args);
+            resp::error(
+                out,
+                &format!(
+                    "ERR Can't execute '{named}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+                ),
+            );
+            return;
+        }
+
         // ---- AUTH command ----
         if cmd == b"AUTH" {
             self.handle_auth(fd, args);
@@ -1387,45 +1440,6 @@ impl Worker {
             return;
         }
 
-        // ---- pub/sub: handled before keyed-command scoping. Channels
-        // are tenant-scoped for non-exempt authed roles (same `{tenant}:` prefix
-        // as keys); the scoping is transparent — every reply/message frame echoes
-        // the client's own unscoped name. ----
-        match cmd.as_slice() {
-            b"SUBSCRIBE" => return self.handle_subscribe(fd, args, false),
-            b"PSUBSCRIBE" => return self.handle_subscribe(fd, args, true),
-            b"UNSUBSCRIBE" => return self.handle_unsubscribe(fd, args, false),
-            b"PUNSUBSCRIBE" => return self.handle_unsubscribe(fd, args, true),
-            b"PUBLISH" => return self.handle_publish(fd, args),
-            b"SSUBSCRIBE" => return self.handle_ssubscribe(fd, args),
-            b"SUNSUBSCRIBE" => return self.handle_sunsubscribe(fd, args),
-            b"SPUBLISH" => return self.handle_spublish(fd, args),
-            _ => {}
-        }
-        // In RESP2 subscribe mode only (P)(UN)SUBSCRIBE / PING / QUIT / RESET run.
-        let subscribed = self
-            .conns
-            .get(&fd)
-            .map(|c| !c.subs.is_empty() || !c.psubs.is_empty() || !c.ssubs.is_empty())
-            .unwrap_or(false);
-        if subscribed && !matches!(cmd.as_slice(), b"PING" | b"QUIT" | b"RESET") {
-            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-            // Redis names the S-variants here now that they exist, and so does
-            // this: a client told only about (P)SUBSCRIBE would conclude that
-            // SSUBSCRIBE is what it just got refused for. It also names the
-            // command it refused, `container|subcommand` where there is one --
-            // this string was already being rewritten for the S-variants, and
-            // leaving the other half of the same divergence in place would have
-            // been a choice rather than an omission.
-            let named = refused_name(&cmd, args);
-            resp::error(
-                out,
-                &format!(
-                    "ERR Can't execute '{named}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
-                ),
-            );
-            return;
-        }
         if cmd == b"QUIT" {
             let c = self.conns.get_mut(&fd).unwrap();
             resp::simple(&mut c.wbuf, "OK");
@@ -1582,7 +1596,17 @@ impl Worker {
 
         match cmd.as_slice() {
             b"PING" => {
-                if nargs >= 2 {
+                // In RESP2 subscribe mode PING answers with a two-element array
+                // -- `pong` and the optional argument -- because the reply
+                // stream is carrying pub/sub frames and a bare `+PONG` would be
+                // ambiguous against them. Outside subscribe mode, and in RESP3
+                // where pub/sub arrives out of band as push frames, it is the
+                // ordinary `+PONG`. All three verified against redis 7.0.15.
+                if subscribed && !resp3 {
+                    resp::array_header(out, 2);
+                    resp::bulk(out, b"pong");
+                    resp::bulk(out, if nargs >= 2 { &args[1] } else { b"" });
+                } else if nargs >= 2 {
                     resp::bulk(out, &args[1]);
                 } else {
                     resp::simple(out, "PONG");
@@ -1592,7 +1616,8 @@ impl Worker {
                 resp::simple(out, "OK");
                 self.conns.get_mut(&fd).unwrap().closing = true;
             }
-            // HELLO and CLIENT are handled before this match.
+            // AUTH, HELLO and CLIENT are handled above this match, below the
+            // subscribe-context gate.
             b"CONFIG" | b"SELECT" | b"RESET" => resp::simple(out, "OK"),
             b"COMMAND" => {
                 let specs = command_specs();

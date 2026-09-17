@@ -134,6 +134,29 @@ chk "shard subscriptions count separately from channel ones" \
 got="$(printf 'SSUBSCRIBE b c\r\nSUNSUBSCRIBE b\r\nSUNSUBSCRIBE\r\n' | raw | flat)"
 chk "SUNSUBSCRIBE confirms named, then the bare form drops the rest" \
     "*3  \$10  ssubscribe  \$1  b  :1  *3  \$10  ssubscribe  \$1  c  :2  *3  \$12  sunsubscribe  \$1  b  :1  *3  \$12  sunsubscribe  \$1  c  :0  " "$got"
+# The subscribe-context gate, in both protocols. AUTH, HELLO and CLIENT used to
+# be dispatched above it and so ran anyway; redis refuses all three, and a
+# client that used CLIENT SETNAME to label a subscriber connection got a silent
+# +OK here and an error there.
+for c in 'CLIENT GETNAME' 'CLIENT SETNAME foo' 'CLIENT ID' 'HELLO' 'AUTH x'; do
+  got="$(printf "SUBSCRIBE a\r\n$c\r\n" | raw | flat | sed 's/.*-ERR/-ERR/')"
+  chk "RESP2 subscribe mode refuses $c" "1" "$(echo "$got" | grep -c "allowed in this context")"
+done
+# RESP3 has no such restriction: pub/sub is out of band there, so redis runs
+# anything on a subscribed connection and so must this.
+got="$(printf 'HELLO 3\r\nSUBSCRIBE a\r\nSET gk gv\r\n' | raw | flat)"
+chk "RESP3 subscribe mode runs ordinary commands" "1" "$(echo "$got" | grep -c '+OK')"
+# PING's reply SHAPE is subscribe-context behaviour: a two-element array in
+# RESP2 subscribe mode, a bare +PONG everywhere else.
+chk "RESP2 subscribed PING is an array" \
+    "*2  \$4  pong  \$0    " "$(printf 'SUBSCRIBE a\r\nPING\r\n' | raw | flat | sed 's/.*:1  //')"
+chk "RESP2 subscribed PING carries its argument" \
+    "*2  \$4  pong  \$2  hi  " "$(printf 'SUBSCRIBE a\r\nPING hi\r\n' | raw | flat | sed 's/.*:1  //')"
+chk "RESP3 subscribed PING is +PONG" "1" \
+    "$(printf 'HELLO 3\r\nSUBSCRIBE a\r\nPING\r\n' | raw | flat | grep -c '+PONG')"
+chk "unsubscribed PING is still +PONG" "1" "$(printf 'PING\r\n' | raw | flat | grep -c '+PONG')"
+chk "CLIENT still works when not subscribed" "1" \
+    "$(printf 'CLIENT SETNAME bar\r\n' | raw | flat | grep -c '+OK')"
 # SSUBSCRIBE must be allowed in subscribe context, and the refusal that
 # follows must name the command redis names.
 got="$(printf 'SUBSCRIBE a\r\nSSUBSCRIBE b\r\nSET k v\r\n' | raw | flat | sed 's/.*-ERR/-ERR/')"
