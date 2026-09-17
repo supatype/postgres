@@ -1368,9 +1368,12 @@ pub extern "C" fn _PG_init() {
         "Number of shared-nothing RESP slot workers",
         "Each worker owns its own shared-memory segment and listens on \
          pg_keyspace.port + its index; clients shard keys across the ports \
-         (Redis-Cluster style). Aggregate throughput scales ~linearly. Persistence \
-         and the Mode B row cache stay single-worker in this slice, so >1 forces \
-         the ephemeral tier. Changing it needs a restart (it resizes shared memory).",
+         (Redis-Cluster style). Aggregate throughput scales ~linearly. Scale-out \
+         composes with every durability tier: a persisted tier with >1 worker \
+         enforces slot routing, so it requires pg_keyspace.cluster_announce_host \
+         and a cluster-aware client that follows MOVED. Changing it needs a \
+         restart (it resizes shared memory), and reshards most of the keyspace -- \
+         see supacache.topology_change().",
         &GUC_WORKERS,
         1,
         64,

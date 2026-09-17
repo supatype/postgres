@@ -124,11 +124,28 @@ client-side caching (`invalidate` pushes) in every mode — default, `BCAST`
 | Bloom filter | `BF.RESERVE` `BF.ADD` `BF.MADD` `BF.INSERT` `BF.EXISTS` `BF.MEXISTS` `BF.INFO` `BF.CARD` `BF.SCANDUMP` `BF.LOADCHUNK` |
 | Cuckoo filter | `CF.RESERVE` `CF.ADD` `CF.ADDNX` `CF.INSERT` `CF.INSERTNX` `CF.EXISTS` `CF.MEXISTS` `CF.DEL` `CF.COUNT` `CF.INFO` `CF.SCANDUMP` `CF.LOADCHUNK` |
 
-**Not yet supported** — scripting (`EVAL`/`FUNCTION`), streams (`XADD`…),
-blocking ops (`BLPOP`/`BRPOP`/`BZPOPMIN`…), HyperLogLog, geo, and cluster
-commands. HyperLogLog is not planned (Postgres extensions do it better over the
-same data); geo is declined outright, because PostGIS is one `CREATE EXTENSION`
-away and operates on the same rows. `CLIENT TRACKING` supports every mode (default, `BCAST` with
+**Not yet supported.** Split by intent, because "missing" and "not coming" are
+different things to plan around:
+
+| Missing | Status | Tracked |
+|---|---|---|
+| Streams (`XADD`, `XREADGROUP`, `XACK`…) | **Planned.** The one gap with no workaround — consumer groups are why teams reach for streams. Scoped for both the ephemeral and durable tiers. Large. | [#109](https://github.com/supatype/postgres/issues/109) |
+| Scripting (`EVAL`/`EVALSHA`/`SCRIPT`) | **Planned.** A stock client that sends `EVAL` is a broken client, not an unsupported one. Medium. | [#114](https://github.com/supatype/postgres/issues/114) |
+| Blocking ops (`BLPOP`/`BRPOP`/`BZPOPMIN`…) | **Planned**, after streams — `XREAD BLOCK` builds the parked-connection and deadline machinery these need. | [#109](https://github.com/supatype/postgres/issues/109) |
+| `FUNCTION`/`FCALL` | **Declined**, not deferred. RESP `role_name` is an ACL label, not a Postgres role; bridging RESP auth into SQL execution reopens every privilege question. `EVAL` is safe because it cannot escape the keyspace. | [#114](https://github.com/supatype/postgres/issues/114) |
+| HyperLogLog | **Not planned.** Postgres extensions do it better over the same data. | — |
+| Geo | **Declined.** PostGIS is one `CREATE EXTENSION` away and operates on the same rows. | — |
+
+No date is attached to the planned rows — they are scoped and tracked, not
+scheduled. Follow the issue for status.
+
+Cluster commands **are** supported: `CLUSTER SLOTS`/`SHARDS`/`NODES`/`MYID`/`INFO`/`KEYSLOT`
+publish the slot map a cluster client bootstraps from — see
+[Multi-worker scale-out](#multi-worker-scale-out). What is not supported is
+online resharding ([#101](https://github.com/supatype/postgres/issues/101)):
+`pg_keyspace.workers` is fixed at startup.
+
+`CLIENT TRACKING` supports every mode (default, `BCAST` with
 `PREFIX`, `OPTIN`/`OPTOUT` with `CLIENT CACHING`, `REDIRECT`). Invalidations are
 delivered as RESP3 pushes, or — for a RESP2 `REDIRECT` target — as
 `__redis__:invalidate` pub/sub messages. `NOLOOP` is accepted and is always in
@@ -1928,6 +1945,19 @@ rather than mis-read.
 
 Scoping for this version — the extension works; these are the edges to know:
 
+- **Streams and scripting are not implemented yet, and both are planned.** A
+  client that sends `XADD` or `EVAL` gets `ERR unknown command`, which reads to
+  the application as a broken server rather than an absent feature. Streams
+  ([#109](https://github.com/supatype/postgres/issues/109)) are the only type
+  gap with no workaround — a Redis Streams work queue cannot move here without
+  an architecture change. For scripting
+  ([#114](https://github.com/supatype/postgres/issues/114)), `MULTI`/`WATCH` are
+  implemented with real atomic apply and WATCH-abort and cover what most `EVAL`
+  scripts do (check-and-set, atomic pop-and-push, rate limiting); for **new**
+  code that is the better answer anyway, and anything with real logic belongs in
+  a SQL function. That does not help an **existing** client whose argument is
+  Lua source. Check both before adopting: they are the two gaps most likely to
+  stop a drop-in replacement.
 - **A persisted multi-worker cluster requires the client's *cluster* constructor**
   (`Redis.Cluster`, `NewClusterClient`, `JedisCluster`, …), not the standalone
   default, since each worker serves only its own slot range and redirects the
