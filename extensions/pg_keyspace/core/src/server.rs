@@ -3561,18 +3561,26 @@ impl Worker {
             }
             // ---- sorted sets --------------------------------------
             b"ZADD" => {
-                // ZADD key [NX|XX] [CH] score member [score member ...]
+                // ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]
+                //
+                // Flags may appear in any order and may interleave (`INCR NX`,
+                // `NX CH INCR` are both accepted by redis), so they are read as
+                // a set until the first token that is not one.
                 if nargs < 4 {
                     resp::error(out, "ERR wrong number of arguments for 'zadd'");
                     return;
                 }
                 let mut i = 2;
                 let (mut nx, mut xx, mut ch) = (false, false, false);
+                let (mut gt, mut lt, mut incr) = (false, false, false);
                 while i < nargs {
                     match args[i].to_ascii_uppercase().as_slice() {
                         b"NX" => { nx = true; i += 1; }
                         b"XX" => { xx = true; i += 1; }
+                        b"GT" => { gt = true; i += 1; }
+                        b"LT" => { lt = true; i += 1; }
                         b"CH" => { ch = true; i += 1; }
+                        b"INCR" => { incr = true; i += 1; }
                         _ => break,
                     }
                 }
@@ -3580,11 +3588,29 @@ impl Worker {
                     resp::error(out, "ERR XX and NX options at the same time are not compatible");
                     return;
                 }
+                // GT/LT ask "only if the new score beats the old one", which NX
+                // ("only if there is no old one") cannot also be true of. XX is
+                // compatible with both and is not part of this check.
+                if (gt && lt) || (nx && (gt || lt)) {
+                    resp::error(
+                        out,
+                        "ERR GT, LT, and/or NX options at the same time are not compatible",
+                    );
+                    return;
+                }
                 if i >= nargs || (nargs - i) % 2 != 0 {
                     resp::error(out, "ERR syntax error");
                     return;
                 }
-                // validate all scores first (atomic-ish)
+                if incr && nargs - i != 2 {
+                    resp::error(
+                        out,
+                        "ERR INCR option supports a single increment-element pair",
+                    );
+                    return;
+                }
+                // Every score is validated before the set is touched, so a bad
+                // one in the middle leaves the earlier pairs unapplied.
                 let mut pairs: Vec<(f64, &[u8])> = Vec::new();
                 let mut j = i;
                 while j + 1 < nargs {
@@ -3601,11 +3627,66 @@ impl Worker {
                     Some(x) => x,
                     None => return,
                 };
+
+                if incr {
+                    // INCR answers the resulting score rather than a count, and
+                    // answers NIL whenever a flag blocked the write. A blocked
+                    // INCR must not create the key either, so nothing is saved
+                    // on that path.
+                    let (by, m) = pairs[0];
+                    let cur = z.score(m);
+                    if (nx && cur.is_some()) || (xx && cur.is_none()) {
+                        resp::null(out, resp3);
+                        return;
+                    }
+                    let next = match cur {
+                        Some(c) => match aggr::incr_score(c, by) {
+                            Some(v) => v,
+                            None => {
+                                resp::error(out, "ERR resulting score is not a number (NaN)");
+                                return;
+                            }
+                        },
+                        // A member that is not there yet takes the increment AS
+                        // its score: `0.0 + -0.0` is `+0.0` in IEEE, and redis
+                        // reports the sign here.
+                        None if by.is_nan() => {
+                            resp::error(out, "ERR resulting score is not a number (NaN)");
+                            return;
+                        }
+                        None => by,
+                    };
+                    // GT/LT compare the RESULT against the old score, and only
+                    // where there is an old score: on a missing member they add
+                    // it, exactly as they do without INCR.
+                    if let Some(c) = cur {
+                        if (gt && !(next > c)) || (lt && !(next < c)) {
+                            resp::null(out, resp3);
+                            return;
+                        }
+                    }
+                    z.add(m, next);
+                    if !save_zset(&store, &args[1], &z, exp, out) {
+                        return;
+                    }
+                    resp::double(out, &aggr::fmt_score(next), resp3);
+                    return;
+                }
+
                 let (mut added, mut changed) = (0i64, 0i64);
                 for (s, m) in pairs {
-                    let exists = z.score(m).is_some();
+                    let cur = z.score(m);
+                    let exists = cur.is_some();
                     if (nx && exists) || (xx && !exists) {
                         continue;
+                    }
+                    // A GT/LT that does not beat the current score is a no-op,
+                    // and a no-op counts as neither added nor changed -- so
+                    // `ZADD k GT CH 1 m` over a score of 7 answers 0.
+                    if let Some(c) = cur {
+                        if (gt && !(s > c)) || (lt && !(s < c)) {
+                            continue;
+                        }
                     }
                     let (was_added, was_changed) = z.add(m, s);
                     if was_added {
