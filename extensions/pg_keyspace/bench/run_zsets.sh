@@ -62,6 +62,76 @@ if redis-cli -p 6379 PING 2>/dev/null | grep -q PONG; then
 fi
 
 echo
+# ---- ZADD GT / LT / INCR ----------------------------------------------------
+# Every expectation measured against redis 7.0.15. These three were not
+# implemented at all: `ZADD k INCR 5 m` answered "ERR syntax error".
+$K DEL fg fl fi fx fp >/dev/null 2>&1
+
+# Incompatible combinations, and the two DIFFERENT messages redis uses for them.
+chk "NX+XX is refused" "1" \
+    "$($K ZADD fg NX XX 1 m 2>&1 | grep -c 'XX and NX options at the same time')"
+chk "GT+NX is refused" "1" \
+    "$($K ZADD fg GT NX 1 m 2>&1 | grep -c 'GT, LT, and/or NX options')"
+chk "LT+NX likewise"   "1" \
+    "$($K ZADD fg LT NX 1 m 2>&1 | grep -c 'GT, LT, and/or NX options')"
+chk "GT+LT likewise"   "1" \
+    "$($K ZADD fg GT LT 1 m 2>&1 | grep -c 'GT, LT, and/or NX options')"
+# GT/LT with XX is legal -- XX is not part of that incompatibility.
+chk "GT+XX is accepted"  "0"  "$($K ZADD fg GT XX 1 m)"
+
+# GT raises only. The return stays the ADDED count, so an update answers 0.
+$K ZADD fg 5 m >/dev/null
+chk "GT with a lower score does nothing" "0" "$($K ZADD fg GT 3 m)"
+chk "and the score is unchanged"         "5" "$($K ZSCORE fg m)"
+chk "GT with a higher score updates"     "0" "$($K ZADD fg GT 7 m)"
+chk "and the score moved"                "7" "$($K ZSCORE fg m)"
+chk "GT CH reports the change"           "1" "$($K ZADD fg GT CH 9 m)"
+chk "GT CH reports a no-op as 0"         "0" "$($K ZADD fg GT CH 1 m)"
+
+# LT lowers only.
+$K ZADD fl 5 m >/dev/null
+chk "LT with a higher score does nothing" "0" "$($K ZADD fl LT 9 m)"
+chk "and the score is unchanged"          "5" "$($K ZSCORE fl m)"
+chk "LT with a lower score updates"       "0" "$($K ZADD fl LT 3 m)"
+chk "and the score moved"                 "3" "$($K ZSCORE fl m)"
+
+# A member that is not there yet is ADDED by GT/LT -- there is no old score to
+# lose the comparison against.
+chk "GT adds a missing member"            "1" "$($K ZADD fx GT 5 new)"
+chk "with the given score"                "5" "$($K ZSCORE fx new)"
+chk "LT adds a missing member too"        "1" "$($K ZADD fx LT 5 new2)"
+
+# INCR answers the resulting score rather than a count.
+chk "INCR on a new member"                "5" "$($K ZADD fi INCR 5 m)"
+chk "INCR accumulates"                  "7.5" "$($K ZADD fi INCR 2.5 m)"
+chk "and the score is stored"           "7.5" "$($K ZSCORE fi m)"
+chk "INCR takes only one pair"            "1" \
+    "$($K ZADD fi INCR 1 a 2 b 2>&1 | grep -c 'single increment-element pair')"
+# Flags may interleave, in any order.
+chk "CH INCR parses"                     "10" "$($K ZADD fi CH INCR 2.5 m)"
+chk "INCR NX on a new member"             "3" "$($K ZADD fp INCR NX 3 m)"
+# A blocked INCR answers NIL and writes nothing.
+chk "NX INCR on an existing member -> nil" ""  "$($K ZADD fp NX INCR 5 m)"
+chk "and the score did not move"          "3" "$($K ZSCORE fp m)"
+chk "XX INCR on a missing member -> nil"  ""  "$($K ZADD fp XX INCR 5 nope)"
+# GT/LT gate the RESULT against the old score.
+chk "GT INCR that would lower -> nil"     ""  "$($K ZADD fp GT INCR -1 m)"
+chk "GT INCR that raises"                 "8" "$($K ZADD fp GT INCR 5 m)"
+chk "LT INCR that would raise -> nil"     ""  "$($K ZADD fp LT INCR 1 m)"
+chk "LT INCR that lowers"                 "3" "$($K ZADD fp LT INCR -5 m)"
+# ...but on a missing member they add it, INCR or not.
+chk "GT INCR adds a missing member"       "5" "$($K ZADD fp GT INCR 5 fresh)"
+# An increment to NaN is refused, and the signed zero of the fix above survives
+# this path too.
+$K ZADD fn inf m >/dev/null
+chk "INCR to NaN is refused"              "1" \
+    "$($K ZADD fn INCR -inf m 2>&1 | grep -c 'not a number')"
+chk "INCR -0 on a new member -> -0"      "-0" "$($K ZADD fn2 GT INCR -0 fresh)"
+# A blocked write must not bring the key into existence.
+chk "XX on a missing key creates nothing" "0" "$($K ZADD nokey XX 5 m >/dev/null; $K EXISTS nokey)"
+chk "XX INCR likewise"                    "0" "$($K ZADD nokey2 XX INCR 5 m >/dev/null; $K EXISTS nokey2)"
+$K DEL fg fl fi fx fp fn fn2 nokey nokey2 >/dev/null 2>&1
+
 # ---- signed zero ------------------------------------------------------------
 # Every expectation here was measured against redis 7.0.15, not reasoned about.
 # The rule is narrower than it looks: redis's d2string prints "-0" for a
