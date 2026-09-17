@@ -51,6 +51,8 @@ Default superuser is `supatype_admin` (set via `POSTGRES_USER`).
 | [pg_plan_filter](https://github.com/pgexperts/pg_plan_filter) | Rejects queries that exceed a cost threshold |
 | [wal2json](https://github.com/eulerto/wal2json) | Logical decoding output plugin (JSON CDC for realtime) |
 | [pg_guard](extensions/pg_guard/) | Role and extension privilege enforcement (bundled) |
+| [pg_keyspace](extensions/pg_keyspace/) | RESP (Redis/Valkey-compatible) keyspace in shared memory + PostgREST row cache (bundled, opt-in) |
+| [supatype_mask](extensions/supatype_mask/) | Per-column read masking and write rejection, enforced in the planner (bundled) |
 
 ### Auto-loaded libraries
 
@@ -58,6 +60,19 @@ Default superuser is `supatype_admin` (set via `POSTGRES_USER`).
 shared_preload_libraries = 'pg_stat_statements, pg_cron, pg_net, plan_filter, safeupdate'
 session_preload_libraries = 'pg_guard'
 ```
+
+`pg_keyspace` is bundled and creatable but deliberately **not** auto-loaded: it
+registers background workers and requests shared memory at postmaster start, so
+turning it on is a restart rather than a runtime toggle. To enable it, add it to
+`shared_preload_libraries` — **before** `supatype_mask` — and restart:
+
+```
+shared_preload_libraries = '..., pg_keyspace, supatype_mask'
+```
+
+See [config/pg_keyspace.conf](config/pg_keyspace.conf) for the settings, and
+[extensions/pg_keyspace/README.md](extensions/pg_keyspace/README.md) for what it
+serves.
 
 ---
 
@@ -177,6 +192,8 @@ config/
   extension-custom-scripts/     Per-extension post-install SQL hooks
 extensions/
   pg_guard/                     Bundled pg_guard C extension source
+  pg_keyspace/                  Bundled RESP keyspace + row cache (Rust/pgrx; built in-image)
+  supatype_mask/                Bundled column masking C extension source
 migrations/
   db/
     init-scripts/               Run once on first database initialisation
@@ -201,6 +218,8 @@ tests/
 | `docker-image-test.yml` | PRs, push to `develop` | Builds image, verifies extensions load, that migrations apply on both a fresh volume and an existing one, and that `doctor --fix` repairs a migration that never took effect |
 | `native-archives.yml` | Tag push | Builds native PG17 tarballs for all platforms, uploads to CDN and GitHub Release |
 | `test-pg-guard.yml` | PRs touching `extensions/pg_guard/**` | Runs pg_guard regression suite |
+| `test-pg-keyspace.yml` | All PRs, push to `main`/`develop` | Unit tests, RESP conformance against a real redis, macOS/kqueue build, and durability + fault injection inside PostgreSQL. No `paths:` filter — two of its checks are required on `develop`, and GitHub never queues a workflow whose path filter misses, so the filtering lives in a `changes` job every other job keys off |
+| `test-supatype-mask.yml` | PRs touching `extensions/supatype_mask/**` | Runs the masking regression suite |
 
 ---
 
