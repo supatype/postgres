@@ -3696,12 +3696,25 @@ impl Worker {
                 };
                 // Checked before the member is touched: an increment that
                 // would refuse must leave the set exactly as it found it.
-                let next = match aggr::incr_score(z.score(&args[3]).unwrap_or(0.0), by) {
-                    Some(v) => v,
-                    None => {
+                //
+                // A member that is not there yet takes the increment AS its
+                // score, rather than 0 + it. IEEE says `0.0 + -0.0` is `+0.0`,
+                // so adding to an implicit zero erases the sign that redis
+                // reports here: `ZINCRBY z -0 m` on a fresh member answers
+                // "-0" there. The stored score is normalised either way.
+                let next = match z.score(&args[3]) {
+                    Some(cur) => match aggr::incr_score(cur, by) {
+                        Some(v) => v,
+                        None => {
+                            resp::error(out, "ERR resulting score is not a number (NaN)");
+                            return;
+                        }
+                    },
+                    None if by.is_nan() => {
                         resp::error(out, "ERR resulting score is not a number (NaN)");
                         return;
                     }
+                    None => by,
                 };
                 z.add(&args[3], next);
                 if !save_zset(&store, &args[1], &z, exp, out) {

@@ -62,6 +62,39 @@ if redis-cli -p 6379 PING 2>/dev/null | grep -q PONG; then
 fi
 
 echo
+# ---- signed zero ------------------------------------------------------------
+# Every expectation here was measured against redis 7.0.15, not reasoned about.
+# The rule is narrower than it looks: redis's d2string prints "-0" for a
+# negative zero, but a STORED score never is one — so the sign shows up in the
+# ZINCRBY reply and nowhere else.
+#
+# Two halves, and either alone is a divergence:
+#   - format a computed negative zero as "-0"        (d2string)
+#   - normalise a stored one, so no READ surfaces it (ZSCORE and friends)
+# Teaching the formatter about the sign without normalising on store would fix
+# the ZINCRBY reply and break ZSCORE, ZRANGE WITHSCORES, ZMSCORE and ZPOPMIN.
+$K DEL nz0 nz1 nz2 nz3 nz4 >/dev/null 2>&1
+
+# A new member takes the increment AS its score: `0.0 + -0.0` is `+0.0` in
+# IEEE, so adding to an implicit zero would erase the sign.
+chk "ZINCRBY -0 on a new member -> -0"  "-0"  "$($K ZINCRBY nz0 -0 m)"
+chk "ZINCRBY -0.0 likewise"             "-0"  "$($K ZINCRBY nz1 -0.0 m)"
+# ...but the stored score is normalised, so every read says 0.
+chk "ZSCORE of it -> 0, not -0"          "0"  "$($K ZSCORE nz0 m)"
+chk "ZRANGE WITHSCORES -> 0"           "m,0"  "$($K ZRANGE nz0 0 -1 WITHSCORES | paste -sd,)"
+chk "ZMSCORE -> 0"                       "0"  "$($K ZMSCORE nz0 m)"
+chk "ZPOPMIN -> 0"                     "m,0"  "$($K ZPOPMIN nz0 | paste -sd,)"
+# A second increment adds to a stored +0, so the sign does not come back.
+chk "ZINCRBY -0 again -> 0"              "0"  "$($K ZINCRBY nz1 -0 m)"
+# ZADD stores directly, so it never reports the sign in the first place.
+chk "ZADD -0 then ZSCORE -> 0"           "0"  "$($K ZADD nz2 -0 m >/dev/null; $K ZSCORE nz2 m)"
+# And a zero reached by arithmetic is a positive zero, as it is in redis.
+chk "ZINCRBY back to zero -> 0"          "0"  "$($K ZADD nz3 1 m >/dev/null; $K ZINCRBY nz3 -1 m)"
+chk "from a negative score -> 0"         "0"  "$($K ZADD nz4 -1 m >/dev/null; $K ZINCRBY nz4 1 m)"
+# Ordinary scores are untouched by any of this.
+chk "a negative score still prints"   "-1.5"  "$($K ZADD nzf -1.5 m >/dev/null; $K ZSCORE nzf m)"
+$K DEL nz0 nz1 nz2 nz3 nz4 nzf >/dev/null 2>&1
+
 if command -v redis-benchmark >/dev/null 2>&1; then
   TLSFLAGS=""; echo "$K" | grep -q tls && TLSFLAGS="--tls --insecure"
   echo "# throughput (redis-benchmark, 100k ZADD across 100k small zsets, pipeline 16):"

@@ -528,6 +528,17 @@ pub fn fmt_score(s: f64) -> String {
     if s.is_infinite() {
         return if s > 0.0 { "inf".into() } else { "-inf".into() };
     }
+    // Signed zero, before the integral fast path below -- `-0.0 as i64` is 0 and
+    // loses the sign. Redis's d2string tests it as `1.0/value < 0` and prints
+    // "-0"; `is_sign_negative` is that test without the division.
+    //
+    // Only a COMPUTED score ever reaches here negative: a stored one is
+    // normalised on the way in (see `ZSet::add`), which is what makes
+    // `ZINCRBY z -0 m` answer "-0" while the `ZSCORE` after it answers "0",
+    // exactly as redis does.
+    if s == 0.0 {
+        return if s.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
     // (i64::MAX / 2) as f64, the bound in Valkey's double2ll.
     const LL_HALF: f64 = 4_611_686_018_427_387_903.0;
     if s == s.trunc() && s >= -LL_HALF && s <= LL_HALF {
@@ -758,6 +769,12 @@ impl ZSet {
 
     /// Insert or update. Returns (added, changed).
     pub fn add(&mut self, member: &[u8], score: f64) -> (bool, bool) {
+        // Negative zero is normalised on the way in, so no READ of a stored
+        // score can surface it. That is redis's observable behaviour: `ZADD z
+        // -0 m` then `ZSCORE z m` answers "0" there, as do ZRANGE WITHSCORES,
+        // ZMSCORE and ZPOPMIN. Without this, teaching fmt_score about signed
+        // zero would have fixed one reply and broken every one of those.
+        let score = if score == 0.0 { 0.0 } else { score };
         if let Some(e) = self.members.iter_mut().find(|(m, _)| m == member) {
             let changed = e.1 != score;
             e.1 = score;
@@ -1349,6 +1366,32 @@ mod tests {
         assert_eq!(zset_card(&blob), 2);
         assert_eq!(zset_score(&blob, b"b"), Some(2.0));
         assert_eq!(zset_rank(&blob, b"b"), Some(1));
+    }
+
+    /// Signed zero. Redis's d2string tests `1.0/value < 0` and prints "-0";
+    /// the integral fast path in fmt_score used to reach `-0.0 as i64`, which
+    /// is 0, and lost the sign.
+    #[test]
+    fn fmt_score_keeps_negative_zero() {
+        assert_eq!(fmt_score(0.0), "0");
+        assert_eq!(fmt_score(-0.0), "-0");
+        assert_eq!(fmt_score(0.0 * -1.0), "-0");
+        // and does not invent one
+        assert_eq!(fmt_score(-1.0 + 1.0), "0");
+    }
+
+    /// A STORED score is normalised, so no read can surface a negative zero --
+    /// which is what redis does: ZADD z -0 m then ZSCORE z m answers "0".
+    #[test]
+    fn stored_score_normalises_negative_zero() {
+        let mut z = ZSet::new();
+        z.add(b"m", -0.0);
+        assert_eq!(fmt_score(z.score(b"m").unwrap()), "0");
+        z.add(b"m", -0.0 * 1.0);
+        assert_eq!(fmt_score(z.score(b"m").unwrap()), "0");
+        // an ordinary negative score is untouched
+        z.add(b"n", -1.5);
+        assert_eq!(fmt_score(z.score(b"n").unwrap()), "-1.5");
     }
 
     #[test]
