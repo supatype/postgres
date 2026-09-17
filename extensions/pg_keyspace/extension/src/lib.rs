@@ -3637,15 +3637,42 @@ pub extern "C" fn pg_keyspace_relay_main(_arg: pg_sys::Datum) {
     // NUMPAT on its own instance read 0 -- it was never subscribed when anything
     // was published.
     let mut sock: Option<std::net::TcpStream> = None;
+    let mut last_drop_log: Option<std::time::Instant> = None;
+    let mut installed = false;
+    let mut warned_dblink = false;
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
-    while !BackgroundWorker::sigterm_received() {
+    // `stopping` rather than `while !sigterm_received()`, because
+    // BackgroundWorker::sigterm_received is a SWAP, not a read: it clears the
+    // flag and hands you what was there. BackgroundWorker::wait_latch calls it
+    // internally to produce its own return value, so a loop that waits and then
+    // re-tests the flag tests a flag the wait already consumed. This worker did
+    // exactly that and became unkillable -- SIGTERM arrived, wait_latch ate it,
+    // the loop saw false, and `pg_ctl stop` hung until the postmaster gave up
+    // and took the whole cluster down the hard way. Every wait's return value is
+    // now the answer, and the flag is read in exactly one place per pass.
+    let mut stopping = false;
+    while !stopping {
+        // The fan-out function is installed here rather than before the loop
+        // because this worker starts with the postmaster: on a cluster where
+        // pg_keyspace is preloaded but CREATE EXTENSION has not run yet, there
+        // is no supacache schema to create it in. Doing it eagerly made a
+        // first start fatal -- CREATE FUNCTION raised, the ERROR longjmped out
+        // of SPI, and the worker died (#130) before the schema it was waiting
+        // for could appear.
+        if !installed {
+            installed = relay_install_fanout(&dbname, &mut warned_dblink);
+            if !installed {
+                stopping = !BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
+                continue;
+            }
+        }
         if sock.is_none() {
             sock = relay_connect(&patterns);
             if sock.is_none() {
                 // Nothing to subscribe to yet (the worker may be up before the
                 // RESP port is). Back off rather than spin.
-                BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
+                stopping = !BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
                 continue;
             }
             buf.clear();
@@ -3656,8 +3683,21 @@ pub extern "C" fn pg_keyspace_relay_main(_arg: pg_sys::Datum) {
         // losing the subscription is expected -- exceeding the output-buffer
         // limit is how a relay that cannot keep up is shed -- so it reconnects.
         if !relay_read_once(sock.as_mut().unwrap(), &mut buf, &mut relayed, &mut failed) {
-            log!("pg_keyspace relay: subscription dropped, reconnecting");
+            // Logged at most once a minute. An earlier version logged every
+            // drop, and a relay that reconnected in a loop wrote thousands of
+            // lines a second into the server log -- the defect made worse by
+            // its own reporting.
+            if last_drop_log.is_none_or(|t: std::time::Instant| t.elapsed() >= Duration::from_secs(60)) {
+                log!("pg_keyspace relay: subscription dropped, reconnecting");
+                last_drop_log = Some(std::time::Instant::now());
+            }
             sock = None;
+            stopping = !BackgroundWorker::wait_latch(Some(Duration::from_millis(200)));
+        } else {
+            // No wait on this path: relay_read_once has its own 500ms socket
+            // timeout, so the loop already paces itself and only the flag needs
+            // reading.
+            stopping = BackgroundWorker::sigterm_received();
         }
         if last_report.elapsed() >= Duration::from_secs(60) {
             log!("pg_keyspace relay: {relayed} message(s) forwarded, {failed} peer call(s) failed");
@@ -3691,6 +3731,90 @@ fn relay_connect(patterns: &[String]) -> Option<std::net::TcpStream> {
     Some(sock)
 }
 
+/// One RESP *reply* frame, or what is missing.
+///
+/// `resp::parse` is the COMMAND parser: an array whose every element is a bulk
+/// string, because that is all a client may send. A reply is not that. The
+/// `psubscribe` confirmation is `*3 $10 psubscribe $7 inval:* :1` -- its third
+/// element is an integer -- so parsing replies with the command parser failed
+/// on the very first frame the relay ever received, and the relay read its own
+/// subscription confirmation as a broken connection and reconnected, forever.
+enum RelayFrame {
+    /// Not all here yet; read more and retry.
+    Need,
+    /// Not RESP at all: drop the connection.
+    Bad,
+    /// A whole frame. `args` is its bulk strings, flattened; integers and
+    /// simple strings contribute nothing, which is exactly what the relay
+    /// wants -- the only frame it acts on is `pmessage`, four bulk strings.
+    Done { consumed: usize, args: Vec<Vec<u8>> },
+}
+
+/// Largest bulk string the relay will accept from its own server. The RESP
+/// server's own limit is what actually bounds a published payload; this only
+/// stops a corrupted length header turning into an allocation.
+const RELAY_MAX_BULK: i64 = 512 * 1024 * 1024;
+
+fn relay_frame(buf: &[u8], depth: u8) -> RelayFrame {
+    // Replies nest (an array of arrays), but not deeply, and recursion driven
+    // by attacker-chosen length headers is a stack overflow waiting to happen.
+    if depth > 4 {
+        return RelayFrame::Bad;
+    }
+    if buf.is_empty() {
+        return RelayFrame::Need;
+    }
+    let Some(eol) = buf.windows(2).position(|w| w == b"\r\n") else {
+        return RelayFrame::Need;
+    };
+    let head = &buf[1..eol];
+    let after = eol + 2;
+    match buf[0] {
+        // Array, and RESP3's push frame, which is an array in all but the byte.
+        b'*' | b'>' => {
+            let Ok(n) = std::str::from_utf8(head).unwrap_or("x").parse::<i64>() else {
+                return RelayFrame::Bad;
+            };
+            let mut pos = after;
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..n.max(0) {
+                match relay_frame(&buf[pos..], depth + 1) {
+                    RelayFrame::Need => return RelayFrame::Need,
+                    RelayFrame::Bad => return RelayFrame::Bad,
+                    RelayFrame::Done { consumed, mut args } => {
+                        pos += consumed;
+                        out.append(&mut args);
+                    }
+                }
+            }
+            RelayFrame::Done { consumed: pos, args: out }
+        }
+        b'$' | b'=' => {
+            let Ok(len) = std::str::from_utf8(head).unwrap_or("x").parse::<i64>() else {
+                return RelayFrame::Bad;
+            };
+            if len < 0 {
+                // A null bulk string: a whole frame carrying no value.
+                return RelayFrame::Done { consumed: after, args: Vec::new() };
+            }
+            if len > RELAY_MAX_BULK {
+                return RelayFrame::Bad;
+            }
+            let end = after + len as usize;
+            if end + 2 > buf.len() {
+                return RelayFrame::Need;
+            }
+            RelayFrame::Done { consumed: end + 2, args: vec![buf[after..end].to_vec()] }
+        }
+        // Simple string, error, integer, double, boolean, big number, null.
+        // Whole frames that carry nothing the relay forwards.
+        b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => {
+            RelayFrame::Done { consumed: after, args: Vec::new() }
+        }
+        _ => RelayFrame::Bad,
+    }
+}
+
 /// One read from the subscription, then every complete frame it completed.
 ///
 /// Returns false when the connection is gone and should be rebuilt. A read
@@ -3707,35 +3831,129 @@ fn relay_read_once(
     match sock.read(&mut chunk) {
         Ok(0) => return false, // peer closed
         Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        // Interrupted belongs with the timeout, not with the errors: Postgres
+        // sets this worker's latch (SIGUSR1) routinely and read() returns EINTR,
+        // which std does not retry. Treating it as a disconnect span the relay
+        // through thousands of connect/PSUBSCRIBE/drop cycles a second, so it
+        // was never subscribed when anything was published.
         Err(e)
             if matches!(
                 e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
             ) =>
         {
             return true // idle; keep the subscription
         }
         Err(_) => return false,
     }
-    let mut args: Vec<(usize, usize)> = Vec::new();
     loop {
-        match resp::parse(buf, &mut args, 512 * 1024 * 1024) {
-            resp::Parse::Complete { consumed } => {
+        match relay_frame(buf, 0) {
+            RelayFrame::Done { consumed, args } => {
                 // pmessage | pattern | channel | payload
-                if args.len() == 4 && &buf[args[0].0..args[0].1] == b"pmessage" {
-                    let channel = buf[args[2].0..args[2].1].to_vec();
-                    let payload = buf[args[3].0..args[3].1].to_vec();
-                    match relay_to_peers(&channel, &payload) {
+                if args.len() == 4 && args[0] == b"pmessage" {
+                    match relay_to_peers(&args[2], &args[3]) {
                         Ok(n) => *relayed += n,
                         Err(()) => *failed += 1,
                     }
                 }
                 buf.drain(..consumed);
             }
-            resp::Parse::Incomplete => return true,
-            resp::Parse::Error => return false,
+            RelayFrame::Need => return true,
+            RelayFrame::Bad => return false,
         }
     }
+}
+
+/// Install the fan-out function the relay calls. Returns false until the
+/// database is ready for it, and never raises.
+///
+/// A plpgsql loop with a per-peer `EXCEPTION` block rather than one SQL
+/// statement joining `supacache.peer` to `dblink`. A refused connection, a
+/// peer without `supacache.publish_relayed`, a wrong password: every one of
+/// those is a Postgres ERROR, and an ERROR inside SPI longjmps out, aborts the
+/// transaction and takes this worker with it (#130) -- so one unreachable peer
+/// would put the relay in the five-second relaunch loop, and one dead peer in
+/// a set of five would stop the other four being told anything. Catching per
+/// peer makes a dead peer cost that peer's messages and nothing else, which is
+/// the at-most-once contract already documented for pub/sub.
+///
+/// The unreachable-peer warning is rate-limited to one a minute, in a session
+/// GUC under a prefix of its own -- the relay holds one long-lived session, so
+/// a session setting is exactly the right lifetime. Warning per message meant a
+/// dead peer plus a busy channel filled the server log with the same line, which
+/// is the failure reporting on itself rather than reporting the failure.
+///
+/// The schema is CHECKED rather than the failure caught, for the same reason
+/// as the replication slot above: CREATE FUNCTION in a schema that does not
+/// exist is that same fatal ERROR, and this worker starts with the postmaster,
+/// so on a cluster where the library is preloaded but CREATE EXTENSION has not
+/// run yet the schema legitimately is not there.
+fn relay_install_fanout(dbname: &str, warned_dblink: &mut bool) -> bool {
+    use std::panic::AssertUnwindSafe;
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        let ready = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'supacache')",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        if !ready {
+            return false;
+        }
+        // dblink is the transport, and it is not a dependency this extension
+        // declares: relaying is opt-in, so requiring it of every install would
+        // tax the deployments that never relay. Report its absence by name --
+        // without this the operator sees a relay that subscribes, forwards
+        // nothing, and says nothing about why. It is a warning, not a block:
+        // CREATE EXTENSION dblink afterwards needs no restart, because the
+        // function body resolves dblink per call.
+        if !*warned_dblink
+            && !Spi::get_one::<bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'dblink')",
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+        {
+            log!(
+                "pg_keyspace relay: pg_keyspace.relay_channels is set but the dblink extension \
+                 is not installed in database {dbname}, so nothing can be forwarded. \
+                 Run: CREATE EXTENSION dblink"
+            );
+            *warned_dblink = true;
+        }
+        Spi::run(
+            "CREATE OR REPLACE FUNCTION supacache.relay_fanout(ch text, payload bytea) \
+             RETURNS bigint LANGUAGE plpgsql AS $ks_relay$ \
+             DECLARE p record; total bigint := 0; n bigint; \
+             BEGIN \
+               BEGIN \
+                 FOR p IN SELECT conninfo FROM supacache.peer WHERE enabled LOOP \
+                   BEGIN \
+                     SELECT t.n INTO n FROM dblink(p.conninfo || ' connect_timeout=2', \
+                       format('SELECT supacache.publish_relayed(%L, decode(%L, ''hex''))', \
+                              ch, encode(payload, 'hex'))) AS t(n bigint); \
+                     total := total + coalesce(n, 0); \
+                   EXCEPTION WHEN OTHERS THEN \
+                     IF coalesce(current_setting('ks_relay.warned_at', true), '0')::bigint \
+                          < extract(epoch from clock_timestamp())::bigint - 60 THEN \
+                       RAISE WARNING 'pg_keyspace relay: peer unreachable: % (%)', \
+                         SQLERRM, SQLSTATE; \
+                       PERFORM set_config('ks_relay.warned_at', \
+                         extract(epoch from clock_timestamp())::bigint::text, false); \
+                     END IF; \
+                   END; \
+                 END LOOP; \
+               EXCEPTION WHEN OTHERS THEN \
+                 RAISE WARNING 'pg_keyspace relay: fan-out failed: % (%)', SQLERRM, SQLSTATE; \
+               END; \
+               RETURN total; \
+             END $ks_relay$",
+        )
+        .is_ok()
+    }))
 }
 
 /// Call `supacache.publish_relayed()` on every enabled peer, over dblink.
@@ -3749,20 +3967,27 @@ fn relay_read_once(
 /// `connect_timeout` bounds how long a dead peer can hold this worker, and the
 /// channel is passed through already tenant-scoped: `publish_relayed` applies
 /// no scope of its own and never relays onward, so nothing can loop.
+///
+/// Parameters, not an interpolated statement: a channel name is client-supplied
+/// (`PUBLISH <anything>`), so building the SQL by hand would have been an
+/// injection into a superuser-owned worker's session.
 fn relay_to_peers(channel: &[u8], payload: &[u8]) -> Result<u64, ()> {
-    let ch = String::from_utf8_lossy(channel).replace('\'', "''");
-    let hex = payload.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let sql = format!(
-        "SELECT sum(t.n)::bigint FROM supacache.peer p, \
-         LATERAL dblink(p.conninfo || ' connect_timeout=2', \
-           'SELECT supacache.publish_relayed(''{ch}'', ''\\x{hex}''::bytea)') AS t(n bigint) \
-         WHERE p.enabled"
-    );
-    match Spi::get_one::<i64>(&sql) {
-        Ok(Some(n)) => Ok(n.max(0) as u64),
-        Ok(None) => Ok(0), // no enabled peers
-        Err(_) => Err(()),
-    }
+    use std::panic::AssertUnwindSafe;
+    let ch = String::from_utf8_lossy(channel).into_owned();
+    let payload = payload.to_vec();
+    BackgroundWorker::transaction(AssertUnwindSafe(move || {
+        match Spi::get_one_with_args::<i64>(
+            "SELECT supacache.relay_fanout($1, $2)",
+            vec![
+                (PgBuiltInOids::TEXTOID.oid(), ch.into_datum()),
+                (PgBuiltInOids::BYTEAOID.oid(), payload.into_datum()),
+            ],
+        ) {
+            Ok(Some(n)) => Ok(n.max(0) as u64),
+            Ok(None) => Ok(0), // no enabled peers
+            Err(_) => Err(()),
+        }
+    }))
 }
 
 /// The expiry worker: periodically DROP TTL partitions whose whole

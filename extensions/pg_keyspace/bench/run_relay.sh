@@ -44,10 +44,18 @@ start() { # dir pgport resp relay_channels
     echo "pg_keyspace.keys = 10000"
     [ -n "$4" ] && echo "pg_keyspace.relay_channels = '$4'"; } >> $1/postgresql.conf
   su postgres -c "$PGBIN/pg_ctl -D $1 -l $1/log -o '-p $2 -k /tmp' -w start" >/dev/null 2>&1
-  for i in $(seq 1 40); do $PGBIN/psql -h /tmp -p $2 -U postgres -d postgres -tAc "SELECT 1" 2>/dev/null | grep -q 1 && break; sleep 1; done
+  for i in $(seq 1 40); do $PGBIN/psql -h /tmp -p $2 -U postgres -d postgres -tAc "SELECT 1" 2>/dev/null | grep -q 1 && return; sleep 1; done
+  # Abort rather than run the suite against an instance that is not there. A
+  # stale postmaster holding the port makes CREATE EXTENSION fail silently, and
+  # every later assertion then fails for a reason that has nothing to do with
+  # the relay -- which has cost more debugging here than any real defect.
+  echo "INSTANCE AT PORT $2 DID NOT START -- refusing to run the suite"; tail -15 $1/log; exit 1
 }
 restart() {
-  su postgres -c "$PGBIN/pg_ctl -D $1 -m fast -w restart -o '-p $2 -k /tmp'" >/dev/null 2>&1
+  # -l, or the restarted postmaster writes nowhere and every relay log line
+  # after the first start is lost -- which is what made this harness's one
+  # failing assertion so hard to read.
+  su postgres -c "$PGBIN/pg_ctl -D $1 -l $1/log -m fast -w restart -o '-p $2 -k /tmp'" >/dev/null 2>&1
   for i in $(seq 1 40); do $PGBIN/psql -h /tmp -p $2 -U postgres -d postgres -tAc "SELECT 1" 2>/dev/null | grep -q 1 && break; sleep 1; done
 }
 waitresp() { for i in $(seq 1 30); do redis-cli -p $1 PING 2>/dev/null | grep -q PONG && return; sleep 1; done; }
@@ -63,7 +71,12 @@ chk "instance A serves RESP" "PONG" "$(redis-cli -p $ARESP PING 2>&1)"
 chk "instance B serves RESP" "PONG" "$(redis-cli -p $BRESP PING 2>&1)"
 chk "they are separate postmasters" "1" \
     "$([ "$(head -1 $ADATA/postmaster.pid)" != "$(head -1 $BDATA/postmaster.pid)" ] && echo 1 || echo 0)"
-chk "A started its relay worker" "1" "$(grep -c 'relay: forwarding' $ADATA/log)"
+# "at least one", not "exactly one": the log now survives the restart above, so
+# A's log carries one startup line per postmaster start.
+chk "A started its relay worker" "1" \
+    "$([ "$(grep -c 'relay: forwarding' $ADATA/log)" -ge 1 ] && echo 1 || echo 0)"
+chk "A's relay is subscribed, not reconnecting in a loop" "1" \
+    "$([ "$(grep -c 'relay: subscribed to' $ADATA/log)" -le 2 ] && echo 1 || echo 0)"
 chk "B started none (relay_channels empty)" "0" "$(grep -c 'relay: forwarding' $BDATA/log)"
 
 echo ""
@@ -115,6 +128,14 @@ chk "and answered promptly (<5s)" "1" "$([ $((t1-t0)) -lt 5 ] && echo 1 || echo 
 sleep 4
 chk "A's relay worker is still alive" "1" \
     "$(ps -eo args | grep -c 'pg_keyspace: cross-instance rela[y]')"
+# Reported, and reported ONCE: the warning is rate-limited, so a permanently
+# dead peer on a busy channel does not fill the log with one line per message.
+redis-cli -p $ARESP PUBLISH "inval:users" dead-peer-again >/dev/null 2>&1
+redis-cli -p $ARESP PUBLISH "inval:users" dead-peer-again2 >/dev/null 2>&1
+sleep 2
+nwarn=$(grep -c 'peer unreachable' $ADATA/log)
+chk "the dead peer is reported, and only once a minute" "1" \
+    "$([ "$nwarn" -ge 1 ] && [ "$nwarn" -le 2 ] && echo 1 || echo 0)"
 
 echo ""
 echo "########## E. at-most-once: a message sent while B is down is lost ##########"

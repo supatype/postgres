@@ -1242,6 +1242,55 @@ rather than believed. A subscriber authenticated as `acme` that subscribed to
 RESP `PUBLISH` — asserted end to end by `bench/run_sql_publish.sh`.
 
 
+#### Cross-instance pub/sub
+
+A `PUBLISH` reaches every subscriber on **this** instance. It does not reach
+another instance unless you say so, and this is opt-in per channel pattern:
+
+```conf
+pg_keyspace.relay_channels = 'inval:*'   # SIGHUP; empty (the default) = off
+```
+
+```sql
+INSERT INTO supacache.peer(name, conninfo)
+VALUES ('eu-west', 'host=db2.internal port=5432 user=relay dbname=postgres');
+```
+
+With at least one pattern set, the extension runs one extra background worker
+that subscribes to those patterns on its own RESP port and calls
+`supacache.publish_relayed()` on every enabled row of `supacache.peer`, over
+**dblink** — so authentication, TLS and `pg_hba` are Postgres's, not something
+this extension invented. `CREATE EXTENSION dblink` is required in the relaying
+database; a missing one is reported by name in the server log.
+
+The worker is a RESP *client*, not a participant in the shared-memory pub/sub
+bus. Giving it its own inbox would have meant sizing the bus for `nworkers+1`
+— quadratic, and paid by every deployment whether it relays or not. As a
+subscriber it needs no shared memory at all, and relaying off costs nothing:
+with no patterns set, the worker is never registered.
+
+What the relay is, and is not:
+
+| | |
+|---|---|
+| delivery | **at-most-once**, like valkey. A message published while a peer is unreachable is lost |
+| catch-up | none. There is no replay and no backlog; the link recovers for what comes *next* |
+| loops | structurally impossible: `publish_relayed()` delivers locally and never relays onward, so `A → B → A` cannot form |
+| scope | only the patterns in `relay_channels`; everything else stays local |
+| tenancy | the channel crosses already tenant-scoped, and `pg_keyspace.relay_user` bounds what the relay may forward — a tenant-scoped credential relays only that tenant's channels |
+| a dead peer | costs that peer's messages only. It cannot wedge the RESP port (the fan-out runs in the relay's own process), cannot kill the worker (each peer is tried inside its own exception block), and cannot flood the log (the warning is rate-limited to one a minute) |
+| turning it on | a restart, because a worker has to be registered. Changing the patterns afterwards is a `SIGHUP` |
+
+This is a **cache** that speaks Valkey, not a replica: the relay propagates
+invalidations between instances, it does not make them one keyspace. A client
+that cannot miss an invalidation should ping its invalidation channel and flush
+on breakage — which is what it would do against a real valkey, and is unchanged
+by whether a relay exists.
+
+`bench/run_relay.sh` asserts all of the above against two independent
+postmasters, including that nothing is replayed to a peer that was down.
+
+
 #### Changing the worker count
 
 `pg_keyspace.workers` is a restart, and the restart reshuffles which worker owns
@@ -1464,6 +1513,10 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.tenant_arena_pct` | 0 | cap one tenant at this % of a partition's entries (0 = off); over-budget tenants are evicted from first |
 | `pg_keyspace.tenant_ops_per_sec` | 0 | commands per second one tenant may issue (0 = no limit) |
 | `pg_keyspace.tenant` | *(unset)* | tenant a SQL backend publishes as, scoping `supacache.publish()` to `{tenant}:`; unset leaves it superuser-only |
+| `pg_keyspace.pubsub_buffer_mb` | 32 | per-connection output buffer a subscriber may fall behind by before it is disconnected (0 = unbounded) |
+| `pg_keyspace.relay_channels` | *(empty)* | channel globs relayed to the peers in `supacache.peer`; empty means cross-instance pub/sub is off and no relay worker runs |
+| `pg_keyspace.relay_user` | *(empty)* | RESP username the relay subscribes with; bounds what it may forward |
+| `pg_keyspace.relay_secret` | *(empty)* | secret for `pg_keyspace.relay_user` (superuser-visible only) |
 
 ### Sizing
 
@@ -1884,19 +1937,22 @@ Scoping for this version — the extension works; these are the edges to know:
   multi-worker deployments are unaffected. Online resharding (live slot
   migration, `ASKING`/`MIGRATE`) is not supported; changing `pg_keyspace.workers`
   is a restart.
-- **Pub/sub does not cross instances.** Within one instance it *does* cross
-  processes: the routing table and the per-worker inboxes live in Postgres
-  shared memory, so a `SUBSCRIBE` on one worker and a `PUBLISH` on another meet
-  even though the workers are separate processes — asserted in CI by section Q
-  of `bench/run_durability_pg.sh`, which publishes on worker 0 and receives on
-  worker N-1 — and a SQL backend reaches the same subscribers through
-  `supacache.publish()`. What does not cross is the boundary between
-  *instances*: a subscriber connected to one Postgres never sees a `PUBLISH`
-  issued against another, which matters for a primary and its replicas, after a
-  failover, and behind a pooler that spreads clients across nodes. The failure
-  is silent — the subscriber simply never receives a message. `LISTEN`/`NOTIFY`
-  does not close that gap either: it cannot even be registered on a standby, so
-  it does not reach the failover case.
+- **Pub/sub crosses instances only where you opt in, and at most once.** Within
+  one instance it crosses processes by itself: the routing table and the
+  per-worker inboxes live in Postgres shared memory, so a `SUBSCRIBE` on one
+  worker and a `PUBLISH` on another meet even though the workers are separate
+  processes — asserted in CI by section Q of `bench/run_durability_pg.sh`, which
+  publishes on worker 0 and receives on worker N-1 — and a SQL backend reaches
+  the same subscribers through `supacache.publish()`. Across *instances*,
+  `pg_keyspace.relay_channels` plus rows in `supacache.peer` forward the
+  patterns you name to the peers you name (see
+  [Cross-instance pub/sub](#cross-instance-pubsub)). What that is not is a
+  replicated keyspace: delivery is at-most-once and there is no catch-up, so a
+  message published while a peer is unreachable is lost, exactly as in valkey.
+  Channels outside `relay_channels` never leave the instance, and the failure
+  there is silent — the subscriber simply never receives a message.
+  `LISTEN`/`NOTIFY` is no substitute: it cannot even be registered on a standby,
+  so it does not reach the failover case.
 - **A standby serves no RESP.** Every pg_keyspace background worker uses SPI, so
   Postgres registers it with `BgWorkerStartTime::RecoveryFinished` and does not
   launch it until recovery ends — which on a streaming standby never happens.
