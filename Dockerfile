@@ -130,6 +130,7 @@ COPY config/pg_ident.conf /etc/postgresql/pg_ident.conf
 COPY config/pg_guard.conf /etc/postgresql-custom/pg_guard.conf
 COPY config/supatype_mask.conf /etc/postgresql-custom/supatype_mask.conf
 COPY config/pg_keyspace.conf /etc/postgresql-custom/pg_keyspace.conf
+COPY config/pg_cron.conf /etc/postgresql-custom/pg_cron.conf
 COPY config/extension-custom-scripts/ /etc/postgresql-custom/extension-custom-scripts/
 
 # Bootstrap: the stock postgres entrypoint only runs *.sh / *.sql in this
