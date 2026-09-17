@@ -38,6 +38,45 @@ export SUPATYPE_MIGRATION_ROLE
 supatype_note() { echo "supatype-entrypoint: $*"; }
 supatype_warn() { echo "supatype-entrypoint: $*" >&2; }
 
+readonly SUPATYPE_CRON_CONF=/etc/postgresql-custom/pg_cron.conf
+
+# Point pg_cron at this stack's database.
+#
+# pg_cron runs its background worker against exactly one database per cluster, named by
+# `cron.database_name`, and it refuses `CREATE EXTENSION pg_cron` in any other:
+#
+#   ERROR: can only create extension in database postgres
+#   HINT:  Add cron.database_name = 'supatype' in postgresql.conf to use the current database.
+#
+# That name was hardcoded to 'postgres' in the image config while a stack's database is whatever
+# POSTGRES_DB says, so on every deployment that names it anything else the extension could be
+# created nowhere at all. Anything scheduled recorded its intent and nothing ever ran it, and the
+# only hint was a NOTICE during schema push saying the scheduler was absent.
+#
+# It happens here rather than in a bootstrap script because the setting is PGC_POSTMASTER. Those
+# scripts run against a temporary server that has already read its configuration, so the extension
+# would still be refused on the first boot, which is the only boot that runs them.
+supatype_write_cron_database() {
+	local db="${POSTGRES_DB:-postgres}"
+	# A single quote in a database name would end the literal and leave a file Postgres refuses to
+	# start on. Doubling is the escape it expects.
+	local line="cron.database_name = '${db//\'/\'\'}'"
+
+	# The second pass after the gosu re-exec below runs as `postgres`, which cannot write here and
+	# has nothing to do: the first pass already wrote it.
+	if [ -f "$SUPATYPE_CRON_CONF" ] && grep -qxF "$line" "$SUPATYPE_CRON_CONF"; then
+		return 0
+	fi
+
+	if ! printf '%s\n%s\n' \
+		"# Written at container start. The value follows POSTGRES_DB; edits do not survive." \
+		"$line" > "$SUPATYPE_CRON_CONF" 2>/dev/null
+	then
+		supatype_warn "could not write $SUPATYPE_CRON_CONF; pg_cron keeps whatever database it is"
+		supatype_warn "already pointed at, and scheduled jobs in '$db' will not run."
+	fi
+}
+
 # Named explicitly, by the same rule the runner uses. Without -d, psql would
 # connect to a database named after the role: identical in the default image
 # (POSTGRES_DB defaults to POSTGRES_USER) and wrong the moment an operator sets
@@ -118,6 +157,10 @@ fi
 if [ "${1-}" = 'postgres' ] && ! _pg_want_help "$@"; then
 	docker_setup_env
 	docker_create_db_directories
+
+	# Before anything starts a server, including the temporary one the migration path below uses:
+	# cron.database_name is read at postmaster start and never re-read.
+	supatype_write_cron_database
 
 	if [ "$(id -u)" = '0' ]; then
 		# Same re-exec as the stock entrypoint: the temporary server and psql

@@ -110,6 +110,19 @@ fi
 psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
     -c "ALTER USER authenticator WITH PASSWORD '$_auth_pw'"
 
+# pg_cron, in this database.
+#
+# The extension is preloaded by the image and was created by nobody, so the cluster had a
+# scheduler it could never use. `cron.database_name` is written from POSTGRES_DB by the entrypoint
+# before any server starts, so by the time this runs the current database is the one pg_cron will
+# accept.
+#
+# Non-fatal: a cluster with pg_cron pointed elsewhere is a degraded stack, not a broken one, and
+# anything that schedules work says so when it finds no scheduler.
+psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
+    -c 'CREATE EXTENSION IF NOT EXISTS pg_cron' \
+  || echo "$0: WARNING: could not create pg_cron in $PGDATABASE; scheduled jobs will not run on a timer." >&2
+
 # run any post migration script to update role passwords
 postinit="/etc/postgresql.schema.sql"
 if [ -e "$postinit" ]; then
