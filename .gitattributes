@@ -10,6 +10,10 @@
 # Same reasoning for anything else consumed by a Unix tool or shipped into a
 # container, where a stray CR is either a syntax error or silent corruption.
 *.bash text eol=lf
+# Extensionless, so the *.sh rule above does not reach it, and it is copied into the image as an
+# executable. With CRLF the kernel looks for an interpreter called `/bin/sh\r` and the container
+# dies on first boot with `supatype: not found`, which names the script rather than the cause.
+scripts/supatype text eol=lf
 Dockerfile text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
