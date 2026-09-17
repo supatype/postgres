@@ -3631,16 +3631,34 @@ pub extern "C" fn pg_keyspace_relay_main(_arg: pg_sys::Datum) {
     let mut relayed: u64 = 0;
     let mut failed: u64 = 0;
     let mut last_report = std::time::Instant::now();
+    // The subscription lives across iterations. The first version rebuilt the
+    // connection every pass and treated a read timeout as a disconnect, so the
+    // relay held a subscription for a few milliseconds at a time and PUBSUB
+    // NUMPAT on its own instance read 0 -- it was never subscribed when anything
+    // was published.
+    let mut sock: Option<std::net::TcpStream> = None;
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
-    while BackgroundWorker::wait_latch(Some(Duration::from_millis(500))) {
-        // Reconnect each pass if the link is down. A dropped subscription is
-        // expected -- exceeding the output-buffer limit is exactly how a relay
-        // that cannot keep up is shed -- so it is a loop, not an error path.
-        let sock = match relay_connect(&patterns) {
-            Some(s) => s,
-            None => continue,
-        };
-        relay_pump(sock, &mut relayed, &mut failed);
+    while !BackgroundWorker::sigterm_received() {
+        if sock.is_none() {
+            sock = relay_connect(&patterns);
+            if sock.is_none() {
+                // Nothing to subscribe to yet (the worker may be up before the
+                // RESP port is). Back off rather than spin.
+                BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
+                continue;
+            }
+            buf.clear();
+            log!("pg_keyspace relay: subscribed to {} pattern(s)", patterns.len());
+        }
+        // One read, then whatever complete frames it completed. A timeout is the
+        // idle case and keeps the connection; only EOF or an error drops it, and
+        // losing the subscription is expected -- exceeding the output-buffer
+        // limit is how a relay that cannot keep up is shed -- so it reconnects.
+        if !relay_read_once(sock.as_mut().unwrap(), &mut buf, &mut relayed, &mut failed) {
+            log!("pg_keyspace relay: subscription dropped, reconnecting");
+            sock = None;
+        }
         if last_report.elapsed() >= Duration::from_secs(60) {
             log!("pg_keyspace relay: {relayed} message(s) forwarded, {failed} peer call(s) failed");
             last_report = std::time::Instant::now();
@@ -3673,41 +3691,49 @@ fn relay_connect(patterns: &[String]) -> Option<std::net::TcpStream> {
     Some(sock)
 }
 
-/// Read pmessage frames and forward each to every enabled peer.
-fn relay_pump(sock: std::net::TcpStream, relayed: &mut u64, failed: &mut u64) {
+/// One read from the subscription, then every complete frame it completed.
+///
+/// Returns false when the connection is gone and should be rebuilt. A read
+/// TIMEOUT is not that: it is the idle case, and returning on it was the bug
+/// that kept this relay unsubscribed.
+fn relay_read_once(
+    sock: &mut std::net::TcpStream,
+    buf: &mut Vec<u8>,
+    relayed: &mut u64,
+    failed: &mut u64,
+) -> bool {
     use std::io::Read;
-    let mut sock = sock;
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut chunk = [0u8; 16 * 1024];
+    match sock.read(&mut chunk) {
+        Ok(0) => return false, // peer closed
+        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return true // idle; keep the subscription
+        }
+        Err(_) => return false,
+    }
     let mut args: Vec<(usize, usize)> = Vec::new();
     loop {
-        if !BackgroundWorker::wait_latch(Some(Duration::from_millis(0))) {
-            return; // SIGTERM
-        }
-        match sock.read(&mut chunk) {
-            Ok(0) => return, // the server closed us: reconnect next pass
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return,
-            Err(_) => return,
-        }
-        loop {
-            match resp::parse(&buf, &mut args, 512 * 1024 * 1024) {
-                resp::Parse::Complete { consumed } => {
-                    // pmessage | pattern | channel | payload
-                    if args.len() == 4 && &buf[args[0].0..args[0].1] == b"pmessage" {
-                        let channel = buf[args[2].0..args[2].1].to_vec();
-                        let payload = buf[args[3].0..args[3].1].to_vec();
-                        match relay_to_peers(&channel, &payload) {
-                            Ok(n) => *relayed += n,
-                            Err(()) => *failed += 1,
-                        }
+        match resp::parse(buf, &mut args, 512 * 1024 * 1024) {
+            resp::Parse::Complete { consumed } => {
+                // pmessage | pattern | channel | payload
+                if args.len() == 4 && &buf[args[0].0..args[0].1] == b"pmessage" {
+                    let channel = buf[args[2].0..args[2].1].to_vec();
+                    let payload = buf[args[3].0..args[3].1].to_vec();
+                    match relay_to_peers(&channel, &payload) {
+                        Ok(n) => *relayed += n,
+                        Err(()) => *failed += 1,
                     }
-                    buf.drain(..consumed);
                 }
-                resp::Parse::Incomplete => break,
-                resp::Parse::Error => return,
+                buf.drain(..consumed);
             }
+            resp::Parse::Incomplete => return true,
+            resp::Parse::Error => return false,
         }
     }
 }
