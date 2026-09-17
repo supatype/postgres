@@ -5680,7 +5680,14 @@ impl Worker {
         if let Some(bus) = self.bus.clone() {
             receivers += bus.publish(self.worker_id, &channel, &msg, |p, c| glob_match(p, c)) as i64;
         }
-        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        // The publisher may have been one of the subscribers: RESP3 allows
+        // PUBLISH while subscribed, so a single message large enough to cross
+        // the output-buffer limit closes the very connection this reply is for.
+        // There is nobody left to tell, and unwrapping here crashed the worker.
+        let Some(c) = self.conns.get_mut(&fd) else {
+            return;
+        };
+        let out = &mut c.wbuf;
         resp::integer(out, receivers);
         self.flush(fd);
     }
@@ -5885,7 +5892,12 @@ impl Worker {
         }
         let msg = args[2].clone();
         let receivers = self.deliver_shard(&channel, &msg) as i64;
-        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        // As in handle_publish: the publisher may have been a subscriber this
+        // delivery just disconnected for exceeding its output-buffer limit.
+        let Some(c) = self.conns.get_mut(&fd) else {
+            return;
+        };
+        let out = &mut c.wbuf;
         resp::integer(out, receivers);
         self.flush(fd);
     }

@@ -195,6 +195,30 @@ PYEOF
   chk "and other clients are unaffected" "OK" "$($CLI SET after-slowsub v)"
   kill $slowpid 2>/dev/null
   rm -f /tmp/pgks_slowsub.py
+
+  # The publisher can BE the subscriber. RESP3 allows PUBLISH while subscribed,
+  # so one message large enough to cross the limit in a single delivery closes
+  # the very connection the reply was for. Replying into it crashed the worker:
+  #   thread 'slot-worker-0' panicked at src/server.rs: called `Option::unwrap()`
+  # which is a one-line remote abort, so it is asserted rather than reasoned about.
+  cat > /tmp/pgks_selfpub.py <<'PYEOF'
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.sendall(b"HELLO 3\r\nSUBSCRIBE selfch\r\n")
+time.sleep(0.5)
+payload = b"x" * (40 * 1024 * 1024)
+try:
+    s.sendall(b"*3\r\n$7\r\nPUBLISH\r\n$6\r\nselfch\r\n$" +
+              str(len(payload)).encode() + b"\r\n" + payload + b"\r\n")
+except Exception:
+    pass
+time.sleep(1)
+PYEOF
+  maxv=$($CLI CONFIG GET maxmemory >/dev/null 2>&1; echo ok)
+  python3 /tmp/pgks_selfpub.py "$RESP" >/dev/null 2>&1
+  chk "a subscriber publishing past its own limit does not crash the worker" "PONG" "$($CLI PING)"
+  chk "and the worker still serves other clients" "OK" "$($CLI SET after-selfpub v)"
+  rm -f /tmp/pgks_selfpub.py
 else
   echo "  SKIP  slow-subscriber limit (no python3)"
 fi
