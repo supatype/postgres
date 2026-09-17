@@ -10,6 +10,62 @@
 //! because every fd is drained to `EAGAIN` on each wake (reads, writes, accept,
 //! and the cross-worker wake fd).
 
+/// The error redis gives for a malformed integer argument, which is most of
+/// them. The commands that answer something else say so at their call site.
+const ERR_NOT_INT: &str = "ERR value is not an integer or out of range";
+
+/// Parse an integer argument strictly (#150) or refuse the command.
+///
+/// A macro rather than a function because the refusal is an early `return` from
+/// the caller. Swapping the parser alone was not enough and that is the whole
+/// trap in this change: nearly every one of these sites read
+/// `...parse().ok().unwrap_or(0)`, so a rejected argument became a silent
+/// DEFAULT rather than an error -- `LINDEX l +1` would have quietly answered
+/// with element 0 instead of refusing.
+macro_rules! int_arg {
+    ($out:expr, $arg:expr) => {
+        match resp::arg_int($arg) {
+            Some(v) => v,
+            None => {
+                resp::error($out, ERR_NOT_INT);
+                return;
+            }
+        }
+    };
+    // A command with its own error text for this argument.
+    ($out:expr, $arg:expr, $msg:expr) => {
+        match resp::arg_int($arg) {
+            Some(v) => v,
+            None => {
+                resp::error($out, $msg);
+                return;
+            }
+        }
+    };
+}
+
+/// `int_arg!` for an argument that must also be non-negative.
+macro_rules! uint_arg {
+    ($out:expr, $arg:expr) => {
+        match resp::arg_uint($arg) {
+            Some(v) => v,
+            None => {
+                resp::error($out, ERR_NOT_INT);
+                return;
+            }
+        }
+    };
+    ($out:expr, $arg:expr, $msg:expr) => {
+        match resp::arg_uint($arg) {
+            Some(v) => v,
+            None => {
+                resp::error($out, $msg);
+                return;
+            }
+        }
+    };
+}
+
 use crate::aggr;
 use crate::batcher::{Batcher, Tier};
 use crate::bitmap;
@@ -1743,37 +1799,47 @@ impl Worker {
                 let (mut only_if_absent, mut only_if_present, mut want_old) = (false, false, false);
                 let mut i = 3;
                 let mut bad_syntax = false;
+                // A MISSING argument after EX is a syntax error; one that is
+                // present but not an integer is "not an integer". redis
+                // distinguishes them and so must this, or `SET k v EX +1` tells
+                // the client its syntax is wrong when its number is.
+                let mut bad_int = false;
                 while i < nargs {
                     let mut opt = args[i].clone();
                     opt.make_ascii_uppercase();
                     // Pair options consume the next argument as a number.
-                    let mut pair = |factor: i64, absolute: bool| -> Option<i64> {
-                        let raw: i64 = args
-                            .get(i + 1)
-                            .and_then(|a| std::str::from_utf8(a).ok())
-                            .and_then(|t| t.parse().ok())?;
-                        Some(if absolute {
+                    // None = absent, Some(None) = present but malformed.
+                    let mut pair = |factor: i64, absolute: bool| -> Option<Option<i64>> {
+                        let a = args.get(i + 1)?;
+                        let Some(raw) = resp::arg_int(a) else {
+                            return Some(None);
+                        };
+                        Some(Some(if absolute {
                             // EXAT/PXAT are absolute deadlines; store TTL is relative.
                             (raw * factor - now_micros()).max(1)
                         } else {
                             raw * factor
-                        })
+                        }))
                     };
                     match opt.as_slice() {
                         b"EX" => match pair(1_000_000, false) {
-                            Some(v) => { ttl_micros = v; i += 2; }
+                            Some(Some(v)) => { ttl_micros = v; i += 2; }
+                            Some(None) => { bad_int = true; break; }
                             None => { bad_syntax = true; break; }
                         },
                         b"PX" => match pair(1_000, false) {
-                            Some(v) => { ttl_micros = v; i += 2; }
+                            Some(Some(v)) => { ttl_micros = v; i += 2; }
+                            Some(None) => { bad_int = true; break; }
                             None => { bad_syntax = true; break; }
                         },
                         b"EXAT" => match pair(1_000_000, true) {
-                            Some(v) => { ttl_micros = v; i += 2; }
+                            Some(Some(v)) => { ttl_micros = v; i += 2; }
+                            Some(None) => { bad_int = true; break; }
                             None => { bad_syntax = true; break; }
                         },
                         b"PXAT" => match pair(1_000, true) {
-                            Some(v) => { ttl_micros = v; i += 2; }
+                            Some(Some(v)) => { ttl_micros = v; i += 2; }
+                            Some(None) => { bad_int = true; break; }
                             None => { bad_syntax = true; break; }
                         },
                         b"KEEPTTL" => { keep_ttl = true; i += 1; }
@@ -1782,6 +1848,10 @@ impl Worker {
                         b"GET" => { want_old = true; i += 1; }
                         _ => { bad_syntax = true; break; }
                     }
+                }
+                if bad_int {
+                    resp::error(out, ERR_NOT_INT);
+                    return;
                 }
                 if bad_syntax || (only_if_absent && only_if_present) {
                     resp::error(out, "ERR syntax error");
@@ -1926,7 +1996,7 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'expire'");
                     return;
                 }
-                let n: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()) {
+                let n: i64 = match resp::arg_int(&args[2]) {
                     Some(v) => v,
                     None => {
                         resp::error(out, "ERR value is not an integer or out of range");
@@ -1969,6 +2039,11 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'scan'");
                     return;
                 }
+                // Deliberately NOT resp::arg_int (#150). Redis reads a SCAN
+                // cursor with strtoull, not string2ll, so `SCAN 00` and
+                // `SCAN +0` are both accepted there -- verified against redis
+                // 7.0.15. Tightening this to match the rest of the surface
+                // would be a new divergence, not a fix.
                 let cursor: u64 =
                     std::str::from_utf8(&args[1]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
                 let mut pattern: Option<&[u8]> = None;
@@ -1978,11 +2053,7 @@ impl Worker {
                     match args[i].to_ascii_uppercase().as_slice() {
                         b"MATCH" => pattern = Some(&args[i + 1]),
                         b"COUNT" => {
-                            if let Some(n) =
-                                std::str::from_utf8(&args[i + 1]).ok().and_then(|t| t.parse::<usize>().ok())
-                            {
-                                count = n.max(1);
-                            }
+                            count = uint_arg!(out, &args[i + 1]).max(1);
                         }
                         _ => {}
                     }
@@ -2053,7 +2124,7 @@ impl Worker {
                     return;
                 }
                 let mut by: i64 = if cmd == b"INCRBY" || cmd == b"DECRBY" {
-                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0)
+                    int_arg!(out, &args[2])
                 } else {
                     1
                 };
@@ -2142,7 +2213,7 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'setex'");
                     return;
                 }
-                let n: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()) {
+                let n: i64 = match resp::arg_int(&args[2]) {
                     Some(v) => v,
                     None => {
                         resp::error(out, "ERR value is not an integer or out of range");
@@ -2194,12 +2265,14 @@ impl Worker {
                 let mut new_exp: Option<i64> = None; // Some(0)=persist, Some(e)=set
                 if nargs >= 2 {
                     let opt = args.get(2).map(|a| a.to_ascii_uppercase());
-                    let n = || -> i64 {
-                        args.get(3)
-                            .and_then(|a| std::str::from_utf8(a).ok())
-                            .and_then(|t| t.parse().ok())
-                            .unwrap_or(0)
-                    };
+                    // `?`-free: a malformed TTL has to refuse the command,
+                    // and silently reading it as 0 set an immediate expiry.
+                    let raw_n = args.get(3).map(|a| resp::arg_int(a));
+                    if matches!(raw_n, Some(None)) {
+                        resp::error(out, ERR_NOT_INT);
+                        return;
+                    }
+                    let n = || -> i64 { raw_n.flatten().unwrap_or(0) };
                     match opt.as_deref() {
                         Some(b"EX") => new_exp = Some(now_micros() + n() * 1_000_000),
                         Some(b"PX") => new_exp = Some(now_micros() + n() * 1_000),
@@ -2266,8 +2339,8 @@ impl Worker {
                     Lookup::Miss => Vec::new(),
                 };
                 let (s, e) = (
-                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse::<i64>().ok()),
-                    std::str::from_utf8(&args[3]).ok().and_then(|t| t.parse::<i64>().ok()),
+                    resp::arg_int(&args[2]),
+                    resp::arg_int(&args[3]),
                 );
                 match (s, e) {
                     (Some(s), Some(e)) => resp::bulk(out, substr(&v, s, e)),
@@ -2282,8 +2355,16 @@ impl Worker {
                 if !check_string(&store, &args[1], out) {
                     return;
                 }
-                let off: usize = match std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()) {
-                    Some(v) => v,
+                // Two different refusals, as redis has: a malformed offset is
+                // "not an integer", a well-formed negative one is "out of
+                // range". Collapsing them would tell a client with a signed
+                // offset that its number was unparseable.
+                let off: usize = match resp::arg_int(&args[2]) {
+                    Some(v) if v >= 0 => v as usize,
+                    Some(_) => {
+                        resp::error(out, "ERR offset is out of range");
+                        return;
+                    }
                     None => {
                         resp::error(out, "ERR value is not an integer or out of range");
                         return;
@@ -3271,7 +3352,7 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'hincrby'");
                     return;
                 }
-                let by: i64 = match std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()) {
+                let by: i64 = match resp::arg_int(&args[3]) {
                     Some(n) => n,
                     None => {
                         resp::error(out, "ERR value is not an integer or out of range");
@@ -3284,7 +3365,7 @@ impl Worker {
                 };
                 let cur: i64 = match h.get(&args[2]) {
                     None => 0,
-                    Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
+                    Some(v) => match resp::arg_int(v) {
                         Some(n) => n,
                         None => {
                             resp::error(out, "ERR hash value is not an integer");
@@ -3335,7 +3416,7 @@ impl Worker {
                 }
                 // optional count argument (Redis 6.2+): returns an array
                 let count: Option<i64> = if nargs >= 3 {
-                    match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+                    match resp::arg_int(&args[2]) {
                         Some(n) if n >= 0 => Some(n),
                         _ => {
                             resp::error(out, "ERR value is out of range, must be positive");
@@ -3392,7 +3473,7 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'lindex'");
                     return;
                 }
-                let i: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let i: i64 = int_arg!(out, &args[2]);
                 let raw = match list_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
@@ -3416,8 +3497,8 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'lrange'");
                     return;
                 }
-                let start: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let stop: i64 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let start: i64 = int_arg!(out, &args[2]);
+                let stop: i64 = int_arg!(out, &args[3]);
                 let raw = match list_raw(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
@@ -3440,7 +3521,7 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'lset'");
                     return;
                 }
-                let i: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let i: i64 = int_arg!(out, &args[2]);
                 let (mut l, exp) = match load_list(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
@@ -3465,8 +3546,8 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'ltrim'");
                     return;
                 }
-                let start: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let stop: i64 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let start: i64 = int_arg!(out, &args[2]);
+                let stop: i64 = int_arg!(out, &args[3]);
                 let (mut l, exp) = match load_list(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
@@ -3654,8 +3735,8 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments");
                     return;
                 }
-                let start: i64 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let stop: i64 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let start: i64 = int_arg!(out, &args[2]);
+                let stop: i64 = int_arg!(out, &args[3]);
                 let withscores = args[4..].iter().any(|a| a.eq_ignore_ascii_case(b"WITHSCORES"));
                 let rev = cmd == b"ZREVRANGE"
                     || args[4..].iter().any(|a| a.eq_ignore_ascii_case(b"REV"));
@@ -3704,12 +3785,13 @@ impl Worker {
                 };
                 let withscores = args[4..].iter().any(|a| a.eq_ignore_ascii_case(b"WITHSCORES"));
                 // optional LIMIT offset count
-                let mut offset = 0usize;
+                // Signed: redis accepts `LIMIT -1 1` and answers with nothing.
+                let mut offset = 0i64;
                 let mut count: Option<usize> = None;
                 for w in 4..nargs {
                     if args[w].eq_ignore_ascii_case(b"LIMIT") && w + 2 < nargs {
-                        offset = std::str::from_utf8(&args[w + 1]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let c: i64 = std::str::from_utf8(&args[w + 2]).ok().and_then(|s| s.parse().ok()).unwrap_or(-1);
+                        offset = int_arg!(out, &args[w + 1]);
+                        let c: i64 = int_arg!(out, &args[w + 2]);
                         count = if c < 0 { None } else { Some(c as usize) };
                     }
                 }
@@ -3724,7 +3806,9 @@ impl Worker {
                 if rev {
                     items.reverse();
                 }
-                let items: Vec<_> = items.into_iter().skip(offset).take(count.unwrap_or(usize::MAX)).collect();
+                let items: Vec<_> = if offset < 0 { Vec::new() } else {
+                    items.into_iter().skip(offset as usize).take(count.unwrap_or(usize::MAX)).collect()
+                };
                 if withscores {
                     reply_scored(out, &items, resp3, resp3);
                 } else {
@@ -3811,7 +3895,7 @@ impl Worker {
                     return;
                 }
                 let count: i64 =
-                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                    int_arg!(out, &args[2]);
                 let withvals = nargs >= 4 && args[3].eq_ignore_ascii_case(b"WITHVALUES");
                 if h.is_empty() || count == 0 {
                     resp::array_header(out, 0);
@@ -3879,7 +3963,7 @@ impl Worker {
                     return;
                 }
                 let count: i64 =
-                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                    int_arg!(out, &args[2]);
                 let (mut l, exp) = match load_list(&store, &args[1], out) {
                     Some(x) => x,
                     None => return,
@@ -3931,15 +4015,16 @@ impl Worker {
                 while i + 1 < nargs {
                     match args[i].to_ascii_uppercase().as_slice() {
                         b"RANK" => {
-                            rank = std::str::from_utf8(&args[i + 1])
-                                .ok()
-                                .and_then(|t| t.parse().ok())
-                                .unwrap_or(1);
+                            rank = int_arg!(out, &args[i + 1]);
                         }
                         b"COUNT" => {
-                            count = std::str::from_utf8(&args[i + 1])
-                                .ok()
-                                .and_then(|t| t.parse().ok());
+                            // redis validates COUNT as a non-negative number and
+                            // reports the same text for malformed and negative.
+                            count = Some(int_arg!(
+                                out,
+                                &args[i + 1],
+                                "ERR COUNT can't be negative"
+                            ));
                         }
                         _ => {}
                     }
@@ -4094,7 +4179,7 @@ impl Worker {
                 }
                 let count_given = nargs >= 3;
                 let count: usize = if count_given {
-                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(1)
+                    uint_arg!(out, &args[2], "ERR value is out of range, must be positive")
                 } else {
                     1
                 };
@@ -4138,7 +4223,7 @@ impl Worker {
                     return;
                 }
                 let count: i64 =
-                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                    int_arg!(out, &args[2]);
                 let withscores = nargs >= 4 && args[3].eq_ignore_ascii_case(b"WITHSCORES");
                 if z.is_empty() || count == 0 {
                     resp::array_header(out, 0);
@@ -4272,8 +4357,7 @@ impl Worker {
                     resp::bulk(out, &m);
                     return;
                 }
-                let count: i64 =
-                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                let count: i64 = int_arg!(out, &args[2], "ERR value is out of range, must be positive");
                 if count < 0 {
                     resp::error(out, "ERR value is out of range, must be positive");
                     return;
@@ -4317,7 +4401,7 @@ impl Worker {
                     return;
                 }
                 let count: i64 =
-                    std::str::from_utf8(&args[2]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                    int_arg!(out, &args[2]);
                 if s.is_empty() || count == 0 {
                     resp::array_header(out, 0);
                     return;
@@ -4489,11 +4573,10 @@ impl Worker {
             | b"ZDIFF" => {
                 let store_variant = cmd.ends_with(b"STORE");
                 let numkeys_pos = if store_variant { 2 } else { 1 };
-                let numkeys: usize = args
-                    .get(numkeys_pos)
-                    .and_then(|a| std::str::from_utf8(a).ok())
-                    .and_then(|t| t.parse().ok())
-                    .unwrap_or(0);
+                let numkeys: usize = match args.get(numkeys_pos) {
+                    Some(a) => uint_arg!(out, a),
+                    None => 0,
+                };
                 let first_key = numkeys_pos + 1;
                 if numkeys == 0 || first_key + numkeys > nargs {
                     resp::error(out, "ERR at least 1 input key is needed");
@@ -4567,11 +4650,10 @@ impl Worker {
             }
             b"ZMPOP" => {
                 // ZMPOP numkeys key [key ...] MIN|MAX [COUNT n]
-                let numkeys: usize = args
-                    .get(1)
-                    .and_then(|a| std::str::from_utf8(a).ok())
-                    .and_then(|t| t.parse().ok())
-                    .unwrap_or(0);
+                let numkeys: usize = match args.get(1) {
+                    Some(a) => uint_arg!(out, a, "ERR numkeys should be greater than 0"),
+                    None => 0,
+                };
                 let first_key = 2;
                 let dir_pos = first_key + numkeys;
                 if numkeys == 0 || dir_pos >= nargs {
@@ -4588,9 +4670,7 @@ impl Worker {
                 };
                 let mut count = 1usize;
                 if dir_pos + 2 < nargs && args[dir_pos + 1].eq_ignore_ascii_case(b"COUNT") {
-                    count = std::str::from_utf8(&args[dir_pos + 2])
-                        .ok()
-                        .and_then(|t| t.parse().ok())
+                    count = resp::arg_uint(&args[dir_pos + 2])
                         .unwrap_or(1);
                 }
                 // Pop from the first non-empty key.
@@ -4671,12 +4751,13 @@ impl Worker {
                         return;
                     }
                 };
-                let mut offset = 0usize;
+                // Signed: redis accepts `LIMIT -1 1` and answers with nothing.
+                let mut offset = 0i64;
                 let mut count: Option<usize> = None;
                 for w in 4..nargs {
                     if args[w].eq_ignore_ascii_case(b"LIMIT") && w + 2 < nargs {
-                        offset = std::str::from_utf8(&args[w + 1]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let c: i64 = std::str::from_utf8(&args[w + 2]).ok().and_then(|s| s.parse().ok()).unwrap_or(-1);
+                        offset = int_arg!(out, &args[w + 1]);
+                        let c: i64 = int_arg!(out, &args[w + 2]);
                         count = if c < 0 { None } else { Some(c as usize) };
                     }
                 }
@@ -4695,7 +4776,9 @@ impl Worker {
                     ms.reverse();
                 }
                 let ms: Vec<Vec<u8>> =
-                    ms.into_iter().skip(offset).take(count.unwrap_or(usize::MAX)).collect();
+                    if offset < 0 { Vec::new() } else {
+                        ms.into_iter().skip(offset as usize).take(count.unwrap_or(usize::MAX)).collect()
+                    };
                 resp::array_header(out, ms.len());
                 for m in &ms {
                     resp::bulk(out, m);
@@ -4710,12 +4793,13 @@ impl Worker {
                 let byscore = args[5..].iter().any(|a| a.eq_ignore_ascii_case(b"BYSCORE"));
                 let bylex = args[5..].iter().any(|a| a.eq_ignore_ascii_case(b"BYLEX"));
                 let rev = args[5..].iter().any(|a| a.eq_ignore_ascii_case(b"REV"));
-                let mut offset = 0usize;
+                // Signed: redis accepts `LIMIT -1 1` and answers with nothing.
+                let mut offset = 0i64;
                 let mut limit: Option<usize> = None;
                 for w in 5..nargs {
                     if args[w].eq_ignore_ascii_case(b"LIMIT") && w + 2 < nargs {
-                        offset = std::str::from_utf8(&args[w + 1]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let c: i64 = std::str::from_utf8(&args[w + 2]).ok().and_then(|s| s.parse().ok()).unwrap_or(-1);
+                        offset = int_arg!(out, &args[w + 1]);
+                        let c: i64 = int_arg!(out, &args[w + 2]);
                         limit = if c < 0 { None } else { Some(c as usize) };
                     }
                 }
@@ -4753,8 +4837,8 @@ impl Worker {
                     }
                 } else {
                     // by rank (index)
-                    let start: i64 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let stop: i64 = std::str::from_utf8(&args[4]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let start: i64 = int_arg!(out, &args[3]);
+                    let stop: i64 = int_arg!(out, &args[4]);
                     let sorted = z.sorted();
                     let (l, h) = aggr::rank_bounds(sorted.len(), start, stop);
                     sorted[l..h].to_vec()
@@ -4763,7 +4847,9 @@ impl Worker {
                     items.reverse();
                 }
                 if bylex || byscore {
-                    items = items.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).collect();
+                    items = if offset < 0 { Vec::new() } else {
+                        items.into_iter().skip(offset as usize).take(limit.unwrap_or(usize::MAX)).collect()
+                    };
                 }
                 // Store at the destination (clears its prior value/TTL).
                 let mut nz = aggr::ZSet::new();
@@ -4788,11 +4874,10 @@ impl Worker {
             }
             b"SINTERCARD" => {
                 // SINTERCARD numkeys key [key ...] [LIMIT n]
-                let numkeys: usize = args
-                    .get(1)
-                    .and_then(|a| std::str::from_utf8(a).ok())
-                    .and_then(|t| t.parse().ok())
-                    .unwrap_or(0);
+                let numkeys: usize = match args.get(1) {
+                    Some(a) => uint_arg!(out, a, "ERR numkeys should be greater than 0"),
+                    None => 0,
+                };
                 let first_key = 2;
                 if numkeys == 0 || first_key + numkeys > nargs {
                     resp::error(out, "ERR numkeys should be greater than 0");
@@ -4801,10 +4886,7 @@ impl Worker {
                 let mut limit = usize::MAX;
                 let opt_pos = first_key + numkeys;
                 if opt_pos + 1 < nargs && args[opt_pos].eq_ignore_ascii_case(b"LIMIT") {
-                    let l: i64 = std::str::from_utf8(&args[opt_pos + 1])
-                        .ok()
-                        .and_then(|t| t.parse().ok())
-                        .unwrap_or(0);
+                    let l: i64 = int_arg!(out, &args[opt_pos + 1], "ERR LIMIT can't be negative");
                     if l < 0 {
                         resp::error(out, "ERR LIMIT can't be negative");
                         return;
@@ -5125,7 +5207,12 @@ impl Worker {
         };
         let mut i = 1;
         if args.len() >= 2 {
-            match std::str::from_utf8(&args[1]).ok().and_then(|t| t.parse::<i64>().ok()) {
+            match resp::arg_int(&args[1]) {
+                None => {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(out, "ERR Protocol version is not an integer or out of range");
+                    return;
+                }
                 Some(p) if p == 2 || p == 3 => {
                     proto = p;
                     i = 2;
@@ -5378,9 +5465,7 @@ impl Worker {
                 while i < args.len() {
                     match args[i].to_ascii_uppercase().as_slice() {
                         b"REDIRECT" if i + 1 < args.len() => {
-                            let id: i64 = std::str::from_utf8(&args[i + 1])
-                                .ok()
-                                .and_then(|s| s.parse().ok())
+                            let id: i64 = resp::arg_int(&args[i + 1])
                                 .unwrap_or(-1);
                             // 0 means "no redirect"; otherwise the id must be a live
                             // client (our client id is its fd).
@@ -7066,8 +7151,7 @@ fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
     let numkeyed = |count_pos: usize, dst_first: bool| -> Vec<usize> {
         let n: usize = args
             .get(count_pos)
-            .and_then(|a| std::str::from_utf8(a).ok())
-            .and_then(|t| t.parse().ok())
+            .and_then(|a| resp::arg_uint(a))
             .unwrap_or(0);
         let mut v = Vec::new();
         if dst_first {

@@ -593,3 +593,44 @@ mod fuzz {
         }
     }
 }
+
+/// Parse an integer argument the way Redis's `string2ll` does: an optional `-`,
+/// then digits, with no leading `+`, no leading zeros (`08` is not 8), no
+/// surrounding whitespace and no overflow.
+///
+/// Stricter than `str::parse`, deliberately, and the difference is not cosmetic.
+/// `str::parse` accepts `+5`, `05` and `-0`; a real Redis refuses all three. A
+/// client that sends `INCRBY n 05` — a zero-padded id, a formatted string, a
+/// value out of a spreadsheet column — is told its argument is wrong by Redis
+/// and would be silently obeyed here.
+///
+/// NOT for float arguments. Redis parses those with `strtod`, which *does*
+/// accept `+1`, so `ZADD z +1 m` is legal there and must stay legal here.
+/// Applying this to a score would create a new divergence while fixing one.
+pub fn arg_int(arg: &[u8]) -> Option<i64> {
+    let (neg, digits) = match arg.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, arg),
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    // "0" alone is the only string that may start with a zero, and "-0" is not
+    // one of them.
+    if digits[0] == b'0' && (digits.len() > 1 || neg) {
+        return None;
+    }
+    std::str::from_utf8(arg).ok()?.parse::<i64>().ok()
+}
+
+/// `arg_int` for an argument that must also be non-negative, as a `usize`.
+///
+/// The bound belongs here rather than in a cast at the call site: `as usize` on
+/// a negative `i64` wraps to something enormous, so a count or an offset that
+/// Redis rejects would become a gigantic allocation rather than an error.
+pub fn arg_uint(arg: &[u8]) -> Option<usize> {
+    match arg_int(arg) {
+        Some(n) if n >= 0 => Some(n as usize),
+        _ => None,
+    }
+}
