@@ -436,6 +436,21 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_pubsub_introspect.sh
 
+      # Cross-instance pub/sub: two INDEPENDENT postmasters, a message published
+      # on one reaching a RESP subscriber on the other. Also pins the contract:
+      # only the opted-in patterns cross, a relayed message is never relayed
+      # onward (so A -> B -> A cannot form), a dead peer neither wedges the RESP
+      # port nor floods the log, and delivery is at-most-once -- nothing is
+      # replayed to a peer that was down. Its own clusters and ports. dblink is
+      # the transport and needs no extra package: Debian ships the contrib
+      # modules inside postgresql-NN itself.
+      - name: Cross-instance relay
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_relay.sh
+
       - name: pg_basebackup + PITR restores the cache
         env:
           PGKS_BUILD_PROFILE: debug

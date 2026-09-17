@@ -244,6 +244,27 @@ static GUC_TENANT_OPS_PER_SEC: GucSetting<i32> = GucSetting::<i32>::new(0);
 static GUC_TENANT: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(None);
 
+/// Channels whose messages are relayed to the peers in `supacache.peer`, as a
+/// comma-separated glob list. Empty (the default) relays nothing.
+///
+/// Opt-in per pattern rather than all-or-nothing, and that is the design rather
+/// than caution. Relaying every channel reproduces the problem redis 7 added
+/// sharded pub/sub to escape: a broadcast whose cost grows with the number of
+/// instances, paid on the highest-volume, lowest-value traffic in most systems
+/// (presence, typing indicators, cursor positions). The channels that genuinely
+/// need to cross an instance boundary -- cache invalidation, session
+/// revocation -- are few and low-rate, and naming them keeps the fan-out bill
+/// proportional to the value.
+static GUC_RELAY_CHANNELS: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+/// RESP credential the relay subscribes with, when the cluster requires AUTH.
+/// What it may relay is bounded by this credential's scope, which is the point:
+/// a tenant-scoped role relays only that tenant's channels.
+static GUC_RELAY_USER: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+static GUC_RELAY_SECRET: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+
 /// KV store config for the Mode B row cache: keys are (relid,pk) 12-byte tuples,
 /// values are raw heap-tuple bytes.
 /// One megabyte, the smallest a row-cache partition is allowed to be. Each
@@ -1738,6 +1759,44 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_string_guc(
+        "pg_keyspace.relay_channels",
+        "Channels relayed to the peers in supacache.peer (comma-separated globs)",
+        "Empty (the default) relays nothing, and cross-instance pub/sub is off. \
+         A channel matching one of these globs is additionally delivered to every \
+         enabled row of supacache.peer, by a background worker over libpq -- so \
+         no WAL, no new protocol, and Postgres's own authentication, TLS and \
+         pg_hba apply to the peer link. Opt in per pattern rather than relaying \
+         everything: a relay whose cost grows with the number of instances is \
+         what sharded pub/sub exists to avoid, and paying it on presence or \
+         typing traffic is the worst version of that. The receiver count \
+         PUBLISH returns stays LOCAL: there is no cheap honest cross-instance \
+         answer, and redis reports per node too.",
+        &GUC_RELAY_CHANNELS,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.relay_user",
+        "RESP username the relay subscribes with (empty = no AUTH)",
+        "Needed only where the cluster requires AUTH. What the relay may forward \
+         is bounded by this credential's scope, which is deliberate: give it an \
+         exempt service role to relay every tenant's channels, or a \
+         tenant-scoped one to relay only that tenant's. The relay is a RESP \
+         client like any other, so the permission model is the existing one \
+         rather than a second one invented for peers.",
+        &GUC_RELAY_USER,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.relay_secret",
+        "Secret for pg_keyspace.relay_user",
+        "Superuser-visible only. Set it in postgresql.conf alongside relay_user.",
+        &GUC_RELAY_SECRET,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_string_guc(
         "pg_keyspace.tenant",
         "Tenant a SQL backend acts as, scoping supacache.publish() to {tenant}:",
         "Unset (default) leaves supacache.publish() superuser-only, as it was \
@@ -1859,6 +1918,20 @@ pub extern "C" fn _PG_init() {
     // restarted, which is what `set_restart_time` below is for -- and it is why
     // the restart interval is a second rather than the five the other workers
     // use, since here it is not a failure path but the cycle itself.
+    // Registered only when relaying is configured, so a deployment that does not
+    // relay carries no extra process. relay_channels is SIGHUP, but this read
+    // happens at _PG_init: adding a pattern while the worker runs takes effect
+    // on its next reconnect, whereas going from none to some needs a restart to
+    // start the worker at all. Documented rather than papered over with a
+    // second GUC.
+    if !relay_patterns().is_empty() {
+        BackgroundWorkerBuilder::new("pg_keyspace: cross-instance relay")
+            .set_function("pg_keyspace_relay_main")
+            .set_library("pg_keyspace")
+            .enable_spi_access()
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .load();
+    }
     if GUC_ROWCACHE_DECODE.get() {
         for k in 0..rowcache_pool_size() {
             BackgroundWorkerBuilder::new(&format!(
@@ -2946,6 +3019,16 @@ fn pg_ensure_schema() {
              username text PRIMARY KEY, secret text NOT NULL, \
              role_name text NOT NULL, tenant text NOT NULL DEFAULT '')",
         );
+        // Peers this instance relays to. Modelled on Citus's pg_dist_node: the
+        // membership is a table an operator maintains, and the transport is
+        // libpq, so authentication, TLS and pg_hba are Postgres's rather than
+        // something this extension invents and has to be trusted about.
+        let _ = Spi::run(
+            "CREATE TABLE IF NOT EXISTS supacache.peer (\
+             name text PRIMARY KEY, conninfo text NOT NULL, \
+             enabled boolean NOT NULL DEFAULT true, \
+             added_at timestamptz NOT NULL DEFAULT now())",
+        );
         let _ = Spi::run(
             "CREATE TABLE IF NOT EXISTS supacache.acl (\
              role_name text NOT NULL, prefix text NOT NULL, \
@@ -3480,6 +3563,431 @@ fn bulk_upsert(
             Ok::<(), pgrx::spi::Error>(())
         })
     })
+}
+
+/// Comma-separated globs from `pg_keyspace.relay_channels`, trimmed and
+/// non-empty. Empty result means relaying is off.
+fn relay_patterns() -> Vec<String> {
+    GUC_RELAY_CHANNELS
+        .get()
+        .and_then(|c| c.to_str().ok().map(|s| s.to_string()))
+        .unwrap_or_default()
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// One RESP array, encoded for the wire.
+fn resp_cmd(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+    for p in parts {
+        out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+        out.extend_from_slice(p);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// The cross-instance relay: a RESP client that forwards what it hears.
+///
+/// It subscribes to `pg_keyspace.relay_channels` on this instance's own RESP
+/// port and calls `supacache.publish_relayed()` on each enabled peer.
+///
+/// A RESP client rather than a bus participant, and that is the whole design.
+/// Giving the relay its own inbox would have meant sizing the pub/sub bus for
+/// `nworkers + 1`, which adds `2n+1` rings to hand ONE participant a mailbox --
+/// quadratic growth (+768 KB at 1 worker, +4.25 MB at 8) paid for by every
+/// deployment whether or not it relays. As a subscriber it needs no shared
+/// memory at all: the fan-out, the tenant scoping and the wakeups are the ones
+/// that already exist, and relaying off costs exactly nothing.
+///
+/// Delivery is AT-MOST-ONCE, matching valkey: "if the subscriber is unable to
+/// handle the message (for example, due to an error or a network disconnect)
+/// the message is forever lost". A message published while a peer is down is
+/// not replayed, and this worker deliberately has no catch-up: valkey's answer
+/// for a client that cannot miss an invalidation is for that client to ping its
+/// invalidation channel and flush its cache when the channel breaks, which is
+/// unchanged by whether a relay exists. Flushing peers' caches on every relay
+/// blip would be worse than the problem.
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_keyspace_relay_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
+    let dbname = GUC_DATABASE
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("postgres")
+        .to_string();
+    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+
+    let patterns = relay_patterns();
+    log!(
+        "pg_keyspace relay: forwarding {} channel pattern(s) to peers in supacache.peer",
+        patterns.len()
+    );
+
+    let mut relayed: u64 = 0;
+    let mut failed: u64 = 0;
+    let mut last_report = std::time::Instant::now();
+    // The subscription lives across iterations. The first version rebuilt the
+    // connection every pass and treated a read timeout as a disconnect, so the
+    // relay held a subscription for a few milliseconds at a time and PUBSUB
+    // NUMPAT on its own instance read 0 -- it was never subscribed when anything
+    // was published.
+    let mut sock: Option<std::net::TcpStream> = None;
+    let mut last_drop_log: Option<std::time::Instant> = None;
+    let mut installed = false;
+    let mut warned_dblink = false;
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+    // `stopping` rather than `while !sigterm_received()`, because
+    // BackgroundWorker::sigterm_received is a SWAP, not a read: it clears the
+    // flag and hands you what was there. BackgroundWorker::wait_latch calls it
+    // internally to produce its own return value, so a loop that waits and then
+    // re-tests the flag tests a flag the wait already consumed. This worker did
+    // exactly that and became unkillable -- SIGTERM arrived, wait_latch ate it,
+    // the loop saw false, and `pg_ctl stop` hung until the postmaster gave up
+    // and took the whole cluster down the hard way. Every wait's return value is
+    // now the answer, and the flag is read in exactly one place per pass.
+    let mut stopping = false;
+    while !stopping {
+        // The fan-out function is installed here rather than before the loop
+        // because this worker starts with the postmaster: on a cluster where
+        // pg_keyspace is preloaded but CREATE EXTENSION has not run yet, there
+        // is no supacache schema to create it in. Doing it eagerly made a
+        // first start fatal -- CREATE FUNCTION raised, the ERROR longjmped out
+        // of SPI, and the worker died (#130) before the schema it was waiting
+        // for could appear.
+        if !installed {
+            installed = relay_install_fanout(&dbname, &mut warned_dblink);
+            if !installed {
+                stopping = !BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
+                continue;
+            }
+        }
+        if sock.is_none() {
+            sock = relay_connect(&patterns);
+            if sock.is_none() {
+                // Nothing to subscribe to yet (the worker may be up before the
+                // RESP port is). Back off rather than spin.
+                stopping = !BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
+                continue;
+            }
+            buf.clear();
+            log!("pg_keyspace relay: subscribed to {} pattern(s)", patterns.len());
+        }
+        // One read, then whatever complete frames it completed. A timeout is the
+        // idle case and keeps the connection; only EOF or an error drops it, and
+        // losing the subscription is expected -- exceeding the output-buffer
+        // limit is how a relay that cannot keep up is shed -- so it reconnects.
+        if !relay_read_once(sock.as_mut().unwrap(), &mut buf, &mut relayed, &mut failed) {
+            // Logged at most once a minute. An earlier version logged every
+            // drop, and a relay that reconnected in a loop wrote thousands of
+            // lines a second into the server log -- the defect made worse by
+            // its own reporting.
+            if last_drop_log.is_none_or(|t: std::time::Instant| t.elapsed() >= Duration::from_secs(60)) {
+                log!("pg_keyspace relay: subscription dropped, reconnecting");
+                last_drop_log = Some(std::time::Instant::now());
+            }
+            sock = None;
+            stopping = !BackgroundWorker::wait_latch(Some(Duration::from_millis(200)));
+        } else {
+            // No wait on this path: relay_read_once has its own 500ms socket
+            // timeout, so the loop already paces itself and only the flag needs
+            // reading.
+            stopping = BackgroundWorker::sigterm_received();
+        }
+        if last_report.elapsed() >= Duration::from_secs(60) {
+            log!("pg_keyspace relay: {relayed} message(s) forwarded, {failed} peer call(s) failed");
+            last_report = std::time::Instant::now();
+        }
+    }
+    log!("pg_keyspace relay: exiting ({relayed} forwarded, {failed} failed)");
+}
+
+/// Connect to this instance's RESP port, AUTH if configured, and PSUBSCRIBE.
+fn relay_connect(patterns: &[String]) -> Option<std::net::TcpStream> {
+    use std::io::Write;
+    let port = GUC_PORT.get() as u16;
+    let sock = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    sock.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
+    let mut w = &sock;
+    let user = GUC_RELAY_USER.get().and_then(|c| c.to_str().ok().map(String::from));
+    if let Some(u) = user.filter(|u| !u.is_empty()) {
+        let secret = GUC_RELAY_SECRET
+            .get()
+            .and_then(|c| c.to_str().ok().map(String::from))
+            .unwrap_or_default();
+        w.write_all(&resp_cmd(&[b"AUTH", u.as_bytes(), secret.as_bytes()])).ok()?;
+    }
+    let mut cmd: Vec<&[u8]> = vec![b"PSUBSCRIBE"];
+    for p in patterns {
+        cmd.push(p.as_bytes());
+    }
+    w.write_all(&resp_cmd(&cmd)).ok()?;
+    w.flush().ok()?;
+    Some(sock)
+}
+
+/// One RESP *reply* frame, or what is missing.
+///
+/// `resp::parse` is the COMMAND parser: an array whose every element is a bulk
+/// string, because that is all a client may send. A reply is not that. The
+/// `psubscribe` confirmation is `*3 $10 psubscribe $7 inval:* :1` -- its third
+/// element is an integer -- so parsing replies with the command parser failed
+/// on the very first frame the relay ever received, and the relay read its own
+/// subscription confirmation as a broken connection and reconnected, forever.
+enum RelayFrame {
+    /// Not all here yet; read more and retry.
+    Need,
+    /// Not RESP at all: drop the connection.
+    Bad,
+    /// A whole frame. `args` is its bulk strings, flattened; integers and
+    /// simple strings contribute nothing, which is exactly what the relay
+    /// wants -- the only frame it acts on is `pmessage`, four bulk strings.
+    Done { consumed: usize, args: Vec<Vec<u8>> },
+}
+
+/// Largest bulk string the relay will accept from its own server. The RESP
+/// server's own limit is what actually bounds a published payload; this only
+/// stops a corrupted length header turning into an allocation.
+const RELAY_MAX_BULK: i64 = 512 * 1024 * 1024;
+
+fn relay_frame(buf: &[u8], depth: u8) -> RelayFrame {
+    // Replies nest (an array of arrays), but not deeply, and recursion driven
+    // by attacker-chosen length headers is a stack overflow waiting to happen.
+    if depth > 4 {
+        return RelayFrame::Bad;
+    }
+    if buf.is_empty() {
+        return RelayFrame::Need;
+    }
+    let Some(eol) = buf.windows(2).position(|w| w == b"\r\n") else {
+        return RelayFrame::Need;
+    };
+    let head = &buf[1..eol];
+    let after = eol + 2;
+    match buf[0] {
+        // Array, and RESP3's push frame, which is an array in all but the byte.
+        b'*' | b'>' => {
+            let Ok(n) = std::str::from_utf8(head).unwrap_or("x").parse::<i64>() else {
+                return RelayFrame::Bad;
+            };
+            let mut pos = after;
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..n.max(0) {
+                match relay_frame(&buf[pos..], depth + 1) {
+                    RelayFrame::Need => return RelayFrame::Need,
+                    RelayFrame::Bad => return RelayFrame::Bad,
+                    RelayFrame::Done { consumed, mut args } => {
+                        pos += consumed;
+                        out.append(&mut args);
+                    }
+                }
+            }
+            RelayFrame::Done { consumed: pos, args: out }
+        }
+        b'$' | b'=' => {
+            let Ok(len) = std::str::from_utf8(head).unwrap_or("x").parse::<i64>() else {
+                return RelayFrame::Bad;
+            };
+            if len < 0 {
+                // A null bulk string: a whole frame carrying no value.
+                return RelayFrame::Done { consumed: after, args: Vec::new() };
+            }
+            if len > RELAY_MAX_BULK {
+                return RelayFrame::Bad;
+            }
+            let end = after + len as usize;
+            if end + 2 > buf.len() {
+                return RelayFrame::Need;
+            }
+            RelayFrame::Done { consumed: end + 2, args: vec![buf[after..end].to_vec()] }
+        }
+        // Simple string, error, integer, double, boolean, big number, null.
+        // Whole frames that carry nothing the relay forwards.
+        b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => {
+            RelayFrame::Done { consumed: after, args: Vec::new() }
+        }
+        _ => RelayFrame::Bad,
+    }
+}
+
+/// One read from the subscription, then every complete frame it completed.
+///
+/// Returns false when the connection is gone and should be rebuilt. A read
+/// TIMEOUT is not that: it is the idle case, and returning on it was the bug
+/// that kept this relay unsubscribed.
+fn relay_read_once(
+    sock: &mut std::net::TcpStream,
+    buf: &mut Vec<u8>,
+    relayed: &mut u64,
+    failed: &mut u64,
+) -> bool {
+    use std::io::Read;
+    let mut chunk = [0u8; 16 * 1024];
+    match sock.read(&mut chunk) {
+        Ok(0) => return false, // peer closed
+        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        // Interrupted belongs with the timeout, not with the errors: Postgres
+        // sets this worker's latch (SIGUSR1) routinely and read() returns EINTR,
+        // which std does not retry. Treating it as a disconnect span the relay
+        // through thousands of connect/PSUBSCRIBE/drop cycles a second, so it
+        // was never subscribed when anything was published.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            return true // idle; keep the subscription
+        }
+        Err(_) => return false,
+    }
+    loop {
+        match relay_frame(buf, 0) {
+            RelayFrame::Done { consumed, args } => {
+                // pmessage | pattern | channel | payload
+                if args.len() == 4 && args[0] == b"pmessage" {
+                    match relay_to_peers(&args[2], &args[3]) {
+                        Ok(n) => *relayed += n,
+                        Err(()) => *failed += 1,
+                    }
+                }
+                buf.drain(..consumed);
+            }
+            RelayFrame::Need => return true,
+            RelayFrame::Bad => return false,
+        }
+    }
+}
+
+/// Install the fan-out function the relay calls. Returns false until the
+/// database is ready for it, and never raises.
+///
+/// A plpgsql loop with a per-peer `EXCEPTION` block rather than one SQL
+/// statement joining `supacache.peer` to `dblink`. A refused connection, a
+/// peer without `supacache.publish_relayed`, a wrong password: every one of
+/// those is a Postgres ERROR, and an ERROR inside SPI longjmps out, aborts the
+/// transaction and takes this worker with it (#130) -- so one unreachable peer
+/// would put the relay in the five-second relaunch loop, and one dead peer in
+/// a set of five would stop the other four being told anything. Catching per
+/// peer makes a dead peer cost that peer's messages and nothing else, which is
+/// the at-most-once contract already documented for pub/sub.
+///
+/// The unreachable-peer warning is rate-limited to one a minute, in a session
+/// GUC under a prefix of its own -- the relay holds one long-lived session, so
+/// a session setting is exactly the right lifetime. Warning per message meant a
+/// dead peer plus a busy channel filled the server log with the same line, which
+/// is the failure reporting on itself rather than reporting the failure.
+///
+/// The schema is CHECKED rather than the failure caught, for the same reason
+/// as the replication slot above: CREATE FUNCTION in a schema that does not
+/// exist is that same fatal ERROR, and this worker starts with the postmaster,
+/// so on a cluster where the library is preloaded but CREATE EXTENSION has not
+/// run yet the schema legitimately is not there.
+fn relay_install_fanout(dbname: &str, warned_dblink: &mut bool) -> bool {
+    use std::panic::AssertUnwindSafe;
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        let ready = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'supacache')",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        if !ready {
+            return false;
+        }
+        // dblink is the transport, and it is not a dependency this extension
+        // declares: relaying is opt-in, so requiring it of every install would
+        // tax the deployments that never relay. Report its absence by name --
+        // without this the operator sees a relay that subscribes, forwards
+        // nothing, and says nothing about why. It is a warning, not a block:
+        // CREATE EXTENSION dblink afterwards needs no restart, because the
+        // function body resolves dblink per call.
+        if !*warned_dblink
+            && !Spi::get_one::<bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'dblink')",
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+        {
+            log!(
+                "pg_keyspace relay: pg_keyspace.relay_channels is set but the dblink extension \
+                 is not installed in database {dbname}, so nothing can be forwarded. \
+                 Run: CREATE EXTENSION dblink"
+            );
+            *warned_dblink = true;
+        }
+        Spi::run(
+            "CREATE OR REPLACE FUNCTION supacache.relay_fanout(ch text, payload bytea) \
+             RETURNS bigint LANGUAGE plpgsql AS $ks_relay$ \
+             DECLARE p record; total bigint := 0; n bigint; \
+             BEGIN \
+               BEGIN \
+                 FOR p IN SELECT conninfo FROM supacache.peer WHERE enabled LOOP \
+                   BEGIN \
+                     SELECT t.n INTO n FROM dblink(p.conninfo || ' connect_timeout=2', \
+                       format('SELECT supacache.publish_relayed(%L, decode(%L, ''hex''))', \
+                              ch, encode(payload, 'hex'))) AS t(n bigint); \
+                     total := total + coalesce(n, 0); \
+                   EXCEPTION WHEN OTHERS THEN \
+                     IF coalesce(current_setting('ks_relay.warned_at', true), '0')::bigint \
+                          < extract(epoch from clock_timestamp())::bigint - 60 THEN \
+                       RAISE WARNING 'pg_keyspace relay: peer unreachable: % (%)', \
+                         SQLERRM, SQLSTATE; \
+                       PERFORM set_config('ks_relay.warned_at', \
+                         extract(epoch from clock_timestamp())::bigint::text, false); \
+                     END IF; \
+                   END; \
+                 END LOOP; \
+               EXCEPTION WHEN OTHERS THEN \
+                 RAISE WARNING 'pg_keyspace relay: fan-out failed: % (%)', SQLERRM, SQLSTATE; \
+               END; \
+               RETURN total; \
+             END $ks_relay$",
+        )
+        .is_ok()
+    }))
+}
+
+/// Call `supacache.publish_relayed()` on every enabled peer, over dblink.
+///
+/// dblink rather than a socket of our own: it is libpq, so authentication, TLS
+/// and pg_hba are Postgres's, and the peer needs no listener this extension
+/// invented. The call is synchronous, which is safe HERE and nowhere else --
+/// this is the relay's own process, so a slow peer delays only relaying. Doing
+/// it inline on the RESP path would have put a dead peer on the event loop.
+///
+/// `connect_timeout` bounds how long a dead peer can hold this worker, and the
+/// channel is passed through already tenant-scoped: `publish_relayed` applies
+/// no scope of its own and never relays onward, so nothing can loop.
+///
+/// Parameters, not an interpolated statement: a channel name is client-supplied
+/// (`PUBLISH <anything>`), so building the SQL by hand would have been an
+/// injection into a superuser-owned worker's session.
+fn relay_to_peers(channel: &[u8], payload: &[u8]) -> Result<u64, ()> {
+    use std::panic::AssertUnwindSafe;
+    let ch = String::from_utf8_lossy(channel).into_owned();
+    let payload = payload.to_vec();
+    BackgroundWorker::transaction(AssertUnwindSafe(move || {
+        match Spi::get_one_with_args::<i64>(
+            "SELECT supacache.relay_fanout($1, $2)",
+            vec![
+                (PgBuiltInOids::TEXTOID.oid(), ch.into_datum()),
+                (PgBuiltInOids::BYTEAOID.oid(), payload.into_datum()),
+            ],
+        ) {
+            Ok(Some(n)) => Ok(n.max(0) as u64),
+            Ok(None) => Ok(0), // no enabled peers
+            Err(_) => Err(()),
+        }
+    }))
 }
 
 /// The expiry worker: periodically DROP TTL partitions whose whole
@@ -6132,6 +6640,51 @@ mod supacache {
         // rings this lane uses.
         unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
         let n = bus.publish_external(scoped.as_bytes(), message, |p, c| {
+            server::glob_match(p, c)
+        });
+        unsafe { pg_sys::LWLockRelease(lock) };
+        n.unwrap_or(0) as i64
+    }
+
+    /// The endpoint a peer's relay worker calls. **Not** for applications.
+    ///
+    /// `supacache.publish()` is the front door: it scopes the channel to the
+    /// caller's tenant and, where `pg_keyspace.relay_channels` matches, hands
+    /// the message to the relay worker for the peers. This is the back door a
+    /// peer arrives through, and it differs in exactly two ways, both of which
+    /// are why it is a separate function rather than a flag on the other one:
+    ///
+    /// * the channel arrives **already scoped** -- the publishing instance
+    ///   applied its own tenant prefix, and re-applying this instance's would
+    ///   deliver into the wrong namespace or nowhere;
+    /// * it **never relays onward**. That is what stops A -> B -> A. A message
+    ///   crosses at most one instance boundary, always, and the rule is
+    ///   structural rather than a hop count that has to be right.
+    ///
+    /// Superuser-only, like the relay connection itself. An operator who wants
+    /// a peer link that cannot publish into arbitrary namespaces gives it a
+    /// tenant-scoped role and lets it call `publish()` instead; this function
+    /// is for a trusted relay, and says so.
+    #[pg_extern]
+    fn publish_relayed(channel: &str, message: &[u8]) -> i64 {
+        if !unsafe { pg_sys::superuser() } {
+            error!(
+                "supacache.publish_relayed() is superuser-only: it publishes a \
+                 pre-scoped channel name without applying this instance's tenant \
+                 scope, which is safe only for a peer relay. Applications want \
+                 supacache.publish()"
+            );
+        }
+        let bus = match BUS.get() {
+            Some(b) => b,
+            None => return 0,
+        };
+        let lock = PS_EXT_LOCK.load(Ordering::Acquire);
+        if lock.is_null() {
+            error!("supacache.publish_relayed(): the pub/sub bus is not initialised in this cluster");
+        }
+        unsafe { pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE) };
+        let n = bus.publish_external(channel.as_bytes(), message, |p, c| {
             server::glob_match(p, c)
         });
         unsafe { pg_sys::LWLockRelease(lock) };
