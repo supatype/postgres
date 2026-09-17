@@ -164,6 +164,41 @@ chk "S-variants allowed in subscribe context, others refused by name" \
     "-ERR Can't execute 'set': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context  " \
     "$got"
 
+# ---- a subscriber that stops reading ---------------------------------------
+# It gets disconnected rather than buffered without limit. Before this existed,
+# publishing 256 MB to a subscriber that never read took a worker from 708 MB
+# RSS to 961 MB, linear in what was published -- which in an in-Postgres
+# background worker ends at the OOM killer, taking the cluster with it.
+#
+# pg_keyspace.max_held_reply_bytes did NOT cover this: it is applied on the
+# dispatch path, so it only fires for a connection that is SENDING commands, and
+# a pure subscriber sends none. Its buffer is filled by other clients' publishes.
+if command -v python3 >/dev/null 2>&1; then
+  cat > /tmp/pgks_slowsub.py <<'PYEOF'
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.sendall(b"SUBSCRIBE slowch\r\n")
+time.sleep(float(sys.argv[2]))
+PYEOF
+  python3 /tmp/pgks_slowsub.py "$RESP" 40 &
+  slowpid=$!
+  sleep 1
+  chk "the slow subscriber is attached" "slowch 1" "$($CLI PUBSUB NUMSUB slowch | paste -sd' ')"
+  # Enough to pass the 32 MiB default several times over, in 64 KiB messages.
+  payload=$(head -c 65536 /dev/zero | tr '\0' 'x')
+  for i in $(seq 1 1500); do echo "PUBLISH slowch $payload"; done | $CLI --pipe >/dev/null 2>&1
+  sleep 1
+  chk "it was disconnected rather than buffered without limit" "slowch 0" \
+      "$($CLI PUBSUB NUMSUB slowch | paste -sd' ')"
+  # The point of the limit: the worker is still here to say so.
+  chk "the worker survived and still serves" "PONG" "$($CLI PING)"
+  chk "and other clients are unaffected" "OK" "$($CLI SET after-slowsub v)"
+  kill $slowpid 2>/dev/null
+  rm -f /tmp/pgks_slowsub.py
+else
+  echo "  SKIP  slow-subscriber limit (no python3)"
+fi
+
 # ---- PUBSUB introspection -------------------------------------------------
 # Subscribers on BOTH servers, so the parity comparisons below describe the same
 # state rather than two different ones.

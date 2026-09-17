@@ -135,6 +135,8 @@ static GUC_PERSIST_WINDOW_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static GUC_RING_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 static GUC_PUBSUB_ROUTES: GucSetting<i32> = GucSetting::<i32>::new(4096);
 static GUC_PUBSUB_RING_KB: GucSetting<i32> = GucSetting::<i32>::new(256);
+/// Per-subscriber cap on undelivered pub/sub, in MiB (0 = no limit).
+static GUC_PUBSUB_BUFFER_MB: GucSetting<i32> = GucSetting::<i32>::new(32);
 static GUC_WATCHDOG_SECS: GucSetting<i32> = GucSetting::<i32>::new(30);
 static GUC_PERSIST_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 // TTL by partition drop: time-bucket width and sweep interval.
@@ -1431,6 +1433,27 @@ pub extern "C" fn _PG_init() {
         GucFlags::empty(),
     );
     GucRegistry::define_int_guc(
+        "pg_keyspace.pubsub_buffer_mb",
+        "Undelivered pub/sub one subscriber may hold before it is disconnected (0 = no limit)",
+        "A subscriber that stops reading has its messages buffered by the worker, \
+         and nothing else bounds that: pg_keyspace.max_held_reply_bytes applies on \
+         the dispatch path, so it only ever fires for a connection that is SENDING \
+         commands, and a pure subscriber sends none. Measured before this limit \
+         existed, publishing 256 MB to a subscriber that never read took a worker \
+         from 708 MB RSS to 961 MB, linear in what was published -- which in a \
+         background worker ends at the OOM killer, taking the cluster with it. \
+         Past the limit the subscriber is disconnected and the reason logged, \
+         which is what redis does (its pubsub class defaults to the same 32 MiB) \
+         and the only option that leaves the client able to tell: one that has \
+         silently missed messages but is still subscribed looks exactly like one \
+         that has not. 0 disables the limit and restores the old behaviour.",
+        &GUC_PUBSUB_BUFFER_MB,
+        0,
+        64 * 1024,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
         "pg_keyspace.pubsub_ring_kb",
         "Queue per ordered worker pair for cross-worker pub/sub, in KB",
         "A publish to a worker whose queue is full is dropped and counted.",
@@ -2283,6 +2306,11 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
              supacache.kv in {:?}",
             t0.elapsed()
         );
+        // Unconditional, and deliberately outside the persistence branch below:
+        // a subscriber that stops reading grows the worker whatever tier it is,
+        // and an ephemeral cluster is if anything likelier to be the one with a
+        // chatty pub/sub workload and no persistence to slow it down.
+        worker.set_pubsub_buf_limit((GUC_PUBSUB_BUFFER_MB.get().max(0) as usize) << 20);
         let rbase = RING_BASE.load(Ordering::Acquire);
         if !rbase.is_null() {
             let stride = ring_stride();

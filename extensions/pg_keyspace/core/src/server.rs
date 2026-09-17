@@ -220,6 +220,27 @@ pub const PUSH_DEADLINE: Duration = Duration::from_secs(2);
 /// thing to bound.
 pub const MAX_HELD_REPLY_BYTES: usize = 1 << 20;
 
+/// How much undelivered pub/sub may pile up for one subscriber before it is
+/// disconnected. 0 disables the limit.
+///
+/// `MAX_HELD_REPLY_BYTES` above does not cover this. It bounds a client's own
+/// pipelined replies, applied on the DISPATCH path -- so it can only fire for a
+/// connection that is sending commands. A pure subscriber sends nothing: its
+/// buffer is filled by OTHER clients' publishes, and nothing was checking it.
+///
+/// Measured before this existed, on a subscriber that subscribed and then never
+/// read: publishing 256 MB to it took the worker's RSS from 708 MB to 961 MB,
+/// linear in what was published, with the worker still answering PING. Nothing
+/// stops that short of the OOM killer, and in an in-Postgres background worker
+/// that takes the cluster with it.
+///
+/// 32 MiB matches redis's own default for the pubsub class
+/// (`client-output-buffer-limit pubsub 33554432 8388608 60`). Redis also has a
+/// soft limit -- 8 MiB sustained for 60s -- which is not implemented here: it
+/// needs per-connection timing to catch a subscriber that is slow rather than
+/// stopped, and the hard limit is what prevents the crash.
+pub const DEFAULT_PUBSUB_BUFFER_BYTES: usize = 32 << 20;
+
 /// How many commands one connection may be served in a single event-loop pass.
 ///
 /// `process` used to drain a connection's whole read buffer before yielding, so
@@ -635,6 +656,9 @@ pub struct Worker {
     tls_config: Option<Arc<rustls::ServerConfig>>,
     // pub/sub: reverse indexes channel/pattern -> subscriber fds, so a
     // PUBLISH fans out without scanning every connection. Local to this worker.
+    /// Per-subscriber cap on undelivered pub/sub (see
+    /// `DEFAULT_PUBSUB_BUFFER_BYTES`). 0 disables it.
+    pubsub_buf_limit: usize,
     channels: HashMap<Vec<u8>, HashSet<RawFd>>,
     patterns: HashMap<Vec<u8>, HashSet<RawFd>>,
     /// Sharded channels held on THIS worker, which is all of them for any
@@ -698,6 +722,7 @@ impl Worker {
             routing: None,
             max_value_bytes: resp::DEFAULT_MAX_BULK_LEN,
             tls_config: None,
+            pubsub_buf_limit: DEFAULT_PUBSUB_BUFFER_BYTES,
             channels: HashMap::new(),
             patterns: HashMap::new(),
             shard_channels: HashMap::new(),
@@ -768,6 +793,11 @@ impl Worker {
     /// recovery restores each key into the segment its slot range covers, so a
     /// worker that accepted a key it does not own would lose that key on the next
     /// restart — after having acked the write as durable.
+    /// Cap undelivered pub/sub per subscriber; 0 disables it.
+    pub fn set_pubsub_buf_limit(&mut self, bytes: usize) {
+        self.pubsub_buf_limit = bytes;
+    }
+
     pub fn set_slot_routing(&mut self, index: usize, nworkers: usize, endpoints: Vec<String>) {
         self.routing = if nworkers > 1 {
             let node_ids = endpoints.iter().map(|e| node_id_for(e)).collect();
@@ -5711,6 +5741,7 @@ impl Worker {
                 self.flush(*sfd);
             }
         }
+        self.enforce_pubsub_buf_limit(&flushed);
         receivers
     }
 
@@ -5859,6 +5890,45 @@ impl Worker {
         self.flush(fd);
     }
 
+    /// Disconnect any of `fds` whose undelivered pub/sub has passed the limit.
+    ///
+    /// Called after a delivery round has flushed: what is left in the buffer is
+    /// what the socket would not take, so this measures a subscriber that is not
+    /// keeping up rather than one that simply has a message in flight.
+    ///
+    /// Disconnecting is the same choice redis makes, and it is the only one
+    /// available. The message cannot be held (that is the leak) and it cannot be
+    /// dropped silently while leaving the connection open, because a subscriber
+    /// that has missed messages but is still subscribed looks exactly like one
+    /// that has not -- a closed connection is the only signal a client can act
+    /// on. It is logged with the fd and the byte count so an operator can tell
+    /// which client was too slow.
+    fn enforce_pubsub_buf_limit(&mut self, fds: &HashSet<RawFd>) {
+        if self.pubsub_buf_limit == 0 {
+            return;
+        }
+        let over: Vec<RawFd> = fds
+            .iter()
+            .copied()
+            .filter(|fd| {
+                self.conns
+                    .get(fd)
+                    .map(|c| c.held_reply_bytes() > self.pubsub_buf_limit)
+                    .unwrap_or(false)
+            })
+            .collect();
+        for fd in over {
+            let held = self.conns.get(&fd).map(|c| c.held_reply_bytes()).unwrap_or(0);
+            eprintln!(
+                "pg_keyspace: disconnecting subscriber fd {fd}: {held} bytes of undelivered \
+                 pub/sub, over the {} byte limit. It subscribed and stopped reading; holding \
+                 more would grow this worker without bound.",
+                self.pubsub_buf_limit
+            );
+            self.close(fd);
+        }
+    }
+
     /// Deliver an `smessage` frame to this worker's shard subscribers.
     fn deliver_shard(&mut self, channel: &[u8], msg: &[u8]) -> usize {
         let targets: Vec<RawFd> = match self.shard_channels.get(channel) {
@@ -5878,9 +5948,11 @@ impl Worker {
                 receivers += 1;
             }
         }
-        for sfd in &targets {
+        let flushed: HashSet<RawFd> = targets.iter().copied().collect();
+        for sfd in &flushed {
             self.flush(*sfd);
         }
+        self.enforce_pubsub_buf_limit(&flushed);
         receivers
     }
 
