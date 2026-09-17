@@ -119,7 +119,7 @@ client-side caching (`invalidate` pushes) in every mode — default, `BCAST`
 | Lists | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP` `LLEN` `LINDEX` `LRANGE` `LSET` `LTRIM` `LINSERT` `LREM` `LPOS` `LMOVE` `RPOPLPUSH` |
 | Sets | `SADD` `SREM` `SCARD` `SISMEMBER` `SMISMEMBER` `SMEMBERS` `SPOP` `SRANDMEMBER` `SMOVE` `SSCAN` `SUNION` `SINTER` `SDIFF` `SUNIONSTORE` `SINTERSTORE` `SDIFFSTORE` `SINTERCARD` |
 | Sorted sets | `ZADD` `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZINCRBY` `ZRANK` `ZREVRANK` `ZCOUNT` `ZRANGE` `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` `ZLEXCOUNT` `ZRANGESTORE` `ZPOPMIN` `ZPOPMAX` `ZRANDMEMBER` `ZMPOP` `ZSCAN` `ZUNION` `ZINTER` `ZDIFF` `ZUNIONSTORE` `ZINTERSTORE` `ZDIFFSTORE` |
-| Pub/sub | `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` |
+| Pub/sub | `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` `PUBSUB` |
 | Transactions | `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` |
 | Bloom filter | `BF.RESERVE` `BF.ADD` `BF.MADD` `BF.INSERT` `BF.EXISTS` `BF.MEXISTS` `BF.INFO` `BF.CARD` `BF.SCANDUMP` `BF.LOADCHUNK` |
 | Cuckoo filter | `CF.RESERVE` `CF.ADD` `CF.ADDNX` `CF.INSERT` `CF.INSERTNX` `CF.EXISTS` `CF.MEXISTS` `CF.DEL` `CF.COUNT` `CF.INFO` `CF.SCANDUMP` `CF.LOADCHUNK` |
@@ -144,6 +144,29 @@ atomic apply and `WATCH`-abort are exact); `HSCAN`/`SSCAN`/`ZSCAN` return the
 whole collection in one call with cursor `0` (each aggregate is one blob), so
 `COUNT` is a hint; sorted-set scores print exactly as Valkey 8 prints them,
 verified against it.
+
+`PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT` answer for the **whole instance**, where
+Redis Cluster answers per node. That is deliberate, and it follows from what
+this is: a cache inside Postgres that speaks Valkey, not a Redis replica. A
+Redis Cluster node is a peer the client chose and can address; a pg_keyspace
+worker is an implementation detail of one cache, and which worker a connection
+landed on is not something the client picked, can see, or could act on. An
+answer scoped to it would describe our internals rather than the keyspace the
+client believes it is talking to. Every worker therefore gives the same answer,
+read from the shared routing table, and `bench/run_pubsub_introspect.sh`
+asserts it by subscribing on workers 1 and 2 and asking worker 0.
+
+Where the same reasoning does not apply, parity wins: the replies, the ordering
+rules and the error text are matched verbatim against a real Redis, including
+which of three different messages an invalid subcommand produces. Tenant-scoped
+connections see only their own namespace, unprefixed — enumeration is precisely
+the leak that scoping exists to stop, since a tenant able to list another's
+channels learns what it is doing without receiving a message.
+
+`PUBSUB SHARDCHANNELS`/`SHARDNUMSUB` are **not** implemented, because sharded
+pub/sub (`SSUBSCRIBE`/`SPUBLISH`) is not. `PUBSUB HELP` lists only what this
+build actually serves, rather than copying Redis's help text and advertising
+subcommands that would answer "unknown command".
 
 ---
 

@@ -1398,6 +1398,9 @@ impl Worker {
             c.closing = true; // flushed then closed by on_readable/flush
             return;
         }
+        if cmd == b"PUBSUB" {
+            return self.handle_pubsub(fd, args);
+        }
 
         // ---- transactions: MULTI / EXEC / DISCARD / WATCH / UNWATCH ----
         match cmd.as_slice() {
@@ -5650,6 +5653,152 @@ impl Worker {
             }
         }
         receivers
+    }
+
+    /// Every live channel and pattern this instance holds subscribers for, as
+    /// `(name, is_pattern, subscribers)`.
+    ///
+    /// The cross-worker routing table is the source, because it is the only
+    /// instance-wide view and every local subscription registers there. Local
+    /// maps are merged in solely to cover a name longer than
+    /// `pubsub_shm::MAX_CHAN`, which the table refuses to record but this
+    /// worker still delivers to: telling a client that a channel it is
+    /// subscribed to does not exist would be a stranger answer than listing it.
+    fn pubsub_routes(&self) -> Vec<(Vec<u8>, bool, usize)> {
+        let mut out = match &self.bus {
+            Some(b) => b.routes(),
+            None => Vec::new(),
+        };
+        let seen: HashSet<(Vec<u8>, bool)> =
+            out.iter().map(|(k, p, _)| (k.clone(), *p)).collect();
+        for (pattern, table) in [(false, &self.channels), (true, &self.patterns)] {
+            for (name, fds) in table {
+                if !fds.is_empty() && !seen.contains(&(name.clone(), pattern)) {
+                    out.push((name.clone(), pattern, fds.len()));
+                }
+            }
+        }
+        out
+    }
+
+    /// `PUBSUB CHANNELS [pattern]` | `PUBSUB NUMSUB [channel ...]` | `PUBSUB NUMPAT`.
+    ///
+    /// Answered for the whole instance rather than for the worker this
+    /// connection landed on. Redis Cluster answers per node; this deliberately
+    /// does not, because the two are not the same shape of thing. A Redis
+    /// Cluster node is a peer the client chose; a pg_keyspace worker is an
+    /// implementation detail of one cache, and which one a connection landed on
+    /// is not something the client picked or can reason about. Recorded as a
+    /// deliberate divergence in the README.
+    ///
+    /// Tenant-scoped connections see only their own namespace, with the
+    /// `{tenant}:` prefix stripped on the way out. That is not decoration:
+    /// channel enumeration is precisely the leak scoping exists to stop, since
+    /// a tenant that can list another's channels learns what it is doing
+    /// without receiving a single message.
+    fn handle_pubsub(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        if args.len() < 2 {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, "ERR wrong number of arguments for 'pubsub' command");
+            self.flush(fd);
+            return;
+        }
+        let sub = args[1].to_ascii_uppercase();
+        let prefix = self.conn_prefix(fd);
+        let routes = self.pubsub_routes();
+        // What this connection may see, already stripped back to the name it
+        // would itself have subscribed with.
+        let visible = |name: &[u8]| -> Option<Vec<u8>> {
+            match &prefix {
+                Some(p) => name.starts_with(p.as_slice()).then(|| name[p.len()..].to_vec()),
+                None => Some(name.to_vec()),
+            }
+        };
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        match sub.as_slice() {
+            b"CHANNELS" if args.len() <= 3 => {
+                let mut names: Vec<Vec<u8>> = routes
+                    .iter()
+                    .filter(|(_, pat, _)| !pat)
+                    .filter_map(|(n, _, _)| visible(n))
+                    .filter(|n| args.get(2).map_or(true, |p| glob_match(p, n)))
+                    .collect();
+                // Redis leaves this in hash order; sorting costs nothing at
+                // these sizes and makes the reply diffable in a test.
+                names.sort();
+                resp::array_header(out, names.len());
+                for n in &names {
+                    resp::bulk(out, n);
+                }
+            }
+            b"NUMSUB" => {
+                resp::array_header(out, (args.len() - 2) * 2);
+                for ch in &args[2..] {
+                    let want: Vec<u8> = match &prefix {
+                        Some(p) => [p.as_slice(), ch.as_slice()].concat(),
+                        None => ch.clone(),
+                    };
+                    let n = routes
+                        .iter()
+                        .find(|(name, pat, _)| !pat && *name == want)
+                        .map_or(0, |(_, _, c)| *c);
+                    resp::bulk(out, ch);
+                    resp::integer(out, n as i64);
+                }
+            }
+            b"NUMPAT" if args.len() == 2 => {
+                let n = routes
+                    .iter()
+                    .filter(|(_, pat, _)| *pat)
+                    .filter(|(name, _, _)| visible(name).is_some())
+                    .count();
+                resp::integer(out, n as i64);
+            }
+            // The HELP text lists what this build actually serves. Redis also
+            // lists SHARDCHANNELS/SHARDNUMSUB; advertising a subcommand that
+            // answers "unknown command" is the exact defect this commit fixes,
+            // so they appear here only once they work.
+            b"HELP" => {
+                let lines: [&str; 9] = [
+                    "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "CHANNELS [<pattern>]",
+                    "    Return the currently active channels matching a <pattern> (default: '*').",
+                    "NUMPAT",
+                    "    Return number of subscriptions to patterns.",
+                    "NUMSUB [<channel> ...]",
+                    "    Return the number of subscribers for the specified channels, excluding",
+                    "    pattern subscriptions(default: no channels).",
+                    "HELP",
+                ];
+                resp::array_header(out, lines.len() + 1);
+                for l in lines {
+                    resp::simple(out, l);
+                }
+                resp::simple(out, "    Prints this help.");
+            }
+            // Redis distinguishes the three, and echoes the subcommand with the
+            // case the client sent. Matched verbatim: a client that greps for
+            // one of these strings should not have to special-case us.
+            b"NUMPAT" => resp::error(
+                out,
+                "ERR wrong number of arguments for 'pubsub|numpat' command",
+            ),
+            b"CHANNELS" => resp::error(
+                out,
+                &format!(
+                    "ERR unknown subcommand or wrong number of arguments for '{}'. Try PUBSUB HELP.",
+                    String::from_utf8_lossy(&args[1])
+                ),
+            ),
+            _ => resp::error(
+                out,
+                &format!(
+                    "ERR unknown subcommand '{}'. Try PUBSUB HELP.",
+                    String::from_utf8_lossy(&args[1])
+                ),
+            ),
+        }
+        self.flush(fd);
     }
 
     /// The tenant scope prefix (`{tenant}:`) for this connection, or `None` when
