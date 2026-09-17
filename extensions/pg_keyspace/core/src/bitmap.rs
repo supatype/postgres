@@ -42,28 +42,10 @@ pub fn parse_unit(arg: &[u8]) -> Option<Unit> {
     }
 }
 
-/// Parse an integer argument the way Redis's `string2ll` does: an optional `-`,
-/// then digits, with no leading `+`, no leading zeros (`08` is not 8), no
-/// surrounding whitespace and no overflow.
-///
-/// Stricter than `str::parse`, deliberately. A stock client that sends `SETBIT k
-/// 08 1` is told the offset is invalid by a real Redis, and has to be told the
-/// same here — accepting it would set a bit the client never asked to set.
-pub fn parse_int(arg: &[u8]) -> Option<i64> {
-    let (neg, digits) = match arg.split_first() {
-        Some((b'-', rest)) => (true, rest),
-        _ => (false, arg),
-    };
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    // "0" alone is the only string that may start with a zero, and "-0" is not
-    // one of them.
-    if digits[0] == b'0' && (digits.len() > 1 || neg) {
-        return None;
-    }
-    std::str::from_utf8(arg).ok()?.parse::<i64>().ok()
-}
+/// The strict integer parser, which now lives in `resp` because the whole
+/// command surface needs it rather than only the bitmap commands (#150). Kept
+/// as a re-export so the bitmap call sites below read as they did.
+pub use crate::resp::arg_int as parse_int;
 
 /// Parse a bit offset for `SETBIT`/`GETBIT`/`BITFIELD`.
 ///

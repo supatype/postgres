@@ -32,6 +32,38 @@ pub mod store;
 
 #[cfg(test)]
 mod tests {
+    // #150: the strict integer parser. Redis's string2ll, not str::parse.
+    #[test]
+    fn arg_int_matches_string2ll() {
+        use crate::resp::{arg_int, arg_uint};
+        // accepted
+        assert_eq!(arg_int(b"0"), Some(0));
+        assert_eq!(arg_int(b"5"), Some(5));
+        assert_eq!(arg_int(b"-1"), Some(-1));
+        assert_eq!(arg_int(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(arg_int(b"-9223372036854775808"), Some(i64::MIN));
+        // the three forms str::parse takes and redis does not
+        assert_eq!(arg_int(b"+1"), None, "leading + must be refused");
+        assert_eq!(arg_int(b"05"), None, "leading zero must be refused");
+        assert_eq!(arg_int(b"-0"), None, "negative zero must be refused");
+        assert_eq!(arg_int(b"00"), None);
+        assert_eq!(arg_int(b"-01"), None);
+        // and the ones it already refused
+        assert_eq!(arg_int(b""), None);
+        assert_eq!(arg_int(b"-"), None);
+        assert_eq!(arg_int(b" 1"), None);
+        assert_eq!(arg_int(b"1 "), None);
+        assert_eq!(arg_int(b"1.0"), None);
+        assert_eq!(arg_int(b"abc"), None);
+        assert_eq!(arg_int(b"9223372036854775808"), None, "overflow");
+        // arg_uint bounds below rather than casting: `as usize` on a negative
+        // would wrap to something enormous.
+        assert_eq!(arg_uint(b"0"), Some(0));
+        assert_eq!(arg_uint(b"7"), Some(7));
+        assert_eq!(arg_uint(b"-1"), None);
+        assert_eq!(arg_uint(b"+1"), None);
+    }
+
     use std::collections::BTreeSet;
 
     /// Every module here must also be declared by the pgrx extension.
