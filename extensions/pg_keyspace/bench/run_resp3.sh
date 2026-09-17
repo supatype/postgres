@@ -112,6 +112,62 @@ else
   echo "  SKIP  tracking invalidation (TLS port; raw socket unavailable)"
 fi
 
+# ---- connection state: RESET and CLIENT SETNAME/GETNAME ----------------------
+# One connection across several commands, so redis-cli is no use here (it opens
+# a new one per invocation) -- these go down a raw socket.
+#
+# Every expectation below was measured against redis 7.0.15 rather than recalled.
+# RESET used to reply +OK and do nothing at all, which mattered most in exactly
+# the place it looks harmless: RESET is on the short allowlist of commands
+# accepted in RESP2 subscribe mode, because it is the documented way OUT of it.
+raw() { # reads commands on stdin, returns the multiplexed replies
+  if echo "$R2" | grep -q tls; then
+    { cat; sleep 0.5; } | timeout 5 openssl s_client -quiet -connect 127.0.0.1:$RESP 2>/dev/null
+  else
+    { cat; sleep 0.5; } | timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$RESP; cat >&3; cat <&3"
+  fi
+}
+
+out="$(printf 'CLIENT GETNAME\r\nCLIENT SETNAME worker-7\r\nCLIENT GETNAME\r\n' | raw)"
+chk "CLIENT GETNAME unset is a null, not an empty string" "1" "$(echo "$out" | grep -c '^\$-1')"
+chk "CLIENT SETNAME then GETNAME round-trips" "1" "$(echo "$out" | grep -c 'worker-7')"
+
+out="$(printf 'HELLO 3\r\nCLIENT GETNAME\r\n' | raw)"
+chk "CLIENT GETNAME unset is RESP3 null under HELLO 3" "1" "$(echo "$out" | grep -c '^_')"
+
+# Multibulk, not inline: the inline protocol splits on whitespace, so
+# `CLIENT SETNAME a b` arrives as the perfectly legal name "a" and proves
+# nothing. A name with a space or a newline in it can only be sent as a frame.
+out="$(printf '*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$3\r\na b\r\n' | raw)"
+chk "CLIENT SETNAME refuses a name with a space" "1" \
+    "$(echo "$out" | grep -c 'cannot contain spaces')"
+out="$(printf '*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$3\r\na\nb\r\n' | raw)"
+chk "CLIENT SETNAME refuses a name with a newline" "1" \
+    "$(echo "$out" | grep -c 'cannot contain spaces')"
+# An empty name is legal, and means "unset".
+out="$(printf '*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$0\r\n\r\nCLIENT GETNAME\r\n' | raw)"
+chk "CLIENT SETNAME '' is accepted and unsets" "1" "$(echo "$out" | grep -c '^\$-1')"
+
+out="$(printf 'RESET\r\n' | raw)"
+chk "RESET replies +RESET, not +OK" "1" "$(echo "$out" | grep -c '^+RESET')"
+
+# The one that matters: subscribe mode is a state you must be able to leave.
+out="$(printf 'SUBSCRIBE ch\r\nGET nokey\r\nRESET\r\nGET nokey\r\n' | raw)"
+chk "a keyed command is refused while subscribed" "1" \
+    "$(echo "$out" | grep -c "allowed in this context")"
+chk "RESET exits subscribe mode" "1" "$(echo "$out" | grep -c '^\$-1')"
+
+out="$(printf 'MULTI\r\nSET k v\r\nRESET\r\nEXEC\r\n' | raw)"
+chk "RESET inside MULTI runs rather than queueing" "1" "$(echo "$out" | grep -c '^+RESET')"
+chk "and discards the transaction" "1" "$(echo "$out" | grep -c 'EXEC without MULTI')"
+
+out="$(printf 'CLIENT SETNAME gone\r\nRESET\r\nCLIENT GETNAME\r\n' | raw)"
+chk "RESET clears the connection name" "1" "$(echo "$out" | grep -c '^\$-1')"
+
+# RESET undoes HELLO 3, so a miss must come back as $-1 and not _.
+out="$(printf 'HELLO 3\r\nGET nokey\r\nRESET\r\nGET nokey\r\n' | raw)"
+chk "RESET drops RESP3 back to RESP2" "1" "$(echo "$out" | grep -c '^\$-1')"
+
 echo
 echo "# result: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

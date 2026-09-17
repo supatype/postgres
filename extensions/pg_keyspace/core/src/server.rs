@@ -590,6 +590,10 @@ struct Conn {
     // OPTIN / OPTOUT modes) or matched by prefix at write time (BCAST); an
     // `invalidate` push is then sent to this connection or its REDIRECT target.
     track: Tracking,
+    /// `CLIENT SETNAME`. Empty means unset, which `CLIENT GETNAME` answers with
+    /// a null rather than an empty string -- the two are different replies and
+    /// clients that label their connections read the difference.
+    name: Vec<u8>,
 }
 
 impl Conn {
@@ -1171,6 +1175,7 @@ impl Worker {
                     watch: Vec::new(),
                     resp3: false,
                     track: Tracking::default(),
+                    name: Vec::new(),
                 },
             );
         }
@@ -1492,6 +1497,11 @@ impl Worker {
                 resp::simple(&mut c.wbuf, "OK");
                 return;
             }
+            // RESET runs rather than queueing, for the same reason DISCARD does:
+            // it is one of the ways out of a transaction, so a queued RESET
+            // would be a RESET you could only deliver by completing the thing
+            // you were trying to abandon.
+            b"RESET" => return self.handle_reset(fd),
             _ => {}
         }
         // Inside MULTI, every other command is queued (not run) and answered
@@ -1648,7 +1658,7 @@ impl Worker {
             }
             // AUTH, HELLO and CLIENT are handled above this match, below the
             // subscribe-context gate.
-            b"CONFIG" | b"SELECT" | b"RESET" => resp::simple(out, "OK"),
+            b"CONFIG" | b"SELECT" => resp::simple(out, "OK"),
             b"COMMAND" => {
                 let specs = command_specs();
                 match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
@@ -5207,6 +5217,60 @@ impl Worker {
         resp::array_header(out, 0);
     }
 
+    /// `RESET`: return the connection to the state it had when it was opened,
+    /// and reply `+RESET`.
+    ///
+    /// This used to reply `+OK` and do nothing, which was worse than not
+    /// implementing it. `RESET` is on the short allowlist of commands accepted
+    /// in RESP2 subscribe mode precisely because it is the documented way OUT of
+    /// subscribe mode -- so a client that sent it got an affirmative reply and
+    /// stayed exactly where it was, with no way to tell.
+    ///
+    /// Each clause below is measured against redis 7.0.15 rather than recalled;
+    /// the protocol downgrade in particular is easy to assume away.
+    fn handle_reset(&mut self, fd: RawFd) {
+        // Subscribe mode, in all three namespaces, Bus routes included.
+        self.unsubscribe_all(fd);
+        // Client-side caching. Same teardown CLIENT TRACKING OFF does, including
+        // the bus tracker count -- a RESET that left the count up would keep
+        // every writer paying for invalidation checks with nobody listening.
+        let was_tracking = self.conns.get(&fd).map(|c| c.track.on).unwrap_or(false);
+        self.bcast_subs.remove(&fd);
+        if !self.tracked.is_empty() {
+            self.untrack_fd(fd);
+        }
+        if was_tracking {
+            if let Some(bus) = &self.bus {
+                bus.tracker_remove();
+            }
+        }
+        // Whether this worker requires AUTH at all. Redis deauthenticates on
+        // RESET only where a password is configured; with no auth there is no
+        // authenticated state to drop, and clearing `authed` would lock out a
+        // no-auth connection that had done nothing wrong.
+        let requires_auth = self.auth.is_some();
+        let c = match self.conns.get_mut(&fd) {
+            Some(c) => c,
+            None => return,
+        };
+        c.in_multi = false;
+        c.queued.clear();
+        c.watch.clear();
+        c.track = Tracking::default();
+        c.name.clear();
+        // Back to RESP2: RESET undoes HELLO 3, so a client that resets and then
+        // reads a miss must get $-1 and not _.
+        c.resp3 = false;
+        if requires_auth {
+            c.authed = false;
+            c.role.clear();
+            c.tenant.clear();
+            c.tenant_id = 0;
+            c.exempt = false;
+        }
+        resp::simple(&mut c.wbuf, "RESET");
+    }
+
     /// CLIENT subcommands. TRACKING ON/OFF drives server-assisted client-side
     /// caching; the rest are the benign ones clients send at connect (ID, GETNAME,
     /// SETNAME, SETINFO, NO-EVICT, …), answered OK.
@@ -5217,8 +5281,39 @@ impl Worker {
                 resp::integer(out, fd as i64);
             }
             Some(b"GETNAME") => {
-                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-                resp::bulk(out, b"");
+                let c = self.conns.get_mut(&fd).unwrap();
+                // Unset is a NULL, not an empty string. This replied with an
+                // empty bulk in both protocols, so a client could not tell an
+                // unnamed connection from one named "".
+                if c.name.is_empty() {
+                    let resp3 = c.resp3;
+                    resp::null(&mut c.wbuf, resp3);
+                } else {
+                    let name = std::mem::take(&mut c.name);
+                    resp::bulk(&mut c.wbuf, &name);
+                    c.name = name;
+                }
+            }
+            Some(b"SETNAME") => {
+                let Some(name) = args.get(2) else {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(out, "ERR wrong number of arguments for 'client|setname' command");
+                    return;
+                };
+                // Redis's own rule: printable ASCII excluding space, so the name
+                // stays one field in CLIENT LIST output. An empty name is legal
+                // and means "unset".
+                if name.iter().any(|&b| !(b'!'..=b'~').contains(&b)) {
+                    let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                    resp::error(
+                        out,
+                        "ERR Client names cannot contain spaces, newlines or special characters.",
+                    );
+                    return;
+                }
+                let c = self.conns.get_mut(&fd).unwrap();
+                c.name = name.clone();
+                resp::simple(&mut c.wbuf, "OK");
             }
             Some(b"TRACKING") => self.handle_tracking(fd, args),
             Some(b"CACHING") => {
@@ -5246,7 +5341,7 @@ impl Worker {
                 resp::simple(&mut c.wbuf, "OK");
             }
             _ => {
-                // SETNAME / SETINFO / NO-EVICT / NO-TOUCH / UNPAUSE / …
+                // SETINFO / NO-EVICT / NO-TOUCH / UNPAUSE / …
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                 resp::simple(out, "OK");
             }
@@ -6357,7 +6452,30 @@ impl Worker {
     }
 
     fn close(&mut self, fd: RawFd) {
-        // drop this fd from every channel/pattern it was subscribed to.
+        self.unsubscribe_all(fd);
+        // Drop this fd from the client-side-caching tracking table (and the BCAST
+        // set) so a future connection reusing the fd never inherits a stale
+        // invalidation target.
+        if !self.tracked.is_empty() {
+            self.untrack_fd(fd);
+        }
+        self.bcast_subs.remove(&fd);
+        if self.conns.get(&fd).map(|c| c.track.on).unwrap_or(false) {
+            if let Some(bus) = &self.bus {
+                bus.tracker_remove();
+            }
+        }
+        // Deregister before closing: the fd must still be valid for deregister.
+        let _ = self.registry.deregister(&mut SourceFd(&fd));
+        unsafe { libc::close(fd) };
+        self.conns.remove(&fd);
+    }
+
+    /// Drop this fd from every channel, pattern and shard channel it holds,
+    /// keeping the reverse indexes and the shared-memory Bus routing table in
+    /// step. Shared by `close` and `RESET`: the Bus bookkeeping here is the
+    /// easiest thing in this file to leak, and one copy of it cannot drift.
+    fn unsubscribe_all(&mut self, fd: RawFd) {
         // Take the subscription sets out so we can mutate the reverse indexes and
         // the Bus without holding a borrow on self.conns.
         let (subs, psubs) = match self.conns.get_mut(&fd) {
@@ -6400,22 +6518,6 @@ impl Worker {
                 }
             }
         }
-        // Drop this fd from the client-side-caching tracking table (and the BCAST
-        // set) so a future connection reusing the fd never inherits a stale
-        // invalidation target.
-        if !self.tracked.is_empty() {
-            self.untrack_fd(fd);
-        }
-        self.bcast_subs.remove(&fd);
-        if self.conns.get(&fd).map(|c| c.track.on).unwrap_or(false) {
-            if let Some(bus) = &self.bus {
-                bus.tracker_remove();
-            }
-        }
-        // Deregister before closing: the fd must still be valid for deregister.
-        let _ = self.registry.deregister(&mut SourceFd(&fd));
-        unsafe { libc::close(fd) };
-        self.conns.remove(&fd);
     }
 }
 

@@ -69,7 +69,11 @@ su postgres -c "$PGBIN/initdb -D $PGDATA -U postgres" >/dev/null 2>&1
   echo "shared_preload_libraries = 'pg_keyspace'"
   echo "pg_keyspace.port = $RESP"
   echo "pg_keyspace.require_mask = off"
-  # Pub/sub needs no persistence, and >1 worker forces the ephemeral tier anyway.
+  # Pub/sub needs no persistence, so this runs on the cheapest tier.
+  # NOT because a multi-worker cluster has to be ephemeral -- it does not.
+  # Each slot worker owns a disjoint slot range, its own segment and its own
+  # ring set, so durability and scale-out compose; run_pubsub_introspect.sh
+  # runs a durable 3-worker cluster and depends on that.
   echo "pg_keyspace.durability = 'ephemeral'"
   echo "pg_keyspace.workers = $WORKERS"
   echo "pg_keyspace.cluster_announce_host = '127.0.0.1'"
