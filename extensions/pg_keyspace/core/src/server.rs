@@ -7892,6 +7892,9 @@ mod tests {
         _buf: Vec<u8>,
         cons: ring::Consumer,
         worker: Worker,
+        /// Record kinds seen by the last drain, so a test can tell an inline
+        /// staging from a by-reference one.
+        kinds: Vec<u8>,
     }
 
     impl Fixture {
@@ -7912,7 +7915,7 @@ mod tests {
             if let Some(p) = policy {
                 worker.set_durability_policy(p);
             }
-            Fixture { port, _buf: buf, cons, worker }
+            Fixture { port, _buf: buf, cons, worker, kinds: Vec::new() }
         }
 
         /// Run the event loop until the client thread finishes, then return
@@ -7939,10 +7942,17 @@ mod tests {
                 );
             h.join().expect("client thread");
             let mut got = Vec::new();
-            self.cons.drain(usize::MAX, |k, _v, e, _kind| {
+            self.cons.drain(usize::MAX, |k, _v, e, kind| {
                 got.push((k.to_vec(), e == DELETE_TOMBSTONE));
+                self.kinds.push(kind);
             });
             got
+        }
+
+        /// Whether every record drained by the last `run` was staged by
+        /// reference rather than carrying its value inline.
+        fn all_by_ref(&self) -> bool {
+            !self.kinds.is_empty() && self.kinds.iter().all(|k| k & ring::KIND_REF != 0)
         }
     }
 
@@ -8028,6 +8038,47 @@ mod tests {
             send(port, &["MSET routing:a v1 cache:b v2"]);
         });
         assert_eq!(keys(&got), vec!["+routing:a"]);
+    }
+
+    /// A value over `INLINE_MAX` is staged by REFERENCE: the ring record
+    /// carries the entry's version and the persistence worker reads the bytes
+    /// out of the shared segment. That is a second branch inside the drain
+    /// loop, reached only by large values, and the per-key filter has to hold
+    /// on both sides of it -- an ephemeral large value must not be staged, and
+    /// a durable one must still take the reference path rather than being
+    /// copied into the ring.
+    ///
+    /// Every other test here uses values of a dozen bytes, so without this the
+    /// large-value path had no coverage under a policy at all.
+    #[test]
+    fn a_large_value_is_filtered_and_still_staged_by_reference() {
+        let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
+        let mut fx = Fixture::new("bigval", Some(policy), false);
+        // One command straddling the policy, so the per-command gate cannot
+        // decide it and the drain-loop filter is the thing under test -- and
+        // both values are past INLINE_MAX (8 KiB), so the record that does get
+        // staged takes the by-reference branch inside that same loop.
+        let big_a = "a".repeat(INLINE_MAX * 2);
+        let big_c = "c".repeat(INLINE_MAX * 2);
+        let got = fx.run(move |port| {
+            send(port, &[&format!("MSET acme:big {big_a} cache:big {big_c}")]);
+        });
+        assert_eq!(keys(&got), vec!["+acme:big"], "only the durable large value is staged");
+        assert!(fx.all_by_ref(), "a value over INLINE_MAX stages by reference, kinds={:?}", fx.kinds);
+    }
+
+    /// The mirror: a large value the policy calls ephemeral must not reach the
+    /// ring by either path, and must not leave a staged-sequence marker on the
+    /// entry that eviction would then respect.
+    #[test]
+    fn a_large_ephemeral_value_is_not_staged_at_all() {
+        let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
+        let mut fx = Fixture::new("bigeph", Some(policy), false);
+        let big = "z".repeat(INLINE_MAX * 2);
+        let got = fx.run(move |port| {
+            send(port, &[&format!("SET cache:big {big}")]);
+        });
+        assert!(got.is_empty(), "nothing should reach the ring, got {:?}", keys(&got));
     }
 
     /// A DEL is staged on the same predicate as the write, so an ephemeral key
