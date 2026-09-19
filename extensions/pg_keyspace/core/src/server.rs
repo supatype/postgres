@@ -8084,6 +8084,13 @@ mod tests {
     /// A DEL is staged on the same predicate as the write, so an ephemeral key
     /// -- which never had a row -- does not spend a ring record on a tombstone
     /// the pre-flight reserved no room for.
+    ///
+    /// The delete has to STRADDLE the policy to test the per-key check. A
+    /// single-key ephemeral DEL never reaches it: the per-command gate ahead
+    /// of the dispatch already answered no, so the site at `:2035` could be
+    /// deleted outright and a one-key-at-a-time version of this test would
+    /// still pass. `DEL a b` is where the two answers differ -- the command
+    /// stages something, and only one of its keys.
     #[test]
     fn a_delete_is_staged_on_the_same_predicate_as_the_write() {
         let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
@@ -8091,7 +8098,7 @@ mod tests {
         let got = fx.run(|port| {
             send(
                 port,
-                &["SET acme:cert v1", "SET cache:page v2", "DEL acme:cert", "DEL cache:page"],
+                &["SET acme:cert v1", "SET cache:page v2", "DEL acme:cert cache:page"],
             );
         });
         assert_eq!(keys(&got), vec!["+acme:cert", "-acme:cert"]);
@@ -8107,6 +8114,114 @@ mod tests {
         });
         got.retain(|(_, tomb)| *tomb);
         assert_eq!(keys(&got), vec!["-acme:cert"]);
+    }
+
+    /// The tombstone half of sync-ack, which the two tests above cannot reach:
+    /// they run with sync-ack off, so `holds_reply` short-circuits on the flag
+    /// and the policy is never consulted on a DEL at all. A tombstone is the
+    /// one record whose loss silently *resurrects* data, so it has to be held
+    /// on exactly the terms its write was.
+    ///
+    /// Nothing drains the ring here, so a held reply never arrives -- the same
+    /// tell `a_relaxed_write_is_staged_but_not_held` uses.
+    #[test]
+    fn a_tombstone_holds_the_reply_on_the_same_terms_as_the_write() {
+        let policy = Policy::parse(Tier::Ephemeral, "rx:=relaxed, dx:=durable").unwrap();
+        let mut fx = Fixture::new("deltomb", Some(policy), true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut got = fx.run(move |port| {
+            // Each on its own connection: the durable SET holds its own reply.
+            send(port, &["SET dx:k v1"]);
+            send(port, &["SET rx:k v1"]);
+            send(port, &["SET cache:k v1"]);
+            let durable = send(port, &["DEL dx:k"]);
+            let relaxed = send(port, &["DEL rx:k"]);
+            let ephemeral = send(port, &["DEL cache:k"]);
+            tx.send((durable, relaxed, ephemeral)).unwrap();
+        });
+        let (durable, relaxed, ephemeral) = rx.recv().expect("client result");
+        assert!(durable.is_empty(), "a durable DEL waits for its tombstone, got {durable:?}");
+        assert_eq!(relaxed, vec![":1"], "a relaxed DEL acks before its tombstone commits");
+        assert_eq!(ephemeral, vec![":1"], "an ephemeral DEL stages nothing to wait for");
+        got.retain(|(_, tomb)| *tomb);
+        assert_eq!(keys(&got), vec!["-dx:k", "-rx:k"], "and only the staged keys are tombstoned");
+    }
+
+    /// FLUSHDB's own hold, for the same reason and by the same predicate.
+    ///
+    /// The three cases have to be distinguished, not just the outer two: a
+    /// flush whose victims were never staged has nothing to wait for and one
+    /// with a durable victim does, but a `relaxed` victim is staged *and* not
+    /// waited on -- which is the only case that tells the policy apart from
+    /// the sync-ack flag. Without it, dropping the policy from this site
+    /// leaves every assertion here still passing.
+    #[test]
+    fn flushdb_holds_its_reply_only_for_a_victim_the_policy_holds() {
+        let policy = Policy::parse(Tier::Ephemeral, "dx:=durable, rx:=relaxed").unwrap();
+        let mut fx = Fixture::new("flushhold", Some(policy), true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut got = fx.run(move |port| {
+            send(port, &["SET cache:a v1", "SET cache:b v2"]);
+            let ephemeral_only = send(port, &["FLUSHDB"]);
+            send(port, &["SET rx:k v1"]);
+            let relaxed_only = send(port, &["FLUSHDB"]);
+            send(port, &["SET dx:k v1"]);
+            let with_durable = send(port, &["FLUSHDB"]);
+            tx.send((ephemeral_only, relaxed_only, with_durable)).unwrap();
+        });
+        let (ephemeral_only, relaxed_only, with_durable) = rx.recv().expect("client result");
+        assert_eq!(ephemeral_only, vec!["+OK"], "nothing was staged, so nothing is waited on");
+        assert_eq!(relaxed_only, vec!["+OK"], "a relaxed victim is staged but not waited on");
+        assert!(with_durable.is_empty(), "a durable victim holds the flush, got {with_durable:?}");
+        got.retain(|(_, tomb)| *tomb);
+        assert_eq!(keys(&got), vec!["-rx:k", "-dx:k"], "and only the staged victims are tombstoned");
+    }
+
+    /// Strings are not the only thing staged. An aggregate write (hash, list,
+    /// set, zset) reaches the ring through its own `stages.push`, which
+    /// re-reads the whole value out of the store and picks inline or
+    /// by-reference for itself. Every other test here writes strings, so a
+    /// policy had never been applied to that site at all.
+    #[test]
+    fn an_aggregate_write_follows_the_policy_like_a_string_does() {
+        let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
+        let mut fx = Fixture::new("aggr", Some(policy), false);
+        let got = fx.run(|port| {
+            send(
+                port,
+                &[
+                    "HSET acme:h f v",
+                    "HSET cache:h f v",
+                    "LPUSH acme:l v",
+                    "LPUSH cache:l v",
+                    "SADD acme:s v",
+                    "SADD cache:s v",
+                    "ZADD acme:z 1 v",
+                    "ZADD cache:z 1 v",
+                ],
+            );
+        });
+        assert_eq!(keys(&got), vec!["+acme:h", "+acme:l", "+acme:s", "+acme:z"]);
+    }
+
+    /// The aggregate case that reaches the DRAIN filter rather than the
+    /// per-command gate. Aggregate writes are single-key, so the gate ahead of
+    /// the dispatch answers each of them on its own and the per-record filter
+    /// never has to disagree -- the test above passes with either gate removed,
+    /// because the other one still catches it.
+    ///
+    /// `SMOVE src dst member` is the exception: it writes both keys, so one
+    /// command straddles the policy. The gate says yes for the durable
+    /// destination and the ephemeral source has to be dropped per record, the
+    /// same way `MSET` is.
+    #[test]
+    fn a_set_move_across_the_policy_stages_only_the_covered_side() {
+        let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
+        let mut fx = Fixture::new("smove", Some(policy), false);
+        let got = fx.run(|port| {
+            send(port, &["SADD cache:src a b", "SMOVE cache:src acme:dst a"]);
+        });
+        assert_eq!(keys(&got), vec!["+acme:dst"], "the ephemeral source is not staged");
     }
 
     /// With no policy set, every write goes through the rings exactly as it
