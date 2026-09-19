@@ -253,6 +253,18 @@ mv $RESTOREDATA/log $RESTOREDATA/log.refused
 start_pg $RESTOREDATA $RPORT
 if wait_ready $RPORT; then
   chk "with the announce host set, the re-shard starts" "1" "$(psql_ $RPORT "SELECT 1")"
+  # Both of the next two are written by worker 0 during startup, not by
+  # Postgres accepting connections, so `wait_ready` does not imply either.
+  # Worker 0 runs the (idempotent) schema DDL before it recovers, and
+  # record_topology lives in the recovery path behind it -- so on a restore
+  # that adds a column or an index, the row lands measurably after the port
+  # opens. Reading immediately was a race that happened to hold while that
+  # DDL was empty. Bounded, so a re-shard that genuinely never records still
+  # fails here rather than hanging.
+  for _ in $(seq 1 30); do
+    [ "$(psql_ $RPORT "SELECT workers FROM supacache.topology WHERE id=1")" = "3" ] && break
+    sleep 1
+  done
   chk "and says so, rather than changing shape silently" "1" \
       "$(grep -c 'WORKER COUNT CHANGED' $RESTOREDATA/log 2>/dev/null | head -1)"
   echo "  $(grep -o 'WORKER COUNT CHANGED.*' $RESTOREDATA/log | tail -1 | cut -c1-170)"
