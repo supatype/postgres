@@ -49,6 +49,14 @@ CREATE VIEW supacache.pg_stat_keyspace_topology AS
 SELECT recorded_workers, running_workers, slots_moved, pct_moved, addressing, resize_safe
 FROM supacache.topology_change();
 
+-- DROP VIEW took the comment with it, and a fresh install has one. The
+-- upgrade-vs-fresh catalogue diff compares comments as well as definitions and
+-- ACLs, so restoring it is not cosmetic: without this the two catalogues
+-- differ on a view that is otherwise identical. Must match the text in the
+-- pg_stat_keyspace_views block exactly.
+COMMENT ON VIEW supacache.pg_stat_keyspace_topology IS
+  'pg_keyspace: worker layout the persisted keyspace was written under vs the one running now, and what a change between them costs.';
+
 /* ---------------------------------------------------------------------------
  * New function.
  * ------------------------------------------------------------------------ */
