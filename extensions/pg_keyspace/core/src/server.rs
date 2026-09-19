@@ -70,6 +70,7 @@ use crate::aggr;
 use crate::batcher::{Batcher, Tier};
 use crate::bitmap;
 use crate::crc16;
+use crate::durability::Policy;
 use crate::prob;
 use crate::pubsub;
 use crate::resp::{self, Parse};
@@ -695,6 +696,11 @@ pub struct Worker {
     // itself is by id. Populated at AUTH, so it holds the tenants this worker
     // has actually seen rather than every configured one.
     tenant_names: HashMap<TenantId, String>,
+    // Per-key durability (#164). `None` is the instance-wide behaviour every
+    // deployment had before overrides existed: if the rings are attached, every
+    // write goes through them. `Some` resolves each key to its own tier, so one
+    // instance can carry a durable prefix beside an ephemeral cache.
+    durability: Option<Policy>,
     // when set, RESP AUTH is required and keys are ACL-checked + tenant-scoped.
     auth: Option<AuthConfig>,
     // durable tier: hold each write's RESP reply until its ring record commits.
@@ -777,6 +783,7 @@ impl Worker {
             tenant_share: true,
             rates: TenantRates::new(),
             tenant_names: HashMap::new(),
+            durability: None,
             auth: None,
             sync_ack: false,
             routing: None,
@@ -807,8 +814,61 @@ impl Worker {
     }
 
     /// Durable tier: hold each write's reply until its ring record has committed.
+    ///
+    /// Instance-wide, and a ceiling rather than the whole answer once a
+    /// durability policy is set: a key the policy puts at `relaxed` is acked
+    /// immediately even here, but no key is held when this is off.
     pub fn set_sync_ack(&mut self, on: bool) {
         self.sync_ack = on;
+    }
+
+    /// Resolve each key's durability tier individually (#164).
+    ///
+    /// The policy narrows what the rings carry; it cannot widen it. The rings,
+    /// the persistence workers and `set_sync_ack` are provisioned from the
+    /// strongest tier the policy can produce, so an instance whose default tier
+    /// is `ephemeral` still has rings when a prefix asks for `durable`.
+    pub fn set_durability_policy(&mut self, policy: Policy) {
+        self.durability = Some(policy);
+    }
+
+    /// Whether the policy stages `key` at all. Callers have already
+    /// established that the rings exist.
+    ///
+    /// Takes the field rather than `&self` on purpose: the call sites run under
+    /// a live `&mut self.conns` borrow (the reply buffer), and only a borrow of
+    /// the individual field is disjoint from it.
+    #[inline]
+    fn policy_persists(durability: &Option<Policy>, key: &[u8]) -> bool {
+        durability.as_ref().map_or(true, |p| p.persists(key))
+    }
+
+    /// Whether a write to `key` holds its RESP reply until the record commits.
+    /// Same borrow reasoning as `policy_persists`.
+    #[inline]
+    fn holds_reply(durability: &Option<Policy>, sync_ack: bool, key: &[u8]) -> bool {
+        sync_ack && durability.as_ref().map_or(true, |p| p.holds_reply(key))
+    }
+
+    /// Whether this command could stage anything at all, checked once before
+    /// the store is touched so the common all-ephemeral write does no staging
+    /// work -- `stages.push` clones the key and the value, which is not
+    /// something to do and throw away on the hot path.
+    ///
+    /// Keyless writes (FLUSHDB) answer yes and filter per victim at their own
+    /// site, because there is no key here to ask about.
+    fn command_persists(&self, key_idxs: &[usize], args: &[Vec<u8>]) -> bool {
+        if self.producers.is_empty() {
+            return false;
+        }
+        let pol = match &self.durability {
+            Some(p) => p,
+            None => return true,
+        };
+        if key_idxs.is_empty() {
+            return true;
+        }
+        key_idxs.iter().any(|&i| args.get(i).is_some_and(|k| pol.persists(k)))
     }
 
     /// Largest bulk string to accept from a client (`pg_keyspace.max_value_bytes`).
@@ -1033,6 +1093,13 @@ impl Worker {
                 Some(k) => k,
                 None => continue,
             };
+            // A key this policy never persists reserves nothing (#164). Without
+            // this an ephemeral write parks on a ring full of somebody else's
+            // durable records -- the whole point of keeping it out of the ring
+            // is that a backlog it does not contribute to cannot stall it.
+            if !self.durability.as_ref().map_or(true, |p| p.persists(key)) {
+                continue;
+            }
             let inline_bound = if aggregate {
                 // current blob (if any) + everything this command could add
                 let cur = self
@@ -1624,7 +1691,11 @@ impl Worker {
         let store = self.store.clone();
         let batcher = self.batcher.clone();
         let tier = self.tier;
-        let persist_on = !self.producers.is_empty();
+        // Per-command, not per-instance (#164): with a durability policy set,
+        // a command none of whose keys persist stages nothing and takes none
+        // of the ring paths below. The drain loop re-checks per key, which is
+        // what makes a multi-key command spanning both kinds come out right.
+        let persist_on = self.command_persists(&key_idxs, args);
         // The tenant every record this command stages is charged to (#43).
         // Read before the `out` borrow below, which takes `self.conns` mutably.
         let who: TenantId = self.conns.get(&fd).map_or(0, |c| c.tenant_id);
@@ -1951,13 +2022,25 @@ impl Worker {
                 for a in &args[1..] {
                     if store.del(a) {
                         count += 1;
-                        if persist_on {
+                        // The tombstone follows the same predicate as the
+                        // write, so a key that never entered a ring never
+                        // leaves one either. Rows left behind by a prefix moved
+                        // from durable to ephemeral are handled where they are
+                        // actually a problem -- recovery skips them, and
+                        // supacache.prune_undurable() removes them -- rather
+                        // than by pushing a ring record for every ephemeral
+                        // DEL, which the pre-flight above deliberately reserves
+                        // no room for and which would therefore sleep the event
+                        // loop against a full ring.
+                        if persist_on && Self::policy_persists(&self.durability, a) {
                             // propagate the delete so it does not resurrect on
                             // crash recovery (key is already tenant-scoped in eff)
                             if let Some(sa) =
                                 shard_push(&self.producers, &mut self.shares, who, a, b"", DELETE_TOMBSTONE, b's')
                             {
-                                acks.push(sa);
+                                if Self::holds_reply(&self.durability, sync_ack, a) {
+                                    acks.push(sa);
+                                }
                             }
                         }
                     }
@@ -3170,11 +3253,14 @@ impl Worker {
                 }
                 for k in &victims {
                     store.del(k);
-                    if persist_on {
+                    // Same predicate as DEL, for the same reason.
+                    if persist_on && Self::policy_persists(&self.durability, k) {
                         if let Some(sa) =
                             shard_push(&self.producers, &mut self.shares, who, k, b"", DELETE_TOMBSTONE, b's')
                         {
-                            acks.push(sa);
+                            if Self::holds_reply(&self.durability, sync_ack, k) {
+                                acks.push(sa);
+                            }
                         }
                     }
                 }
@@ -5042,8 +5128,29 @@ impl Worker {
             });
         }
 
+        // Resolve each staged write's tier before touching the rings (#164).
+        // Done here rather than inside the loop because the policy borrow
+        // cannot be held across `shard_push`, which takes `self.shares`
+        // mutably -- and done at all because a key the policy calls ephemeral
+        // must not reach a ring even when a sibling key in the same command
+        // does.
+        let plan: Vec<(PendingWrite, bool)> = match &self.durability {
+            Some(pol) => stages
+                .into_iter()
+                .filter(|(k, _, _, _)| pol.persists(k))
+                .map(|w| {
+                    let hold = sync_ack && pol.holds_reply(&w.0);
+                    (w, hold)
+                })
+                .collect(),
+            None => stages.into_iter().map(|w| (w, sync_ack)).collect(),
+        };
+
+        // Whether the record that could not be queued was one whose reply we
+        // were holding. Only that case can break a durability promise; a
+        // `relaxed` write is already acked and has nothing to take back.
         let mut queue_failed = false;
-        for (k, v, e, kind) in stages {
+        for ((k, v, e, kind), hold) in plan {
             // sharded so a given key always lands on the same ring/persist worker
             // — no cross-worker key conflicts on ON CONFLICT.
             //
@@ -5082,14 +5189,18 @@ impl Worker {
                 None => shard_push(&self.producers, &mut self.shares, who, &k, &v, e, kind),
             };
             match staged {
-                Some(sa) => acks.push(sa),
+                Some(sa) => {
+                    if hold {
+                        acks.push(sa)
+                    }
+                }
                 None => {
-                    queue_failed = true;
+                    queue_failed = hold;
                     break;
                 }
             }
         }
-        if queue_failed && sync_ack {
+        if queue_failed {
             // A sync-ack tier promises that a successful reply means the write
             // reached supacache.kv. The record could not even be queued, so the
             // promise cannot be kept: replace the reply already written with an
@@ -7757,5 +7868,246 @@ mod auth_tests {
         assert!(glob_match(b"", b""));
         assert!(!glob_match(b"", b"x"));
         assert!(glob_match(b"*.*.*", b"a.b.c"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::durability::Policy;
+    use crate::store::Config;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A worker with persistence rings attached, driven from a client thread.
+    ///
+    /// Persistence is not reachable from the standalone daemon, so the
+    /// per-key decisions (#164) would otherwise only be covered by the in-PG
+    /// harnesses. The ring is an ordinary buffer here, exactly as `ring.rs`'s
+    /// own tests use it; the worker runs on this thread so the raw pointer
+    /// never crosses one, and the client runs on the spawned thread instead.
+    struct Fixture {
+        port: u16,
+        _buf: Vec<u8>,
+        cons: ring::Consumer,
+        worker: Worker,
+    }
+
+    impl Fixture {
+        fn new(tag: &str, policy: Option<Policy>, sync_ack: bool) -> Fixture {
+            let seg = format!("pgks_t_{tag}_{}", std::process::id());
+            let cfg = Config::for_capacity(1, 512, 64);
+            let store = Arc::new(Store::create(&seg, &cfg).expect("shmem"));
+            let mut buf = vec![0u8; ring::bytes_for(1 << 16)];
+            let base = buf.as_mut_ptr();
+            unsafe { ring::init(base, 1 << 16) };
+            let prod = unsafe { ring::Producer::attach(base) };
+            let cons = unsafe { ring::Consumer::attach(base) };
+
+            let mut worker = Worker::new(store, None, Tier::Durable, "127.0.0.1", 0).expect("listen");
+            let port = bound_port(worker.listen_fd);
+            worker.set_ring_producers(vec![prod]);
+            worker.set_sync_ack(sync_ack);
+            if let Some(p) = policy {
+                worker.set_durability_policy(p);
+            }
+            Fixture { port, _buf: buf, cons, worker }
+        }
+
+        /// Run the event loop until the client thread finishes, then return
+        /// every (key, is_tombstone) the rings received, in order.
+        fn run(&mut self, client: impl FnOnce(u16) + Send + 'static) -> Vec<(Vec<u8>, bool)> {
+            let done = Arc::new(AtomicBool::new(false));
+            let flag = done.clone();
+            let port = self.port;
+            let h = std::thread::spawn(move || {
+                client(port);
+                flag.store(true, Ordering::SeqCst);
+            });
+            let _ = self
+                .worker
+                .run_with(
+                    || {
+                        if done.load(Ordering::SeqCst) {
+                            Tick::Stop
+                        } else {
+                            Tick::Continue
+                        }
+                    },
+                    5,
+                );
+            h.join().expect("client thread");
+            let mut got = Vec::new();
+            self.cons.drain(usize::MAX, |k, _v, e, _kind| {
+                got.push((k.to_vec(), e == DELETE_TOMBSTONE));
+            });
+            got
+        }
+    }
+
+    /// The port the kernel chose for a `:0` bind.
+    fn bound_port(fd: RawFd) -> u16 {
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len)
+        };
+        assert_eq!(rc, 0, "getsockname");
+        u16::from_be(addr.sin_port)
+    }
+
+    fn send(port: u16, lines: &[&str]) -> Vec<String> {
+        let s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut w = &s;
+        for l in lines {
+            write!(w, "{l}\r\n").unwrap();
+        }
+        w.flush().unwrap();
+        let mut out = Vec::new();
+        let mut r = BufReader::new(&s);
+        for _ in 0..lines.len() {
+            let mut line = String::new();
+            match r.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // closed, or the reply is being held
+                Ok(_) => out.push(line.trim_end().to_string()),
+            }
+        }
+        out
+    }
+
+    fn keys(got: &[(Vec<u8>, bool)]) -> Vec<String> {
+        got.iter()
+            .map(|(k, tomb)| {
+                format!("{}{}", if *tomb { "-" } else { "+" }, String::from_utf8_lossy(k))
+            })
+            .collect()
+    }
+
+    /// The whole point of #164: on one instance, a durable prefix reaches the
+    /// ring and an ephemeral one never does.
+    #[test]
+    fn only_keys_the_policy_persists_reach_the_ring() {
+        let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
+        let mut fx = Fixture::new("mixed", Some(policy), false);
+        let got = fx.run(|port| {
+            send(
+                port,
+                &[
+                    "SET acme:cert v1",
+                    "SET cache:page v2",
+                    "SET acme:acct v3",
+                    "GET cache:page",
+                ],
+            );
+        });
+        assert_eq!(keys(&got), vec!["+acme:cert", "+acme:acct"]);
+    }
+
+    /// The case the per-key filter in the drain loop exists for: one command
+    /// whose keys straddle the policy. The cheap per-command gate cannot
+    /// decide this one -- it says "yes, something here persists" -- so the
+    /// split has to happen per staged record or the ephemeral half rides along.
+    #[test]
+    fn a_multi_key_write_spanning_both_tiers_stages_only_the_durable_half() {
+        let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
+        let mut fx = Fixture::new("mset", Some(policy), false);
+        let got = fx.run(|port| {
+            send(port, &["MSET acme:a v1 cache:b v2 acme:c v3"]);
+        });
+        assert_eq!(keys(&got), vec!["+acme:a", "+acme:c"]);
+    }
+
+    /// The mirror image: a mixed MSET on a mostly-durable instance.
+    #[test]
+    fn a_multi_key_write_drops_the_ephemeral_half_under_a_durable_default() {
+        let policy = Policy::parse(Tier::Durable, "cache:=ephemeral").unwrap();
+        let mut fx = Fixture::new("mset2", Some(policy), false);
+        let got = fx.run(|port| {
+            send(port, &["MSET routing:a v1 cache:b v2"]);
+        });
+        assert_eq!(keys(&got), vec!["+routing:a"]);
+    }
+
+    /// A DEL is staged on the same predicate as the write, so an ephemeral key
+    /// -- which never had a row -- does not spend a ring record on a tombstone
+    /// the pre-flight reserved no room for.
+    #[test]
+    fn a_delete_is_staged_on_the_same_predicate_as_the_write() {
+        let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
+        let mut fx = Fixture::new("del", Some(policy), false);
+        let got = fx.run(|port| {
+            send(
+                port,
+                &["SET acme:cert v1", "SET cache:page v2", "DEL acme:cert", "DEL cache:page"],
+            );
+        });
+        assert_eq!(keys(&got), vec!["+acme:cert", "-acme:cert"]);
+    }
+
+    /// FLUSHDB has no key to ask about, so it filters per victim instead.
+    #[test]
+    fn flushdb_tombstones_only_the_victims_that_were_persisted() {
+        let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
+        let mut fx = Fixture::new("flush", Some(policy), false);
+        let mut got = fx.run(|port| {
+            send(port, &["SET acme:cert v1", "SET cache:page v2", "FLUSHDB"]);
+        });
+        got.retain(|(_, tomb)| *tomb);
+        assert_eq!(keys(&got), vec!["-acme:cert"]);
+    }
+
+    /// With no policy set, every write goes through the rings exactly as it
+    /// did before per-key durability existed.
+    #[test]
+    fn no_policy_is_the_old_instance_wide_behaviour() {
+        let mut fx = Fixture::new("legacy", None, false);
+        let got = fx.run(|port| {
+            send(port, &["SET acme:cert v1", "SET cache:page v2"]);
+        });
+        assert_eq!(keys(&got), vec!["+acme:cert", "+cache:page"]);
+    }
+
+    /// `relaxed` is the tier that makes per-key acking more than a rename: the
+    /// record goes to the ring like a durable one, but the reply does not wait
+    /// for it. Nothing drains the ring here, so a held reply never arrives --
+    /// which is how a relaxed write is told from a durable one.
+    #[test]
+    fn a_relaxed_write_is_staged_but_not_held() {
+        let policy = Policy::parse(Tier::Ephemeral, "rx:=relaxed, dx:=durable").unwrap();
+        let mut fx = Fixture::new("relaxed", Some(policy), true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let got = fx.run(move |port| {
+            let relaxed = send(port, &["SET rx:k v1"]);
+            let durable = send(port, &["SET dx:k v1"]);
+            tx.send((relaxed, durable)).unwrap();
+        });
+        let (relaxed, durable) = rx.recv().expect("client result");
+        assert_eq!(relaxed, vec!["+OK"], "relaxed acks before its record commits");
+        assert!(durable.is_empty(), "durable waits for its record, got {durable:?}");
+        // Both were staged; only the wait differs.
+        assert_eq!(keys(&got), vec!["+rx:k", "+dx:k"]);
+    }
+
+    /// An ephemeral key is acked immediately on an instance whose sync-ack is
+    /// on for the durable prefix beside it. Nothing drains the ring here, so a
+    /// held reply never arrives -- which is exactly how the two are told apart.
+    #[test]
+    fn an_ephemeral_write_is_not_held_behind_a_durable_ack() {
+        let policy = Policy::parse(Tier::Ephemeral, "acme:=durable").unwrap();
+        let mut fx = Fixture::new("ack", Some(policy), true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        fx.run(move |port| {
+            let ephemeral = send(port, &["SET cache:page v1"]);
+            let durable = send(port, &["SET acme:cert v1"]);
+            tx.send((ephemeral, durable)).unwrap();
+        });
+        let (ephemeral, durable) = rx.recv().expect("client result");
+        assert_eq!(ephemeral, vec!["+OK"], "an ephemeral write promises nothing, so it acks now");
+        assert!(
+            durable.is_empty(),
+            "a durable write must wait for its record to commit, got {durable:?}"
+        );
     }
 }
