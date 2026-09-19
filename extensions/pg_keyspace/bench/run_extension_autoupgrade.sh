@@ -27,11 +27,11 @@ PORT=${PGKS_PG_PORT:-5471}
 RESP=${PGKS_RESP_PORT:-6471}
 PROFILE=${PGKS_BUILD_PROFILE:-release}
 OLD_VER=0.1.0
-NEW_VER=0.6.0
+NEW_VER=0.7.0
 # The upgrade is a chain of scripts (#120 added the second step, supacache.publish
 # the third). Postgres walks it on its own, so the worker still issues one ALTER
 # EXTENSION -- but section 6 needs to know which file to remove to break the walk.
-CHAIN="0.1.0--0.2.0 0.2.0--0.3.0 0.3.0--0.4.0 0.4.0--0.5.0 0.5.0--0.6.0"
+CHAIN="0.1.0--0.2.0 0.2.0--0.3.0 0.3.0--0.4.0 0.4.0--0.5.0 0.5.0--0.6.0 0.6.0--0.7.0"
 pass=0; fail=0
 chk() {
   if [ "$2" = "$3" ]; then echo "PASS  $1"; pass=$((pass+1));
@@ -138,7 +138,7 @@ echo "########## 2. restarting is the whole procedure ##########"
 # moved it.
 cycle
 chk "after a restart the extension reports $NEW_VER" "$NEW_VER" "$(extver)"
-chk "it now has all 41 functions" "41" "$(nfuncs)"
+chk "it now has all 42 functions" "42" "$(nfuncs)"
 chk "and every view" "11" "$(nviews)"
 chk "the worker said so in the log, once" "1" \
     "$(logcount "upgraded the extension catalogue $OLD_VER -> $NEW_VER")"

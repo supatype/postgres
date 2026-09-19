@@ -497,6 +497,13 @@ jobs:
           sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
             bash extensions/pg_keyspace/bench/run_per_key_durability.sh
 
+      - name: Owner-addressed recovery
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_owner_recovery.sh
+
       - name: Extension upgrade path (0.1.0 -> 0.2.0)
         env:
           PGKS_BUILD_PROFILE: debug

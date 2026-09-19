@@ -853,6 +853,67 @@ rings (`pg_keyspace.persist_workers` multiplies this further, as it is a count o
 rings *per worker*). Persistence worker *processes* do not scale with `workers` —
 persistence worker `s` drains shard `s` of every slot worker's ring set.
 
+#### Recovery addressing: owner, for a client that cannot follow `MOVED`
+
+The `MOVED` above is not a property of the storage. It exists because recovery
+addresses persisted keys by CRC16 slot — `supacache.kv.slot` is written at
+persist time and read only by the recovery scan — so the worker that *accepts*
+a write must already be the one that will recover it. Change how recovery
+addresses keys and the redirect is unnecessary:
+
+```ini
+pg_keyspace.recovery_addressing = 'owner'   # slot (default) | owner
+```
+
+Under `owner`, the persist path stamps the accepting worker into
+`supacache.kv.owner` and each worker recovers what it wrote. A key comes back
+where it was written, so nothing has to redirect, **`cluster_announce_host` is
+not required**, and a standalone client works against a persisted multi-worker
+cluster — which slot addressing refuses outright, at the first `SET`.
+
+The default is `slot` and is unchanged in every respect.
+
+**What owner addressing assumes** is that a client is consistent about which
+worker it uses for a given key. It does not create a split keyspace — an
+unrouted multi-worker cluster already has one — but it decides which copy
+survives: the single `supacache.kv` row per key means last writer wins at the
+next restart.
+
+**Resizing is the sharp edge, and it is refused rather than documented.**
+Recovery places a key at `owner % workers`, and a client sharding
+`hash(key) % workers` finds it there only when the new count *divides* the old
+one. So `4 → 2`, `6 → 3` and `4 → 1` are safe, and `2 → 4`, `4 → 3` and every
+other growth are not — the key is still there, on a worker no client asks,
+and the rewrite that follows is collapsed by the single row at the *next*
+restart. That puts the loss one restart after the resize that caused it, so
+startup refuses the change:
+
+```sql
+SELECT supacache.rehome(3);   -- rewrite every row to the owner 3 workers puts its key on
+```
+
+Then restart at the new count. `rehome()` assigns the placement
+`supacache.key_worker()` reports, because that is the only one a client can
+compute for itself; keys do change segments, which is what owner addressing
+otherwise avoids, so it is a deliberate step rather than something recovery
+does unasked. `pg_keyspace.allow_owner_resize = on` accepts the cold, partly
+unreachable cache instead.
+
+`supacache.topology_change()` reports which mode is in effect, and whether the
+current count is a safe move from the recorded one:
+
+```sql
+SELECT addressing, resize_safe, slots_moved FROM supacache.topology_change();
+```
+
+`slots_moved` and `pct_moved` are NULL under `owner` — they count a reshard of
+the CRC16 map, and nothing is keyed on that map in this mode. A number there
+would invite reconciling against a scheme the cluster is not using.
+
+Rows written by a build older than the `owner` column default to owner 0, so
+they all recover onto worker 0 after an upgrade: correct, but cold and
+unbalanced until they are rewritten or rehomed.
+
 ### Mode B — transparent PostgREST row cache
 
 ```sql
@@ -1586,6 +1647,8 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
 | `pg_keyspace.max_value_bytes` | 536870912 | largest value accepted from a client; matches Valkey/Redis `proto-max-bulk-len` |
 | `pg_keyspace.durability` | `ephemeral` | `ephemeral` \| `relaxed` \| `durable` \| `replicated` — the tier for keys no override covers |
+| `pg_keyspace.recovery_addressing` | `slot` | `slot` \| `owner` — how a persisted key returns to a segment at startup. `owner` needs no `cluster_announce_host` and no cluster-aware client; see [Recovery addressing](#recovery-addressing-owner-for-a-client-that-cannot-follow-moved) |
+| `pg_keyspace.allow_owner_resize` | `off` | permit a worker-count change that `owner` addressing cannot keep findable (see above); off refuses it and points at `supacache.rehome()` |
 | `pg_keyspace.durability_overrides` | *(empty)* | per-key durability: `prefix=tier` pairs, e.g. `acme:=durable, cache:=ephemeral`. Longest prefix wins; matched on the stored (tenant-scoped) key. See [Per-key durability](#per-key-durability) |
 | `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables (Mode A), and the one worker 0 auto-upgrades. Since #120 it does **not** bound the row cache: Mode B serves every database that registers a table |
 | `pg_keyspace.persist_workers` | 1 | persist workers/rings draining in parallel |
@@ -1743,6 +1806,18 @@ serving them, that `prune_undurable()` refuses to empty the table and then
 removes exactly the stranded rows, and that both an unparseable spec and a
 `replicated` tier mixed with others stop the worker instead of being
 half-applied.
+
+`run_owner_recovery.sh` owns its own cluster and restarts it at four worker
+counts. It brings up a persisted four-worker cluster with **no**
+`cluster_announce_host` — which slot addressing refuses — writes through a
+plain, non-cluster client, and asserts every key returns to the worker that
+wrote it across a restart, and to `owner % 2` across a shrink to two. Its
+section 5 is the one worth reading: a resize to three is *refused*, because
+recovery would place keys where no client asks and the rewrite that follows is
+lost at the restart after that. Section 6 then runs `supacache.rehome(3)` and
+shows the same keys findable at `supacache.key_worker()`. Section 7 is the
+control — under slot addressing the same plain client is answered `MOVED` at
+its first write, which is what makes section 2 mean anything.
 
 `run_prefix_match_cost.sh` is the one gate that is a measurement.
 `Policy::tier_for` runs on every write, in front of an op measured in
@@ -2061,7 +2136,10 @@ Scoping for this version — the extension works; these are the edges to know:
 - **A persisted multi-worker cluster requires the client's *cluster* constructor**
   (`Redis.Cluster`, `NewClusterClient`, `JedisCluster`, …), not the standalone
   default, since each worker serves only its own slot range and redirects the
-  rest. The topology is discoverable over `CLUSTER SLOTS`/`SHARDS`/`NODES`, so no
+  rest — *unless* `pg_keyspace.recovery_addressing = 'owner'`, which recovers
+  what each worker wrote and issues no redirects, at the cost of refusing a
+  worker-count change that would move keys out from under a client
+  ([Recovery addressing](#recovery-addressing-owner-for-a-client-that-cannot-follow-moved)). The topology is discoverable over `CLUSTER SLOTS`/`SHARDS`/`NODES`, so no
   client-side slot table is needed — see
   [Multi-worker scale-out](#multi-worker-scale-out). Single-worker and ephemeral
   multi-worker deployments are unaffected. Online resharding (live slot
