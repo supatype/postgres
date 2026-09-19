@@ -1144,6 +1144,19 @@ fn ks_effective_tier() -> Tier {
     ks_policy_lossy().strongest()
 }
 
+/// A stranded row's key reduced to something worth grouping on: everything up
+/// to and including the first `:`, which is how a RESP keyspace is namespaced
+/// in practice. Bounded, because the grouping is for a human to read and an
+/// unbounded key would make one row per key.
+fn group_prefix(key: &[u8]) -> String {
+    let end = key.iter().position(|&b| b == b':').map(|i| i + 1).unwrap_or(key.len());
+    let end = end.min(64);
+    if end == 0 {
+        return "(no prefix)".to_string();
+    }
+    String::from_utf8_lossy(&key[..end]).to_string()
+}
+
 /// Whether this instance persists anything at all.
 fn ks_persisted() -> bool {
     ks_policy_lossy().any_persisted()
@@ -3556,7 +3569,8 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
             "pg_keyspace worker {w}: recovery skipped {skipped} row(s) whose key is no longer \
              covered by a persisted prefix under pg_keyspace.durability_overrides. They are \
              still in supacache.kv and are not being served, so this is a narrowed policy \
-             rather than lost data"
+             rather than lost data: supacache.undurable_rows() lists them and \
+             supacache.prune_undurable() removes them"
         );
     }
 
@@ -6978,6 +6992,157 @@ mod supacache {
         crc16::key_owner(key.as_bytes(), worker_count()) as i32
     }
 
+    // ---- per-key durability (#164) -----------------------------------
+
+    /// The tier `key` is written at, by the same policy the RESP write path
+    /// and crash recovery use.
+    ///
+    /// Pass the key **as stored**: with RESP AUTH configured that is the
+    /// tenant-scoped `{tenant}:{key}` form, which is what the prefixes are
+    /// matched against. Same convention as `key_worker()`.
+    #[pg_extern(stable, parallel_safe)]
+    fn key_durability(key: &str) -> String {
+        durability::tier_name(ks_policy_lossy().tier_for(key.as_bytes())).to_string()
+    }
+
+    /// Rows in `supacache.kv` whose key the current policy no longer persists,
+    /// grouped by key prefix.
+    ///
+    /// These are what a narrowed `pg_keyspace.durability_overrides` leaves
+    /// behind. They are inert -- recovery skips them, so they are not served
+    /// and cannot resurrect -- but they still occupy the table, and this is
+    /// how you see how much before deciding to remove it.
+    ///
+    /// The filtering happens here rather than in the WHERE clause on purpose.
+    /// Longest-prefix-wins does not translate into SQL without restating the
+    /// matcher, and a maintenance function that deletes by a *reimplementation*
+    /// of the rule is precisely the one that must not disagree with it. The
+    /// scan is a cursor, so the table does not land in the backend at once.
+    ///
+    /// `supacache.kv_ttl` is deliberately not counted: it is range-partitioned
+    /// by expiry bucket and whole partitions are dropped once expired, so
+    /// stranded TTL'd rows clear themselves within the bucket width.
+    #[pg_extern]
+    fn undurable_rows() -> TableIterator<
+        'static,
+        (name!(key_prefix, String), name!(rows, i64), name!(bytes, i64)),
+    > {
+        let mut agg: HashMap<String, (i64, i64)> = HashMap::new();
+        if table_exists("supacache.kv") {
+            let policy = ks_policy_lossy();
+            let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+                let mut cur = client
+                    .try_open_cursor("SELECT key, length(val) FROM supacache.kv", None)?;
+                loop {
+                    let tup = cur.fetch(RECOVER_BATCH as _)?;
+                    if tup.is_empty() {
+                        break;
+                    }
+                    for row in tup {
+                        let k: Vec<u8> = match row.get::<Vec<u8>>(1)? {
+                            Some(k) => k,
+                            None => continue,
+                        };
+                        if policy.persists(&k) {
+                            continue;
+                        }
+                        let n = row.get::<i32>(2)?.unwrap_or(0) as i64;
+                        let e = agg.entry(group_prefix(&k)).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 += n + k.len() as i64;
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut rows: Vec<(String, i64, i64)> =
+            agg.into_iter().map(|(p, (r, b))| (p, r, b)).collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        TableIterator::new(rows)
+    }
+
+    /// Delete the rows `undurable_rows()` reports. Returns how many.
+    ///
+    /// Not run on its own at startup, and guarded here, because the input is a
+    /// GUC string: an operator typo, or a config include that failed to load,
+    /// brings the instance up with an empty or wrong map, and a prune that
+    /// trusted it would delete the entire durable dataset in the one situation
+    /// where the configuration cannot be trusted. So it refuses when nothing
+    /// at all is persisted, and when it would empty the table, unless `force`
+    /// says that is genuinely the intent. Recovery already skips these rows,
+    /// so waiting until you have looked at `undurable_rows()` costs nothing.
+    #[pg_extern]
+    fn prune_undurable(force: default!(bool, false)) -> i64 {
+        if !table_exists("supacache.kv") {
+            return 0;
+        }
+        let policy = ks_policy_lossy();
+        if !policy.any_persisted() && !force {
+            warning!(
+                "supacache.prune_undurable(): refusing — this instance persists nothing, so                  every row in supacache.kv would be deleted. That is what a mistyped or                  unloaded pg_keyspace.durability_overrides looks like. Pass true to confirm"
+            );
+            return 0;
+        }
+        // Collect first, delete second: the same matcher as the write path
+        // decides, and a cursor over a table being deleted from is not a shape
+        // worth relying on.
+        let mut victims: Vec<Vec<u8>> = Vec::new();
+        let mut total = 0i64;
+        let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+            let mut cur = client.try_open_cursor("SELECT key FROM supacache.kv", None)?;
+            loop {
+                let tup = cur.fetch(RECOVER_BATCH as _)?;
+                if tup.is_empty() {
+                    break;
+                }
+                for row in tup {
+                    if let Some(k) = row.get::<Vec<u8>>(1)? {
+                        total += 1;
+                        if !policy.persists(&k) {
+                            victims.push(k);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        if victims.is_empty() {
+            return 0;
+        }
+        if victims.len() as i64 == total && !force {
+            warning!(
+                "supacache.prune_undurable(): refusing — this would delete all {total} row(s)                  in supacache.kv, which is what a mistyped pg_keyspace.durability_overrides                  looks like rather than a narrowed one. Check supacache.undurable_rows(),                  then pass true to confirm"
+            );
+            return 0;
+        }
+        let deleted = Spi::connect(|mut client| {
+            let mut n: i64 = 0;
+            for chunk in victims.chunks(1000) {
+                let keys: Vec<Vec<u8>> = chunk.to_vec();
+                let r = client.update(
+                    "DELETE FROM supacache.kv WHERE key = ANY($1::bytea[])",
+                    None,
+                    Some(vec![(
+                        PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID),
+                        keys.into_datum(),
+                    )]),
+                );
+                match r {
+                    Ok(t) => n += t.len() as i64,
+                    Err(e) => {
+                        warning!("supacache.prune_undurable(): {e}");
+                        return n;
+                    }
+                };
+            }
+            n
+        });
+        log!(
+            "supacache.prune_undurable(): deleted {deleted} row(s) no longer covered by a              persisted prefix"
+        );
+        deleted
+    }
+
     // ---- in-backend micro-benchmarks --------------------------------
     // These time the raw shared-memory op inside the calling backend, with no
     // client protocol round-trip, so they isolate the ~1-2µs claim from the
@@ -8250,8 +8415,13 @@ GRANT EXECUTE ON FUNCTION
     supacache.rowcache_databases(),
     supacache.pubsub_stats(),
     supacache.topology_change(),
-    supacache.slot_ranges()
+    supacache.slot_ranges(),
+    supacache.key_durability(text),
+    supacache.undurable_rows()
 TO pg_monitor;
+-- supacache.prune_undurable() is deliberately absent: it deletes rows, and a
+-- monitoring role should be able to see the strandage without being able to
+-- act on it.
 GRANT SELECT ON
     supacache.pg_stat_keyspace,
     supacache.pg_stat_keyspace_workers,
