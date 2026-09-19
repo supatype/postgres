@@ -37,6 +37,8 @@ mod store;
 mod resp;
 #[path = "../../core/src/batcher.rs"]
 mod batcher;
+#[path = "../../core/src/durability.rs"]
+mod durability;
 #[path = "../../core/src/ring.rs"]
 mod ring;
 #[path = "../../core/src/rowcache_key.rs"]
