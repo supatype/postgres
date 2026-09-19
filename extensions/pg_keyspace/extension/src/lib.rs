@@ -61,6 +61,7 @@ mod share;
 mod server;
 
 use batcher::Tier;
+use durability::Policy;
 use server::{AclRule, AuthConfig, Cred};
 use std::collections::{HashMap, HashSet};
 use store::{Config, Lookup, Store};
@@ -128,6 +129,11 @@ static GUC_MAX_VALUE_BYTES: GucSetting<i32> =
     GucSetting::<i32>::new(server::DEFAULT_MAX_VALUE_BYTES);
 static GUC_DURABILITY: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(Some(c"ephemeral"));
+// Per-key durability (#164): `prefix=tier` pairs overriding GUC_DURABILITY for
+// the keys under each prefix. Empty means one tier for the whole keyspace,
+// which is every cluster that existed before this setting did.
+static GUC_DURABILITY_OVERRIDES: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
 static GUC_COMMIT_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
 // persistence: which database holds supacache.kv, and how often the worker
 // flushes staged writes to it in one batched transaction.
@@ -979,7 +985,7 @@ fn health_watchdog() {
     if GUC_WATCHDOG_SECS.get() <= 0 || HEALTH_BASE.load(Ordering::Acquire).is_null() {
         return;
     }
-    let persisted = ks_tier() != Tier::Ephemeral;
+    let persisted = ks_persisted();
     let now = store::now_micros();
     let stale = health_stale_us();
     let nworkers = worker_count();
@@ -1096,6 +1102,8 @@ fn seg_base_for(w: usize) -> *mut u8 {
     unsafe { base.add(w * ks_config().total_bytes()) }
 }
 
+/// The tier configured for keys no override covers. Not the same as what the
+/// instance must provide -- see `ks_effective_tier`.
 fn ks_tier() -> Tier {
     match GUC_DURABILITY.get().and_then(|c| c.to_str().ok()) {
         Some("relaxed") => Tier::Relaxed,
@@ -1103,6 +1111,42 @@ fn ks_tier() -> Tier {
         Some("replicated") => Tier::Replicated,
         _ => Tier::Ephemeral,
     }
+}
+
+/// The durability policy: `pg_keyspace.durability` as the default, with
+/// `pg_keyspace.durability_overrides` layered on top (#164).
+fn ks_policy() -> Result<Policy, String> {
+    let spec = GUC_DURABILITY_OVERRIDES.get().and_then(|c| c.to_str().ok().map(str::to_string));
+    match spec {
+        Some(s) if !s.trim().is_empty() => Policy::parse(ks_tier(), &s),
+        _ => Ok(Policy::uniform(ks_tier())),
+    }
+}
+
+/// The policy, or the plain instance-wide one if the override spec does not
+/// parse.
+///
+/// Callers that can refuse to start use `ks_policy` and report the error.
+/// This exists for the ones that cannot -- worker registration and the health
+/// watchdog run before and around that refusal, and must not panic or silently
+/// invent a stronger tier while it happens.
+fn ks_policy_lossy() -> Policy {
+    ks_policy().unwrap_or_else(|_| Policy::uniform(ks_tier()))
+}
+
+/// The strongest tier any key can be written at, which is what the instance's
+/// rings, persistence workers and commit mode have to be provisioned for.
+///
+/// Reading `pg_keyspace.durability` here instead would break the case this
+/// feature exists for: an `ephemeral` default with one `durable` prefix would
+/// start no rings at all, and the durable prefix would have nowhere to go.
+fn ks_effective_tier() -> Tier {
+    ks_policy_lossy().strongest()
+}
+
+/// Whether this instance persists anything at all.
+fn ks_persisted() -> bool {
+    ks_policy_lossy().any_persisted()
 }
 
 /// True when `synchronous_standby_names` is set to something Postgres will
@@ -1417,6 +1461,23 @@ pub extern "C" fn _PG_init() {
         "Durability tier for RESP writes: ephemeral|relaxed|durable|replicated",
         "ephemeral keeps writes shmem-only; non-ephemeral persists to supacache.kv.",
         &GUC_DURABILITY,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.durability_overrides",
+        "Per-key durability: comma-separated prefix=tier overriding pg_keyspace.durability",
+        "Each entry is 'prefix=tier', e.g. 'acme:=durable, metrics:=relaxed'. A key is \
+         written at the tier of the longest prefix that matches it, and at \
+         pg_keyspace.durability if none does, so one instance can hold a durable prefix \
+         beside an ephemeral cache instead of putting every cache write through the WAL \
+         to protect the small part that matters. Matching is against the key as stored, \
+         which is the tenant-scoped form '{tenant}:{key}' when RESP AUTH is configured -- \
+         so a tenant name is a prefix like any other. The rings, the persistence workers \
+         and the commit mode are provisioned for the strongest tier named here, not for \
+         pg_keyspace.durability. Empty (the default) means one tier for the whole \
+         keyspace, exactly as before this setting existed.",
+        &GUC_DURABILITY_OVERRIDES,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -1861,7 +1922,7 @@ pub extern "C" fn _PG_init() {
     // N shared-nothing RESP slot workers: each attaches its own keyspace
     // segment and listens on port + its index. The index is the bgworker arg.
     let nworkers = worker_count();
-    let persisted = ks_tier() != Tier::Ephemeral;
+    let persisted = ks_persisted();
     for w in 0..nworkers {
         BackgroundWorkerBuilder::new(&format!("pg_keyspace: RESP slot worker {w}"))
             .set_library("pg_keyspace")
@@ -2218,7 +2279,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     // Persistence and recovery are per slot worker: this worker owns a disjoint
     // slot range (crc16::slot_range), its own segment, and its own ring set, so
     // durability and scale-out compose instead of excluding each other.
-    let persisted = ks_tier() != Tier::Ephemeral;
+    let persisted = ks_persisted();
 
     let port = GUC_PORT.get() as u16 + w as u16;
     let mut worker = match server::Worker::new(store.clone(), None, Tier::Ephemeral, "0.0.0.0", port)
@@ -2270,10 +2331,69 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         }
     }
 
+    // Per-key durability (#164) is refused rather than half-applied. A
+    // durability setting that silently ignores part of its configuration is
+    // the one kind that cannot be noticed until a restart loses data, so every
+    // reason to distrust the map stops the worker here, the same way a bad TLS
+    // cert does above.
+    let policy = match ks_policy() {
+        Ok(p) => p,
+        Err(why) => {
+            log!(
+                "pg_keyspace worker {w}: REFUSING to start — \
+                 pg_keyspace.durability_overrides is invalid: {why}"
+            );
+            while !BackgroundWorker::sigterm_received() {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            return;
+        }
+    };
+    if !policy.is_uniform() {
+        // A `replicated` override needs the persistence worker to commit that
+        // key's batch with `remote_apply` while committing everything else
+        // more cheaply, and one worker sets `synchronous_commit` once per
+        // batch. Serving it would mean either charging every durable write the
+        // standby round-trip or acking a replicated write that never waited
+        // for a standby. Both are worse than saying no.
+        if policy.rules().iter().any(|(_, t)| *t == Tier::Replicated) {
+            log!(
+                "pg_keyspace worker {w}: REFUSING to start — pg_keyspace.durability_overrides \
+                 names the 'replicated' tier, which cannot yet be mixed with others on one \
+                 instance: the persistence worker sets synchronous_commit once per batch, so \
+                 a replicated prefix would either charge every other durable write the \
+                 standby round-trip or be acked without waiting for one. Use \
+                 pg_keyspace.durability = 'replicated' for the whole keyspace, or an \
+                 override tier of ephemeral, relaxed or durable"
+            );
+            while !BackgroundWorker::sigterm_received() {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            return;
+        }
+        // Per-key durability and slot routing have not been reconciled yet: a
+        // persisted multi-worker tier redirects by slot, and which worker
+        // accepts a key decides nothing about which tier it lands in, so the
+        // two compose in ways nothing has tested. Refuse rather than find out
+        // in production.
+        if worker_count() > 1 {
+            log!(
+                "pg_keyspace worker {w}: REFUSING to start — pg_keyspace.durability_overrides \
+                 is set with pg_keyspace.workers = {} , which is not supported yet. Run one \
+                 worker, or clear the overrides",
+                worker_count()
+            );
+            while !BackgroundWorker::sigterm_received() {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            return;
+        }
+    }
+
     // Fail closed on a durability promise the cluster cannot keep, the same way
     // a bad TLS cert refuses above. Serving `replicated` with no synchronous
     // standby would acknowledge writes as replicated that are only local.
-    if matches!(ks_tier(), Tier::Replicated) {
+    if matches!(ks_effective_tier(), Tier::Replicated) {
         if let Err(why) = check_sync_standby() {
             log!("pg_keyspace worker: REFUSING to start — {why}");
             while !BackgroundWorker::sigterm_received() {
@@ -2401,8 +2521,18 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             worker.set_ring_producers(producers);
             worker.set_tenant_ring_share(GUC_TENANT_RING_SHARE.get());
             // durable/replicated: hold each write's RESP OK until it commits.
-            let sync_ack = matches!(ks_tier(), Tier::Durable | Tier::Replicated);
+            let sync_ack = matches!(ks_effective_tier(), Tier::Durable | Tier::Replicated);
             worker.set_sync_ack(sync_ack);
+            // Narrows what the rings carry, per key. Set after the ring
+            // producers and sync_ack, both of which are the instance-wide
+            // ceiling this refines downwards.
+            if !policy.is_uniform() {
+                log!(
+                    "pg_keyspace worker {w}: per-key durability is ON — {}",
+                    policy.describe()
+                );
+                worker.set_durability_policy(policy.clone());
+            }
             log!(
                 "pg_keyspace worker {w}: persistence ON ({ps} ring(s) -> {ps} persistence \
                  worker(s), sync_ack={sync_ack})"
@@ -2434,7 +2564,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
 
     log!("pg_keyspace worker: RESP listening on 0.0.0.0:{port} (persisted={persisted})");
     // Poll frequently in sync-ack mode so committed durable writes ack promptly.
-    let timeout_ms = if matches!(ks_tier(), Tier::Durable | Tier::Replicated) {
+    let timeout_ms = if matches!(ks_effective_tier(), Tier::Durable | Tier::Replicated) {
         2
     } else {
         500
@@ -2574,12 +2704,16 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         .map(|w| unsafe { ring::Consumer::attach(rbase.add(ring_index(w, idx) * stride)) })
         .collect();
     let idle = Duration::from_millis(GUC_PERSIST_WINDOW_MS.get().max(1) as u64);
-    let sync_commit: &'static str = match ks_tier() {
+    // The strongest tier any key can be written at, not the default one: a
+    // `durable` prefix under an `ephemeral` default still has to be committed
+    // with synchronous_commit = on. Over-serving a weaker key costs it a
+    // stronger commit than it asked for and promises it nothing extra.
+    let sync_commit: &'static str = match ks_effective_tier() {
         Tier::Durable => "on",
         Tier::Replicated => "remote_apply", // needs a synchronous standby
         _ => "off",                          // relaxed: RESP already acked
     };
-    let replicated = matches!(ks_tier(), Tier::Replicated);
+    let replicated = matches!(ks_effective_tier(), Tier::Replicated);
     log!(
         "pg_keyspace persist {idx}: draining shard {idx} of {nworkers} slot worker(s)          -> supacache.kv (synchronous_commit={sync_commit})"
     );
@@ -3284,6 +3418,14 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
         "pg_keyspace worker {w}: recovering slots {lo}..{hi} from supacache.kv \
          (no RESP traffic is served until this finishes)"
     );
+    // Rows a narrowed policy no longer covers must not come back as though
+    // they were still durable (#164). Filtered here, with the same matcher the
+    // write path uses, so the two can never disagree about what a prefix
+    // means. The rows are left in place -- they are inert once unrecovered,
+    // and deleting data on the strength of a GUC that may itself be a typo is
+    // not something recovery should do on its own.
+    let policy = ks_policy_lossy();
+    let mut skipped = 0i64;
     let recovered = BackgroundWorker::transaction(AssertUnwindSafe(|| {
         Spi::connect(|client| {
             let mut cnt = 0i64;
@@ -3325,6 +3467,10 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
                     if let (Some(k), Some(v)) = (k, v) {
                         if e > 0 && e <= now {
                             continue; // already expired
+                        }
+                        if !policy.persists(&k) {
+                            skipped += 1;
+                            continue;
                         }
                         let ttl = if e > 0 { e - now } else { 0 };
                         store.set_typed(&k, &v, ttl, kind);
@@ -3378,6 +3524,10 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
                         .and_then(|s| s.bytes().next())
                         .unwrap_or(b's') as u32;
                     if let (Some(k), Some(v)) = (k, v) {
+                        if !policy.persists(&k) {
+                            skipped += 1;
+                            continue;
+                        }
                         store.set_typed(&k, &v, (e - now).max(1), kind);
                         cnt += 1;
                         if cnt % RECOVER_LOG_EVERY == 0 {
@@ -3396,6 +3546,20 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
     }));
     // Recovery evicts as it loads when the persisted set does not fit, and the
     // cache then comes back quietly partial: every lookup still answers, just
+    // Rows the policy no longer covers are not an error -- narrowing the map
+    // is a deliberate act -- but they are the difference between a key that is
+    // gone and a key that is merely not being served, which is exactly the
+    // question an operator asks after a restart. Name the remedy too, or the
+    // count reads as an unexplained loss.
+    if skipped > 0 {
+        log!(
+            "pg_keyspace worker {w}: recovery skipped {skipped} row(s) whose key is no longer \
+             covered by a persisted prefix under pg_keyspace.durability_overrides. They are \
+             still in supacache.kv and are not being served, so this is a narrowed policy \
+             rather than lost data"
+        );
+    }
+
     // some of them with a miss for a key that is durably stored. Say so.
     let evicted = total_evictions(store).saturating_sub(evicted_before);
     if evicted > 0 {
@@ -6355,7 +6519,9 @@ mod supacache {
 
     /// Whether the `replicated` tier's promise is currently being kept.
     ///
-    /// `tier` is the configured durability. `standby_configured` reflects
+    /// `tier` is the strongest tier any key can be written at, which is the
+    /// one the promise has to be judged against: a `replicated` prefix under a
+    /// `durable` default still needs a standby (#164). `standby_configured` reflects
     /// `synchronous_standby_names`, which is what decides whether Postgres
     /// waits at all; it is `sighup` context, so it can change under a running
     /// server. `sync_standbys_connected` counts standbys in `pg_stat_replication`
@@ -6376,12 +6542,8 @@ mod supacache {
             name!(honoured, bool),
         ),
     > {
-        let tier = match ks_tier() {
-            Tier::Ephemeral => "ephemeral",
-            Tier::Relaxed => "relaxed",
-            Tier::Durable => "durable",
-            Tier::Replicated => "replicated",
-        };
+        let effective = ks_effective_tier();
+        let tier = durability::tier_name(effective);
         let configured = sync_standby_configured();
         let connected = Spi::get_one::<i64>(
             "SELECT count(*) FROM pg_stat_replication WHERE sync_state IN ('sync','quorum')",
@@ -6391,7 +6553,7 @@ mod supacache {
         .unwrap_or(0);
         // Only the replicated tier makes a replication promise; the others are
         // trivially honoured because they promise nothing about a standby.
-        let honoured = !matches!(ks_tier(), Tier::Replicated) || configured;
+        let honoured = !matches!(effective, Tier::Replicated) || configured;
         TableIterator::once((tier.to_string(), configured, connected, honoured))
     }
 
