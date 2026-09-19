@@ -125,11 +125,37 @@ chk "and both keys are readable over RESP meanwhile" "certval|pageval" \
     "$(R GET acme:cert)|$(R GET cache:page)"
 
 echo
+echo "########## 2b. a value too large to inline follows the same rule ##########"
+# Past INLINE_MAX (8 KiB) the ring record carries the entry's version and the
+# persistence worker reads the bytes from shared memory instead. That is a
+# different branch of the staging path, and a durable prefix has to survive a
+# restart through it -- the unit tests cover which records reach the ring,
+# this covers the value actually coming back.
+BIG=$(head -c 20000 /dev/zero | tr '\0' 'x')
+R SET acme:big "$BIG" >/dev/null
+R SET cache:big "$BIG" >/dev/null
+wait_rows 3 || echo "  (timed out waiting for the large durable row)"
+chk "the large durable value is in supacache.kv at full length" "20000" \
+    "$(Q "SELECT length(val) FROM supacache.kv WHERE key = 'acme:big'::bytea")"
+chk "and the large ephemeral one is not there at all" "0" \
+    "$(Q "SELECT count(*) FROM supacache.kv WHERE key = 'cache:big'::bytea")"
+
+echo
 echo "########## 3. a restart keeps one and drops the other ##########"
 stop_pg immediate; start_pg; wait_ready || { echo "NO RESTART"; exit 1; }
 wait_resp || { echo "RESP NEVER CAME UP"; exit 1; }
 chk "the durable key survived kill -9" "certval" "$(R GET acme:cert)"
 chk "the ephemeral one did not" "" "$(R GET cache:page)"
+# The by-reference path end to end: staged as a version, read back out of the
+# segment by the persistence worker, recovered into a fresh segment.
+chk "the large durable value came back whole" "20000" "$(R STRLEN acme:big)"
+chk "and the large ephemeral one did not come back" "0" "$(R EXISTS cache:big)"
+# Put the row count back to what the sections below were written against.
+# They assert exact contents of supacache.kv, so a key that outlives its own
+# section silently rewrites their expectations -- which is how a harness ends
+# up with constants nobody can derive.
+R DEL acme:big >/dev/null
+wait_rows 2 || echo "  (timed out clearing the large durable row)"
 
 echo
 echo "########## 4. a delete of a covered key does not resurrect ##########"
