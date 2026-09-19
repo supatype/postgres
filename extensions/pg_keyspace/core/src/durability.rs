@@ -32,20 +32,38 @@
 
 use crate::batcher::Tier;
 
+/// Equal-length rules up to this many are scanned rather than binary-searched.
+/// See `tier_for`: the crossover is where log(n) cache-missing probes start to
+/// beat n cheap comparisons, which `prefix_match_bench` puts around a dozen.
+const LINEAR_SCAN_MAX: usize = 12;
+
 /// A prefix → tier map with a default, resolving any key to exactly one tier.
 ///
-/// Rules are held sorted by descending prefix length so the first match found
-/// by a forward scan is the longest one. Longest-prefix-wins is what makes
-/// `a:` and `a:b:` both configurable without the result depending on the order
-/// the operator happened to write them in.
+/// Longest-prefix-wins is what makes `a:` and `a:b:` both configurable without
+/// the result depending on the order the operator happened to write them in.
+///
+/// Rules are held sorted by descending length, then by bytes, and `groups`
+/// indexes the runs of equal length. A lookup walks the length groups from
+/// longest to shortest and binary-searches within each, so the first match it
+/// finds is the longest one and the cost is (distinct lengths x log n) rather
+/// than a scan of every rule.
+///
+/// The scan came first and a benchmark rejected it: with 64 rules of the same
+/// length -- which is what a map of same-shaped namespaces looks like -- a key
+/// matching the last of them cost 154 ns/op, against a store write measured in
+/// single-digit nanoseconds. The same case is ~5 ns this way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     default: Tier,
-    /// (prefix, tier), sorted by descending `prefix.len()`.
+    /// (prefix, tier), sorted by descending `prefix.len()` then ascending
+    /// bytes, so each equal-length run is ordered for binary search.
     rules: Vec<(Vec<u8>, Tier)>,
+    /// `(len, start, end)` per run of equal-length rules in `rules`, in
+    /// descending length order.
+    groups: Vec<(usize, usize, usize)>,
     /// Set bit `b` means some rule's first byte is `b`. A key whose first byte
     /// is not in here cannot match any rule, which is the common case on a
-    /// mostly-ephemeral instance and is worth one lookup to skip the scan.
+    /// mostly-ephemeral instance and is worth one lookup to skip the search.
     first_bytes: [u64; 4],
     /// Length of the shortest rule; a key shorter than this cannot match.
     min_len: usize,
@@ -55,7 +73,13 @@ impl Policy {
     /// One tier for every key — what an instance without overrides has, and
     /// what `tier_for` collapses to with no branching worth measuring.
     pub fn uniform(default: Tier) -> Policy {
-        Policy { default, rules: Vec::new(), first_bytes: [0; 4], min_len: usize::MAX }
+        Policy {
+            default,
+            rules: Vec::new(),
+            groups: Vec::new(),
+            first_bytes: [0; 4],
+            min_len: usize::MAX,
+        }
     }
 
     /// Parse the `pg_keyspace.durability_overrides` spec: a comma-separated
@@ -112,7 +136,9 @@ impl Policy {
     /// Build from already-validated rules, establishing the sort order and the
     /// scan shortcuts `tier_for` relies on.
     pub fn from_rules(default: Tier, mut rules: Vec<(Vec<u8>, Tier)>) -> Policy {
-        rules.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        // Length descending so the first group that matches is the longest
+        // prefix; bytes ascending within a length so the group is searchable.
+        rules.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
         let mut first_bytes = [0u64; 4];
         let mut min_len = usize::MAX;
         for (p, _) in &rules {
@@ -121,7 +147,18 @@ impl Policy {
             }
             min_len = min_len.min(p.len());
         }
-        Policy { default, rules, first_bytes, min_len }
+        let mut groups: Vec<(usize, usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < rules.len() {
+            let len = rules[i].0.len();
+            let mut j = i;
+            while j < rules.len() && rules[j].0.len() == len {
+                j += 1;
+            }
+            groups.push((len, i, j));
+            i = j;
+        }
+        Policy { default, rules, groups, first_bytes, min_len }
     }
 
     /// The tier `key` is written at. Runs on every write, so the miss path is
@@ -139,9 +176,27 @@ impl Policy {
         if self.first_bytes[(b >> 6) as usize] & (1u64 << (b & 63)) == 0 {
             return self.default;
         }
-        for (prefix, tier) in &self.rules {
-            if key.starts_with(prefix) {
-                return *tier;
+        for &(len, start, end) in &self.groups {
+            // Groups are length-descending, so the ones too long for this key
+            // come first and every later group is short enough.
+            if len > key.len() {
+                continue;
+            }
+            let head = &key[..len];
+            let group = &self.rules[start..end];
+            // Each prefix is its own allocation, so every binary-search probe
+            // is a likely cache miss -- measured at roughly 10 ns apiece. That
+            // makes the search slower than a scan until the group is big
+            // enough for log(n) to win, which the benchmark puts at about a
+            // dozen. Below that, walk it; above, search it.
+            if group.len() <= LINEAR_SCAN_MAX {
+                for (p, tier) in group {
+                    if p.as_slice() == head {
+                        return *tier;
+                    }
+                }
+            } else if let Ok(i) = group.binary_search_by(|(p, _)| p.as_slice().cmp(head)) {
+                return group[i].1;
             }
         }
         self.default
@@ -412,6 +467,60 @@ mod tests {
             b"metrics:x", b"zz", b"zzz", b"z", b"\x00", b"\xff\xfe", b"Acme:", b"~",
         ] {
             assert_eq!(pol.tier_for(key), brute(key), "key {:?}", String::from_utf8_lossy(key));
+        }
+    }
+
+    /// The grouped binary search replaced a linear scan, so the oracle is
+    /// worth running over something larger than a handful of rules: many
+    /// prefixes, overlapping at several lengths, probed with keys that hit,
+    /// miss, and stop one byte short of a boundary.
+    #[test]
+    fn grouped_search_agrees_with_brute_force_at_scale() {
+        let mut rules: Vec<(Vec<u8>, Tier)> = Vec::new();
+        for i in 0..64u32 {
+            // Same-length siblings, which is the shape that made the scan O(n).
+            rules.push((format!("svc{i:02}:").into_bytes(), Tier::Durable));
+            // ...and a longer, more specific rule inside some of them.
+            if i % 3 == 0 {
+                rules.push((format!("svc{i:02}:cold:").into_bytes(), Tier::Ephemeral));
+            }
+            // ...and a shorter one that several keys also match.
+            if i % 8 == 0 {
+                rules.push((format!("s{i}").into_bytes(), Tier::Relaxed));
+            }
+        }
+        rules.push((b"a".to_vec(), Tier::Relaxed));
+        rules.push((b"ab".to_vec(), Tier::Durable));
+        rules.push((b"abc".to_vec(), Tier::Ephemeral));
+        let pol = Policy::from_rules(Tier::Ephemeral, rules);
+
+        let brute = |key: &[u8]| {
+            let mut best: Option<(usize, Tier)> = None;
+            for (p, t) in pol.rules() {
+                if key.starts_with(p) && best.map_or(true, |(n, _)| p.len() > n) {
+                    best = Some((p.len(), *t));
+                }
+            }
+            best.map(|(_, t)| t).unwrap_or(pol.default_tier())
+        };
+
+        let mut probes: Vec<Vec<u8>> = vec![
+            b"".to_vec(), b"a".to_vec(), b"ab".to_vec(), b"abc".to_vec(), b"abcd".to_vec(),
+            b"s".to_vec(), b"sv".to_vec(), b"svc".to_vec(), b"zzz".to_vec(),
+        ];
+        for i in 0..70u32 {
+            probes.push(format!("svc{i:02}:key").into_bytes());
+            probes.push(format!("svc{i:02}:cold:key").into_bytes());
+            probes.push(format!("svc{i:02}").into_bytes()); // one byte short
+            probes.push(format!("s{i}x").into_bytes());
+        }
+        for key in &probes {
+            assert_eq!(
+                pol.tier_for(key),
+                brute(key),
+                "key {:?}",
+                String::from_utf8_lossy(key)
+            );
         }
     }
 

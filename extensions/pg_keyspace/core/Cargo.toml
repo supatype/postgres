@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "pgkeyspaced"
 path = "src/bin/pgkeyspaced.rs"
 
+[[bin]]
+name = "prefix_match_bench"
+path = "src/bin/prefix_match_bench.rs"
+
 [dependencies]
 libc = "0.2"
 sha2 = "0.11"
