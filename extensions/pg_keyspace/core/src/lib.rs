@@ -18,6 +18,7 @@ pub mod aggr;
 pub mod batcher;
 pub mod bitmap;
 pub mod crc16;
+pub mod durability;
 pub mod prob;
 pub mod pubsub;
 pub mod pubsub_shm;
