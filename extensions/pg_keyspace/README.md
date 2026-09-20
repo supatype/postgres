@@ -610,15 +610,16 @@ persistence machinery. A key written at a weaker tier than the instance
 provides is over-served — a `relaxed` key committed with
 `synchronous_commit = on` — never under-served.
 
-Two combinations are refused at startup rather than half-applied:
+One combination is refused at startup rather than half-applied:
 
 - **`replicated` mixed with other tiers.** The persistence worker sets
   `synchronous_commit` once per batch, so a replicated prefix would either
   charge every other durable write the standby round-trip or be acked without
   waiting for a standby. Use `pg_keyspace.durability = 'replicated'` for the
   whole keyspace instead.
-- **Overrides with `pg_keyspace.workers > 1`.** Per-key durability and slot
-  routing have not been reconciled yet (see [#164](https://github.com/supatype/postgres/issues/164)).
+(Per-key durability composes with `pg_keyspace.workers > 1` in either
+addressing mode: the addressing decides *which* worker holds a key, the policy
+decides whether that worker persists it, and recovery applies both.)
 
 **Narrowing the map leaves rows behind.** A prefix moved from durable to
 ephemeral stops being recovered at the next restart — it is not served, and it
@@ -2145,13 +2146,12 @@ Scoping for this version — the extension works; these are the edges to know:
   multi-worker deployments are unaffected. Online resharding (live slot
   migration, `ASKING`/`MIGRATE`) is not supported; changing `pg_keyspace.workers`
   is a restart.
-- **Per-key durability is single-worker for now.** `pg_keyspace.durability_overrides`
-  with `pg_keyspace.workers > 1` is refused at startup: per-key durability and
-  slot routing have not been reconciled
-  ([#164](https://github.com/supatype/postgres/issues/164)). The `replicated`
-  tier also cannot be mixed with others on one instance, because the
-  persistence worker sets `synchronous_commit` once per batch — it is available
-  as the whole-keyspace tier instead.
+- **The `replicated` tier cannot be mixed with others on one instance.** The
+  persistence worker sets `synchronous_commit` once per batch, so a replicated
+  prefix would either charge every other durable write the standby round-trip
+  or be acked without waiting for one. `pg_keyspace.durability_overrides`
+  refuses it at startup; it is available as the whole-keyspace tier instead
+  ([#164](https://github.com/supatype/postgres/issues/164)).
 - **Pub/sub crosses instances only where you opt in, and at most once.** Within
   one instance it crosses processes by itself: the routing table and the
   per-worker inboxes live in Postgres shared memory, so a `SUBSCRIBE` on one

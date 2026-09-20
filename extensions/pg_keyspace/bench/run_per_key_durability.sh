@@ -39,7 +39,12 @@ chk() {
   else echo "FAIL  $1"; echo "        expected: [$2]"; echo "        actual:   [$3]"; fail=$((fail+1)); fi
 }
 Q() { $PGBIN/psql -h /tmp -p $PORT -U postgres -d postgres -X -q -A -t -c "$1" 2>&1; }
-R() { redis-cli -p $RESP "$@" 2>&1; }
+# Bounded: a durable write whose reply is held by a worker that never
+# commits would otherwise hang the job instead of failing an assertion.
+R() { timeout 10 redis-cli -p $RESP "$@" 2>&1; }
+# Same, against a specific worker's port (section 8 writes to whichever worker
+# owns the key, because slot routing will not accept it anywhere else).
+RW() { local p=$1; shift; timeout 10 redis-cli -p "$p" "$@" 2>&1; }
 start_pg() { su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o \"-p $PORT -k /tmp\" -w start" >/dev/null 2>&1; }
 # Same shutdown care as run_extension_autoupgrade.sh: `pg_ctl -w stop` can give
 # up with the postmaster still shutting down, and starting on top of that turns
@@ -201,6 +206,48 @@ for _ in $(seq 1 30); do grep -q "names the 'replicated' tier" $PGDATA/log && br
 chk "a replicated tier mixed with others stops the worker" "1" \
     "$(grep -c "names the 'replicated' tier" $PGDATA/log)"
 
+echo
+echo "########## 8. it composes with scale-out, in both addressing modes ##########"
+# The two answer different questions: addressing decides WHICH worker holds a
+# key, the policy decides whether that worker persists it. Recovery applies
+# both. This section is why the workers = 1 restriction could be lifted.
+for mode in slot owner; do
+  stop_pg
+  : > $PGDATA/log; chown postgres:postgres $PGDATA/log
+  set_overrides "acme:=durable"
+  grep -v "^pg_keyspace.workers\|^pg_keyspace.recovery_addressing\|^pg_keyspace.cluster_announce_host" \
+    $PGDATA/postgresql.conf > $PGDATA/conf.tmp
+  mv $PGDATA/conf.tmp $PGDATA/postgresql.conf
+  {
+    echo "pg_keyspace.workers = 4"
+    echo "pg_keyspace.recovery_addressing = '$mode'"
+    # Slot addressing redirects by address, so it needs one; owner does not,
+    # and setting it anyway is harmless.
+    echo "pg_keyspace.cluster_announce_host = '127.0.0.1'"
+    echo "pg_keyspace.keys = 10000"
+    echo "pg_keyspace.val_bytes = 1024"
+    echo "pg_keyspace.ring_mb = 1"
+    echo "pg_keyspace.rowcache_mb = 1"
+  } >> $PGDATA/postgresql.conf
+  chown postgres:postgres $PGDATA/postgresql.conf
+  start_pg; wait_ready || { echo "FAIL  $mode: cluster did not start"; fail=$((fail+1)); continue; }
+  for _ in $(seq 1 90); do
+    [ "$(grep -c 'RESP listening on 0.0.0.0:' $PGDATA/log)" -ge 4 ] && break; sleep 1
+  done
+  chk "$mode: four workers start with overrides set" "4" \
+      "$(grep -c 'RESP listening on 0.0.0.0:' $PGDATA/log)"
+  chk "$mode: and each resolved the policy" "4" "$(grep -c 'per-key durability is ON' $PGDATA/log)"
+
+  # Write one durable and one ephemeral key to whichever worker owns each,
+  # so the write is accepted under slot routing too.
+  Q "DELETE FROM supacache.kv" >/dev/null
+  for k in "acme:mw" "cache:mw"; do
+    wk=$(Q "SELECT supacache.key_worker('$k')")
+    RW $((RESP + wk)) SET "$k" "v-$k" >/dev/null
+  done
+  wait_rows 1 || echo "  (timed out waiting for the durable row)"
+  chk "$mode: only the covered key is staged, across four workers" "acme:mw" "$(kv_keys)"
+done
 stop_pg immediate
 
 echo

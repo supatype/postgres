@@ -2556,23 +2556,13 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             }
             return;
         }
-        // Per-key durability and slot routing have not been reconciled yet: a
-        // persisted multi-worker tier redirects by slot, and which worker
-        // accepts a key decides nothing about which tier it lands in, so the
-        // two compose in ways nothing has tested. Refuse rather than find out
-        // in production.
-        if worker_count() > 1 {
-            log!(
-                "pg_keyspace worker {w}: REFUSING to start — pg_keyspace.durability_overrides \
-                 is set with pg_keyspace.workers = {} , which is not supported yet. Run one \
-                 worker, or clear the overrides",
-                worker_count()
-            );
-            while !BackgroundWorker::sigterm_received() {
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            return;
-        }
+        // Per-key durability composes with scale-out rather than excluding it.
+        // The two answer different questions and neither reads the other's
+        // answer: addressing decides WHICH worker holds a key -- by slot range
+        // or by the worker that wrote it -- and the policy decides whether
+        // that worker persists it. Recovery applies both, as independent
+        // filters over the same scan. This was refused until a harness had
+        // actually run it at four workers in both addressing modes.
     }
 
     // Fail closed on a durability promise the cluster cannot keep, the same way
