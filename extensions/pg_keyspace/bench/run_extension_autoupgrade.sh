@@ -138,7 +138,7 @@ echo "########## 2. restarting is the whole procedure ##########"
 # moved it.
 cycle
 chk "after a restart the extension reports $NEW_VER" "$NEW_VER" "$(extver)"
-chk "it now has all 41 functions" "41" "$(nfuncs)"
+chk "it now has all 42 functions" "42" "$(nfuncs)"
 chk "and every view" "11" "$(nviews)"
 chk "the worker said so in the log, once" "1" \
     "$(logcount "upgraded the extension catalogue $OLD_VER -> $NEW_VER")"

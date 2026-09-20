@@ -134,6 +134,16 @@ static GUC_DURABILITY: GucSetting<Option<&'static CStr>> =
 // which is every cluster that existed before this setting did.
 static GUC_DURABILITY_OVERRIDES: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(None);
+// How a persisted key finds its way back into a segment at startup. See
+// `Addressing` and `pg_recover`. Defaults to `slot`, which is the behaviour
+// every existing cluster has, so this changes nothing until it is set.
+static GUC_RECOVERY_ADDRESSING: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(Some(c"slot"));
+// Owner addressing places a recovered key at `owner % workers`, which only
+// agrees with what a client sharding `hash(key) % workers` looks for when the
+// new worker count divides the old one. Anything else is refused at startup
+// unless this says otherwise. See `owner_resize_is_safe`.
+static GUC_ALLOW_OWNER_RESIZE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static GUC_COMMIT_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
 // persistence: which database holds supacache.kv, and how often the worker
 // flushes staged writes to it in one batched transaction.
@@ -1162,6 +1172,140 @@ fn ks_persisted() -> bool {
     ks_policy_lossy().any_persisted()
 }
 
+/// The most RESP slot workers `pg_keyspace.workers` will accept.
+///
+/// Named because `owners_for` depends on it: the owner column holds a worker
+/// index, so this is also the bound on the set of owner values that can ever
+/// exist, however many times a cluster has been resized.
+const MAX_WORKERS: usize = 64;
+
+/// The `owner` values worker `w` claims at `nworkers`, as a list.
+///
+/// `owner % nworkers = w` is the rule, but a modulo is not sargable: Postgres
+/// cannot use `kv_owner_idx` for it and every worker seq-scans the whole of
+/// `supacache.kv`, which is worse than the slot addressing this replaces --
+/// `slot >= lo AND slot < hi` is a range and does use its index. Enumerating
+/// the owners instead gives `owner = ANY(...)`, which is the same set and does.
+///
+/// Bounded because the owner is a worker index and `pg_keyspace.workers` is
+/// capped at MAX_WORKERS, so there are never more than that many values
+/// however many times the cluster has been resized.
+fn owners_for(w: usize, nworkers: usize) -> Vec<i32> {
+    if nworkers == 0 {
+        return vec![w as i32];
+    }
+    (0..MAX_WORKERS).filter(|o| o % nworkers == w).map(|o| o as i32).collect()
+}
+
+/// Whether moving from `was` workers to `now` keeps every key where a client
+/// will look for it, under owner addressing.
+///
+/// Recovery puts a key at `owner % now`, where `owner` is `hash % was` -- the
+/// worker that accepted it. A client sharding the same hash asks `hash % now`.
+/// Those agree for every key exactly when `now` divides `was`, which makes a
+/// shrink to a divisor (4 -> 2, 6 -> 3, 4 -> 1) safe and every growth unsafe,
+/// including 2 -> 4: there, half the keys land on a worker the client never
+/// asks.
+fn owner_resize_is_safe(was: usize, now: usize) -> bool {
+    was == now || (now > 0 && was % now == 0)
+}
+
+/// The worker count `supacache.topology` last recorded, without writing one.
+///
+/// `record_topology` both reads and writes, which is right where it is called
+/// -- inside recovery, once the decision to run has been made. The startup
+/// refusal has to happen before that and has to be able to run again on the
+/// next boot, so it needs the read on its own.
+fn recorded_workers() -> Option<usize> {
+    use std::panic::AssertUnwindSafe;
+    if !extension_installed() {
+        return None;
+    }
+    // `table_exists` is a bare SPI call: it assumes a transaction is already
+    // open, which is true of the #[pg_extern]s that use it and false here.
+    // Calling it from a background worker outside one segfaults the worker,
+    // so it goes inside the transaction with the query it guards.
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        if !table_exists("supacache.topology") {
+            return None;
+        }
+        Spi::get_one::<i32>("SELECT workers FROM supacache.topology WHERE id = 1")
+            .ok()
+            .flatten()
+            .filter(|n| *n > 0)
+            .map(|n| n as usize)
+    }))
+}
+
+/// Whether `supacache.kv` holds anything at all. A resize with nothing
+/// persisted moves no keys and is never worth refusing.
+fn kv_has_rows() -> bool {
+    use std::panic::AssertUnwindSafe;
+    if !extension_installed() {
+        return false;
+    }
+    // Inside the transaction, for the same reason as `recorded_workers`.
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        if !table_exists("supacache.kv") {
+            return false;
+        }
+        Spi::get_one::<bool>("SELECT EXISTS (SELECT 1 FROM supacache.kv)")
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    }))
+}
+
+/// How a persisted key is routed back into a segment at startup.
+///
+/// `Slot` is the original scheme: `supacache.kv.slot` holds the key's CRC16
+/// slot and each worker recovers its own contiguous range. Slot ownership is
+/// stable, so a cluster-aware client always finds a key where it expects it,
+/// and a worker-count change reshards gracefully. The price is that the worker
+/// which *accepts* a write must already be the one that will recover it, which
+/// is why a persisted multi-worker tier has to enforce slot routing and issue
+/// MOVED.
+///
+/// `Owner` stamps the accepting worker instead, and each worker recovers
+/// `owner % workers == w`. A key therefore comes back to the worker that wrote
+/// it, so no redirect is needed and no cluster-aware client is required. The
+/// modulo is what makes a worker-count change graceful rather than orphaning:
+/// it is a partition of the owner space, so every persisted key is claimed by
+/// exactly one worker at any worker count, with no sweep and no special case.
+///
+/// The assumption `Owner` makes, and `Slot` does not, is that a client is
+/// consistent about which worker it talks to for a given key. If it is not,
+/// the same key can exist in two segments with different values, and the
+/// single `supacache.kv` row collapses that to last-writer-wins at restart. A
+/// split keyspace is already what an unrouted multi-worker cluster gives you;
+/// this decides which copy survives rather than introducing the split.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Addressing {
+    Slot,
+    Owner,
+}
+
+fn ks_addressing() -> Addressing {
+    match GUC_RECOVERY_ADDRESSING.get().and_then(|c| c.to_str().ok()) {
+        Some("owner") => Addressing::Owner,
+        _ => Addressing::Slot,
+    }
+}
+
+/// Human-readable name for the set of rows a worker's recovery selected on.
+///
+/// Every message that reports a recovery count pairs it with this, because a
+/// count next to the wrong predicate is worse than a count alone: it invites an
+/// operator to reconcile against a range that had nothing to do with the query.
+fn recovery_scope(w: usize, nworkers: usize) -> String {
+    if nworkers > 1 && ks_addressing() == Addressing::Owner {
+        format!("owner % {nworkers} = {w}")
+    } else {
+        let (lo, hi) = crc16::slot_range(w, nworkers);
+        format!("slots {lo}..{hi}")
+    }
+}
+
 /// True when `synchronous_standby_names` is set to something Postgres will
 /// actually wait for.
 ///
@@ -1435,7 +1579,7 @@ pub extern "C" fn _PG_init() {
          see supacache.topology_change().",
         &GUC_WORKERS,
         1,
-        64,
+        MAX_WORKERS as i32,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -1491,6 +1635,34 @@ pub extern "C" fn _PG_init() {
          pg_keyspace.durability. Empty (the default) means one tier for the whole \
          keyspace, exactly as before this setting existed.",
         &GUC_DURABILITY_OVERRIDES,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.recovery_addressing",
+        "How persisted keys return to a segment at startup: slot|owner",
+        "slot (default) recovers each worker's CRC16 slot range, which is why a \
+         persisted tier with workers > 1 enforces slot routing and needs a \
+         cluster-aware client. owner recovers what this worker itself wrote \
+         (owner % workers), so no redirect is issued and a standalone client \
+         works, at the cost of assuming a client is consistent about which \
+         worker it uses for a given key. No effect with workers = 1.",
+        &GUC_RECOVERY_ADDRESSING,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
+        "pg_keyspace.allow_owner_resize",
+        "Permit a worker-count change that moves keys away from where a client will look",
+        "Only meaningful with pg_keyspace.recovery_addressing = 'owner'. Recovery places a key \
+         at owner % workers, and a client that shards hash(key) % workers finds it there only \
+         when the new count divides the old one -- so 4 -> 2 is safe and 2 -> 4, 4 -> 3 and \
+         every other change is not: the key is still there, on a worker the client will not \
+         ask. That is a silent miss followed by a rewrite under a new owner, which the single \
+         supacache.kv row collapses at the next restart. Startup refuses such a change by \
+         default; supacache.rehome(workers) makes it safe first. On means accept the cold, \
+         partly unreachable cache instead.",
+        &GUC_ALLOW_OWNER_RESIZE,
         GucContext::Postmaster,
         GucFlags::empty(),
     );
@@ -2485,12 +2657,18 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         .and_then(|c| c.to_str().ok().map(str::to_string))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    if persisted && worker_count() > 1 && announce_host.is_none() {
+    // Only slot addressing redirects. Owner addressing recovers what each
+    // worker wrote, so no worker ever has to send a client elsewhere and there
+    // is no address to announce.
+    let routes = ks_addressing() == Addressing::Slot;
+    if persisted && routes && worker_count() > 1 && announce_host.is_none() {
         log!(
             "pg_keyspace worker {w}: REFUSING to start — a persisted tier with \
              pg_keyspace.workers > 1 redirects clients by address, so \
              pg_keyspace.cluster_announce_host must be set to a host your clients \
-             can reach (use '127.0.0.1' for a local-only deployment)"
+             can reach (use '127.0.0.1' for a local-only deployment). \
+             Alternatively set pg_keyspace.recovery_addressing = 'owner', which \
+             recovers what each worker wrote and issues no redirects"
         );
         while !BackgroundWorker::sigterm_received() {
             std::thread::sleep(Duration::from_secs(1));
@@ -2508,12 +2686,52 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let t0 = std::time::Instant::now();
         let nworkers = worker_count();
-        let (lo, hi) = crc16::slot_range(w, nworkers);
+        // A worker-count change under owner addressing is refused unless it
+        // keeps every key where a client will look for it.
+        //
+        // This is not slot addressing's failure. There the slot map is
+        // republished and a cluster-aware client follows it, so a resize costs
+        // a cold cache and nothing else. Here recovery puts a key at
+        // `owner % workers` while a client asks `hash % workers`, and when
+        // those disagree the key is present, on a worker nobody asks, and the
+        // client's next write makes a second copy under a new owner that the
+        // single supacache.kv row collapses at the NEXT restart. The loss
+        // lands one restart after the resize that caused it, which is the
+        // worst possible time to find out -- so it is refused at the resize.
+        //
+        // Nothing to refuse when the table is empty: no key can be misplaced.
+        if ks_addressing() == Addressing::Owner {
+            if let Some(was) = recorded_workers() {
+                if !owner_resize_is_safe(was, nworkers)
+                    && !GUC_ALLOW_OWNER_RESIZE.get()
+                    && kv_has_rows()
+                {
+                    log!(
+                        "pg_keyspace worker {w}: REFUSING to start — pg_keyspace.workers is \
+                         {nworkers} and this keyspace was persisted under {was}, with \
+                         pg_keyspace.recovery_addressing = 'owner'. Recovery would place keys \
+                         at owner % {nworkers} while a client shards by the key, and those two \
+                         agree only when the new count divides the old one — so keys would be \
+                         present but on workers no client asks, and the rewrite that follows \
+                         is lost at the next restart. Either return to \
+                         pg_keyspace.workers = {was}, or run SELECT supacache.rehome({nworkers}) \
+                         and restart, which rewrites every row to the worker that count puts \
+                         its key on. pg_keyspace.allow_owner_resize = on accepts the cold, \
+                         partly unreachable cache instead"
+                    );
+                    while !BackgroundWorker::sigterm_received() {
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    return;
+                }
+            }
+        }
+        let t0 = std::time::Instant::now();
         let n = pg_recover(&store, w, nworkers);
+        let scope = recovery_scope(w, nworkers);
         log!(
-            "pg_keyspace worker {w}: recovered {n} keys (slots {lo}..{hi}) from \
+            "pg_keyspace worker {w}: recovered {n} keys ({scope}) from \
              supacache.kv in {:?}",
             t0.elapsed()
         );
@@ -2550,13 +2768,28 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
                 "pg_keyspace worker {w}: persistence ON ({ps} ring(s) -> {ps} persistence \
                  worker(s), sync_ack={sync_ack})"
             );
-            // Persisted + multi-worker: serve only this worker's slot range and
-            // redirect the rest. Recovery restores each key into the segment its
-            // slot range covers, so a worker that accepted a key it does not own
-            // would lose it on the next restart despite having acked it durable.
-            // A cluster-aware client follows the MOVED and lands on the right
-            // port; a single-port client gets a loud error instead of silent loss.
-            if nworkers > 1 {
+            // Persisted + multi-worker: what a worker may accept depends on how
+            // recovery will address it, because the two have to agree or a write
+            // is acked durable and then recovered into a segment nobody reads.
+            if nworkers > 1 && !routes {
+                // Owner addressing: recovery selects on `owner`, which this
+                // worker stamps itself, so accepting any key is already
+                // consistent with getting it back. Nothing to redirect.
+                log!(
+                    "pg_keyspace worker {w}: recovery addressing is 'owner', so this \
+                     worker serves every slot and issues no MOVED. It recovers what \
+                     it wrote (owner % {nworkers} = {w}); a client must be consistent \
+                     about which worker it uses for a given key"
+                );
+            } else if nworkers > 1 {
+                // Slot addressing: recovery restores each key into the segment
+                // its slot range covers, so a worker that accepted a key it does
+                // not own would lose it on the next restart despite having acked
+                // it durable. Serve only this worker's range and redirect the
+                // rest. A cluster-aware client follows the MOVED and lands on the
+                // right port; a single-port client gets a loud error instead of
+                // silent loss.
+                //
                 // Checked above: a persisted multi-worker cluster does not reach
                 // here without an announce host.
                 let host = announce_host.clone().unwrap_or_default();
@@ -2747,7 +2980,7 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
             last_watch = std::time::Instant::now();
             health_watchdog();
         }
-        let mut batch: Vec<server::PendingWrite> = Vec::with_capacity(8192);
+        let mut batch: Vec<(usize, server::PendingWrite)> = Vec::with_capacity(8192);
         let slices = peek_rings(&consumers, per_ring, idx, &mut batch);
         let count: usize = slices.iter().map(|(n, _)| n).sum();
         if batch.is_empty() {
@@ -2800,7 +3033,7 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         }
     }
     // final drain on shutdown
-    let mut tail: Vec<server::PendingWrite> = Vec::new();
+    let mut tail: Vec<(usize, server::PendingWrite)> = Vec::new();
     let tslices = peek_rings(&consumers, usize::MAX, idx, &mut tail);
     let tcount: usize = tslices.iter().map(|(n, _)| n).sum();
     if !tail.is_empty() {
@@ -2855,13 +3088,13 @@ fn peek_rings(
     consumers: &[ring::Consumer],
     max: usize,
     idx: usize,
-    batch: &mut Vec<server::PendingWrite>,
+    batch: &mut Vec<(usize, server::PendingWrite)>,
 ) -> Vec<(usize, u64)> {
     let mut slices = Vec::with_capacity(consumers.len());
     for (w, c) in consumers.iter().enumerate() {
         slices.push(c.peek(max, |k, v, e, kind| {
             if kind & ring::KIND_REF == 0 {
-                batch.push((k.to_vec(), v.to_vec(), e, kind));
+                batch.push((w, (k.to_vec(), v.to_vec(), e, kind)));
                 return;
             }
             let version = if v.len() == 8 {
@@ -2871,7 +3104,7 @@ fn peek_rings(
             };
             match store_view_for_worker(w).and_then(|st| st.read_staged(k, version)) {
                 Some((_, _, val)) => {
-                    batch.push((k.to_vec(), val, e, kind & !ring::KIND_REF))
+                    batch.push((w, (k.to_vec(), val, e, kind & !ring::KIND_REF)))
                 }
                 // Usually benign: the key was overwritten after staging, so a
                 // newer record is queued behind this one. It is also what
@@ -3205,6 +3438,17 @@ fn pg_ensure_schema() {
         let _ = Spi::run(
             "ALTER TABLE supacache.kv_ttl ADD COLUMN IF NOT EXISTS kind \"char\" NOT NULL DEFAULT 's'",
         );
+        // The slot worker that accepted the write, for
+        // pg_keyspace.recovery_addressing = 'owner'. Added rather than created
+        // inline so a cluster persisted under an older build keeps its rows:
+        // they default to owner 0, which is exactly right for the single-worker
+        // case and is a stale-but-claimed value for any other, since recovery
+        // partitions on `owner % workers` and never leaves a row unclaimed.
+        for t in ["kv", "kv_ttl"] {
+            let _ = Spi::run(&format!(
+                "ALTER TABLE supacache.{t} ADD COLUMN IF NOT EXISTS owner int NOT NULL DEFAULT 0"
+            ));
+        }
         // The worker layout the persisted keyspace was written under (#101).
         // supacache.kv.slot is stable, so a worker-count change never loses a
         // key -- but it does move most of them to a different worker's segment,
@@ -3229,6 +3473,12 @@ fn pg_ensure_schema() {
         // Single-worker recovery scans unfiltered and ignores these.
         let _ = Spi::run("CREATE INDEX IF NOT EXISTS kv_slot_idx ON supacache.kv (slot)");
         let _ = Spi::run("CREATE INDEX IF NOT EXISTS kv_ttl_slot_idx ON supacache.kv_ttl (slot)");
+        // Owner addressing ranges over `owner` instead. Indexed unconditionally
+        // rather than on the GUC, because the addressing mode is a restart away
+        // and an unindexed recovery scan is how that restart becomes an outage.
+        let _ = Spi::run("CREATE INDEX IF NOT EXISTS kv_owner_idx ON supacache.kv (owner)");
+        let _ =
+            Spi::run("CREATE INDEX IF NOT EXISTS kv_ttl_owner_idx ON supacache.kv_ttl (owner)");
         // #111: two of the stats functions read these tables over SPI, and SPI
         // inside a function runs as the CALLER -- the view owner's privileges
         // do not reach down into it. Without these grants,
@@ -3407,7 +3657,11 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
     // same segment the RESP path and the SQL surface will look for it in. A
     // single-worker cluster owns everything, so it keeps the unfiltered scan.
     let (lo, hi) = crc16::slot_range(w, nworkers);
+    let addressing = ks_addressing();
+    // Single worker owns everything under either scheme, so it keeps the
+    // unfiltered scan and the two modes are indistinguishable.
     let sharded = nworkers > 1;
+    let by_owner = sharded && addressing == Addressing::Owner;
     // A too-small keyspace announces itself here as eviction, so take the delta
     // rather than the absolute: a relaunched worker recovers into a segment that
     // may already carry its predecessor's counts.
@@ -3416,15 +3670,30 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
     // the same warning from every worker.
     if w == 0 {
         if let Some((was, moved)) = record_topology(nworkers) {
-            let pct = moved as f64 * 100.0 / crc16::NUM_SLOTS as f64;
-            log!(
-                "pg_keyspace worker 0: WORKER COUNT CHANGED {was} -> {nworkers}. \
-                 {moved} of {} slots ({pct:.1}%) now belong to a different worker, so that \
-                 much of the persisted keyspace is recovering into a different segment. \
-                 No data is lost (supacache.kv.slot is stable) but expect a cold cache \
-                 for those keys",
-                crc16::NUM_SLOTS
-            );
+            if by_owner {
+                // Under owner addressing nothing is keyed on the slot map, so
+                // slots_moved would be a number about a scheme this cluster is
+                // not using. What actually moves is the set of owner values a
+                // worker adopts, and only where `owner % workers` changed.
+                log!(
+                    "pg_keyspace worker 0: WORKER COUNT CHANGED {was} -> {nworkers}, \
+                     recovery addressing is 'owner'. Each worker now adopts \
+                     owner % {nworkers}, so every persisted key is still claimed by \
+                     exactly one worker. No data is lost and no key is orphaned, \
+                     but keys written by a worker that no longer exists come back \
+                     in a different segment, so expect a cold cache for those"
+                );
+            } else {
+                let pct = moved as f64 * 100.0 / crc16::NUM_SLOTS as f64;
+                log!(
+                    "pg_keyspace worker 0: WORKER COUNT CHANGED {was} -> {nworkers}. \
+                     {moved} of {} slots ({pct:.1}%) now belong to a different worker, so that \
+                     much of the persisted keyspace is recovering into a different segment. \
+                     No data is lost (supacache.kv.slot is stable) but expect a cold cache \
+                     for those keys",
+                    crc16::NUM_SLOTS
+                );
+            }
         }
     }
     log!(
@@ -3439,6 +3708,18 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
     // not something recovery should do on its own.
     let policy = ks_policy_lossy();
     let mut skipped = 0i64;
+    if by_owner {
+        log!(
+            "pg_keyspace worker {w}: recovering what this worker wrote \
+             (owner % {nworkers} = {w}) from supacache.kv \
+             (no RESP traffic is served until this finishes)"
+        );
+    } else {
+        log!(
+            "pg_keyspace worker {w}: recovering slots {lo}..{hi} from supacache.kv \
+             (no RESP traffic is served until this finishes)"
+        );
+    }
     let recovered = BackgroundWorker::transaction(AssertUnwindSafe(|| {
         Spi::connect(|client| {
             let mut cnt = 0i64;
@@ -3449,7 +3730,23 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
             // scaled with the persisted key count on top of the segment itself.
             // Fetching keeps the query plan and access path identical — only the
             // delivery changes.
-            let mut cur = if sharded {
+            let mut cur = if by_owner {
+                // `owner % workers = w` partitions the owner space, so every
+                // persisted row is claimed by exactly one worker at any worker
+                // count. That is the whole of the graceful-scaling story: a
+                // shrink from 4 to 2 hands owners 0 and 2 to worker 0 and
+                // owners 1 and 3 to worker 1, with no orphan sweep and no
+                // special case. A grow leaves the new workers cold, which is
+                // correct rather than lossy.
+                client.try_open_cursor(
+                    "SELECT key, val, expires_at, kind::text FROM supacache.kv \
+                     WHERE owner = ANY($1::int[])",
+                    Some(vec![(
+                        PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID),
+                        owners_for(w, nworkers).into_datum(),
+                    )]),
+                )?
+            } else if sharded {
                 client.try_open_cursor(
                     "SELECT key, val, expires_at, kind::text FROM supacache.kv \
                      WHERE slot >= $1 AND slot < $2",
@@ -3500,7 +3797,21 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
             }
             // The DISTINCT ON sort happens server side either way; the cursor
             // only stops its whole output landing in the worker at once.
-            let mut cur = if sharded {
+            let mut cur = if by_owner {
+                client.try_open_cursor(
+                    "SELECT DISTINCT ON (key) key, val, expires_at, kind::text \
+                     FROM supacache.kv_ttl \
+                     WHERE expires_at > $1 AND owner = ANY($2::int[]) \
+                     ORDER BY key, expires_at DESC",
+                    Some(vec![
+                        (PgOid::BuiltIn(PgBuiltInOids::INT8OID), now.into_datum()),
+                        (
+                            PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID),
+                            owners_for(w, nworkers).into_datum(),
+                        ),
+                    ]),
+                )?
+            } else if sharded {
                 client.try_open_cursor(
                     "SELECT DISTINCT ON (key) key, val, expires_at, kind::text \
                      FROM supacache.kv_ttl \
@@ -3577,9 +3888,10 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
     // some of them with a miss for a key that is durably stored. Say so.
     let evicted = total_evictions(store).saturating_sub(evicted_before);
     if evicted > 0 {
+        let scope = recovery_scope(w, nworkers);
         warning!(
             "pg_keyspace worker {w}: recovery evicted {evicted} key(s) while loading — \
-             the persisted set for slots {lo}..{hi} does not fit in pg_keyspace.keys \
+             the persisted set for {scope} does not fit in pg_keyspace.keys \
              ({}), so the cache has come back partial",
             GUC_KEYS.get()
         );
@@ -3592,7 +3904,7 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
 /// TTL'd upserts -> `supacache.kv_ttl` (range-partitioned by expiry bucket, so
 /// expiry is a partition DROP); tombstones -> delete from both.
 fn bulk_upsert(
-    batch: Vec<server::PendingWrite>,
+    batch: Vec<(usize, server::PendingWrite)>,
     sync_commit: &'static str,
     bucket_us: i64,
 ) -> Result<(), pgrx::spi::Error> {
@@ -3600,20 +3912,25 @@ fn bulk_upsert(
     if batch.is_empty() {
         return Ok(());
     }
-    let mut latest: HashMap<Vec<u8>, (Vec<u8>, i64, u8)> = HashMap::with_capacity(batch.len());
-    for (k, v, e, kind) in batch {
-        latest.insert(k, (v, e, kind)); // last op for a key wins (SET then DEL -> DEL)
+    // The owner rides with the record rather than in a parallel array, so the
+    // dedupe below cannot pair a surviving value with a superseded owner: last
+    // op for a key wins, and it wins whole.
+    let mut latest: HashMap<Vec<u8>, (Vec<u8>, i64, u8, i32)> = HashMap::with_capacity(batch.len());
+    for (owner, (k, v, e, kind)) in batch {
+        latest.insert(k, (v, e, kind, owner as i32)); // last op for a key wins (SET then DEL -> DEL)
     }
     // no-TTL upserts -> kv (with the value's type tag; durable aggregates)
-    let (mut keys, mut slots, mut vals, mut kinds) = (
+    let (mut keys, mut slots, mut owners, mut vals, mut kinds) = (
         Vec::<Vec<u8>>::new(),
+        Vec::<i32>::new(),
         Vec::<i32>::new(),
         Vec::<Vec<u8>>::new(),
         Vec::<String>::new(),
     );
     // TTL upserts -> kv_ttl
-    let (mut tkeys, mut tslots, mut tkinds, mut tvals, mut texps, mut tbuckets) = (
+    let (mut tkeys, mut tslots, mut towners, mut tkinds, mut tvals, mut texps, mut tbuckets) = (
         Vec::<Vec<u8>>::new(),
+        Vec::<i32>::new(),
         Vec::<i32>::new(),
         Vec::<String>::new(),
         Vec::<Vec<u8>>::new(),
@@ -3622,7 +3939,7 @@ fn bulk_upsert(
     );
     let mut del_keys: Vec<Vec<u8>> = Vec::new();
     let mut buckets_seen: HashSet<i64> = HashSet::new();
-    for (k, (v, e, kind)) in latest {
+    for (k, (v, e, kind, owner)) in latest {
         if e == server::DELETE_TOMBSTONE {
             del_keys.push(k);
         } else if e > 0 {
@@ -3631,6 +3948,7 @@ fn bulk_upsert(
             let b = e / bucket_us;
             buckets_seen.insert(b);
             tslots.push(crc16::key_slot(&k) as i32);
+            towners.push(owner);
             tkinds.push((kind as char).to_string());
             tvals.push(v);
             texps.push(e);
@@ -3638,6 +3956,7 @@ fn bulk_upsert(
             tkeys.push(k);
         } else {
             slots.push(crc16::key_slot(&k) as i32);
+            owners.push(owner);
             vals.push(v);
             kinds.push((kind as char).to_string());
             keys.push(k);
@@ -3670,14 +3989,16 @@ fn bulk_upsert(
                     (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), slots.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), vals.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID), kinds.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), owners.into_datum()),
                 ];
                 client.update(
-                    "INSERT INTO supacache.kv (tenant,key,slot,kind,val,expires_at,version) \
-                     SELECT '', k, s, ki::\"char\", v, 0, 1 \
-                     FROM unnest($1::bytea[], $2::int[], $3::bytea[], $4::text[]) AS t(k, s, v, ki) \
+                    "INSERT INTO supacache.kv (tenant,key,slot,owner,kind,val,expires_at,version) \
+                     SELECT '', k, s, o, ki::\"char\", v, 0, 1 \
+                     FROM unnest($1::bytea[], $2::int[], $3::bytea[], $4::text[], $5::int[]) \
+                          AS t(k, s, v, ki, o) \
                      ON CONFLICT (tenant,key) DO UPDATE SET \
                      val=EXCLUDED.val, kind=EXCLUDED.kind, expires_at=0, slot=EXCLUDED.slot, \
-                     version=supacache.kv.version+1",
+                     owner=EXCLUDED.owner, version=supacache.kv.version+1",
                     None,
                     Some(args),
                 )?;
@@ -3693,14 +4014,16 @@ fn bulk_upsert(
                     (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), tvals.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), texps.into_datum()),
                     (PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), tbuckets.into_datum()),
+                    (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), towners.into_datum()),
                 ];
                 client.update(
-                    "INSERT INTO supacache.kv_ttl (tenant,key,slot,kind,val,expires_at,bucket) \
-                     SELECT '', k, s, ki::\"char\", v, e, b \
-                     FROM unnest($1::bytea[], $2::int[], $3::text[], $4::bytea[], $5::bigint[], $6::bigint[]) \
-                          AS t(k, s, ki, v, e, b) \
+                    "INSERT INTO supacache.kv_ttl (tenant,key,slot,owner,kind,val,expires_at,bucket) \
+                     SELECT '', k, s, o, ki::\"char\", v, e, b \
+                     FROM unnest($1::bytea[], $2::int[], $3::text[], $4::bytea[], $5::bigint[], $6::bigint[], $7::int[]) \
+                          AS t(k, s, ki, v, e, b, o) \
                      ON CONFLICT (bucket,tenant,key) DO UPDATE SET \
-                     kind=EXCLUDED.kind, val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, slot=EXCLUDED.slot",
+                     kind=EXCLUDED.kind, val=EXCLUDED.val, expires_at=EXCLUDED.expires_at, \
+                     slot=EXCLUDED.slot, owner=EXCLUDED.owner",
                     None,
                     Some(args),
                 )?;
@@ -6925,8 +7248,10 @@ mod supacache {
         (
             name!(recorded_workers, Option<i32>),
             name!(running_workers, i32),
-            name!(slots_moved, i32),
-            name!(pct_moved, f64),
+            name!(slots_moved, Option<i32>),
+            name!(pct_moved, Option<f64>),
+            name!(addressing, String),
+            name!(resize_safe, bool),
         ),
     > {
         let running = super::worker_count();
@@ -6940,12 +7265,30 @@ mod supacache {
         } else {
             None
         };
-        let moved = recorded
-            .filter(|p| *p > 0)
-            .map(|p| crc16::slots_moved(p as usize, running))
-            .unwrap_or(0);
-        let pct = moved as f64 * 100.0 / crc16::NUM_SLOTS as f64;
-        TableIterator::once((recorded, running as i32, moved as i32, pct))
+        let owner_mode = super::ks_addressing() == super::Addressing::Owner;
+        // slots_moved counts a reshard of the CRC16 map. Under owner
+        // addressing nothing is keyed on that map, so reporting a number for
+        // it would invite an operator to reconcile against a scheme this
+        // cluster does not use. NULL says "not this question" where 0 would
+        // have said "no movement".
+        let (moved, pct) = if owner_mode {
+            (None, None)
+        } else {
+            let m = recorded
+                .filter(|p| *p > 0)
+                .map(|p| crc16::slots_moved(p as usize, running))
+                .unwrap_or(0);
+            (Some(m as i32), Some(m as f64 * 100.0 / crc16::NUM_SLOTS as f64))
+        };
+        // What a resize from the recorded count to the running one would do to
+        // keys a client has to find again. Always true under slot addressing:
+        // the map is republished and a cluster-aware client follows it.
+        let resize_safe = match recorded.filter(|p| *p > 0) {
+            Some(p) if owner_mode => super::owner_resize_is_safe(p as usize, running),
+            _ => true,
+        };
+        let addressing = if owner_mode { "owner" } else { "slot" }.to_string();
+        TableIterator::once((recorded, running as i32, moved, pct, addressing, resize_safe))
     }
 
     /// The slot range and RESP port of every shared-nothing slot worker.
@@ -6984,9 +7327,16 @@ mod supacache {
         TableIterator::new(rows)
     }
 
-    /// Which slot worker owns `key`, by the same function the RESP workers, the
-    /// SQL surface, and crash recovery use. Pairs with `slot_ranges()` for
-    /// routing a key to its port.
+    /// Which slot worker owns `key` by CRC16 -- the same function the RESP
+    /// workers and the SQL surface use. Pairs with `slot_ranges()` for routing
+    /// a key to its port.
+    ///
+    /// Under `pg_keyspace.recovery_addressing = 'owner'` this is **not** where
+    /// a persisted key comes back: recovery uses the worker that wrote it. It
+    /// is still the right answer for where the key lives while the cluster is
+    /// up, and it is the placement `supacache.rehome()` assigns. Read
+    /// `supacache.topology_change().addressing` to know which you are looking
+    /// at.
     #[pg_extern(stable, parallel_safe)]
     fn key_worker(key: &str) -> i32 {
         crc16::key_owner(key.as_bytes(), worker_count()) as i32
@@ -7141,6 +7491,119 @@ mod supacache {
             "supacache.prune_undurable(): deleted {deleted} row(s) no longer covered by a              persisted prefix"
         );
         deleted
+    }
+
+    /// Rewrite every persisted row's `owner` to the worker that
+    /// `pg_keyspace.workers = workers` puts its key on, so a resize under
+    /// `recovery_addressing = 'owner'` lands where a client looks.
+    ///
+    /// Owner addressing normally brings a key back to the worker that wrote
+    /// it, which is what lets a persisted cluster run with no redirects. That
+    /// property is exactly what a resize breaks: `owner % workers` and a
+    /// client's own `hash(key) % workers` agree only when the new count
+    /// divides the old one, so every growth and every non-divisor shrink
+    /// leaves keys on workers nobody asks. Startup refuses those; this is the
+    /// way through one.
+    ///
+    /// It assigns the worker `supacache.key_worker()` reports and
+    /// `CLUSTER SLOTS` publishes, because that is the only placement a client
+    /// can compute for itself. Keys do change segments, which is the thing
+    /// owner addressing otherwise avoids -- so this is a deliberate operator
+    /// step before a resize, not something recovery does unasked.
+    ///
+    /// Run it with the cluster stopped or quiesced: rows written afterwards
+    /// carry their accepting worker again.
+    #[pg_extern]
+    fn rehome(workers: i32) -> i64 {
+        if workers < 1 || workers as usize > super::MAX_WORKERS {
+            warning!(
+                "supacache.rehome(): workers must be between 1 and {} (got {workers})",
+                super::MAX_WORKERS
+            );
+            return 0;
+        }
+        let target = workers as usize;
+        let mut moved = 0i64;
+        for table in ["kv", "kv_ttl"] {
+            if !table_exists(&format!("supacache.{table}")) {
+                continue;
+            }
+            // Collected first, then updated in batches: the new owner comes
+            // from the same CRC16 the RESP path uses, which is not something
+            // to restate in SQL.
+            let mut plan: Vec<(Vec<u8>, i32)> = Vec::new();
+            let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+                let mut cur = client
+                    .try_open_cursor(&format!("SELECT key, owner FROM supacache.{table}"), None)?;
+                loop {
+                    let tup = cur.fetch(RECOVER_BATCH as _)?;
+                    if tup.is_empty() {
+                        break;
+                    }
+                    for row in tup {
+                        let k: Vec<u8> = match row.get::<Vec<u8>>(1)? {
+                            Some(k) => k,
+                            None => continue,
+                        };
+                        let was = row.get::<i32>(2)?.unwrap_or(0);
+                        let now = crc16::key_owner(&k, target) as i32;
+                        if now != was {
+                            plan.push((k, now));
+                        }
+                    }
+                }
+                Ok(())
+            });
+            if plan.is_empty() {
+                continue;
+            }
+            let n = Spi::connect(|mut client| {
+                let mut n: i64 = 0;
+                for chunk in plan.chunks(1000) {
+                    let keys: Vec<Vec<u8>> = chunk.iter().map(|(k, _)| k.clone()).collect();
+                    let owners: Vec<i32> = chunk.iter().map(|(_, o)| *o).collect();
+                    let r = client.update(
+                        &format!(
+                            "UPDATE supacache.{table} t SET owner = u.owner \
+                             FROM unnest($1::bytea[], $2::int[]) AS u(key, owner) \
+                             WHERE t.key = u.key"
+                        ),
+                        None,
+                        Some(vec![
+                            (PgOid::BuiltIn(PgBuiltInOids::BYTEAARRAYOID), keys.into_datum()),
+                            (PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID), owners.into_datum()),
+                        ]),
+                    );
+                    match r {
+                        Ok(t) => n += t.len() as i64,
+                        Err(e) => {
+                            warning!("supacache.rehome(): {e}");
+                            return n;
+                        }
+                    };
+                }
+                n
+            });
+            moved += n;
+        }
+        // Record the layout this just created, or the startup check would go
+        // on comparing the new worker count against the one the rows were
+        // written under and refuse the very resize this call exists to
+        // enable. rehome is the statement "this keyspace is now laid out for
+        // `workers`", so it has to say so where that check reads.
+        if table_exists("supacache.topology") {
+            let _ = Spi::run_with_args(
+                "INSERT INTO supacache.topology(id, workers, updated_at) VALUES (1, $1, now()) \
+                 ON CONFLICT (id) DO UPDATE SET workers = EXCLUDED.workers, updated_at = now()",
+                Some(vec![(PgBuiltInOids::INT4OID.oid(), workers.into_datum())]),
+            );
+        }
+        log!(
+            "supacache.rehome({workers}): rewrote {moved} row(s) to the owner \
+             pg_keyspace.workers = {workers} places their key on, and recorded the \
+             keyspace as laid out for {workers} worker(s)"
+        );
+        moved
     }
 
     // ---- in-backend micro-benchmarks --------------------------------
@@ -8384,7 +8847,7 @@ CREATE VIEW supacache.pg_stat_keyspace_pubsub AS
 SELECT dropped, route_full, name_too_long FROM supacache.pubsub_stats();
 
 CREATE VIEW supacache.pg_stat_keyspace_topology AS
-SELECT recorded_workers, running_workers, slots_moved, pct_moved
+SELECT recorded_workers, running_workers, slots_moved, pct_moved, addressing, resize_safe
 FROM supacache.topology_change();
 
 -- A monitoring role gets these and nothing else. `pg_monitor` is the role
@@ -8419,6 +8882,9 @@ GRANT EXECUTE ON FUNCTION
     supacache.key_durability(text),
     supacache.undurable_rows()
 TO pg_monitor;
+-- supacache.rehome() is absent for the same reason as prune_undurable(): it
+-- rewrites rows, and a monitoring role should see a resize coming without
+-- being able to perform one.
 -- supacache.prune_undurable() is deliberately absent: it deletes rows, and a
 -- monitoring role should be able to see the strandage without being able to
 -- act on it.

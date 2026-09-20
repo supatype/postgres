@@ -227,7 +227,7 @@ chk "a fresh CREATE EXTENSION gets $NEW_VER" "$NEW_VER" \
 Q "$CATALOGUE_SQL" upgraded > /tmp/pgks_cat_upgraded.txt
 Q "$CATALOGUE_SQL" fresh    > /tmp/pgks_cat_fresh.txt
 # Guard: an empty or error-filled dump would make the diff below pass vacuously.
-chk "the upgraded catalogue dumped $((41 + 11 + 1)) objects" "53" \
+chk "the upgraded catalogue dumped $((42 + 11 + 1)) objects" "54" \
     "$(grep -c '^\(function\|relation\|schema\)|' /tmp/pgks_cat_upgraded.txt)"
 chk "the fresh catalogue dumped the same number" \
     "$(grep -c '^\(function\|relation\|schema\)|' /tmp/pgks_cat_upgraded.txt)" \
