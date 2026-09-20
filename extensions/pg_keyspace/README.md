@@ -81,7 +81,7 @@ ceiling for deep Postgres integration.
 | Transparent PostgREST/row cache | **Yes** — planner `CustomScan`; coherent within a bounded window ([details](#what-the-row-cache-guarantees-and-what-it-does-not)) | No (app-managed) |
 | Auth / ACL / multi-tenant isolation | Postgres roles, keyspace ACL, forced tenant scoping | Redis ACLs (separate user store) |
 | Column masking / RLS on cached rows | **Yes** — re-applied above the cache | N/A |
-| Durability | Tiered: ephemeral→relaxed→durable(fsync)→replicated; crash-recovers from PG tables | RDB / AOF snapshots & log |
+| Durability | Tiered: ephemeral→relaxed→durable(fsync)→replicated, **selectable per key prefix**; crash-recovers from PG tables | RDB / AOF snapshots & log (instance-wide) |
 | Synchronous replication | **Yes** — ack held until standby fsync | Async by default (WAIT for quorum) |
 | Data types | strings, hashes, lists, sets, sorted sets, bitmaps, Bloom filters, Cuckoo filters, pub/sub (+ TTL), transactions | Superset (adds streams, HLL, geo, scripting) |
 | Raw write ceiling under no-persistence load | Lower (bounded by 1 event loop / worker) | **Higher** — purpose-built |
@@ -562,6 +562,63 @@ own streaming replication for the standby. **It refuses to start unless
 every commit: with that setting empty Postgres does not wait for anything, so
 the tier would quietly be plain `durable`. Query `supacache.replication_status()`
 for the live picture.
+
+#### Per-key durability
+
+One tier for the whole keyspace forces an instance that needs *any* durable
+data to run everything durable — every cache write through the WAL to protect
+the small part that matters. `pg_keyspace.durability_overrides` names the
+exceptions:
+
+```ini
+pg_keyspace.durability = 'ephemeral'                     # the default for keys no rule covers
+pg_keyspace.durability_overrides = 'acme:=durable'       # ...except these
+```
+
+That is one instance holding Kong's ACME certificates across a restart while
+the REST response cache beside them costs nothing to write. It reads the other
+way round just as well, which is why this is a map and not a list of durable
+prefixes:
+
+```ini
+pg_keyspace.durability = 'durable'
+pg_keyspace.durability_overrides = 'cache:=ephemeral, metrics:=relaxed'
+```
+
+| | |
+|---|---|
+| **Matched against** | The key **as stored** — the tenant-scoped `{tenant}:{key}` form when RESP AUTH is configured, so a tenant name is a prefix like any other and per-tenant durability needs no separate setting |
+| **Overlap** | Longest prefix wins, so `a:` and `a:b:` can both be set without the answer depending on the order you wrote them in |
+| **Empty** | Identical to not having the setting: one tier for the whole keyspace |
+| **Context** | `postmaster` — a restart, like `pg_keyspace.durability` itself |
+| **Bad entry** | The worker refuses to start and names the entry |
+
+The tier a key resolves to is what its reply promises, per the table below: an
+`ephemeral` key is acked immediately even on an instance whose durable prefix
+is holding replies, and a `relaxed` key is queued for persistence without
+waiting for the commit.
+
+**Provisioned for the strongest tier, not the default one.** The rings, the
+persistence workers and the commit mode follow the strongest tier any rule can
+produce, so an `ephemeral` default with one `durable` prefix still starts the
+persistence machinery. A key written at a weaker tier than the instance
+provides is over-served — a `relaxed` key committed with
+`synchronous_commit = on` — never under-served.
+
+Two combinations are refused at startup rather than half-applied:
+
+- **`replicated` mixed with other tiers.** The persistence worker sets
+  `synchronous_commit` once per batch, so a replicated prefix would either
+  charge every other durable write the standby round-trip or be acked without
+  waiting for a standby. Use `pg_keyspace.durability = 'replicated'` for the
+  whole keyspace instead.
+- **Overrides with `pg_keyspace.workers > 1`.** Per-key durability and slot
+  routing have not been reconciled yet (see [#164](https://github.com/supatype/postgres/issues/164)).
+
+**Narrowing the map leaves rows behind.** A prefix moved from durable to
+ephemeral stops being recovered at the next restart — it is not served, and it
+cannot resurrect — but its rows stay in `supacache.kv`, and the worker logs how
+many it skipped. Deleting them is a separate, deliberate step.
 
 #### What an acknowledgement means
 
@@ -1505,11 +1562,12 @@ All are `Postmaster` context (set in `postgresql.conf`).
 | GUC | default | meaning |
 |---|---|---|
 | `pg_keyspace.port` | 6380 | RESP listen port (worker *w* uses `port + w`); examples here set 6381 |
-| `pg_keyspace.workers` | 1 | shared-nothing RESP slot workers; >1 forces ephemeral |
+| `pg_keyspace.workers` | 1 | shared-nothing RESP slot workers; >1 with a persisted tier enforces slot routing, so it needs `cluster_announce_host` and a cluster-aware client |
 | `pg_keyspace.keys` | 1000000 | keyspace capacity per worker (sizes the segment) |
 | `pg_keyspace.val_bytes` | 512 | avg value size (sizes the slab arena) |
 | `pg_keyspace.max_value_bytes` | 536870912 | largest value accepted from a client; matches Valkey/Redis `proto-max-bulk-len` |
-| `pg_keyspace.durability` | `ephemeral` | `ephemeral` \| `relaxed` \| `durable` \| `replicated` |
+| `pg_keyspace.durability` | `ephemeral` | `ephemeral` \| `relaxed` \| `durable` \| `replicated` — the tier for keys no override covers |
+| `pg_keyspace.durability_overrides` | *(empty)* | per-key durability: `prefix=tier` pairs, e.g. `acme:=durable, cache:=ephemeral`. Longest prefix wins; matched on the stored (tenant-scoped) key. See [Per-key durability](#per-key-durability) |
 | `pg_keyspace.database` | `postgres` | database holding `supacache.kv` backing tables (Mode A), and the one worker 0 auto-upgrades. Since #120 it does **not** bound the row cache: Mode B serves every database that registers a table |
 | `pg_keyspace.persist_workers` | 1 | persist workers/rings draining in parallel |
 | `pg_keyspace.ring_mb` | 64 | per-worker RESP→persist ring size (burst absorption) |
@@ -1967,6 +2025,13 @@ Scoping for this version — the extension works; these are the edges to know:
   multi-worker deployments are unaffected. Online resharding (live slot
   migration, `ASKING`/`MIGRATE`) is not supported; changing `pg_keyspace.workers`
   is a restart.
+- **Per-key durability is single-worker for now.** `pg_keyspace.durability_overrides`
+  with `pg_keyspace.workers > 1` is refused at startup: per-key durability and
+  slot routing have not been reconciled
+  ([#164](https://github.com/supatype/postgres/issues/164)). The `replicated`
+  tier also cannot be mixed with others on one instance, because the
+  persistence worker sets `synchronous_commit` once per batch — it is available
+  as the whole-keyspace tier instead.
 - **Pub/sub crosses instances only where you opt in, and at most once.** Within
   one instance it crosses processes by itself: the routing table and the
   per-worker inboxes live in Postgres shared memory, so a `SUBSCRIBE` on one

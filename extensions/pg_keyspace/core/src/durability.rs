@@ -189,6 +189,27 @@ impl Policy {
         out
     }
 
+    /// The strongest tier this policy can produce, over the default and every
+    /// rule.
+    ///
+    /// This is what the *instance* must be provisioned for, and it is not the
+    /// same as the configured default tier. An instance whose default is
+    /// `ephemeral` with one `durable` prefix still needs rings, persistence
+    /// workers and a synchronous commit -- provisioning from the default tier
+    /// would leave the durable prefix with nowhere to go. Provisioning from
+    /// the strongest is always safe in the other direction: a tier only ever
+    /// promises less than a stronger one, so a `relaxed` key committed with
+    /// `synchronous_commit = on` is over-served, never under-served.
+    pub fn strongest(&self) -> Tier {
+        let mut best = self.default;
+        for (_, t) in &self.rules {
+            if tier_rank(*t) > tier_rank(best) {
+                best = *t;
+            }
+        }
+        best
+    }
+
     /// True when any key at all can be persisted. An instance whose default is
     /// ephemeral and whose every override is ephemeral needs no rings.
     pub fn any_persisted(&self) -> bool {
@@ -208,6 +229,17 @@ impl Policy {
             s.push_str(&format!("{}*={}", String::from_utf8_lossy(p), tier_name(*t)));
         }
         format!("{s}, otherwise {}", tier_name(self.default))
+    }
+}
+
+/// How much a tier promises, for comparing two of them. Ephemeral promises
+/// nothing; replicated promises the most.
+pub fn tier_rank(t: Tier) -> u8 {
+    match t {
+        Tier::Ephemeral => 0,
+        Tier::Relaxed => 1,
+        Tier::Durable => 2,
+        Tier::Replicated => 3,
     }
 }
 
@@ -381,6 +413,23 @@ mod tests {
         ] {
             assert_eq!(pol.tier_for(key), brute(key), "key {:?}", String::from_utf8_lossy(key));
         }
+    }
+
+    #[test]
+    fn strongest_is_what_the_instance_must_be_provisioned_for() {
+        // The self-host shape: an ephemeral default with one durable prefix
+        // still needs rings and a synchronous commit.
+        assert_eq!(p("acme:=durable").strongest(), Tier::Durable);
+        assert_eq!(p("a:=relaxed, b:=durable").strongest(), Tier::Durable);
+        assert_eq!(p("a:=relaxed").strongest(), Tier::Relaxed);
+        assert_eq!(p("a:=ephemeral").strongest(), Tier::Ephemeral);
+        assert_eq!(p("a:=durable, b:=replicated").strongest(), Tier::Replicated);
+        // A weaker override never lowers what the instance provides.
+        assert_eq!(
+            Policy::parse(Tier::Durable, "cache:=ephemeral").unwrap().strongest(),
+            Tier::Durable
+        );
+        assert_eq!(Policy::uniform(Tier::Ephemeral).strongest(), Tier::Ephemeral);
     }
 
     #[test]
