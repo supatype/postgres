@@ -293,8 +293,13 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 chk "the row written during the outage is what comes back" "CHANGED-DURING-OUTAGE" "$VAL"
-chk "the log says the cached rows were dropped rather than resumed over" "t" \
-    "$([ "$(grep -c 'dropped .* cached row' $PGDATA/log)" -ge 1 ] && echo t || echo f)"
+# The log line that confirms the SAME thing from the server's side is asserted
+# in section 6 rather than here. It is emitted on the last line of the rebuild
+# path, past an early return taken when the new slot is invalidated again
+# before it reserves any WAL -- which is precisely what the hostile bound still
+# in force here provokes, as section 6's own comment records. Asserting it now
+# is a race against that rebuild; asserting it after the bound is raised is a
+# fact. The assertion above is the one that proves the property either way.
 
 echo
 echo "########## 6. the slot is rebuilt and the database is served again ##########"
@@ -321,6 +326,14 @@ chk "the victim is coherent again" "t" \
 HEALTHY=$(Q "SELECT count(*) FROM pg_replication_slots
              WHERE slot_name='$VS' AND plugin='supacache_keys' AND wal_status <> 'lost'")
 chk "a healthy slot exists for it once more" "1" "$HEALTHY"
+# Moved up from section 5, now that the rebuild has provably survived: the poll
+# above waited for a slot that is not 'lost', which is the condition under
+# which the rebuild path runs to its end and logs this. Kept as a separate
+# assertion from the read in section 5 because they fail for different reasons
+# -- a stale read means the cache was resumed over, a missing line means the
+# drop happened somewhere this file cannot see.
+chk "the log says the cached rows were dropped rather than resumed over" "t" \
+    "$([ "$(grep -c 'dropped .* cached row' $PGDATA/log)" -ge 1 ] && echo t || echo f)"
 # 0 here has TWO readings and they are different bugs: no slot at all (the
 # rebuild failed), or a slot that exists and is ALREADY lost again (rebuilt, then
 # invalidated before the worker's next pass noticed). The count cannot tell them
