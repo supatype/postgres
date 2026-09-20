@@ -99,6 +99,37 @@ jobs:
         if: needs.changes.outputs.pgks == 'true'
         run: bash extensions/pg_keyspace/bench/run_prefix_match_cost.sh
 
+      # ---- coverage: REPORTED, never gated ----------------------------------
+      #
+      # There is deliberately no threshold. A percentage target gets gamed --
+      # a test that touches a line without asserting anything moves the number
+      # while verifying nothing -- and the number here would be misleading on
+      # its own terms: server.rs reads about 18% because most of it is only
+      # reachable through the out-of-process harnesses in the jobs below,
+      # which an instrumented `cargo test` never sees. Any global floor would
+      # be either meaningless or permanently red.
+      #
+      # What the table is for is one question a diff should have to answer:
+      # did this change leave anything at zero? That question found three
+      # gates in #164 -- DEL's ack hold, FLUSHDB's ack hold, and aggregate
+      # staging -- that had tests which never executed them, because those
+      # tests ran with sync-ack off and the predicate short-circuits on the
+      # flag before it consults the policy.
+      #
+      # It re-runs the suite under instrumentation rather than replacing the
+      # step above, so a problem in the coverage tooling cannot take out the
+      # test signal.
+      - name: Install cargo-llvm-cov
+        if: needs.changes.outputs.pgks == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Coverage report (core, not gated)
+        if: needs.changes.outputs.pgks == 'true'
+        working-directory: extensions/pg_keyspace/core
+        run: cargo llvm-cov --locked --no-cfg-coverage --summary-only
+
       # ---- extension build: needs PG17 headers + libclang (pgrx bindgen) -----
       - name: Add the PostgreSQL apt repository
         if: needs.changes.outputs.pgks == 'true'
