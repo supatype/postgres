@@ -91,6 +91,14 @@ jobs:
         working-directory: extensions/pg_keyspace/core
         run: cargo test --locked
 
+      # The per-key durability matcher runs on every write, in front of an op
+      # measured in nanoseconds, so its cost is gated rather than asserted in
+      # a comment. Pure Rust like the tests above; see the script for the
+      # budgets and why they are where they are.
+      - name: Per-key durability match cost
+        if: needs.changes.outputs.pgks == 'true'
+        run: bash extensions/pg_keyspace/bench/run_prefix_match_cost.sh
+
       # ---- extension build: needs PG17 headers + libclang (pgrx bindgen) -----
       - name: Add the PostgreSQL apt repository
         if: needs.changes.outputs.pgks == 'true'
@@ -482,6 +490,13 @@ jobs:
       # (#128), and concurrent backends writing one unsynchronised arena under
       # read-through (#127). Both reproduce in seconds, so this is cheap and it
       # is the one test that fails loudly if either comes back.
+      - name: Per-key durability end to end
+        env:
+          PGKS_BUILD_PROFILE: debug
+        run: |
+          sudo -E env "PATH=$PATH" "PGRX_HOME=$HOME/.pgrx" \
+            bash extensions/pg_keyspace/bench/run_per_key_durability.sh
+
       - name: Extension upgrade path (0.1.0 -> 0.2.0)
         env:
           PGKS_BUILD_PROFILE: debug

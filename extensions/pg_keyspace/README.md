@@ -1732,6 +1732,29 @@ asserts that each one comes back with its type and its items — and that a filt
 whose TTL expired stays gone. Both run in CI on every change to
 `extensions/pg_keyspace/`.
 
+`run_per_key_durability.sh` owns its own cluster too, because
+`pg_keyspace.durability_overrides` is postmaster context and the thing under
+test is what survives a restart. It runs the self-host shape — an `ephemeral`
+default with one `durable` prefix, on one worker — and asserts that
+persistence starts at all despite the default, that only the covered prefix
+reaches `supacache.kv`, that only it comes back from `kill -9`, that deleting
+it does not resurrect it, that narrowing the map strands rows rather than
+serving them, that `prune_undurable()` refuses to empty the table and then
+removes exactly the stranded rows, and that both an unparseable spec and a
+`replicated` tier mixed with others stop the worker instead of being
+half-applied.
+
+`run_prefix_match_cost.sh` is the one gate that is a measurement.
+`Policy::tier_for` runs on every write, in front of an op measured in
+nanoseconds, so its cost is bounded in CI rather than asserted in a comment:
+it times the matcher at 0, 1, 4, 8 and 64 rules and fails the build if a miss
+leaves 25 ns or a hit leaves 120 ns. It earned its place immediately — the
+first version of the matcher scanned every rule and cost 154 ns/op on a hit
+against 64 same-length prefixes, which is why it now scans small groups and
+binary-searches large ones. Note that `supacache.bench_set()` cannot be used
+for this: it writes straight to the store from the calling backend and never
+reaches the RESP dispatch where the policy is consulted.
+
 `run_pg_stat_views.sh` covers the monitoring surface the same way: a live
 cluster, a real `pg_monitor` member scraping every view, and the negative
 control that a role *without* `pg_monitor` is refused all ten. It also asserts
