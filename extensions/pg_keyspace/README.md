@@ -598,6 +598,11 @@ The tier a key resolves to is what its reply promises, per the table below: an
 is holding replies, and a `relaxed` key is queued for persistence without
 waiting for the commit.
 
+```sql
+SELECT supacache.key_durability('acme:cert:example.com');    -- durable
+SELECT supacache.key_durability('cache:GET:/rest/v1/todos');  -- ephemeral
+```
+
 **Provisioned for the strongest tier, not the default one.** The rings, the
 persistence workers and the commit mode follow the strongest tier any rule can
 produce, so an `ephemeral` default with one `durable` prefix still starts the
@@ -618,7 +623,21 @@ Two combinations are refused at startup rather than half-applied:
 **Narrowing the map leaves rows behind.** A prefix moved from durable to
 ephemeral stops being recovered at the next restart — it is not served, and it
 cannot resurrect — but its rows stay in `supacache.kv`, and the worker logs how
-many it skipped. Deleting them is a separate, deliberate step.
+many it skipped. Removing them is a separate, deliberate step:
+
+```sql
+SELECT * FROM supacache.undurable_rows();   -- key_prefix, rows, bytes
+SELECT supacache.prune_undurable();         -- delete them, returns the count
+```
+
+`prune_undurable()` refuses, rather than proceeding, when the policy persists
+nothing at all or when it would empty `supacache.kv` — that is what a mistyped
+override or a config include that failed to load looks like, and it is the one
+case where trusting the setting deletes the whole durable dataset. Pass `true`
+to confirm when it really is the intent. Both functions filter with the same
+matcher the write path uses, so they cannot disagree with it about what a
+prefix means; `supacache.kv_ttl` is not counted, because whole expiry
+partitions are dropped and stranded TTL'd rows clear themselves.
 
 #### What an acknowledgement means
 
