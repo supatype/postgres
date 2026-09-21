@@ -325,15 +325,67 @@ jobs:
           exec_migrate doctor
           echo "doctor is clean again"
 
+      # The other jobs here all run with SUPATYPE_KEYSPACE_ENABLED unset, which is half the
+      # contract: the image must be unchanged without it. This is the other half, and it is the
+      # gate the feature is actually for -- serving RESP *with persistence*, which is a different
+      # thing from serving RESP. Without the extension the worker comes up and answers PING while
+      # refusing to persist, saying so once in the log and nowhere else, so a stack configured for
+      # durable keys would be silently ephemeral. Asserting persisted=true is what catches that.
+      - name: Keyspace enabled serves RESP and persists
+        run: |
+          docker run -d --name pg_keyspace_test \
+            -e POSTGRES_PASSWORD=testpassword \
+            -e POSTGRES_DB=supatype \
+            -e SUPATYPE_KEYSPACE_ENABLED=1 \
+            -e SUPATYPE_KEYSPACE_DURABILITY=ephemeral \
+            -e SUPATYPE_KEYSPACE_DURABILITY_OVERRIDES='kong_acme:=durable' \
+            -e SUPATYPE_KEYSPACE_KEYS=10000 \
+            -e SUPATYPE_KEYSPACE_RING_MB=4 \
+            -p 6379:6379 \
+            supatype-postgres:test
+          for i in $(seq 1 45); do
+            if docker exec pg_keyspace_test pg_isready -U supatype_admin -q 2>/dev/null; then break; fi
+            sleep 2
+          done
+
+          # The worker announces both facts on the line it binds the socket on.
+          logs=$(docker logs pg_keyspace_test 2>&1)
+          case "$logs" in
+            *"RESP listening"*) ;;
+            *) echo "FAIL: no RESP listener in the log"; echo "$logs" | tail -40; exit 1 ;;
+          esac
+          case "$logs" in
+            *"persisted=true"*) ;;
+            *) echo "FAIL: RESP came up without persistence -- the extension was not created before the real start"
+               echo "$logs" | grep -i keyspace || true; exit 1 ;;
+          esac
+          case "$logs" in
+            *"kong_acme:*=durable"*) ;;
+            *) echo "FAIL: durability_overrides did not reach the worker"; echo "$logs" | grep -i durability || true; exit 1 ;;
+          esac
+          echo "worker: RESP up, persistence on, per-key durability applied"
+
+          # And the policy resolves per key, not just at startup: the named prefix persists, and
+          # everything else stays in shared memory.
+          docker exec -e PGPASSWORD=testpassword pg_keyspace_test \
+            psql -U supatype_admin -d supatype -tA -c "
+              SELECT CASE
+                WHEN supacache.key_durability('kong_acme:cert_key:example.com') = 'durable'
+                 AND supacache.key_durability('cache:rest:abc') = 'ephemeral'
+                THEN 'ok' ELSE 'FAIL' END" | grep -qx ok \
+            || { echo "FAIL: key_durability did not resolve the ACME prefix to durable"; exit 1; }
+          echo "key_durability: kong_acme: -> durable, everything else -> ephemeral"
+
       - name: Show logs on failure
         if: failure()
         run: |
           docker logs pg_test || true
           docker logs pg_v2 || true
+          docker logs pg_keyspace_test || true
 
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f pg_test pg_v1 pg_v2 || true
+          docker rm -f pg_test pg_v1 pg_v2 pg_keyspace_test || true
           docker volume rm pg_upgrade_vol || true
           exit 0
