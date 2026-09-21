@@ -115,6 +115,18 @@ pg_config --version | grep -F 'PostgreSQL $PG_FULL_VERSION'
     Invoke-Msys2 "cp '$PgvectorSrc/vector.control' '$PgvectorDist/share/'"
     Invoke-Msys2 "find '$PgvectorSrc' -name 'vector--*.sql' -exec cp {} '$PgvectorDist/share/' \;"
 
+    # ── Step 2b-ii: pg_keyspace is NOT built here ────────────────────────────
+    #
+    # Deliberate, and the one extension this archive does not carry. pg_keyspace
+    # is a pgrx extension, and pgrx has no supported Windows target — the same
+    # reason the build-windows job in native-archives.yml skips it. There is
+    # nothing to fall back to inside the archive, so `supatype dev` on Windows
+    # probes for the library, does not find it, and starts the Valkey sidecar
+    # instead. That is a working stack, one container heavier.
+    #
+    # If pgrx gains a Windows target, this is where it would be built, with the
+    # keys-only decode plugin beside it, mirroring Step 7d of build-native.sh.
+
     # ── Step 2c: Clone pgjwt (SQL-only, no compilation needed) ───────────────
     Write-Host "[supatype-postgres] Cloning pgjwt..."
     $PgjwtCommit = "f3d82fd30151e754e19ce5d6a06c71c20689ce3d"
