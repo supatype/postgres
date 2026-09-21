@@ -77,6 +77,75 @@ supatype_write_cron_database() {
 	fi
 }
 
+readonly SUPATYPE_KEYSPACE_CONF=/etc/postgresql-custom/pg_keyspace.conf
+
+# Turn pg_keyspace on from the environment, or leave the image exactly as it was.
+#
+# pg_keyspace registers background workers and requests shared memory at postmaster start, so it
+# has to be in shared_preload_libraries -- there is no runtime toggle, and `CREATE EXTENSION`
+# alone does nothing. That makes enabling it a property of the configuration a server reads before
+# it starts, which is why this happens here rather than in a bootstrap script: those run against a
+# temporary server that has already read its configuration.
+#
+# The whole preload list is restated because shared_preload_libraries is a single string, and this
+# include is read *after* the one in postgresql.conf, so the last assignment wins. Order matters:
+# pg_keyspace goes BEFORE supatype_mask so the mask stays outermost and pg_keyspace.require_mask
+# is satisfied rather than refusing to serve.
+#
+# With SUPATYPE_KEYSPACE_ENABLED unset the file is left alone, and the image behaves exactly as it
+# did before this existed: the extension ships built but not loaded.
+supatype_write_keyspace_conf() {
+	case "${SUPATYPE_KEYSPACE_ENABLED:-}" in
+		1|true|TRUE|on|ON|yes|YES) ;;
+		*) return 0 ;;
+	esac
+
+	# Defaults are the measured floor for a small stack rather than the extension's own, which
+	# reserve ~689 MiB per worker before rings and row cache -- larger than some deployments'
+	# whole memory limit. Every one of these is shared memory taken at postmaster start.
+	local db="${SUPATYPE_KEYSPACE_DATABASE:-${POSTGRES_DB:-postgres}}"
+	local durability="${SUPATYPE_KEYSPACE_DURABILITY:-ephemeral}"
+	local overrides="${SUPATYPE_KEYSPACE_DURABILITY_OVERRIDES:-}"
+	local port="${SUPATYPE_KEYSPACE_PORT:-6379}"
+	local keys="${SUPATYPE_KEYSPACE_KEYS:-200000}"
+	local val_bytes="${SUPATYPE_KEYSPACE_VAL_BYTES:-512}"
+	local ring_mb="${SUPATYPE_KEYSPACE_RING_MB:-16}"
+	local rowcache_mb="${SUPATYPE_KEYSPACE_ROWCACHE_MB:-1}"
+	local require_mask="${SUPATYPE_KEYSPACE_REQUIRE_MASK:-on}"
+	local preload="${SUPATYPE_SHARED_PRELOAD_LIBRARIES:-pg_stat_statements, pg_cron, pg_net, plan_filter, safeupdate, pg_keyspace, supatype_mask}"
+
+	# A single quote would end the literal and leave a file Postgres refuses to start on.
+	local db_lit="${db//\'/\'\'}"
+	local overrides_lit="${overrides//\'/\'\'}"
+
+	{
+		echo "# Written at container start from SUPATYPE_KEYSPACE_*; edits do not survive."
+		echo "# Unset SUPATYPE_KEYSPACE_ENABLED to go back to the shipped, inert configuration."
+		echo "shared_preload_libraries = '${preload}'"
+		echo "pg_keyspace.require_mask = ${require_mask}"
+		echo "pg_keyspace.port = ${port}"
+		echo "pg_keyspace.database = '${db_lit}'"
+		echo "pg_keyspace.durability = '${durability}'"
+		# An if rather than `[ … ] && echo`: this is not the last line of the block, so under a
+		# future `set -e` a false test would abort the group and leave a truncated file, which is
+		# a cluster that refuses to start rather than one missing a setting.
+		if [ -n "$overrides" ]; then
+			echo "pg_keyspace.durability_overrides = '${overrides_lit}'"
+		fi
+		echo "pg_keyspace.keys = ${keys}"
+		echo "pg_keyspace.val_bytes = ${val_bytes}"
+		echo "pg_keyspace.ring_mb = ${ring_mb}"
+		# rowcache_mb is a request, not a reservation: the segment carries a fixed directory for
+		# 200k entries on top, about 15.8 MiB, so even 1 costs ~17 MiB and 0 is not accepted.
+		echo "pg_keyspace.rowcache_mb = ${rowcache_mb}"
+	} > "$SUPATYPE_KEYSPACE_CONF" 2>/dev/null || {
+		supatype_warn "could not write $SUPATYPE_KEYSPACE_CONF; pg_keyspace stays disabled."
+		return 0
+	}
+
+	supatype_note "pg_keyspace enabled: RESP on :${port}, durability=${durability}${overrides:+ (${overrides})}, database=${db}"
+}
+
 # Named explicitly, by the same rule the runner uses. Without -d, psql would
 # connect to a database named after the role: identical in the default image
 # (POSTGRES_DB defaults to POSTGRES_USER) and wrong the moment an operator sets
@@ -100,6 +169,35 @@ supatype_can_connect() {
 # read-only) and wrong.
 supatype_in_recovery() {
 	[ "$(supatype_psql 'SELECT pg_is_in_recovery()' 2>/dev/null)" = 't' ]
+}
+
+# Create the extension while the temporary server is up, so the real one starts with it.
+#
+# Without it the worker serves RESP but refuses to persist, saying so once in the log and
+# nowhere else:
+#
+#   pg_keyspace worker: the pg_keyspace extension is not installed in database '...'; run
+#   CREATE EXTENSION pg_keyspace and restart to enable persistence. Serving RESP in ephemeral
+#   mode until then.
+#
+# "and restart" is the part that matters: creating it against the running server would not take
+# effect until the next boot, so a stack configured for durability would silently be ephemeral
+# for its whole first life. Doing it here means the restart is the one that was going to happen
+# anyway -- this temporary server stops, and the real postmaster starts with the extension
+# already present.
+#
+# Non-fatal: a cluster serving RESP without persistence is degraded, not broken, and the worker
+# already says so.
+supatype_create_keyspace_extension() {
+	case "${SUPATYPE_KEYSPACE_ENABLED:-}" in
+		1|true|TRUE|on|ON|yes|YES) ;;
+		*) return 0 ;;
+	esac
+	if supatype_psql 'CREATE EXTENSION IF NOT EXISTS pg_keyspace' > /dev/null 2>&1; then
+		supatype_note "pg_keyspace extension present; persistence is available on the next start."
+	else
+		supatype_warn "could not create the pg_keyspace extension; RESP will serve without persistence."
+	fi
 }
 
 supatype_migrate_existing_cluster() {
@@ -137,6 +235,7 @@ supatype_migrate_existing_cluster() {
 			export POSTGRES_PORT="$port"
 			supatype migrate sync
 		) || rc=$?
+		supatype_create_keyspace_extension
 	fi
 
 	docker_temp_server_stop
@@ -159,8 +258,10 @@ if [ "${1-}" = 'postgres' ] && ! _pg_want_help "$@"; then
 	docker_create_db_directories
 
 	# Before anything starts a server, including the temporary one the migration path below uses:
-	# cron.database_name is read at postmaster start and never re-read.
+	# cron.database_name is read at postmaster start and never re-read, and pg_keyspace cannot be
+	# loaded at all without being in shared_preload_libraries first.
 	supatype_write_cron_database
+	supatype_write_keyspace_conf
 
 	if [ "$(id -u)" = '0' ]; then
 		# Same re-exec as the stock entrypoint: the temporary server and psql
