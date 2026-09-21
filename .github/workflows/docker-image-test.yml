@@ -343,12 +343,24 @@ jobs:
             -e SUPATYPE_KEYSPACE_RING_MB=4 \
             -p 6379:6379 \
             supatype-postgres:test
-          for i in $(seq 1 45); do
-            if docker exec pg_keyspace_test pg_isready -U supatype_admin -q 2>/dev/null; then break; fi
+          # -h 127.0.0.1, and the reason is the one the Dockerfile's own HEALTHCHECK gives:
+          # initialisation runs against a temporary server listening on the Unix socket alone, so
+          # a socket probe reports ready mid-migration. A TCP answer means the real server is up,
+          # which is the only one whose worker has the extension and can persist.
+          for i in $(seq 1 60); do
+            if docker exec pg_keyspace_test pg_isready -h 127.0.0.1 -U supatype_admin -q 2>/dev/null; then break; fi
             sleep 2
           done
 
-          # The worker announces both facts on the line it binds the socket on.
+          # The worker starts asynchronously after the postmaster, and during initialisation it
+          # runs once against the temporary server *without* the extension -- logging
+          # persisted=false. So wait for the line that only the real start can produce rather than
+          # reading the log the moment Postgres answers.
+          for i in $(seq 1 30); do
+            if docker logs pg_keyspace_test 2>&1 | grep -q "persisted=true"; then break; fi
+            sleep 2
+          done
+
           logs=$(docker logs pg_keyspace_test 2>&1)
           case "$logs" in
             *"RESP listening"*) ;;
