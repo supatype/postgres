@@ -406,14 +406,34 @@ jobs:
             -e SUPATYPE_KEYSPACE_SLOT_WAL_KEEP=256MB \
             supatype-postgres:test
 
+          ready=no
           for i in $(seq 1 60); do
-            if docker exec pg_rowcache_test pg_isready -h 127.0.0.1 -U supatype_admin -q 2>/dev/null; then break; fi
+            if docker exec pg_rowcache_test pg_isready -h 127.0.0.1 -U supatype_admin -q 2>/dev/null; then ready=yes; break; fi
             sleep 2
           done
+          if [ "$ready" != yes ]; then
+            echo "FAIL: the server never accepted TCP connections."
+            echo "An unrecognised parameter in the generated conf stops a cluster from starting, and"
+            echo "that is exactly what this looks like from outside. Conf and log follow."
+            docker exec pg_rowcache_test cat /etc/postgresql-custom/pg_keyspace.conf || true
+            docker logs pg_rowcache_test 2>&1 | tail -40
+            exit 1
+          fi
+          persisted=no
           for i in $(seq 1 30); do
-            if docker logs pg_rowcache_test 2>&1 | grep -q "persisted=true"; then break; fi
+            if docker logs pg_rowcache_test 2>&1 | grep -q "persisted=true"; then persisted=yes; break; fi
             sleep 2
           done
+          if [ "$persisted" != yes ]; then
+            echo "FAIL: RESP came up without persistence"
+            docker logs pg_rowcache_test 2>&1 | grep -i keyspace | tail -20
+            exit 1
+          fi
+
+          echo "::group::row cache: what the toggle wrote, and what the server made of it"
+          docker exec pg_rowcache_test cat /etc/postgresql-custom/pg_keyspace.conf || true
+          docker logs pg_rowcache_test 2>&1 | grep -iE "keyspace|rowcache|invalidation|FATAL|unrecognized" | tail -20 || true
+          echo "::endgroup::"
 
           psql_test() {
             docker exec -e PGPASSWORD=testpassword pg_rowcache_test \
@@ -424,6 +444,7 @@ jobs:
           # participate; the decoder takes a slot per participating database and nothing else.
           psql_test -c "CREATE TABLE orders (id bigint PRIMARY KEY, total numeric)" >/dev/null
           psql_test -c "INSERT INTO orders SELECT g, g FROM generate_series(1,200) g" >/dev/null
+          echo "assert: rowcache_register"
           psql_test -c "SELECT supacache.rowcache_register('public.orders')" | grep -qx t \
             || { echo "FAIL: rowcache_register did not return true"; exit 1; }
 
@@ -442,14 +463,17 @@ jobs:
 
           # The slot exists, is ours, and is bounded by the value the toggle wrote rather than the
           # image's global 4096.
+          echo "assert: decode slot exists"
           psql_test -c "SELECT plugin FROM pg_replication_slots WHERE slot_name LIKE 'supacache_rowcache%'" \
             | grep -qx supacache_keys \
             || { echo "FAIL: no decode slot with the supacache_keys plugin"; exit 1; }
+          echo "assert: max_slot_wal_keep_size"
           psql_test -c "SHOW max_slot_wal_keep_size" | grep -qx 256MB \
             || { echo "FAIL: SUPATYPE_KEYSPACE_SLOT_WAL_KEEP did not beat the image default"; exit 1; }
 
           # On the read path at all: with readthrough off this is a plain index scan, so the custom
           # scan node is the assertion that Mode B is actually serving reads.
+          echo "assert: planner chooses the row cache"
           psql_test -c "EXPLAIN (COSTS OFF) SELECT * FROM orders WHERE id = 7" \
             | grep -q "Custom Scan (pg_keyspace_rowcache)" \
             || { echo "FAIL: the planner did not choose the row cache"
@@ -458,6 +482,7 @@ jobs:
           # And a write invalidates: warm the row, change it, and the next reads must converge on
           # the new value well inside a second at the default 200ms decode interval.
           psql_test -c "SELECT total FROM orders WHERE id = 7" >/dev/null
+          echo "assert: an UPDATE invalidates"
           psql_test -c "UPDATE orders SET total = 4242 WHERE id = 7" >/dev/null
           got=stale
           for i in $(seq 1 20); do
@@ -504,11 +529,14 @@ jobs:
       - name: Show logs on failure
         if: failure()
         run: |
-          docker logs pg_test || true
-          docker logs pg_v2 || true
-          docker logs pg_keyspace_test || true
-          docker logs pg_rowcache_test || true
-          docker logs pg_rowcache_guard || true
+          # --tail, deliberately: these run *after* the step that failed, and an unbounded dump
+          # pushes the actual failure message far enough up the log that a tail no longer reaches
+          # it. That cost a diagnostic cycle on this very workflow.
+          docker logs --tail 40 pg_test || true
+          docker logs --tail 40 pg_v2 || true
+          docker logs --tail 40 pg_keyspace_test || true
+          docker logs --tail 60 pg_rowcache_test || true
+          docker logs --tail 40 pg_rowcache_guard || true
 
       - name: Cleanup
         if: always()
