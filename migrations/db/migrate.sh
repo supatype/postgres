@@ -123,6 +123,26 @@ psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
     -c 'CREATE EXTENSION IF NOT EXISTS pg_cron' \
   || echo "$0: WARNING: could not create pg_cron in $PGDATABASE; scheduled jobs will not run on a timer." >&2
 
+# Same shape for pg_keyspace, and for the same reason one step further on: the extension is what
+# gives the RESP worker somewhere to persist to. Without it the worker still serves, but only from
+# shared memory, and it says so once in the log and nowhere else -- a stack configured for durable
+# keys would be silently ephemeral.
+#
+# This runs against the temporary server the entrypoint starts for initialisation; the real
+# postmaster starts afterwards and finds the extension already there, which is the restart the
+# worker's message asks for.
+#
+# Only when the keyspace was actually enabled: SUPATYPE_KEYSPACE_ENABLED is what put pg_keyspace
+# into shared_preload_libraries, and creating the extension without the library loaded is an error
+# rather than a no-op.
+case "${SUPATYPE_KEYSPACE_ENABLED:-}" in
+  1|true|TRUE|on|ON|yes|YES)
+    psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
+        -c 'CREATE EXTENSION IF NOT EXISTS pg_keyspace' \
+      || echo "$0: WARNING: could not create pg_keyspace in $PGDATABASE; RESP will serve without persistence." >&2
+    ;;
+esac
+
 # run any post migration script to update role passwords
 postinit="/etc/postgresql.schema.sql"
 if [ -e "$postinit" ]; then
