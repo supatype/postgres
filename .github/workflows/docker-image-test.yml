@@ -388,16 +388,131 @@ jobs:
             || { echo "FAIL: key_durability did not resolve the ACME prefix to durable"; exit 1; }
           echo "key_durability: kong_acme: -> durable, everything else -> ephemeral"
 
+      # Mode B, which is a different claim from Mode A above: the RESP keyspace can be perfectly
+      # healthy while the row cache is inert or, worse, serving rows nothing will ever invalidate.
+      # Every assertion here failed at least once while this was being written, which is the point
+      # of having them -- see the output_plugin_libraries case, where the only symptom is a
+      # background worker exiting once a second next to a keyspace that looks fine.
+      - name: Row cache decodes, plans and invalidates
+        run: |
+          docker run -d --name pg_rowcache_test \
+            -e POSTGRES_PASSWORD=testpassword \
+            -e POSTGRES_DB=supatype \
+            -e SUPATYPE_KEYSPACE_ENABLED=1 \
+            -e SUPATYPE_KEYSPACE_KEYS=10000 \
+            -e SUPATYPE_KEYSPACE_RING_MB=4 \
+            -e SUPATYPE_KEYSPACE_ROWCACHE_DECODE=1 \
+            -e SUPATYPE_KEYSPACE_ROWCACHE_READTHROUGH=1 \
+            -e SUPATYPE_KEYSPACE_SLOT_WAL_KEEP=256MB \
+            supatype-postgres:test
+
+          for i in $(seq 1 60); do
+            if docker exec pg_rowcache_test pg_isready -h 127.0.0.1 -U supatype_admin -q 2>/dev/null; then break; fi
+            sleep 2
+          done
+          for i in $(seq 1 30); do
+            if docker logs pg_rowcache_test 2>&1 | grep -q "persisted=true"; then break; fi
+            sleep 2
+          done
+
+          psql_test() {
+            docker exec -e PGPASSWORD=testpassword pg_rowcache_test \
+              psql -U supatype_admin -d supatype -tA "$@"
+          }
+
+          # A table with a primary key, registered. Registration is what makes a database
+          # participate; the decoder takes a slot per participating database and nothing else.
+          psql_test -c "CREATE TABLE orders (id bigint PRIMARY KEY, total numeric)" >/dev/null
+          psql_test -c "INSERT INTO orders SELECT g, g FROM generate_series(1,200) g" >/dev/null
+          psql_test -c "SELECT supacache.rowcache_register('public.orders')" | grep -qx t \
+            || { echo "FAIL: rowcache_register did not return true"; exit 1; }
+
+          for i in $(seq 1 30); do
+            if docker logs pg_rowcache_test 2>&1 | grep -q "invalidation 0: draining slot"; then break; fi
+            sleep 1
+          done
+          logs=$(docker logs pg_rowcache_test 2>&1)
+          case "$logs" in
+            *"invalidation 0: draining slot"*) ;;
+            *) echo "FAIL: the invalidation worker never started draining."
+               echo "If it is exiting with code 1, read the ERROR above it -- an output plugin that"
+               echo "is not allowlisted fails exactly this way."
+               echo "$logs" | grep -iE "invalidation|output plugin|ERROR" | tail -20; exit 1 ;;
+          esac
+
+          # The slot exists, is ours, and is bounded by the value the toggle wrote rather than the
+          # image's global 4096.
+          psql_test -c "SELECT plugin FROM pg_replication_slots WHERE slot_name LIKE 'supacache_rowcache%'" \
+            | grep -qx supacache_keys \
+            || { echo "FAIL: no decode slot with the supacache_keys plugin"; exit 1; }
+          psql_test -c "SHOW max_slot_wal_keep_size" | grep -qx 256MB \
+            || { echo "FAIL: SUPATYPE_KEYSPACE_SLOT_WAL_KEEP did not beat the image default"; exit 1; }
+
+          # On the read path at all: with readthrough off this is a plain index scan, so the custom
+          # scan node is the assertion that Mode B is actually serving reads.
+          psql_test -c "EXPLAIN (COSTS OFF) SELECT * FROM orders WHERE id = 7" \
+            | grep -q "Custom Scan (pg_keyspace_rowcache)" \
+            || { echo "FAIL: the planner did not choose the row cache"
+                 psql_test -c "EXPLAIN (COSTS OFF) SELECT * FROM orders WHERE id = 7"; exit 1; }
+
+          # And a write invalidates: warm the row, change it, and the next reads must converge on
+          # the new value well inside a second at the default 200ms decode interval.
+          psql_test -c "SELECT total FROM orders WHERE id = 7" >/dev/null
+          psql_test -c "UPDATE orders SET total = 4242 WHERE id = 7" >/dev/null
+          got=stale
+          for i in $(seq 1 20); do
+            got=$(psql_test -c "SELECT total FROM orders WHERE id = 7" | tr -d ' ')
+            if [ "$got" = "4242" ]; then break; fi
+            sleep 0.5
+          done
+          [ "$got" = "4242" ] \
+            || { echo "FAIL: a cached row survived the UPDATE that changed it (read back: $got)"
+                 psql_test -c "SELECT * FROM supacache.pg_stat_keyspace_invalidation"; exit 1; }
+
+          # Coherence is what the monitoring will alert on, and it has to say participating rather
+          # than merely not-broken.
+          psql_test -c "SELECT state || ',' || coherent FROM supacache.pg_stat_keyspace_rowcache_databases WHERE datname = 'supatype'" \
+            | grep -qx "participating,t" \
+            || { echo "FAIL: the database is not coherently participating"
+                 psql_test -c "SELECT * FROM supacache.pg_stat_keyspace_rowcache_databases"; exit 1; }
+
+          echo "row cache: decoding, planned, invalidating, coherent"
+
+      # Read-through with no decoder warms rows nothing will ever invalidate, so the entrypoint
+      # refuses it rather than passing it to an extension that silently ignores it.
+      - name: Read-through without decode is refused, not ignored
+        run: |
+          docker run -d --name pg_rowcache_guard \
+            -e POSTGRES_PASSWORD=testpassword \
+            -e POSTGRES_DB=supatype \
+            -e SUPATYPE_KEYSPACE_ENABLED=1 \
+            -e SUPATYPE_KEYSPACE_KEYS=10000 \
+            -e SUPATYPE_KEYSPACE_RING_MB=4 \
+            -e SUPATYPE_KEYSPACE_ROWCACHE_READTHROUGH=1 \
+            supatype-postgres:test
+          for i in $(seq 1 60); do
+            if docker exec pg_rowcache_guard pg_isready -h 127.0.0.1 -U supatype_admin -q 2>/dev/null; then break; fi
+            sleep 2
+          done
+          docker logs pg_rowcache_guard 2>&1 | grep -q "ROWCACHE_READTHROUGH needs" \
+            || { echo "FAIL: the entrypoint accepted read-through with no decoder, in silence"; exit 1; }
+          docker exec -e PGPASSWORD=testpassword pg_rowcache_guard \
+            psql -U supatype_admin -d supatype -tA -c "SHOW pg_keyspace.rowcache_readthrough" | grep -qx off \
+            || { echo "FAIL: read-through is on with no invalidation worker to make it safe"; exit 1; }
+          echo "read-through without decode: warned and forced off"
+
       - name: Show logs on failure
         if: failure()
         run: |
           docker logs pg_test || true
           docker logs pg_v2 || true
           docker logs pg_keyspace_test || true
+          docker logs pg_rowcache_test || true
+          docker logs pg_rowcache_guard || true
 
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f pg_test pg_v1 pg_v2 pg_keyspace_test || true
+          docker rm -f pg_test pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard || true
           docker volume rm pg_upgrade_vol || true
           exit 0

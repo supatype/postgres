@@ -79,6 +79,15 @@ supatype_write_cron_database() {
 
 readonly SUPATYPE_KEYSPACE_CONF=/etc/postgresql-custom/pg_keyspace.conf
 
+# The spellings SUPATYPE_KEYSPACE_ENABLED already accepts, mapped to what Postgres wants in a conf
+# file. Shared so an operator who wrote =1 for one toggle does not discover that another wanted =on.
+supatype_keyspace_bool() {
+	case "${1:-}" in
+		1 | true | TRUE | True | on | ON | On | yes | YES | Yes) echo on ;;
+		*) echo off ;;
+	esac
+}
+
 # Turn pg_keyspace on from the environment, or leave the image exactly as it was.
 #
 # pg_keyspace registers background workers and requests shared memory at postmaster start, so it
@@ -111,8 +120,25 @@ supatype_write_keyspace_conf() {
 	local val_bytes="${SUPATYPE_KEYSPACE_VAL_BYTES:-512}"
 	local ring_mb="${SUPATYPE_KEYSPACE_RING_MB:-16}"
 	local rowcache_mb="${SUPATYPE_KEYSPACE_ROWCACHE_MB:-1}"
+	local rowcache_decode
+	rowcache_decode="$(supatype_keyspace_bool "${SUPATYPE_KEYSPACE_ROWCACHE_DECODE:-}")"
+	local rowcache_readthrough
+	rowcache_readthrough="$(supatype_keyspace_bool "${SUPATYPE_KEYSPACE_ROWCACHE_READTHROUGH:-}")"
+	local rowcache_decode_ms="${SUPATYPE_KEYSPACE_ROWCACHE_DECODE_MS:-200}"
+	local slot_wal_keep="${SUPATYPE_KEYSPACE_SLOT_WAL_KEEP:-512MB}"
+	local output_plugins="${SUPATYPE_KEYSPACE_OUTPUT_PLUGIN_LIBRARIES:-supacache_keys}"
 	local require_mask="${SUPATYPE_KEYSPACE_REQUIRE_MASK:-on}"
 	local preload="${SUPATYPE_SHARED_PRELOAD_LIBRARIES:-pg_stat_statements, pg_cron, pg_net, plan_filter, safeupdate, pg_keyspace, supatype_mask}"
+
+	# Read-through without the decoder is the one combination that serves wrong answers rather than
+	# merely wasting memory: it warms a row on a primary-key miss, and with no invalidation worker
+	# nothing ever drops that row when the table changes, so the stale copy is served until it is
+	# evicted. The extension ignores the setting in that state; the image refuses it out loud,
+	# because an ignored setting looks like a feature that is on.
+	if [ "$rowcache_readthrough" = on ] && [ "$rowcache_decode" = off ]; then
+		supatype_warn "SUPATYPE_KEYSPACE_ROWCACHE_READTHROUGH needs SUPATYPE_KEYSPACE_ROWCACHE_DECODE; forcing it off."
+		rowcache_readthrough=off
+	fi
 
 	# A single quote would end the literal and leave a file Postgres refuses to start on.
 	local db_lit="${db//\'/\'\'}"
@@ -138,12 +164,49 @@ supatype_write_keyspace_conf() {
 		# rowcache_mb is a request, not a reservation: the segment carries a fixed directory for
 		# 200k entries on top, about 15.8 MiB, so even 1 costs ~17 MiB and 0 is not accepted.
 		echo "pg_keyspace.rowcache_mb = ${rowcache_mb}"
+		# Mode B. Off leaves the row cache inert: the segment is still reserved (that is rowcache_mb
+		# above, taken at postmaster start either way) but nothing registers, decodes or serves from
+		# it. On starts the keys-only invalidation worker, which needs wal_level = logical -- the
+		# image sets that in postgresql.conf, so it holds unless a deployment overrides it.
+		echo "pg_keyspace.rowcache_decode = ${rowcache_decode}"
+		echo "pg_keyspace.rowcache_readthrough = ${rowcache_readthrough}"
+		if [ "$rowcache_decode" = on ]; then
+			echo "pg_keyspace.rowcache_decode_ms = ${rowcache_decode_ms}"
+			# Not a pg_keyspace setting, and here on purpose: the decoder is what creates the
+			# replication slot, and a slot pins WAL from its restart_lsn until this bound cuts it
+			# loose. The image's global default is 4096 (4 GB in postgresql.conf), which is larger
+			# than the spare volume on a small deployment -- a pro-tier project is a 10Gi PVC
+			# against an 8 GB allowance, so ~2 GB for everything else including this. 512MB is
+			# bounded well inside that and generous next to a decoder that advances every
+			# rowcache_decode_ms. This include is read after postgresql.conf so it wins over the
+			# global, and a -c on the command line still wins over both.
+			echo "max_slot_wal_keep_size = '${slot_wal_keep}'"
+			# Without this the row cache cannot work at all, and the way it fails is the reason
+			# the line is here rather than in a runbook. PostgreSQL now allowlists logical decoding
+			# output plugins, so creating the slot is refused:
+			#
+			#   ERROR: library "supacache_keys" may not be used as an output plugin
+			#   HINT:  ... add it to "output_plugin_libraries" and reload
+			#
+			# The invalidation worker retries, so what an operator sees is a background worker
+			# exiting with code 1 once a second forever, next to a keyspace that is otherwise
+			# healthy — it reads like a broken build rather than a missing GUC. Reproduced on
+			# PostgreSQL 16.15, fixed by this line, worker up and draining immediately after.
+			#
+			# Set SUPATYPE_KEYSPACE_OUTPUT_PLUGIN_LIBRARIES to the whole list if this deployment
+			# uses other output plugins: this include is read last, so it replaces rather than
+			# adds to anything postgresql.conf set.
+			echo "output_plugin_libraries = '${output_plugins}'"
+		fi
 	} > "$SUPATYPE_KEYSPACE_CONF" 2>/dev/null || {
 		supatype_warn "could not write $SUPATYPE_KEYSPACE_CONF; pg_keyspace stays disabled."
 		return 0
 	}
 
 	supatype_note "pg_keyspace enabled: RESP on :${port}, durability=${durability}${overrides:+ (${overrides})}, database=${db}"
+	if [ "$rowcache_decode" = on ]; then
+		supatype_note "pg_keyspace row cache: decode on (${rowcache_decode_ms}ms), readthrough=${rowcache_readthrough}, max_slot_wal_keep_size=${slot_wal_keep}, output_plugin_libraries=${output_plugins}"
+	fi
 }
 
 # Named explicitly, by the same rule the runner uses. Without -d, psql would
