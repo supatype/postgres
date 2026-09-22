@@ -170,8 +170,13 @@ ENV POSTGRES_USER=supatype_admin
 # temporary server that listens on the Unix socket alone, so a socket probe
 # reports healthy mid-migration and dependents wired to `service_healthy` would
 # start and fail to connect. A TCP answer means the real server is up.
+# -d postgres, and not only for tidiness: without it libpq defaults the database to the user name,
+# so every probe logs `FATAL: database "supatype_admin" does not exist`. The check still passed —
+# pg_isready asks whether the server answers, not whether the connection would succeed — but at one
+# line every five seconds it is most of what this image's log contains, and it buries anything worth
+# reading. It cost two CI cycles of an unreadable `docker logs --tail` to notice.
 HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
-  CMD pg_isready -h 127.0.0.1 -U supatype_admin
+  CMD pg_isready -h 127.0.0.1 -U supatype_admin -d postgres
 
 EXPOSE 5432
 
