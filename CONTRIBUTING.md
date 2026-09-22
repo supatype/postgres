@@ -44,3 +44,18 @@ ROLLBACK;
 ```
 
 This test will be run as part of CI to check that your extension can be enabled successfully from the final Docker image.
+
+## Licence
+
+This repository is released under the [PostgreSQL License](LICENSE), and so is every contribution to it.
+
+By opening a pull request you confirm two things:
+
+- you wrote the contribution yourself, or you otherwise have the right to submit it under this licence; and
+- you licence it — to the project and to everyone who receives the project — under the same licence.
+
+There is no CLA to sign and nothing to email. Where a directory carries its own `LICENSE` file, that licence is the one that applies to contributions to that directory, so check the directory you are working in.
+
+If any part of your contribution is copied or adapted from somewhere else, say so in the pull request and name the source and its licence. That is the one case where we have to check compatibility before merging, and it is much cheaper to check before than to unpick afterwards.
+
+This section describes contributions from here on. It does not restate the licence of code already in the repository.
