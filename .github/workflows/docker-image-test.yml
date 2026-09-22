@@ -416,7 +416,7 @@ jobs:
             echo "An unrecognised parameter in the generated conf stops a cluster from starting, and"
             echo "that is exactly what this looks like from outside. Conf and log follow."
             docker exec pg_rowcache_test cat /etc/postgresql-custom/pg_keyspace.conf || true
-            docker logs pg_rowcache_test 2>&1 | tail -40
+            docker logs pg_rowcache_test 2>&1 | grep -vF 'database "supatype_admin" does not exist' | tail -40
             exit 1
           fi
           persisted=no
@@ -432,7 +432,8 @@ jobs:
 
           echo "::group::row cache: what the toggle wrote, and what the server made of it"
           docker exec pg_rowcache_test cat /etc/postgresql-custom/pg_keyspace.conf || true
-          docker logs pg_rowcache_test 2>&1 | grep -iE "keyspace|rowcache|invalidation|FATAL|unrecognized" | tail -20 || true
+          docker logs pg_rowcache_test 2>&1 | grep -vF 'database "supatype_admin" does not exist' \
+            | grep -iE "keyspace|rowcache|invalidation|FATAL|unrecognized" | tail -20 || true
           echo "::endgroup::"
 
           psql_test() {
@@ -532,11 +533,14 @@ jobs:
           # --tail, deliberately: these run *after* the step that failed, and an unbounded dump
           # pushes the actual failure message far enough up the log that a tail no longer reaches
           # it. That cost a diagnostic cycle on this very workflow.
-          docker logs --tail 40 pg_test || true
-          docker logs --tail 40 pg_v2 || true
-          docker logs --tail 40 pg_keyspace_test || true
-          docker logs --tail 60 pg_rowcache_test || true
-          docker logs --tail 40 pg_rowcache_guard || true
+          # The healthcheck probe writes one FATAL every five seconds, so an unfiltered tail is
+          # entirely that. Dropped here as well as fixed in the Dockerfile, because this workflow
+          # also runs against images built before the fix.
+          noise='database "supatype_admin" does not exist'
+          for c in pg_test pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard; do
+            echo "--- $c"
+            docker logs "$c" 2>&1 | grep -vF "$noise" | tail -40 || true
+          done
 
       - name: Cleanup
         if: always()
