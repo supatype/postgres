@@ -419,13 +419,19 @@ jobs:
             docker logs pg_rowcache_test 2>&1 | grep -vF 'database "supatype_admin" does not exist' | tail -40
             exit 1
           fi
-          persisted=no
+          # "RESP listening", not "persisted=true". persisted reports whether the *persistence*
+          # machinery is running, which needs at least one durable prefix — the keyspace step above
+          # gets it from kong_acme:=durable. This container is deliberately all-ephemeral, because
+          # Mode B is a cache in shared memory and has nothing to do with Mode A durability, so
+          # persisted=false is the right answer here and waiting for true never returns. (It did
+          # not: that wait is what failed the first four runs of this step.)
+          serving=no
           for i in $(seq 1 30); do
-            if docker logs pg_rowcache_test 2>&1 | grep -q "persisted=true"; then persisted=yes; break; fi
+            if docker logs pg_rowcache_test 2>&1 | grep -q "RESP listening"; then serving=yes; break; fi
             sleep 2
           done
-          if [ "$persisted" != yes ]; then
-            echo "FAIL: RESP came up without persistence"
+          if [ "$serving" != yes ]; then
+            echo "FAIL: the RESP worker never came up"
             docker logs pg_rowcache_test 2>&1 | grep -i keyspace | tail -20
             exit 1
           fi
