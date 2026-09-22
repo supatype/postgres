@@ -503,9 +503,25 @@ jobs:
 
           # Coherence is what the monitoring will alert on, and it has to say participating rather
           # than merely not-broken.
-          psql_test -c "SELECT state || ',' || coherent FROM supacache.pg_stat_keyspace_rowcache_databases WHERE datname = 'supatype'" \
-            | grep -qx "participating,t" \
-            || { echo "FAIL: the database is not coherently participating"
+          #
+          # Two columns, read with a field separator, NOT `state || ',' || coherent`. Concatenating
+          # a boolean onto text renders it through text concatenation, which gives "true"; the "t"
+          # this compared against is what psql prints for a *bare* boolean column. So the old form
+          # produced "participating,true" and could never match, whatever the cache was doing. That
+          # is what failed the sixth run of this step, and it failed in under a second because it
+          # was never a race -- the row cache was coherent the entire time.
+          #
+          # Polled anyway, because coherent genuinely is a converging condition: it wants a drain
+          # recorded and recent, and registration happens a fraction of a second earlier.
+          echo "assert: coherent and participating" | tee -a /tmp/rowcache-progress
+          coh=""
+          for i in $(seq 1 20); do
+            coh=$(psql_test -F, -c "SELECT state, coherent FROM supacache.pg_stat_keyspace_rowcache_databases WHERE datname = 'supatype'")
+            if [ "$coh" = "participating,t" ]; then break; fi
+            sleep 0.5
+          done
+          [ "$coh" = "participating,t" ] \
+            || { echo "FAIL: the database is not coherently participating (read back: $coh)"
                  psql_test -c "SELECT * FROM supacache.pg_stat_keyspace_rowcache_databases"; exit 1; }
 
           echo "row cache: decoding, planned, invalidating, coherent"
