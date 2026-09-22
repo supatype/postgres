@@ -35,6 +35,12 @@ BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/pg-build}"
 TARGET=""
 PG_GUARD_DIR="${REPO_ROOT}/extensions/pg_guard"
 MASK_DIR="${REPO_ROOT}/extensions/supatype_mask"
+KEYSPACE_DIR="${REPO_ROOT}/extensions/pg_keyspace"
+
+# The pgrx version pg_keyspace is written against. It is not a floor: cargo-pgrx
+# refuses to build a crate pinned to a different pgrx, so this tracks the
+# `pgrx = "=x.y.z"` in extensions/pg_keyspace/extension/Cargo.toml exactly.
+PGRX_VERSION="${PGRX_VERSION:-0.12.9}"
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -44,7 +50,9 @@ usage() {
 Usage: $(basename "$0") --target TARGET [--help]
 
 Build PostgreSQL ${PG_VERSION} from source and produce a self-contained archive.
-pg_guard is bundled automatically from extensions/pg_guard/ in this repo.
+The in-repo extensions are bundled automatically: pg_guard, supatype_mask and
+pg_keyspace (plus pgvector and pgjwt from upstream). pg_keyspace additionally
+needs a Rust toolchain; everything else needs only a C compiler.
 
 Options:
   --target TARGET        Build target. One of:
@@ -59,6 +67,7 @@ Environment overrides:
   INSTALL_PREFIX         Installation prefix inside archive (default: /usr/local/supatype-pg)
   BUILD_DIR              Scratch directory for source/build (default: ./pg-build)
   JOBS                   Parallel make jobs (default: auto-detected)
+  PGRX_VERSION           cargo-pgrx version for pg_keyspace (default: 0.12.9)
 EOF
 }
 
@@ -132,6 +141,7 @@ info "Jobs:         ${JOBS}"
 info "Cross-build:  ${IS_CROSS}"
 [[ -n "${PG_GUARD_DIR}" ]] && info "pg_guard dir: ${PG_GUARD_DIR}" || warn "pg_guard dir not set — pg_guard will be skipped."
 [[ -n "${MASK_DIR}" ]] && info "mask dir:     ${MASK_DIR}" || warn "supatype_mask dir not set — masking will be skipped."
+[[ -d "${KEYSPACE_DIR}" ]] && info "keyspace dir: ${KEYSPACE_DIR}" || warn "pg_keyspace dir not found — the archive will have no keyspace."
 echo ""
 
 mkdir -p "${BUILD_DIR}"
@@ -360,6 +370,82 @@ cp "${BUILD_DIR}/pgjwt/pgjwt.control" "${SHARE_EXT_DIR}/"
 find "${BUILD_DIR}/pgjwt" -name "pgjwt--*.sql" \
   -exec cp {} "${SHARE_EXT_DIR}/" \;
 info "pgjwt bundled."
+
+# --------------------------------------------------------------------------- #
+# Step 7d — Build and bundle pg_keyspace (Rust/pgrx — native targets only)
+# --------------------------------------------------------------------------- #
+info "=== Step 7d: pg_keyspace ==="
+
+if [[ "${IS_CROSS}" == "true" ]]; then
+  # Unlike the mask, an archive without this one is not unsafe, only smaller:
+  # `supatype dev` probes for the library and falls back to the Valkey sidecar
+  # when it is missing. Still worth saying, because the fallback is a second
+  # process the developer did not ask for.
+  warn "pg_keyspace cross-compilation not supported — skipping. \`supatype dev\` will"
+  warn "fall back to the Valkey sidecar with this archive."
+elif [[ ! -d "${KEYSPACE_DIR}" ]]; then
+  die "pg_keyspace directory not found at ${KEYSPACE_DIR} — repo may be incomplete."
+else
+  PG_CONFIG_BIN="${STAGE_DIR}${INSTALL_PREFIX}/bin/pg_config"
+  [[ -x "${PG_CONFIG_BIN}" ]] || die "pg_config not found at ${PG_CONFIG_BIN}"
+
+  command -v cargo >/dev/null 2>&1 \
+    || die "cargo not found. Install Rust (https://rustup.rs) — pg_keyspace is a pgrx extension."
+  if ! command -v cargo-pgrx >/dev/null 2>&1; then
+    info "Installing cargo-pgrx ${PGRX_VERSION}..."
+    cargo install cargo-pgrx --version "${PGRX_VERSION}" --locked
+  fi
+
+  # The major version drives both the pgrx feature and the package directory's
+  # name, and PG_VERSION is an override here rather than a constant, so read it
+  # from the Postgres that was actually built rather than assuming 17.
+  PG_MAJOR="$("${PG_CONFIG_BIN}" --version | awk '{print $2}' | cut -d. -f1)"
+
+  # `cargo pgrx package` builds against --pg-config directly, but it still
+  # requires PGRX_HOME to exist ("$PGRX_HOME does not exist" otherwise).
+  # It must NOT be created with `cargo pgrx init`: init runs initdb, which fails
+  # against a staged (DESTDIR) Postgres whose binaries resolve libpq at an
+  # absolute install prefix that is not installed yet. So write a minimal
+  # PGRX_HOME that registers this pg_config — no initdb involved.
+  #
+  # Under BUILD_DIR rather than ~/.pgrx: a developer running this script may
+  # already have a pgrx home pointing at their own Postgres, and overwriting it
+  # would be a surprising thing for a build script to do.
+  export PGRX_HOME="${BUILD_DIR}/pgrx-home"
+  mkdir -p "${PGRX_HOME}"
+  printf '[configs]\npg%s = "%s"\n' "${PG_MAJOR}" "${PG_CONFIG_BIN}" > "${PGRX_HOME}/config.toml"
+
+  info "Building pg_keyspace from ${KEYSPACE_DIR} against PG${PG_MAJOR}..."
+  ( cd "${KEYSPACE_DIR}/extension" && cargo pgrx package --pg-config "${PG_CONFIG_BIN}" )
+
+  # pgrx lays the package tree under target/release/pg_keyspace-pg{major} at the
+  # paths pg_config REPORTS. PostgreSQL's pg_config is relocatable, so for a
+  # staged build those are the ${STAGE_DIR}/... paths, not ${INSTALL_PREFIX} —
+  # derive them from pg_config rather than assuming the prefix.
+  PKGROOT="${KEYSPACE_DIR}/extension/target/release/pg_keyspace-pg${PG_MAJOR}"
+  LIBSRC="${PKGROOT}$("${PG_CONFIG_BIN}" --pkglibdir)"
+  SHARESRC="${PKGROOT}$("${PG_CONFIG_BIN}" --sharedir)/extension"
+  LIB_DIR="${STAGE_DIR}${INSTALL_PREFIX}/lib"
+  SHARE_EXT_DIR="${STAGE_DIR}${INSTALL_PREFIX}/share/postgresql/extension"
+  mkdir -p "${LIB_DIR}" "${SHARE_EXT_DIR}"
+
+  find "${LIBSRC}" \( -name "pg_keyspace.so" -o -name "pg_keyspace.dylib" \) \
+    -exec cp {} "${LIB_DIR}/" \;
+  cp "${SHARESRC}/pg_keyspace.control" "${SHARE_EXT_DIR}/"
+  cp "${SHARESRC}"/pg_keyspace--*.sql "${SHARE_EXT_DIR}/"
+
+  # Keys-only logical-decode plugin (Mode B row cache), beside the extension.
+  # PG_CONFIG on `clean` too: a PGXS makefile resolves `$(PG_CONFIG) --pgxs` for
+  # every target, so a bare `make clean` would use whichever pg_config is first
+  # on PATH — or fail outright when there is none.
+  make -C "${KEYSPACE_DIR}/plugin" clean PG_CONFIG="${PG_CONFIG_BIN}" || true
+  make -C "${KEYSPACE_DIR}/plugin" PG_CONFIG="${PG_CONFIG_BIN}"
+  find "${KEYSPACE_DIR}/plugin" \
+    \( -name "supacache_keys.so" -o -name "supacache_keys.dylib" \) \
+    -exec cp {} "${LIB_DIR}/" \;
+
+  info "pg_keyspace bundled into lib + share/postgresql/extension."
+fi
 
 # --------------------------------------------------------------------------- #
 # Step 8 — Package archive
