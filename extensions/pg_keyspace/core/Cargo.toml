@@ -3,7 +3,7 @@ name = "pg_keyspace_core"
 version = "0.1.0"
 edition = "2021"
 description = "pg_keyspace core: shared-memory RESP keyspace hot path, shared verbatim with the pgrx extension and benchmarked against Valkey/Redis"
-license = "Apache-2.0"
+license = "PostgreSQL"
 
 [lib]
 name = "pgks"
