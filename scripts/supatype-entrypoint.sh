@@ -79,6 +79,16 @@ supatype_write_cron_database() {
 
 readonly SUPATYPE_KEYSPACE_CONF=/etc/postgresql-custom/pg_keyspace.conf
 
+# Whether this server binary knows a setting at all.
+#
+# Writing an unrecognised parameter into a conf file does not degrade, it stops the cluster from
+# starting -- so a setting that exists only in some minor releases has to be probed before it is
+# written. --describe-config lists every GUC the binary has and needs no data directory, which
+# matters because on a first boot there is not one yet.
+supatype_pg_knows_setting() {
+	postgres --describe-config 2>/dev/null | awk '{print $1}' | grep -qx "$1"
+}
+
 # The spellings SUPATYPE_KEYSPACE_ENABLED already accepts, mapped to what Postgres wants in a conf
 # file. Shared so an operator who wrote =1 for one toggle does not discover that another wanted =on.
 supatype_keyspace_bool() {
@@ -196,7 +206,14 @@ supatype_write_keyspace_conf() {
 			# Set SUPATYPE_KEYSPACE_OUTPUT_PLUGIN_LIBRARIES to the whole list if this deployment
 			# uses other output plugins: this include is read last, so it replaces rather than
 			# adds to anything postgresql.conf set.
-			echo "output_plugin_libraries = '${output_plugins}'"
+			#
+			# Probed rather than written unconditionally. The allowlist arrived in a minor release,
+			# and on a server that predates it there is nothing to allow — but an unrecognised
+			# parameter is not ignored, it stops the cluster from starting. So an image pinned to
+			# an older base would be bricked by Mode B rather than merely unable to use it.
+			if supatype_pg_knows_setting output_plugin_libraries; then
+				echo "output_plugin_libraries = '${output_plugins}'"
+			fi
 		fi
 	} > "$SUPATYPE_KEYSPACE_CONF" 2>/dev/null || {
 		supatype_warn "could not write $SUPATYPE_KEYSPACE_CONF; pg_keyspace stays disabled."
@@ -205,7 +222,9 @@ supatype_write_keyspace_conf() {
 
 	supatype_note "pg_keyspace enabled: RESP on :${port}, durability=${durability}${overrides:+ (${overrides})}, database=${db}"
 	if [ "$rowcache_decode" = on ]; then
-		supatype_note "pg_keyspace row cache: decode on (${rowcache_decode_ms}ms), readthrough=${rowcache_readthrough}, max_slot_wal_keep_size=${slot_wal_keep}, output_plugin_libraries=${output_plugins}"
+		local allowlisted="${output_plugins}"
+		supatype_pg_knows_setting output_plugin_libraries || allowlisted="not needed on this server"
+		supatype_note "pg_keyspace row cache: decode on (${rowcache_decode_ms}ms), readthrough=${rowcache_readthrough}, max_slot_wal_keep_size=${slot_wal_keep}, output_plugin_libraries=${allowlisted}"
 	fi
 }
 
