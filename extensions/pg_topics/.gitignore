@@ -1,0 +1,10 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Runtime artifacts
+*.wal
+*.so
+
+# pgrx
+.pgrx/

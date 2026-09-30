@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "dependencies": {
+    "@confluentinc/kafka-javascript": "1.10.1",
+    "kafkajs": "2.2.4"
+  }
+}

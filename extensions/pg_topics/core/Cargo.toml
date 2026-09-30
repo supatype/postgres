@@ -1,0 +1,27 @@
+[package]
+name = "pg_topics_core"
+version = "0.1.0"
+edition = "2021"
+description = "pg_topics core: the Kafka partitioner, the wire listener and the partition worker, with no pgrx dependency"
+license = "PostgreSQL"
+
+[lib]
+name = "pgt"
+path = "src/lib.rs"
+
+[dependencies]
+postgres = "0.19"
+kafka-protocol = "0.18.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+crc32c = "0.6"
+bytes = "1"
+anyhow = "1"
+base64 = "0.22"
+flate2 = "1"
+lz4 = "1.24"
+snap = "1"
+zstd = "0.13"
+socket2 = "0.6"
+
+[patch.crates-io]
+kafka-protocol = { path = "../vendor/kafka-protocol" }

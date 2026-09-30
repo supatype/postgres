@@ -1,0 +1,7 @@
+comment = 'pg_topics: a Kafka-protocol broker built into PostgreSQL'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_topics'
+relocatable = false
+schema = topic
+superuser = true
+trusted = false
