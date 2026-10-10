@@ -161,6 +161,178 @@ SELECT count(*) FROM posts;                -- no column reference, unaffected
 (1 row)
 
 -- ============================================================================
+-- A subquery inside an aggregate is its own scope.  The aggregate consumes what the
+-- subquery returns, which is already masked, so only a column the aggregate itself
+-- consumes is refused.  This is the shape pg_graphql emits for a nested relation:
+-- the child connection is a correlated subquery inside the parent's jsonb_agg.
+-- ============================================================================
+SET mask.uid = 'alice';
+-- No masked column selected, but `q.*` names every column.
+SELECT jsonb_agg((SELECT jsonb_agg(r.title ORDER BY r.id)
+                    FROM (SELECT q.* FROM posts q WHERE q.id = p.id) r) ORDER BY p.id)
+  FROM posts p;
+           jsonb_agg            
+--------------------------------
+ [["alice post"], ["bob post"]]
+(1 row)
+
+-- A masked column selected in the subquery comes back masked, not refused.
+SELECT jsonb_agg((SELECT q.salary FROM posts q WHERE q.id = p.id) ORDER BY p.id)
+  FROM posts p;
+  jsonb_agg  
+-------------
+ [100, null]
+(1 row)
+
+SELECT jsonb_agg((WITH recs AS (SELECT q.* FROM posts q WHERE q.id = p.id)
+                  SELECT jsonb_agg(recs.salary) FROM recs) ORDER BY p.id)
+  FROM posts p;
+    jsonb_agg    
+-----------------
+ [[100], [null]]
+(1 row)
+
+-- An outer column read inside a subquery that the aggregate wraps is still aggregated.
+SELECT sum((SELECT p.salary)) FROM posts p;
+ERROR:  column "p"."salary" is masked for this role and cannot be aggregated
+-- So is one aggregated by an outer-level aggregate written inside a subquery.
+SELECT (SELECT sum(p.salary) FROM (VALUES (1)) v) FROM posts p;
+ERROR:  column "p"."salary" is masked for this role and cannot be aggregated
+SELECT max(salary), string_agg(salary::text, ',') FROM posts;
+ERROR:  column "posts"."salary" is masked for this role and cannot be aggregated
+-- ============================================================================
+-- A whole-row reference becomes the masked row: every masked column in it is
+-- replaced by its mask, so the row carries exactly what a column-by-column select
+-- would.  This is what a PostgREST computed column passes to its function.
+-- ============================================================================
+RESET ROLE;
+CREATE FUNCTION post_summary(posts) RETURNS text
+  LANGUAGE sql STABLE AS $$ SELECT concat($1.title, ' salary=', $1.salary) $$;
+SET ROLE mask_app;
+SET mask.uid = 'alice';
+SELECT to_jsonb(posts) FROM posts ORDER BY id;
+                                           to_jsonb                                            
+-----------------------------------------------------------------------------------------------
+ {"id": 1, "notes": "alice notes", "title": "alice post", "salary": 100, "author_id": "alice"}
+ {"id": 2, "notes": "bob notes", "title": "bob post", "salary": null, "author_id": "bob"}
+(2 rows)
+
+SELECT row_to_json(p) FROM posts p ORDER BY p.id;
+                                     row_to_json                                      
+--------------------------------------------------------------------------------------
+ {"id":1,"title":"alice post","salary":100,"notes":"alice notes","author_id":"alice"}
+ {"id":2,"title":"bob post","salary":null,"notes":"bob notes","author_id":"bob"}
+(2 rows)
+
+SELECT p FROM posts p ORDER BY p.id;
+                    p                     
+------------------------------------------
+ (1,"alice post",100,"alice notes",alice)
+ (2,"bob post",,"bob notes",bob)
+(2 rows)
+
+SELECT id, post_summary(posts) FROM posts ORDER BY id;
+ id |     post_summary      
+----+-----------------------
+  1 | alice post salary=100
+  2 | bob post salary=
+(2 rows)
+
+SELECT id, can_read_posts__salary(posts) FROM posts ORDER BY id;
+ id | can_read_posts__salary 
+----+------------------------
+  1 | t
+  2 | f
+(2 rows)
+
+-- No oracle through a whole-row qual or sort.
+SELECT id FROM posts WHERE to_jsonb(posts)->>'salary' = '200';
+ id 
+----
+(0 rows)
+
+SELECT id FROM posts WHERE post_summary(posts) LIKE '%salary=2%';
+ id 
+----
+(0 rows)
+
+SELECT id FROM posts p ORDER BY to_jsonb(p)->>'salary' DESC NULLS LAST, id;
+ id 
+----
+  1
+  2
+(2 rows)
+
+-- The nullable side of an outer join stays a NULL row, not a row of NULLs.
+SELECT v.x, to_jsonb(p) FROM (VALUES (1), (9)) v(x)
+  LEFT JOIN posts p ON p.id = v.x ORDER BY v.x;
+ x |                                           to_jsonb                                            
+---+-----------------------------------------------------------------------------------------------
+ 1 | {"id": 1, "notes": "alice notes", "title": "alice post", "salary": 100, "author_id": "alice"}
+ 9 | 
+(2 rows)
+
+-- Aggregating the row consumes its masked column, so it is refused per unreadable row.
+SELECT jsonb_agg(posts) FROM posts;
+ERROR:  column "posts"."salary" is masked for this role and cannot be aggregated
+SELECT jsonb_agg(posts) FROM posts WHERE id = 1;
+                                            jsonb_agg                                            
+-------------------------------------------------------------------------------------------------
+ [{"id": 1, "notes": "alice notes", "title": "alice post", "salary": 100, "author_id": "alice"}]
+(1 row)
+
+-- Whole-row masking survives plan reuse across callers.
+SET plan_cache_mode = force_generic_plan;
+PREPARE wholerow AS SELECT to_jsonb(posts) FROM posts ORDER BY id;
+SET mask.uid = 'alice';
+EXECUTE wholerow;
+                                           to_jsonb                                            
+-----------------------------------------------------------------------------------------------
+ {"id": 1, "notes": "alice notes", "title": "alice post", "salary": 100, "author_id": "alice"}
+ {"id": 2, "notes": "bob notes", "title": "bob post", "salary": null, "author_id": "bob"}
+(2 rows)
+
+SET mask.uid = 'bob';
+EXECUTE wholerow;
+                                            to_jsonb                                            
+------------------------------------------------------------------------------------------------
+ {"id": 1, "notes": "alice notes", "title": "alice post", "salary": null, "author_id": "alice"}
+ {"id": 2, "notes": "bob notes", "title": "bob post", "salary": 200, "author_id": "bob"}
+(2 rows)
+
+DEALLOCATE wholerow;
+RESET plan_cache_mode;
+-- A dropped column keeps its slot in the row type, and a row-independent predicate
+-- masks the whole row the same way.
+RESET ROLE;
+CREATE TABLE wr (id int, gone int, secret text);
+INSERT INTO wr VALUES (1, 0, 'classified');
+ALTER TABLE wr DROP COLUMN gone;
+CREATE FUNCTION can_read_wr() RETURNS boolean LANGUAGE sql STABLE AS
+  $$ SELECT current_setting('mask.uid', true) = 'alice' $$;
+SECURITY LABEL FOR supatype ON COLUMN wr.secret IS 'MASK READ public.can_read_wr';
+GRANT SELECT ON wr TO mask_app;
+SET ROLE mask_app;
+SET mask.uid = 'alice';
+SELECT wr, to_jsonb(wr) FROM wr;
+       wr       |             to_jsonb              
+----------------+-----------------------------------
+ (1,classified) | {"id": 1, "secret": "classified"}
+(1 row)
+
+SET mask.uid = 'bob';
+SELECT wr, to_jsonb(wr) FROM wr;
+  wr  |         to_jsonb          
+------+---------------------------
+ (1,) | {"id": 1, "secret": null}
+(1 row)
+
+RESET ROLE;
+SECURITY LABEL FOR supatype ON COLUMN wr.secret IS NULL;
+DROP TABLE wr;
+DROP FUNCTION can_read_wr(), post_summary(posts);
+SET ROLE mask_app;
+-- ============================================================================
 -- Writes: preserve, accept, reject
 -- ============================================================================
 -- Never saw it, so the null it round-tripped is an artefact, not an intent to clear.
@@ -237,11 +409,6 @@ SET ROLE mask_app;
 -- Constructs that fail closed rather than guess
 -- ============================================================================
 SET mask.uid = 'alice';
--- A whole-row reference would expand to the unmasked column.
-SELECT to_jsonb(posts) FROM posts WHERE id = 1;
-ERROR:  whole-row reference to "posts" is not supported because the table has masked columns
-DETAIL:  A whole-row reference would expand to the unmasked column.
-HINT:  Select the columns explicitly.
 -- MERGE's action lists are not covered by the assignment rewrite.
 CREATE TEMP TABLE post_source (id int, salary numeric);
 INSERT INTO post_source VALUES (1, 1);
