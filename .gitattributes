@@ -17,3 +17,9 @@ scripts/supatype text eol=lf
 Dockerfile text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+
+# pg_regress compares psql's echo of each .sql file byte for byte with the .out file. A
+# CRLF checkout turns every blank line into "\r", which psql echoes and the expected
+# output does not contain, so the suite fails on Windows before it tests anything.
+extensions/*/test/sql/*.sql text eol=lf
+extensions/*/test/expected/*.out text eol=lf
