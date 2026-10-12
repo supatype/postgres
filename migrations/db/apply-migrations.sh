@@ -297,7 +297,14 @@ health_checks_sql() {
 		   'pg_guard preloaded for authenticator',
 		   EXISTS (SELECT 1 FROM pg_roles
 		            WHERE rolname = 'authenticator'
-		              AND array_to_string(rolconfig, ',') LIKE '%pg_guard%'))
+		              AND array_to_string(rolconfig, ',') LIKE '%pg_guard%')),
+		  ('20261012210000_private_table_defaults.sql',
+		   'new tables in public are not granted to anon or authenticated',
+		   NOT EXISTS (SELECT 1 FROM pg_default_acl d, aclexplode(d.defaclacl) a
+		                WHERE d.defaclnamespace = 'public'::regnamespace
+		                  AND d.defaclobjtype = 'r'
+		                  AND a.grantee IN (SELECT oid FROM pg_roles
+		                                     WHERE rolname IN ('anon', 'authenticated'))))
 		) AS t(migration, description, ok)
 	SQL
 }

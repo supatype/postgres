@@ -325,6 +325,45 @@ jobs:
           exec_migrate doctor
           echo "doctor is clean again"
 
+      # A table made by hand in public used to be open to the anon key: the image granted every
+      # privilege on new tables there to anon and authenticated by default.
+      - name: New tables in public are private to service_role
+        env:
+          POSTGRES_PASSWORD: testpassword
+        run: sh tests/default-privileges/check.sh pg_test supatype_admin
+
+      # A cluster created by an older image still has those defaults, and the stock entrypoint
+      # never runs the initial schema on it again. The migration is what reaches it: put the old
+      # defaults back, forget the migration ran, and restart.
+      - name: An existing cluster loses the open table defaults on its next start
+        env:
+          PGDATABASE: supatype_admin
+          POSTGRES_PASSWORD: testpassword
+        run: |
+          set -euo pipefail
+          psql_in() {
+            docker exec -e PGPASSWORD=testpassword -i pg_v2 \
+              psql -v ON_ERROR_STOP=1 -U supatype_admin -d "$PGDATABASE" -tAc "$1"
+          }
+          psql_in "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+                     GRANT ALL ON TABLES TO anon, authenticated;
+                   ALTER DEFAULT PRIVILEGES FOR ROLE supatype_admin IN SCHEMA public
+                     GRANT ALL ON TABLES TO anon, authenticated;
+                   DELETE FROM supatype_migrations.applied
+                    WHERE filename = '20261012210000_private_table_defaults.sql';" > /dev/null
+
+          rc=0; out=$(docker exec -e POSTGRES_PASSWORD=testpassword -e POSTGRES_DB="$PGDATABASE" \
+            pg_v2 supatype migrate doctor 2>&1) || rc=$?
+          echo "$out"
+          test "$rc" -ne 0 || { echo "FAIL: doctor exited 0 with the open table defaults back"; exit 1; }
+
+          docker restart pg_v2 > /dev/null
+          for i in $(seq 1 90); do
+            docker exec pg_v2 pg_isready -h 127.0.0.1 -U supatype_admin -q 2>/dev/null && break
+            sleep 2
+          done
+          sh tests/default-privileges/check.sh pg_v2 "$PGDATABASE"
+
       # The other jobs here all run with SUPATYPE_KEYSPACE_ENABLED unset, which is half the
       # contract: the image must be unchanged without it. This is the other half, and it is the
       # gate the feature is actually for -- serving RESP *with persistence*, which is a different
@@ -420,7 +459,7 @@ jobs:
             exit 1
           fi
           # "RESP listening", not "persisted=true". persisted reports whether the *persistence*
-          # machinery is running, which needs at least one durable prefix — the keyspace step above
+          # machinery is running, which needs at least one durable prefix: the keyspace step above
           # gets it from kong_acme:=durable. This container is deliberately all-ephemeral, because
           # Mode B is a cache in shared memory and has nothing to do with Mode A durability, so
           # persisted=false is the right answer here and waiting for true never returns. (It did
@@ -565,8 +604,8 @@ jobs:
           done
 
       # Last, deliberately. Steps run in order and the dump above is long, so anything printed
-      # before it cannot survive into a log tail — which is all that is available when a job log is
-      # read back through the API. Four diagnostic cycles went into learning that.
+      # before it cannot survive into a log tail, and a log tail is all that is available when a job
+      # log is read back through the API. Four diagnostic cycles went into learning that.
       - name: Which assertion failed
         if: failure()
         run: |

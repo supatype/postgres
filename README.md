@@ -16,7 +16,7 @@ docker pull supatype/postgres:17-latest
 
 | Tag | Description |
 |---|---|
-| `17-latest` | Most recent PG17 **release** — moves only when a `vX.Y.Z` tag is published, not on `develop` pushes |
+| `17-latest` | Most recent PG17 **release**; moves only when a `vX.Y.Z` tag is published, not on `develop` pushes |
 | `x.y.z` | Pinned, immutable release |
 | `latest` | Alias for the most recent release (same digest as `17-latest`) |
 | `develop` | Latest build from the `develop` branch |
@@ -64,7 +64,7 @@ session_preload_libraries = 'pg_guard'
 `pg_keyspace` is bundled and creatable but deliberately **not** auto-loaded: it
 registers background workers and requests shared memory at postmaster start, so
 turning it on is a restart rather than a runtime toggle. To enable it, add it to
-`shared_preload_libraries` — **before** `supatype_mask` — and restart:
+`shared_preload_libraries`, **before** `supatype_mask`, and restart:
 
 ```
 shared_preload_libraries = '..., pg_keyspace, supatype_mask'
@@ -101,7 +101,7 @@ The image ships a set of SQL migrations in [migrations/db/migrations/](migration
 - **First boot**, from `00-supatype-bootstrap.sh`, which the stock Postgres entrypoint runs once against a data directory it has just created.
 - **Every subsequent start**, from the image's entrypoint, which applies anything the cluster has not already run before it lets clients connect.
 
-The second one matters when you pull a newer tag over a volume you already have. The stock entrypoint runs `/docker-entrypoint-initdb.d/` **only** on an empty data directory, so without this an in-place update would skip every migration added since that volume was created — silently, with no error.
+The second one matters when you pull a newer tag over a volume you already have. The stock entrypoint runs `/docker-entrypoint-initdb.d/` **only** on an empty data directory, so without this an in-place update would skip every migration added since that volume was created, silently and with no error.
 
 Each database records what it has run in `supatype_migrations.applied`:
 
@@ -114,7 +114,7 @@ docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
 |---|---|
 | `filename` | The migration, named as it ships |
 | `applied_at` | When this database ran it |
-| `backfilled` | `true` if it was *assumed* applied rather than observed running — see below |
+| `backfilled` | `true` if it was *assumed* applied rather than observed running (see below) |
 
 `supatype migrate doctor` checks whether the load-bearing migrations actually took effect, and `doctor --fix` applies any that did not.
 
@@ -122,7 +122,7 @@ docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
 
 Clusters created by an earlier image have no ledger, and nothing on disk records which migrations they ran. **On the first start under a ledger-carrying image, such a volume gets a ledger in which every shipped migration is marked applied without being run** (`backfilled = true`). This happens once per database, and the container log says so.
 
-That choice is deliberate: marking them applied never replays DDL against live data. Replaying all 52 instead would repair a volume that was behind, but only if every one of them is safe to re-run against a populated database — which has not been established, so it is not the default.
+That choice is deliberate: marking them applied never replays DDL against live data. Replaying all of them instead would repair a volume that was behind, but only if every one is safe to re-run against a populated database. That has not been established, so it is not the default.
 
 What it costs:
 
@@ -146,7 +146,8 @@ docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
            migration: 20260809214500_supatype_mask.sql (ledger: assumed applied, never run here)
            fix: supatype migrate replay 20260809214500_supatype_mask.sql
   OK       pg_guard preloaded for authenticator
-supatype migrate: doctor: 3 checks, 1 need attention.
+  OK       new tables in public are not granted to anon or authenticated
+supatype migrate: doctor: 4 checks, 1 need attention.
 ```
 
 Exit status is 0 when everything checks out, non-zero otherwise, so it drops straight into a health script. The entrypoint runs these same checks automatically after adopting a volume, so the container log already tells you which case you are in.
@@ -158,7 +159,7 @@ docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
   supatype-postgres supatype migrate doctor --fix
 ```
 
-This applies **only** the migrations whose check failed, in filename order, and then re-runs the checks and reports whether it worked. A check that passes is left alone, so this is not a replay of work already done — a failing check means that migration's effect is absent.
+This applies **only** the migrations whose check failed, in filename order, and then re-runs the checks and reports whether it worked. A check that passes is left alone, so this is not a replay of work already done: a failing check means that migration's effect is absent.
 
 `supatype migrate replay <filename>` remains available for anything outside the checked set; `supatype migrate status` lists every migration flagged `backfilled`.
 
@@ -166,9 +167,28 @@ This applies **only** the migrations whose check failed, in filename order, and 
 
 | Check | Migration | Until repaired |
 |---|---|---|
-| `pg_guard preloaded for authenticator` | `20260810150000_authenticator_session_preload.sql` | **`pg_guard` does not load for PostgREST sessions.** The `authenticator` role keeps an inherited `session_preload_libraries` naming only `safeupdate`, so privilege enforcement is off across the whole API surface — silently, with no error |
+| `pg_guard preloaded for authenticator` | `20260810150000_authenticator_session_preload.sql` | **`pg_guard` does not load for PostgREST sessions.** The `authenticator` role keeps an inherited `session_preload_libraries` naming only `safeupdate`, so privilege enforcement is off across the whole API surface, silently and with no error |
 | `supatype_mask extension present` | `20260809214500_supatype_mask.sql` | A masked-write rejection raises `supatype_mask.deny() is not available` instead of a permission error |
 | `supatype_privileged_role exists` | `20260211120934_supabase_privileged_role.sql` | The `supatype_privileged_role` role does not exist |
+| `new tables in public are not granted to anon or authenticated` | `20261012210000_private_table_defaults.sql` | **A table made by hand in `public` is readable and writable with the anon key.** The open default privileges described below are still in place |
+
+### Default privileges in `public`
+
+A new table in `public` is granted to `service_role` (and `postgres`, and its owner) and to nobody else. `anon` and `authenticated` get a table's privileges only when something grants them: the Supatype schema engine writes a model table's grants from its access rules on every push, so a model behaves as its schema says and a table made by hand stays private until you grant it.
+
+Earlier images granted every privilege on new tables in `public` to `anon` and `authenticated` by default, so any table made by hand was open to the anon key.
+
+What stays as it was:
+
+- **Sequences.** New sequences in `public` are still granted to `anon`, `authenticated` and `service_role`. An insert into a table with a `serial` or identity column needs `USAGE` on its sequence, and older schema engines do not grant it on a model's sequences themselves.
+- **Functions** in `public`. This change is about tables.
+- **Every other schema.** The defaults in `storage`, `graphql`, `graphql_public`, `extensions`, `auth`, `realtime` and `cron` are unchanged, because the stack's services rely on them.
+- **Tables that already exist.** Nothing revokes a grant a table already has.
+
+**Existing volumes.** The initial schema runs only on an empty data directory, so a volume created by an earlier image keeps the open defaults until something removes them. Two things do, and either is enough:
+
+- `20261012210000_private_table_defaults.sql` revokes them the next time this image starts on the volume. On a volume adopted without a ledger (above) it is marked applied without running; `supatype migrate doctor` reports it and `doctor --fix` applies it.
+- The Supatype CLI revokes them on every `supatype dev` and on `supatype push` to a local compose stack, so a project the CLI has already reached is unchanged by the migration.
 
 ### Notes
 
@@ -218,7 +238,7 @@ tests/
 | `docker-image-test.yml` | PRs, push to `develop` | Builds image, verifies extensions load, that migrations apply on both a fresh volume and an existing one, and that `doctor --fix` repairs a migration that never took effect |
 | `native-archives.yml` | Tag push | Builds native PG17 tarballs for all platforms, uploads to CDN and GitHub Release |
 | `test-pg-guard.yml` | PRs touching `extensions/pg_guard/**` | Runs pg_guard regression suite |
-| `test-pg-keyspace.yml` | All PRs, push to `main`/`develop` | Unit tests, RESP conformance against a real redis, macOS/kqueue build, and durability + fault injection inside PostgreSQL. No `paths:` filter — two of its checks are required on `develop`, and GitHub never queues a workflow whose path filter misses, so the filtering lives in a `changes` job every other job keys off |
+| `test-pg-keyspace.yml` | All PRs, push to `main`/`develop` | Unit tests, RESP conformance against a real redis, macOS/kqueue build, and durability + fault injection inside PostgreSQL. No `paths:` filter: two of its checks are required on `develop`, and GitHub never queues a workflow whose path filter misses, so the filtering lives in a `changes` job every other job keys off |
 | `test-supatype-mask.yml` | PRs touching `extensions/supatype_mask/**` | Runs the masking regression suite |
 
 ---
@@ -254,7 +274,7 @@ pg_guard is a PostgreSQL extension bundled in `extensions/pg_guard/` that provid
 - Prevents privilege escalation via `CREATE ROLE ... SUPERUSER`
 - Enforces a designated privileged role (`pg_guard.privileged_role`)
 - Enables safe creation of publications and event triggers without granting superuser
-- Loaded via `session_preload_libraries` — active on every connection; can be overridden per-role via `ALTER ROLE ... SET session_preload_libraries`
+- Loaded via `session_preload_libraries`, so it is active on every connection; can be overridden per-role via `ALTER ROLE ... SET session_preload_libraries`
 
 Regression tests run on every PR that touches the extension source:
 

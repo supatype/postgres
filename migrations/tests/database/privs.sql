@@ -13,8 +13,9 @@ create table test_priv();
 SELECT table_owner_is('test_priv', 'postgres');
 SELECT table_privs_are('test_priv', 'supatype_admin', array['DELETE', 'INSERT', 'REFERENCES', 'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE']);
 SELECT table_privs_are('test_priv', 'postgres', array['DELETE', 'INSERT', 'REFERENCES', 'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE']);
-SELECT table_privs_are('test_priv', 'anon', array['DELETE', 'INSERT', 'REFERENCES', 'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE']);
-SELECT table_privs_are('test_priv', 'authenticated', array['DELETE', 'INSERT', 'REFERENCES', 'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE']);
+-- A table made by hand is private to service_role and its owner until something grants more.
+SELECT table_privs_are('test_priv', 'anon', array[]::text[]);
+SELECT table_privs_are('test_priv', 'authenticated', array[]::text[]);
 SELECT table_privs_are('test_priv', 'service_role', array['DELETE', 'INSERT', 'REFERENCES', 'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE']);
 reset role;
 
