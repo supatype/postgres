@@ -146,6 +146,8 @@ equally `DISABLE ROW LEVEL SECURITY`; this is no weaker than RLS against the sam
 | `WHERE`, `ORDER BY`, `GROUP BY`, joins, subqueries | masked, so a qual cannot be used as an oracle |
 | `sum(salary)`, `max(salary)`, `string_agg(salary::text, ',')` etc. | rejected per unreadable row, so a total is either correct or an error, never quietly partial |
 | aggregate over a subquery (`jsonb_agg((SELECT q.salary FROM t q ...))`) | the subquery's own reads mask to NULL; the aggregate consumes what the subquery returns |
+| window aggregate (`sum(salary) OVER (...)`, `count(*) FILTER (WHERE salary > 0) OVER ()`) | rejected per unreadable row, like `sum(salary)` |
+| window `PARTITION BY` / `ORDER BY` on the column, ranking functions, `lag`, `first_value` | masked to NULL: unreadable rows tie, so no rank or order reaches the caller |
 | `UPDATE`, caller may write | accepted |
 | `UPDATE`, caller cannot read | old value preserved silently |
 | `UPDATE`, caller can read but not write | rejected |

@@ -27,7 +27,7 @@ typedef struct RelMask {
 } RelMask;
 
 /// One query level: its masked relations, and whether the walk is inside an
-/// aggregate written at this level.
+/// aggregate (plain or window) written at this level.
 ///
 /// The aggregate flag is per level because a subquery is its own scope. An aggregate
 /// over a subquery consumes what the subquery returns, which is already masked, so a
@@ -37,7 +37,7 @@ typedef struct RelMask {
 /// builds, since each child connection is a subquery inside the parent's `jsonb_agg`.
 typedef struct MaskLevel {
   List *rels;
-  bool  in_aggref;
+  bool  in_aggregate;
 } MaskLevel;
 
 /// `levels` is innermost-first: a `Var` with `varlevelsup = k` belongs to
@@ -88,7 +88,7 @@ reference_is_aggregated(MaskCtx *ctx, Index levelsup) {
   Index i;
 
   for (i = 0; i <= levelsup; i++)
-    if (((MaskLevel *) list_nth(ctx->levels, i))->in_aggref) return true;
+    if (((MaskLevel *) list_nth(ctx->levels, i))->in_aggregate) return true;
 
   return false;
 }
@@ -649,6 +649,39 @@ mask_var(MaskCtx *ctx, Var *var) {
   return build_read_mask(ctx, rm, var, col);
 }
 
+/// Whether the node may fold many rows' inputs into one answer, so masking its input
+/// to NULL would make it quietly partial: a plain aggregate, or a window function
+/// (`sum(x) OVER ()`), FILTER included.
+///
+/// The built-in non-aggregate window functions are the exception: `lag(x)` and
+/// `first_value(x)` return one row's value, which is then the masked value a plain
+/// select returns, and the ranking functions take no argument. A non-aggregate window
+/// function from outside the catalog could fold its frame, so it is refused like an
+/// aggregate rather than trusted.
+static bool
+consumes_rows(const Node *node) {
+  const WindowFunc *wfunc;
+
+  if (IsA(node, Aggref)) return true;
+  if (!IsA(node, WindowFunc)) return false;
+
+  wfunc = (const WindowFunc *) node;
+  return wfunc->winagg || wfunc->winfnoid >= FirstNormalObjectId;
+}
+
+static Node *
+mask_aggregate(Node *node, MaskCtx *ctx) {
+  MaskLevel *level = current_level(ctx);
+  bool       saved = level->in_aggregate;
+  Node      *result;
+
+  level->in_aggregate = true;
+  result           = expression_tree_mutator(node, mask_mutator, ctx);
+  level->in_aggregate = saved;
+
+  return result;
+}
+
 static Node *
 mask_mutator(Node *node, void *context) {
   MaskCtx *ctx = (MaskCtx *) context;
@@ -657,17 +690,7 @@ mask_mutator(Node *node, void *context) {
 
   if (IsA(node, Var)) return mask_var(ctx, (Var *) node);
 
-  if (IsA(node, Aggref)) {
-    MaskLevel *level = current_level(ctx);
-    bool       saved = level->in_aggref;
-    Node      *result;
-
-    level->in_aggref = true;
-    result           = expression_tree_mutator(node, mask_mutator, context);
-    level->in_aggref = saved;
-
-    return result;
-  }
+  if (consumes_rows(node)) return mask_aggregate(node, ctx);
 
   if (IsA(node, Query)) return (Node *) mask_query((Query *) node, ctx);
 

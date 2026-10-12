@@ -144,6 +144,83 @@ SELECT (SELECT sum(p.salary) FROM (VALUES (1)) v) FROM posts p;
 SELECT max(salary), string_agg(salary::text, ',') FROM posts;
 
 -- ============================================================================
+-- Window functions.  A window aggregate consumes its input exactly as a plain
+-- aggregate does, so masking that input to NULL would make `sum() OVER ()` total
+-- only the rows the caller may read and say nothing.  It is refused per unreadable
+-- row instead, FILTER included.
+--
+-- PARTITION BY and ORDER BY in a window are target-list entries like a plain ORDER
+-- BY or GROUP BY, so they see the masked value: every unreadable row is NULL and
+-- they all tie.  Ranks, partitions and running totals therefore carry no order the
+-- caller could not compute from what they can already read.  Value functions
+-- (`lag`, `first_value`) return the masked value, as a plain select does.
+-- ============================================================================
+
+RESET ROLE;
+CREATE TABLE staff (id int primary key, dept text, salary numeric, owner text);
+INSERT INTO staff VALUES
+  (1, 'a', 400, 'alice'), (2, 'a', 100, 'bob'),
+  (3, 'b', 300, 'bob'),   (4, 'b', 200, 'alice');
+CREATE FUNCTION can_read_staff__salary(staff staff) RETURNS boolean
+  LANGUAGE sql STABLE AS $$
+    SELECT owner = current_setting('mask.uid', true) FROM (SELECT ($1).*) AS staff;
+  $$;
+SECURITY LABEL FOR supatype ON COLUMN staff.salary
+  IS 'MASK READ public.can_read_staff__salary';
+GRANT SELECT ON staff TO mask_app;
+SET ROLE mask_app;
+SET mask.uid = 'alice';
+
+-- Refused: rows 2 and 3 are not readable.
+SELECT id, sum(salary) OVER () FROM staff ORDER BY id;
+SELECT id, sum(salary) OVER (PARTITION BY dept) FROM staff ORDER BY id;
+SELECT id, avg(salary) OVER (ORDER BY id) FROM staff ORDER BY id;
+SELECT id, count(*) FILTER (WHERE salary > 150) OVER () FROM staff ORDER BY id;
+SELECT id, count(salary) OVER (), rank() OVER (ORDER BY id) FROM staff ORDER BY id;
+
+-- Correct for a caller entitled to every row the window covers.
+SELECT id, sum(salary) OVER () FROM staff WHERE owner = 'alice' ORDER BY id;
+SELECT id, sum(salary) OVER (ORDER BY salary) FROM staff WHERE owner = 'alice' ORDER BY id;
+
+-- No order leak: unreadable rows rank, number and partition as tied NULLs.
+SELECT id, rank() OVER (ORDER BY salary), dense_rank() OVER (ORDER BY salary DESC),
+       row_number() OVER (ORDER BY salary, id),
+       percent_rank() OVER (ORDER BY salary)
+  FROM staff ORDER BY id;
+SELECT id, rank() OVER (PARTITION BY dept ORDER BY salary),
+       count(*) OVER (PARTITION BY salary),
+       count(*) OVER (ORDER BY salary)
+  FROM staff ORDER BY id;
+SELECT id, lag(salary) OVER (ORDER BY id), first_value(salary) OVER (ORDER BY id DESC),
+       ntile(2) OVER (ORDER BY salary, id)
+  FROM staff ORDER BY id;
+
+-- A window aggregate over a subquery's output consumes values that are already
+-- masked, the same scoping as a plain aggregate over a subquery.
+SELECT id, count(s) OVER (), sum(s) OVER ()
+  FROM (SELECT id, salary AS s FROM staff) q ORDER BY id;
+-- A subquery's own window aggregate is still refused.
+SELECT id, (SELECT sum(t.salary) OVER () FROM staff t WHERE t.id = q.id)
+  FROM staff q ORDER BY id;
+
+-- Window masking survives plan reuse across callers.
+SET plan_cache_mode = force_generic_plan;
+PREPARE win AS SELECT id, sum(salary) OVER () FROM staff WHERE owner = 'alice' ORDER BY id;
+SET mask.uid = 'alice';
+EXECUTE win;
+SET mask.uid = 'bob';
+EXECUTE win;
+DEALLOCATE win;
+RESET plan_cache_mode;
+
+RESET ROLE;
+REVOKE ALL ON staff FROM mask_app;
+DROP FUNCTION can_read_staff__salary(staff);
+DROP TABLE staff;
+SET ROLE mask_app;
+SET mask.uid = 'alice';
+
+-- ============================================================================
 -- A whole-row reference becomes the masked row: every masked column in it is
 -- replaced by its mask, so the row carries exactly what a column-by-column select
 -- would.  This is what a PostgREST computed column passes to its function.
