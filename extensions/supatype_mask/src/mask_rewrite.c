@@ -144,25 +144,28 @@ supatype_mask_build_deny(Oid type, int32 typmod, Oid collation, const char *mess
 /// at run time (never folded into the plan; `STABLE` and IMMUTABLE-rejected), so
 /// a plan cached for one role re-runs the InitPlan for the next caller's session:
 /// no cross-caller leak, same guarantee as the whole-row form.
+/// An empty `SELECT` with no `FROM`, for a sub-select this file builds.
+static Query *
+new_select(void) {
+  Query *sub = makeNode(Query);
+
+  sub->commandType = CMD_SELECT;
+  sub->canSetTag   = false;
+  sub->jointree    = makeFromExpr(NIL, NULL);
+
+  return sub;
+}
+
 static Node *
 build_norow_predicate(Oid funcid) {
-  FuncExpr    *call;
-  TargetEntry *te;
-  Query       *sub;
-  SubLink     *sublink;
+  FuncExpr *call;
+  Query    *sub = new_select();
+  SubLink  *sublink;
 
   call = makeFuncExpr(funcid, BOOLOID, NIL, InvalidOid, InvalidOid,
                       COERCE_EXPLICIT_CALL);
-  te   = makeTargetEntry((Expr *) call, 1, "supatype_mask_read", false);
-
-  sub                    = makeNode(Query);
-  sub->commandType       = CMD_SELECT;
-  sub->canSetTag         = false;
-  sub->targetList        = list_make1(te);
-  sub->rtable            = NIL;
-  sub->jointree          = makeNode(FromExpr);
-  sub->jointree->fromlist = NIL;
-  sub->jointree->quals    = NULL;
+  sub->targetList =
+      list_make1(makeTargetEntry((Expr *) call, 1, "supatype_mask_read", false));
 
   sublink              = makeNode(SubLink);
   sublink->subLinkType = EXPR_SUBLINK;
@@ -268,35 +271,25 @@ build_read_mask(MaskCtx *ctx, RelMask *rm, Var *var, MaskedColumn *col) {
 /// The engine conjoins a field's write rule with its read rule, so write-without-read
 /// is unrepresentable there; mirroring that here keeps a caller from round-tripping a
 /// value they were never shown and destroying it.
+///
+/// `inserted` is the row an INSERT is about to store (`build_inserted_row`), and NULL
+/// for an UPDATE, whose rule is judged against the stored row. A row-independent rule
+/// (`Role<"admin">`) is the same once-per-statement InitPlan either way.
 static Node *
-build_write_test(MaskCtx *ctx, RelMask *rm, MaskedColumn *col, Index levelsup,
-                 bool for_insert) {
+build_write_test(MaskCtx *ctx, RelMask *rm, MaskedColumn *col, Node *inserted) {
   bool valid_write = OidIsValid(col->write_fn);
   Oid  funcid      = valid_write ? col->write_fn : col->read_fn;
   bool norow       = valid_write ? col->write_norow : col->read_norow;
 
-  if (!for_insert)
-    return build_predicate_call(ctx, rm, funcid, norow, levelsup, NULL);
+  if (inserted == NULL || norow)
+    return build_predicate_call(ctx, rm, funcid, norow, 0, NULL);
 
-  // A row-independent rule (`Role<"admin">`) is the same once-per-statement
-  // InitPlan whether or not there is an old row, so an INSERT uses it directly.
-  if (norow) {
-    ctx->curquery->hasSubLinks = true;
-    return build_norow_predicate(funcid);
-  }
-
-  // An INSERT has no old row, so the predicate is evaluated against `NULL::t`. An
-  // identity-only rule (`Role<"admin">`) answers correctly; a row-dependent one
-  // (`Owner<"author_id">`) compares against NULL, yields NULL, and the column falls
-  // back to its default -- fail closed rather than accept an unauthorised value.
-  //
-  // This is the one place a masking predicate is called with a constant argument, and
-  // therefore the reason mask_cache.c refuses an IMMUTABLE predicate: immutable and
-  // constant-argument is folded at plan time and baked into a cached plan.
-  return (Node *) makeFuncExpr(
-      funcid, BOOLOID,
-      list_make1(makeNullConst(get_rel_type_id(rm->rte->relid), -1, InvalidOid)),
-      InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+  // Judged as an RLS `WITH CHECK` judges a new row. When every value the statement
+  // supplies is a constant, so is the argument, which is why mask_cache.c refuses an
+  // IMMUTABLE predicate: immutable and constant-argument is folded at plan time and
+  // baked into a cached plan.
+  return (Node *) makeFuncExpr(funcid, BOOLOID, list_make1(copyObject(inserted)),
+                               InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 }
 
 /// `UPDATE`: preserve, accept or reject, decided per row.
@@ -327,7 +320,7 @@ build_update_coercion(MaskCtx *ctx, RelMask *rm, MaskedColumn *col, Node *submit
   if (col->force_mask) return (Node *) oldvalue;
 
   accept         = makeNode(CaseWhen);
-  accept->expr   = (Expr *) build_write_test(ctx, rm, col, 0, false);
+  accept->expr   = (Expr *) build_write_test(ctx, rm, col, NULL);
   accept->result = (Expr *) submitted;
 
   caseexpr             = makeNode(CaseExpr);
@@ -365,41 +358,6 @@ build_update_coercion(MaskCtx *ctx, RelMask *rm, MaskedColumn *col, Node *submit
   return (Node *) caseexpr;
 }
 
-/// `INSERT`: accept or fall back to the column's default.
-///
-/// There is no old row to preserve, and a whole-object client POSTing `salary: null`
-/// must not error, so an unauthorised value coerces to what the column would have got
-/// had the caller not mentioned it.
-static Node *
-build_insert_coercion(MaskCtx *ctx, RelMask *rm, MaskedColumn *col, Node *submitted) {
-  Relation  rel;
-  Node     *fallback;
-  CaseExpr *caseexpr;
-  CaseWhen *accept;
-
-  rel      = relation_open(rm->rte->relid, NoLock);
-  fallback = build_column_default(rel, col->attnum);
-  relation_close(rel, NoLock);
-
-  if (fallback == NULL)
-    fallback = (Node *) makeNullConst(col->coltype, col->coltypmod, col->colcollation);
-
-  if (col->force_mask) return fallback;
-
-  accept         = makeNode(CaseWhen);
-  accept->expr   = (Expr *) build_write_test(ctx, rm, col, 0, true);
-  accept->result = (Expr *) submitted;
-
-  caseexpr             = makeNode(CaseExpr);
-  caseexpr->casetype   = col->coltype;
-  caseexpr->casecollid = col->colcollation;
-  caseexpr->arg        = NULL;
-  caseexpr->args       = list_make1(accept);
-  caseexpr->defresult  = (Expr *) fallback;
-
-  return (Node *) caseexpr;
-}
-
 static RelMask *
 result_rel(Query *query, MaskCtx *ctx) {
   if (query->resultRelation == 0) return NULL;
@@ -414,28 +372,374 @@ result_rel(Query *query, MaskCtx *ctx) {
 /// masked column and must not return the real value -- then wrapped in the coercion.
 /// Running the projection mutator over the list as a whole instead would re-mask the
 /// preserved old value and write NULL over the data.
+static void
+mask_assigned_exprs(List *tlist, MaskCtx *ctx) {
+  ListCell *lc;
+
+  foreach (lc, tlist) {
+    TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+    te->expr = (Expr *) mask_mutator((Node *) te->expr, ctx);
+  }
+}
+
+/// The masked column an assignment writes, or NULL.
+static MaskedColumn *
+assigned_column(RelMask *target, const TargetEntry *te) {
+  if (target == NULL || te->resjunk || te->resno <= 0) return NULL;
+
+  return supatype_mask_column(target->entry, te->resno);
+}
+
 static List *
-mask_assignments(Query *query, List *tlist, MaskCtx *ctx, bool as_update) {
+mask_update_assignments(Query *query, List *tlist, MaskCtx *ctx) {
   RelMask  *target = result_rel(query, ctx);
+  ListCell *lc;
+
+  mask_assigned_exprs(tlist, ctx);
+
+  foreach (lc, tlist) {
+    TargetEntry  *te  = lfirst_node(TargetEntry, lc);
+    MaskedColumn *col = assigned_column(target, te);
+
+    if (col != NULL)
+      te->expr = (Expr *) build_update_coercion(ctx, target, col, (Node *) te->expr);
+  }
+
+  return tlist;
+}
+
+/// One assignment of an INSERT, as the write rules see it (MASK-N1, MK3).
+///
+/// `source` is the column of the values subquery holding what the statement sent, and
+/// `dflt` the column of the defaults subquery holding the column's default for this row
+/// (0 when there is none). A volatile default is held there as `COALESCE(<sent>,
+/// <default>)`, so it is evaluated only for a row that sent nothing.
+typedef struct InsertColumn {
+  TargetEntry  *te;
+  MaskedColumn *col; // NULL for a column with no label
+  Node         *fallback;
+  bool          volatile_default;
+  AttrNumber    source;
+  AttrNumber    dflt;
+} InsertColumn;
+
+/// Where the values an INSERT stores come from once it is rewritten: two `LATERAL`
+/// subqueries joined to its own source, so each value is evaluated once per row and the
+/// rules judge exactly the values stored.
+typedef struct InsertPlan {
+  List *columns; // InsertColumn *, one per assignment, in target-list order
+  bool  masked;  // whether any of them writes a masked column
+  Index values;
+  Index defaults; // 0 when no masked column has a default
+} InsertPlan;
+
+static void
+describe_insert(InsertPlan *plan, RelMask *target, Relation rel, List *tlist) {
   ListCell *lc;
 
   foreach (lc, tlist) {
     TargetEntry  *te = lfirst_node(TargetEntry, lc);
-    MaskedColumn *col;
+    InsertColumn *ic;
 
-    te->expr = (Expr *) mask_mutator((Node *) te->expr, ctx);
+    if (te->resjunk) continue;
 
-    if (target == NULL || te->resjunk || te->resno <= 0) continue;
+    ic      = (InsertColumn *) palloc0(sizeof(InsertColumn));
+    ic->te  = te;
+    ic->col = assigned_column(target, te);
+    if (ic->col != NULL) {
+      plan->masked         = true;
+      ic->fallback         = build_column_default(rel, te->resno);
+      ic->volatile_default = ic->fallback != NULL && contain_volatile_functions(ic->fallback);
+    }
+    plan->columns = lappend(plan->columns, ic);
+  }
+}
 
-    col = supatype_mask_column(target->entry, te->resno);
-    if (col == NULL) continue;
+/// Whether an assignment is the column's default because the statement left the column
+/// out or named DEFAULT: the rewriter fills both in with this same expression. A broken
+/// label is treated the same way, so the column takes its default.
+static bool
+left_to_default(const InsertColumn *ic) {
+  return ic->col != NULL &&
+         (ic->col->force_mask ||
+          (ic->fallback != NULL && equal(ic->fallback, ic->te->expr)));
+}
 
-    te->expr = (Expr *) (as_update
-                             ? build_update_coercion(ctx, target, col, (Node *) te->expr)
-                             : build_insert_coercion(ctx, target, col, (Node *) te->expr));
+static AttrNumber
+add_output(Query *sub, Node *expr) {
+  AttrNumber n = (AttrNumber) list_length(sub->targetList) + 1;
+
+  sub->targetList = lappend(sub->targetList,
+                            makeTargetEntry((Expr *) expr, n, psprintf("c%d", n), false));
+  return n;
+}
+
+/// Joins `sub` to the statement as `LATERAL (sub) AS alias` and returns its index.
+static Index
+add_lateral(Query *query, Query *sub, const char *alias) {
+  RangeTblEntry *rte     = makeNode(RangeTblEntry);
+  RangeTblRef   *ref     = makeNode(RangeTblRef);
+  List          *columns = NIL;
+  ListCell      *lc;
+
+  foreach (lc, sub->targetList)
+    columns = lappend(columns, makeString(pstrdup(lfirst_node(TargetEntry, lc)->resname)));
+
+  rte->rtekind  = RTE_SUBQUERY;
+  rte->subquery = sub;
+  rte->lateral  = true;
+  rte->inFromCl = true;
+  rte->alias    = makeAlias(alias, NIL);
+  rte->eref     = makeAlias(alias, columns);
+
+  query->rtable             = lappend(query->rtable, rte);
+  ref->rtindex              = list_length(query->rtable);
+  query->jointree->fromlist = lappend(query->jointree->fromlist, ref);
+
+  return ref->rtindex;
+}
+
+/// What the statement sent for each column, one output each, read from one level down.
+/// A column left to its default sends NULL, so its default is evaluated once, below.
+static Index
+add_values_subquery(Query *query, List *columns) {
+  Query    *sub = new_select();
+  ListCell *lc;
+
+  foreach (lc, columns) {
+    InsertColumn *ic   = (InsertColumn *) lfirst(lc);
+    Node         *sent = (Node *) copyObject(ic->te->expr);
+
+    if (left_to_default(ic))
+      sent = (Node *) makeNullConst(exprType(sent), exprTypmod(sent), exprCollation(sent));
+    else
+      IncrementVarSublevelsUp(sent, 1, 0);
+    ic->source = add_output(sub, sent);
+  }
+  sub->hasSubLinks = checkExprHasSubLink((Node *) sub->targetList);
+
+  return add_lateral(query, sub, "supatype_mask_values");
+}
+
+static Node *
+sent_var(const InsertPlan *plan, const InsertColumn *ic, Index levelsup) {
+  Node *like = (Node *) ic->te->expr;
+
+  return (Node *) makeVar(plan->values, ic->source, exprType(like), exprTypmod(like),
+                          exprCollation(like), levelsup);
+}
+
+static Node *
+coalesce_of(Node *first, Node *second) {
+  CoalesceExpr *coalesce = makeNode(CoalesceExpr);
+
+  coalesce->coalescetype   = exprType(first);
+  coalesce->coalescecollid = exprCollation(first);
+  coalesce->args           = list_make2(first, second);
+  coalesce->location       = -1;
+
+  return (Node *) coalesce;
+}
+
+/// Each masked column's default for this row, evaluated once: a stable one always, so a
+/// value the caller sent can be compared with it; a volatile one only for a row that
+/// sent nothing, so no sequence value is drawn for a row that does not use it.
+static void
+add_defaults_subquery(Query *query, InsertPlan *plan) {
+  Query    *sub = new_select();
+  ListCell *lc;
+
+  foreach (lc, plan->columns) {
+    InsertColumn *ic = (InsertColumn *) lfirst(lc);
+
+    if (ic->col == NULL || ic->fallback == NULL) continue;
+    ic->dflt = add_output(sub, ic->volatile_default
+                                   ? coalesce_of(sent_var(plan, ic, 1),
+                                                 copyObject(ic->fallback))
+                                   : copyObject(ic->fallback));
+  }
+  if (sub->targetList != NIL)
+    plan->defaults = add_lateral(query, sub, "supatype_mask_defaults");
+}
+
+static Node *
+default_var(const InsertPlan *plan, const InsertColumn *ic) {
+  return (Node *) makeVar(plan->defaults, ic->dflt, ic->col->coltype, ic->col->coltypmod,
+                          ic->col->colcollation, 0);
+}
+
+/// The value the row stores: what was sent, or the default where nothing was.
+static Node *
+stored_value(const InsertPlan *plan, const InsertColumn *ic) {
+  if (ic->dflt == 0) return sent_var(plan, ic, 0);
+  if (ic->volatile_default) return default_var(plan, ic);
+
+  return coalesce_of(sent_var(plan, ic, 0), default_var(plan, ic));
+}
+
+/// `ROW(<value each column stores>)::t`, the final values, so a rule reading another
+/// column (`Owner<"owner_id">` with `owner_id DEFAULT auth.uid()`, a generated key) sees
+/// what is stored, as an RLS `WITH CHECK` does.
+static Node *
+build_inserted_row(Relation rel, const InsertPlan *plan) {
+  TupleDesc      desc   = RelationGetDescr(rel);
+  RowExpr       *row    = makeNode(RowExpr);
+  InsertColumn **byattr = (InsertColumn **) palloc0((desc->natts + 1) * sizeof(InsertColumn *));
+  ListCell      *lc;
+  int            attno;
+
+  foreach (lc, plan->columns) {
+    InsertColumn *ic = (InsertColumn *) lfirst(lc);
+
+    if (ic->te->resno <= desc->natts) byattr[ic->te->resno] = ic;
   }
 
-  return tlist;
+  for (attno = 1; attno <= desc->natts; attno++) {
+    Form_pg_attribute att = TupleDescAttr(desc, attno - 1);
+    InsertColumn     *ic  = byattr[attno];
+
+    // A dropped column keeps its slot, filled as build_masked_row_expr fills it.
+    row->args = lappend(row->args,
+                        att->attisdropped ? (Node *) makeNullConst(INT4OID, -1, InvalidOid)
+                        : ic != NULL      ? stored_value(plan, ic)
+                                          : (Node *) makeNullConst(att->atttypid,
+                                                                   att->atttypmod,
+                                                                   att->attcollation));
+  }
+
+  row->row_typeid = RelationGetForm(rel)->reltype;
+  row->row_format = COERCE_IMPLICIT_CAST;
+  row->colnames   = NIL; // a named composite takes its field names from the catalog
+  row->location   = -1;
+
+  return (Node *) row;
+}
+
+/// `left IS DISTINCT FROM right` by the type's equality, or NULL when the type has none.
+static Node *
+distinct_from(Node *left, Node *right, Oid collation) {
+  TypeCacheEntry *type = lookup_type_cache(getBaseType(exprType(left)), TYPECACHE_EQ_OPR);
+  DistinctExpr   *expr;
+
+  if (!OidIsValid(type->eq_opr)) return NULL;
+
+  expr               = makeNode(DistinctExpr);
+  expr->opno         = type->eq_opr;
+  expr->opfuncid     = get_opcode(type->eq_opr);
+  expr->opresulttype = BOOLOID;
+  expr->opretset     = false;
+  expr->opcollid     = InvalidOid;
+  expr->inputcollid  = collation;
+  expr->args         = list_make2(left, right);
+  expr->location     = -1;
+
+  return (Node *) expr;
+}
+
+/// Whether the caller wrote the column (MK1, MK6): it sent a value, and not one equal to
+/// the column's default. NULL, a left-out column, DEFAULT, and the default's own value
+/// (which PostgREST's `Prefer: missing=default` sends in the default's place) are not
+/// writes. A volatile default never equals what was sent, so it is not compared.
+static Node *
+caller_wrote(const InsertPlan *plan, const InsertColumn *ic) {
+  NullTest *sent = makeNode(NullTest);
+  Node     *differs;
+
+  sent->arg          = (Expr *) sent_var(plan, ic, 0);
+  sent->nulltesttype = IS_NOT_NULL;
+  sent->argisrow     = false;
+  sent->location     = -1;
+
+  if (ic->dflt == 0 || ic->volatile_default) return (Node *) sent;
+  differs = distinct_from(sent_var(plan, ic, 0), default_var(plan, ic), ic->col->colcollation);
+  if (differs == NULL) return (Node *) sent;
+
+  return (Node *) makeBoolExpr(AND_EXPR, list_make2(sent, differs), -1);
+}
+
+/// `CASE WHEN <caller wrote it> AND can_write(<row>) IS NOT TRUE THEN deny(...)
+///  ELSE <stored value> END`: a value the rule refuses is an error, never dropped.
+static Node *
+judged_value(MaskCtx *ctx, RelMask *rm, const InsertPlan *plan, const InsertColumn *ic,
+             Node *row) {
+  MaskedColumn *col     = ic->col;
+  BooleanTest  *refused = makeNode(BooleanTest);
+  CaseWhen     *when    = makeNode(CaseWhen);
+  CaseExpr     *expr    = makeNode(CaseExpr);
+
+  refused->arg          = (Expr *) build_write_test(ctx, rm, col, row);
+  refused->booltesttype = IS_NOT_TRUE;
+  refused->location     = -1;
+
+  // The rule first: a row-independent one is a once-per-statement InitPlan, cheaper than
+  // the per-row comparison with the default.
+  when->expr     = makeBoolExpr(AND_EXPR,
+                                list_make2(refused, caller_wrote(plan, ic)), -1);
+  when->result   = (Expr *) supatype_mask_build_deny(
+      col->coltype, col->coltypmod, col->colcollation,
+      psprintf("column %s cannot be written by this role",
+               column_label(rm, col->attnum)));
+  when->location = -1;
+
+  expr->casetype   = col->coltype;
+  expr->casecollid = col->colcollation;
+  expr->args       = list_make1(when);
+  expr->defresult  = (Expr *) stored_value(plan, ic);
+  expr->location   = -1;
+
+  return (Node *) expr;
+}
+
+/// Each assignment reads its value from the subqueries: an unmasked column as sent, a
+/// masked one judged, one with a broken label as its default.
+static void
+rewrite_insert_assignments(MaskCtx *ctx, RelMask *target, const InsertPlan *plan,
+                           Node *row) {
+  ListCell *lc;
+
+  foreach (lc, plan->columns) {
+    InsertColumn *ic = (InsertColumn *) lfirst(lc);
+
+    if (ic->col == NULL)
+      ic->te->expr = (Expr *) sent_var(plan, ic, 0);
+    else if (ic->col->force_mask)
+      ic->te->expr = (Expr *) stored_value(plan, ic);
+    else
+      ic->te->expr = (Expr *) judged_value(ctx, target, plan, ic, row);
+  }
+}
+
+/// `INSERT`: judge the final values (MASK-N1, MK3).
+///
+/// The statement's values move into a `LATERAL` subquery and each masked column's
+/// default into a second, so every value, a default or a sequence draw included, is
+/// evaluated once per row, and each write rule is judged against `ROW(<stored values>)`
+/// as an RLS `WITH CHECK` judges a new row. A value the caller wrote that the rule
+/// refuses is an error; a column the caller did not write takes its default.
+static void
+mask_insert_assignments(Query *query, MaskCtx *ctx) {
+  RelMask   *target = result_rel(query, ctx);
+  InsertPlan plan   = {0};
+  Relation   rel;
+  Node      *row;
+
+  mask_assigned_exprs(query->targetList, ctx);
+  if (target == NULL) return;
+
+  rel = relation_open(target->rte->relid, NoLock);
+  describe_insert(&plan, target, rel, query->targetList);
+  if (!plan.masked) {
+    // An INSERT naming no masked column is left as it is.
+    relation_close(rel, NoLock);
+    return;
+  }
+  plan.values = add_values_subquery(query, plan.columns);
+  add_defaults_subquery(query, &plan);
+  row = build_inserted_row(rel, &plan);
+  relation_close(rel, NoLock);
+
+  rewrite_insert_assignments(ctx, target, &plan, row);
 }
 
 static void
@@ -486,7 +790,7 @@ mask_on_conflict(Query *query, MaskCtx *ctx) {
   // DO UPDATE assigns to an existing row, so it takes the UPDATE coercion even though
   // the statement is an INSERT.
   onconflict->onConflictSet =
-      mask_assignments(query, onconflict->onConflictSet, ctx, true);
+      mask_update_assignments(query, onconflict->onConflictSet, ctx);
 }
 
 static void
@@ -500,9 +804,9 @@ mask_query_fields(Query *query, MaskCtx *ctx) {
             errhint("Use INSERT ... ON CONFLICT, UPDATE or DELETE."));
 
   if (query->commandType == CMD_UPDATE)
-    query->targetList = mask_assignments(query, query->targetList, ctx, true);
+    query->targetList = mask_update_assignments(query, query->targetList, ctx);
   else if (query->commandType == CMD_INSERT)
-    query->targetList = mask_assignments(query, query->targetList, ctx, false);
+    mask_insert_assignments(query, ctx);
   else
     query->targetList = (List *) mask_mutator((Node *) query->targetList, ctx);
 

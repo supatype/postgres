@@ -316,22 +316,156 @@ UPDATE posts SET title = coalesce(salary::text, 'masked') WHERE id = 2;
 SELECT id, title FROM posts WHERE id = 2;
 
 -- ============================================================================
--- INSERT has no old row, so an unauthorised value coerces to the column default
+-- INSERT judges a write rule against the row being inserted, as an RLS WITH CHECK
+-- does, and refuses a value the rule does not allow
 -- ============================================================================
 
--- Row-dependent write rule: cannot be evaluated before the row exists, so `salary`
--- falls back to its default for everyone.  Identity-only `notes` is accepted for
--- alice and refused for bob.
+-- A rule that reads the row: alice, holding the write claim, may set the salary of a
+-- row she authors, and the value is stored.  Identity-only `notes` is hers to write.
 SET mask.uid = 'alice';
+SET mask.writer = 'on';
 INSERT INTO posts (id, title, salary, notes, author_id)
   VALUES (3, 'alice new', 555, 'alice wrote this', 'alice');
 
+-- INSERT ... SELECT is the shape PostgREST sends, and a multi-row VALUES judges each
+-- row by itself.
+BEGIN;
+INSERT INTO posts (id, title, salary, author_id)
+  SELECT 10, 'alice select', 321, 'alice';
+INSERT INTO posts (id, title, salary, author_id)
+  VALUES (11, 'alice row a', 11, 'alice'), (12, 'alice row b', 12, 'alice');
+RESET ROLE;
+SELECT id, salary FROM posts WHERE id >= 10 ORDER BY id;
+ROLLBACK;
+SET ROLE mask_app;
+
+-- The same writer setting the salary of a row someone else authors: refused, never
+-- stored as NULL.
+INSERT INTO posts (id, title, salary, author_id) VALUES (13, 'for bob', 1, 'bob');
+INSERT INTO posts (id, title, salary, author_id)
+  VALUES (14, 'alice ok', 14, 'alice'), (15, 'for bob', 15, 'bob');
+RESET mask.writer;
+
+-- Her own row without the write claim: the rule is NULL, not true, so refused too.
+INSERT INTO posts (id, title, salary, author_id) VALUES (16, 'no claim', 16, 'alice');
+
+-- A generic plan built for one row judges the next row afresh.
+SET plan_cache_mode = force_generic_plan;
+PREPARE post_insert(int, numeric, text) AS
+  INSERT INTO posts (id, title, salary, author_id) VALUES ($1, 'prepared', $2, $3);
+SET mask.writer = 'on';
+BEGIN;
+EXECUTE post_insert(20, 20, 'alice');
+RESET ROLE;
+SELECT id, salary FROM posts WHERE id = 20;
+ROLLBACK;
+SET ROLE mask_app;
+EXECUTE post_insert(21, 21, 'bob');
+RESET mask.writer;
+EXECUTE post_insert(22, 22, 'alice');
+DEALLOCATE post_insert;
+RESET plan_cache_mode;
+
+-- An identity-only rule bob does not meet: refused.
 SET mask.uid = 'bob';
+INSERT INTO posts (id, title, notes, author_id) VALUES (4, 'bob new', 'bob wrote this', 'bob');
+
+-- Leaving a column out, naming DEFAULT, or sending NULL is not a write: the column takes
+-- its default, so a whole-object POST still works for a caller who may not write it.
+INSERT INTO posts (id, title, author_id) VALUES (4, 'bob new', 'bob');
+BEGIN;
 INSERT INTO posts (id, title, salary, notes, author_id)
-  VALUES (4, 'bob new', 777, 'bob wrote this', 'bob');
+  VALUES (17, 'bob nulls', NULL, NULL, 'bob');
+INSERT INTO posts (id, title, salary, notes, author_id)
+  VALUES (18, 'bob defaults', DEFAULT, DEFAULT, 'bob');
+INSERT INTO posts (id, title, salary, notes, author_id)
+  SELECT 19, 'bob select nulls', NULL, NULL, 'bob';
+-- A multi-row VALUES naming DEFAULT puts the default in the VALUES list, not the target list.
+INSERT INTO posts (id, title, salary, notes, author_id)
+  VALUES (23, 'bob values a', DEFAULT, DEFAULT, 'bob'), (24, 'bob values b', NULL, NULL, 'bob');
+-- PostgREST's bulk POST with `?columns=` and `Prefer: missing=default` (MK4), verbatim but
+-- for the table: a key a row leaves out is filled with the column's default as a JSON
+-- value before the insert sees it.
+INSERT INTO posts (id, title, salary, notes, author_id)
+  SELECT b.id, b.title, b.salary, b.notes, b.author_id
+    FROM (SELECT '[{"id": 25, "title": "bob bulk", "author_id": "bob"}]'::jsonb AS json_data) p,
+         LATERAL (SELECT jsonb_agg(jsonb_build_object('salary', 0, 'notes', 'default notes')
+                                   || elem) AS val
+                    FROM jsonb_array_elements(p.json_data) elem) d,
+         LATERAL (SELECT id, title, salary, notes, author_id
+                    FROM jsonb_to_recordset(d.val)
+                      AS _(id int, title text, salary numeric, notes text, author_id text)) b;
+-- The default's own value, sent explicitly, is no write either (MK6).
+INSERT INTO posts (id, title, salary, notes, author_id)
+  VALUES (26, 'bob sends defaults', 0, 'default notes', 'bob');
+RESET ROLE;
+SELECT id, salary, notes FROM posts WHERE id >= 17 ORDER BY id;
+ROLLBACK;
 
 RESET ROLE;
 SELECT id, salary, notes FROM posts WHERE id IN (3, 4) ORDER BY id;
+
+-- The judged row is built without evaluating a volatile default a second time: a serial
+-- key is drawn once per row, so the stored keys have no gaps.
+CREATE TABLE ledger (
+  id     serial primary key,
+  owner  text,
+  secret text
+);
+CREATE FUNCTION can_read_ledger__secret(ledger ledger) RETURNS boolean
+  LANGUAGE sql STABLE AS $$
+    SELECT owner = current_setting('mask.uid', true) FROM (SELECT ($1).*) AS ledger;
+  $$;
+SECURITY LABEL FOR supatype ON COLUMN ledger.secret
+  IS 'MASK READ public.can_read_ledger__secret';
+GRANT SELECT, INSERT ON ledger TO mask_app;
+GRANT USAGE ON SEQUENCE ledger_id_seq TO mask_app;
+SET ROLE mask_app;
+SET mask.uid = 'alice';
+INSERT INTO ledger (owner, secret) VALUES ('alice', 'one');
+INSERT INTO ledger (owner, secret) VALUES ('alice', 'two');
+RESET ROLE;
+SELECT id, owner, secret FROM ledger ORDER BY id;
+SECURITY LABEL FOR supatype ON COLUMN ledger.secret IS NULL;
+DROP FUNCTION can_read_ledger__secret(ledger);
+DROP TABLE ledger;
+
+-- The rule judges the values stored, defaults included (MK3): a serial key, a random key
+-- and an owner filled in by their defaults are what the rules read, so the owner's secret
+-- is stored. `owner` carries a rule of its own, and its default is no write by the caller.
+CREATE TABLE vault (
+  id     serial primary key,
+  ref    uuid DEFAULT gen_random_uuid(),
+  owner  text DEFAULT current_setting('mask.uid', true),
+  secret text
+);
+CREATE FUNCTION can_read_vault__owner(vault vault) RETURNS boolean
+  LANGUAGE sql STABLE AS $$
+    SELECT owner = current_setting('mask.uid', true) FROM (SELECT ($1).*) AS vault;
+  $$;
+CREATE FUNCTION can_read_vault__secret(vault vault) RETURNS boolean
+  LANGUAGE sql STABLE AS $$
+    SELECT owner = current_setting('mask.uid', true) AND ref IS NOT NULL AND id > 0
+      FROM (SELECT ($1).*) AS vault;
+  $$;
+SECURITY LABEL FOR supatype ON COLUMN vault.owner IS 'MASK READ public.can_read_vault__owner';
+SECURITY LABEL FOR supatype ON COLUMN vault.secret IS 'MASK READ public.can_read_vault__secret';
+GRANT SELECT, INSERT ON vault TO mask_app;
+GRANT USAGE ON SEQUENCE vault_id_seq TO mask_app;
+SET ROLE mask_app;
+SET mask.uid = 'alice';
+INSERT INTO vault (secret) VALUES ('one');
+INSERT INTO vault (secret) VALUES ('two'), ('three');
+INSERT INTO vault (secret) SELECT 'four';
+-- Bob may not write a row as alice's: refused on the owner column itself.
+SET mask.uid = 'bob';
+INSERT INTO vault (owner, secret) VALUES ('alice', 'planted');
+RESET ROLE;
+SELECT id, ref IS NOT NULL AS has_ref, owner, secret FROM vault ORDER BY id;
+SECURITY LABEL FOR supatype ON COLUMN vault.owner IS NULL;
+SECURITY LABEL FOR supatype ON COLUMN vault.secret IS NULL;
+DROP FUNCTION can_read_vault__owner(vault), can_read_vault__secret(vault);
+DROP TABLE vault;
 SET ROLE mask_app;
 
 -- ============================================================================
