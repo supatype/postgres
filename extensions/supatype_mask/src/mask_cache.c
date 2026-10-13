@@ -138,8 +138,8 @@ resolve_predicate(const char *name, Oid rowtype, const char *relname,
 
   // The security-critical check. A masking predicate reads `request.jwt.claims`, so
   // it is STABLE at best. Labelled IMMUTABLE, the planner is entitled to fold it
-  // wherever its arguments are constant -- which is exactly what the INSERT path
-  // does -- and a folded answer baked into a cached plan is the cross-caller leak
+  // wherever its arguments are constant -- which an INSERT of literal values makes
+  // them -- and a folded answer baked into a cached plan is the cross-caller leak
   // this extension exists to prevent.
   if (func_volatile(funcid) == PROVOLATILE_IMMUTABLE) {
     ereport(WARNING,

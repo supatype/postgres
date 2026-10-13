@@ -151,7 +151,9 @@ equally `DISABLE ROW LEVEL SECURITY`; this is no weaker than RLS against the sam
 | `UPDATE`, caller may write | accepted |
 | `UPDATE`, caller cannot read | old value preserved silently |
 | `UPDATE`, caller can read but not write | rejected |
-| `INSERT` | accepted for an identity-only write rule; coerced to the column default otherwise |
+| `INSERT`, caller may write the value | accepted |
+| `INSERT`, caller may not write the value | rejected, unless it equals the column default |
+| `INSERT`, column left out, `DEFAULT`, NULL, or the default's own value | the column default |
 | `COPY t TO` | rewritten through the planner, so masked |
 | `COPY t FROM` | refused |
 | `MERGE` | refused |
@@ -178,10 +180,23 @@ than erroring; nothing the role may not read is disclosed either way.
 `to_jsonb(t)` and `SELECT t FROM t` see exactly what a column-by-column select would. On
 the nullable side of an outer join an unmatched row stays a NULL row.
 
-**INSERT is the honest limitation.** There is no old row, so the write predicate is
-evaluated against `NULL::t`. An identity-only rule (`Role<"admin">`) answers correctly; a
-row-dependent one (`Owner<"author_id">`) compares against NULL, yields NULL, and the
-column falls back to its default. Fail closed rather than accept an unauthorised value.
+**INSERT judges the values stored.** There is no old row, so the write predicate is
+called with the row the statement stores, `ROW(<each stored value>)::t`, as an RLS
+`WITH CHECK` judges a new row. A rule that reads the row (`Owner<"author_id">`)
+therefore lets a user set a guarded column on a row they own, and a value filled in by
+a default (`owner_id DEFAULT auth.uid()`, a `gen_random_uuid()` or serial key) is what
+the rule reads. To judge exactly what is stored, the statement's values are moved into a
+`LATERAL` subquery and each masked column's default into a second one, so every value is
+evaluated once per row: nothing is drawn from a sequence twice.
+
+A value the caller wrote that the rule refuses is an error (`42501`, naming the table and
+column), never quietly replaced: replacing it with the default lost every value such a
+rule guards. A column the caller did not write takes its default and is not judged: one
+left out, named as `DEFAULT`, sent as NULL, or sent as the default's own value. The last
+is what PostgREST's `Prefer: missing=default` sends for a key a row leaves out, so an
+admin-only `verified DEFAULT false` left out of a bulk POST, or sent as `false`, is
+accepted from anyone, while `true` is refused. A volatile default is never equal to a
+value sent, so it is not compared.
 
 ## Fail-closed states
 
@@ -198,7 +213,7 @@ label was written while the library was not loaded.
 
 **Why `IMMUTABLE` is refused.** A masking predicate reads the caller's claims, so it is
 `STABLE` at best. Declared immutable, the planner is entitled to fold it wherever its
-arguments are constant (which the INSERT path does deliberately), and a folded answer
+arguments are constant (as they are on an INSERT of literal values), and a folded answer
 baked into a cached plan is a cross-caller leak. Five lines of catalog check; the whole
 design rests on them.
 
