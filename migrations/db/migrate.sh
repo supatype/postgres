@@ -110,6 +110,22 @@ fi
 psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
     -c "ALTER USER authenticator WITH PASSWORD '$_auth_pw'"
 
+# `supatype_sql_editor` is the role Studio's SQL editor connects as (SEC-SQL). Like
+# authenticator it is created passwordless, by the editor migration, and needs a password to be
+# usable. Set it here from its own variable, `SUPATYPE_SQL_EDITOR_PASSWORD`.
+#
+# No fallback to `POSTGRES_PASSWORD`: the editor must not share the operator's direct-SQL
+# credential -- that is the whole point of giving the editor its own non-superuser login. When
+# the variable is unset the role is left without a password and cannot log in, which is the safe
+# default: the host that runs the editor (the CLI's reconcile, or the Cloud provisioner) sets it.
+if [ -n "${SUPATYPE_SQL_EDITOR_PASSWORD:-}" ]; then
+    psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
+        -c "ALTER USER supatype_sql_editor WITH PASSWORD '$SUPATYPE_SQL_EDITOR_PASSWORD'"
+else
+    echo "$0: note: SUPATYPE_SQL_EDITOR_PASSWORD is unset; the Studio SQL editor role has no" >&2
+    echo "$0:       password and cannot log in until the host sets one." >&2
+fi
+
 # pg_cron, in this database.
 #
 # The extension is preloaded by the image and was created by nobody, so the cluster had a
