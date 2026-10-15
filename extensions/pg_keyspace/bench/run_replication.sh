@@ -26,7 +26,8 @@ sleep 0.5
   --replica-addr 127.0.0.1 --replica-port "$RPORT" --commit-window-us 200 --shmem-mb 64 \
   >/tmp/pgks_repl_pri.log 2>&1 &
 DPID=$!
-trap 'kill $DPID $RPID 2>/dev/null' EXIT
+# Killed, not shut down, the daemon never unlinks its segments: remove them.
+trap 'kill $DPID $RPID 2>/dev/null; rm -f /dev/shm/pgks_w[0-9]*_"$DPID"' EXIT
 for _ in $(seq 1 30); do redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
 redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG || { echo "  FAIL  primary did not start"; cat /tmp/pgks_repl_pri.log; exit 1; }
 

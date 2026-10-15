@@ -249,6 +249,7 @@ jobs:
             runbench "$s" RESP=6400 REDIS8=6380
           done
           kill $dpid 2>/dev/null || true
+          rm -f /dev/shm/pgks_w[0-9]*_"$dpid"
 
           echo "===================================="
           [ "$fail" -eq 0 ] && echo "all benches passed" || echo "some benches FAILED"
