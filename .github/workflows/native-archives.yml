@@ -14,14 +14,11 @@ env:
   PG_TARBALL: "postgresql-17.2.tar.gz"
   PG_URL: "https://ftp.postgresql.org/pub/source/v17.2/postgresql-17.2.tar.gz"
   PG_SHA256: "51d8cdd6a5220fa8c0a3b12f2d0eeb50fcf5e0bdb7b37904a9cdff5cf1e61c36"
-  MSYS2_PG_PACKAGE: "mingw-w64-x86_64-postgresql-17.2-1-any.pkg.tar.zst"
-  MSYS2_PG_URL: "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-postgresql-17.2-1-any.pkg.tar.zst"
-  MSYS2_PG_SHA256: "fcb193f732c51209b74469011219de5178b20ba7ea181177363f3f04ea442f9e"
   INSTALL_PREFIX: "/usr/local/supatype-pg"
-  # Extension versions — must match Dockerfile ARGs
+  # Extension versions: these must match the Dockerfile ARGs
   PGVECTOR_VERSION: "0.8.0"
   PGJWT_COMMIT: "f3d82fd30151e754e19ce5d6a06c71c20689ce3d"
-  # Hetzner Object Storage — env only; configure-aws-credentials calls AWS STS.
+  # Hetzner Object Storage, env only: configure-aws-credentials calls AWS STS.
   AWS_ACCESS_KEY_ID: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
   AWS_DEFAULT_REGION: ${{ secrets.CDN_AWS_REGION }}
@@ -50,10 +47,10 @@ jobs:
             platform: darwin
             arch: arm64
 
-          # macos-13 retired 2025-12-04 — last Intel runner label is macos-15-intel.
+          # macos-13 retired 2025-12-04; the last Intel runner label is macos-15-intel.
           # `darwin-amd64`, matching `linux-amd64` and `windows-amd64`: the archive name comes from
           # this target, and the CLI asks for `amd64` on every platform (process.arch "x64").
-          # Published as `darwin-x86_64`, the Intel macOS archive could never be found — the CLI
+          # Published as `darwin-x86_64`, the Intel macOS archive could never be found, and the CLI
           # reported "Checksum not found for supatype-pg-17-darwin-amd64".
           - target: darwin-amd64
             os: macos-15-intel
@@ -183,14 +180,14 @@ jobs:
           echo "pg_guard bundled into lib dir."
 
       # ------------------------------------------------------------------ #
-      # supatype_mask — per-column read masking and write rejection
+      # supatype_mask: per-column read masking and write rejection
       #
       # Bundled with its `.control` and SQL, not just the library: `CREATE EXTENSION`
       # needs all three. (The pg_guard step above copies only the shared object, which
       # is why that extension cannot be created from a native archive.)
       #
       # Without this, field-level access rules could not be enforced on the native
-      # provider at all — the default `supatype dev` — so a schema declaring them fell
+      # provider at all (the default `supatype dev`), so a schema declaring them fell
       # back to generated `api` views while the same schema on `supatype/postgres` used
       # the planner rewrite. Same source, two mechanisms, purely because of packaging.
       # ------------------------------------------------------------------ #
@@ -203,7 +200,7 @@ jobs:
           mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
           # PG_CONFIG on `clean` too: a PGXS makefile resolves `$(PG_CONFIG) --pgxs` for every target,
           # so `clean` without it fails with "make: pg_config: No such file or directory" wherever the
-          # runner image carries no system PostgreSQL — which is every platform here except
+          # runner image carries no system PostgreSQL, which is every platform here except
           # linux-amd64, the one that passed and made this look platform-specific.
           make -C extensions/supatype_mask clean PG_CONFIG="${PG_CONFIG}"
           make -C extensions/supatype_mask PG_CONFIG="${PG_CONFIG}"
@@ -215,7 +212,7 @@ jobs:
           echo "supatype_mask bundled into lib + share/postgresql/extension."
 
       # ------------------------------------------------------------------ #
-      # pgvector — vector similarity search (C extension, native targets only)
+      # pgvector: vector similarity search (C extension, native targets only)
       # ------------------------------------------------------------------ #
       - name: Build and bundle pgvector
         if: matrix.platform == 'linux' || matrix.platform == 'darwin'
@@ -235,7 +232,7 @@ jobs:
           echo "pgvector bundled."
 
       # ------------------------------------------------------------------ #
-      # pgjwt — JWT generation/verification in SQL (SQL-only, all targets)
+      # pgjwt: JWT generation/verification in SQL (SQL-only, all targets)
       # ------------------------------------------------------------------ #
       - name: Bundle pgjwt
         run: |
@@ -248,13 +245,13 @@ jobs:
           echo "pgjwt bundled."
 
       # ------------------------------------------------------------------ #
-      # pg_keyspace — Postgres-native RESP keyspace + PostgREST row cache
+      # pg_keyspace: Postgres-native RESP keyspace + PostgREST row cache
       # (Rust/pgrx). Built from in-repo source against the staged PG so the
       # native archive ships the same extension as the supatype/postgres image.
       #
       # LINUX + macOS. pg_keyspace's event loop is readiness-driven via mio
       # (epoll on Linux, kqueue on macOS), so it builds on both. Windows is still
-      # excluded — pgrx has no supported Windows target — so that archive ships
+      # excluded, because pgrx has no supported Windows target, so that archive ships
       # the other extensions but not pg_keyspace.
       # ------------------------------------------------------------------ #
       - name: Install clang for pgrx bindgen (Linux)
@@ -282,7 +279,7 @@ jobs:
           # fails against a staged (DESTDIR) Postgres whose binaries resolve libpq
           # at an absolute install prefix that isn't installed yet (the macOS
           # "Library not loaded: .../libpq.5.dylib" failure). So build a minimal
-          # PGRX_HOME that registers pg17 -> this pg_config — no initdb involved.
+          # PGRX_HOME that registers pg17 -> this pg_config, with no initdb involved.
           export PGRX_HOME="${HOME}/.pgrx"
           mkdir -p "${PGRX_HOME}"
           printf '[configs]\npg17 = "%s"\n' "${PG_CONFIG}" > "${PGRX_HOME}/config.toml"
@@ -290,7 +287,7 @@ jobs:
 
           # pgrx lays the package tree under target/release/pg_keyspace-pg17 at the
           # paths pg_config REPORTS. PostgreSQL's pg_config is relocatable, so for a
-          # staged build those are the pg-install/... paths, not ${INSTALL_PREFIX} —
+          # staged build those are the pg-install/... paths, not ${INSTALL_PREFIX}, so
           # derive them from pg_config rather than assuming the prefix.
           PKGROOT="extensions/pg_keyspace/extension/target/release/pg_keyspace-pg17"
           LIBSRC="${PKGROOT}$(${PG_CONFIG} --pkglibdir)"
@@ -309,7 +306,7 @@ jobs:
           echo "pg_keyspace bundled into lib + share/postgresql/extension."
 
       # ------------------------------------------------------------------ #
-      # macOS — Developer ID + notarization (Phase 10.6 B7; same secrets as server-release)
+      # macOS: Developer ID + notarization (Phase 10.6 B7; same secrets as server-release)
       # ------------------------------------------------------------------ #
       - name: Sign staged Postgres tree (macOS)
         if: matrix.platform == 'darwin'
@@ -320,7 +317,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${APPLE_CERT_BASE64:-}" ]; then
-            echo "::notice::APPLE_CERT_BASE64 unset — skipping macOS codesign for Postgres bundle."
+            echo "::notice::APPLE_CERT_BASE64 unset, skipping macOS codesign for Postgres bundle."
             exit 0
           fi
           ROOT="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}"
@@ -359,7 +356,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${APPLE_NOTARY_APPLE_ID:-}" ] || [ -z "${APPLE_NOTARY_PASSWORD:-}" ]; then
-            echo "::notice::Apple notary secrets unset — skipping notarization for Postgres bundle."
+            echo "::notice::Apple notary secrets unset, skipping notarization for Postgres bundle."
             exit 0
           fi
           ARCH="${{ env.ARCHIVE_NAME }}"
@@ -394,9 +391,12 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------- #
-  # Windows — MSYS2/MINGW64: prebuilt PG17 package + extensions compiled
-  # via PGXS.  Produces the same supatype-postgres distribution as Linux/
-  # macOS (pg_guard.dll bundled alongside the PG executables).
+  # Windows: MSYS2/MINGW64. PostgreSQL is built from the same pinned source
+  # as the Linux and macOS archives, with the extensions compiled via PGXS,
+  # by scripts/build-native-windows.sh (the local build runs the same
+  # script). It used to install MSYS2's prebuilt PostgreSQL package, whose
+  # libraries drifted from the rolling repository until the archive could
+  # not start, and which MSYS2 has since deleted.
   # -------------------------------------------------------------------- #
   build-windows:
     name: Build PG17 + extensions (windows-amd64)
@@ -417,117 +417,31 @@ jobs:
           update: true
           install: >-
             mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-icu
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-zstd
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-readline
             make
-            base-devel
+            bison
+            flex
+            diffutils
+            perl
             git
             curl
+            tar
 
-      - name: Install PostgreSQL 17.2 (Windows)
-        run: |
-          curl -fsSL "${{ env.MSYS2_PG_URL }}" -o "${{ env.MSYS2_PG_PACKAGE }}"
-          echo "${{ env.MSYS2_PG_SHA256 }}  ${{ env.MSYS2_PG_PACKAGE }}" | sha256sum --check
-          pacman -U --noconfirm "${{ env.MSYS2_PG_PACKAGE }}"
-          pg_config --version
-          pg_config --version | grep -F "PostgreSQL ${{ env.PG_VERSION }}"
+      # PG_VERSION, PG_SHA256, PGVECTOR_VERSION and PGJWT_COMMIT come from the workflow env.
+      # The script fails when any program or library in the tree cannot load.
+      - name: Build PostgreSQL ${{ env.PG_VERSION }} and extensions
+        run: bash scripts/build-native-windows.sh staging
 
-      # ------------------------------------------------------------------ #
-      # Build pg_guard against MSYS2's PG17
-      # PGXS handles the .dll suffix automatically on win32.
-      # ------------------------------------------------------------------ #
-      - name: Build pg_guard
-        run: |
-          PG_CONFIG=/mingw64/bin/pg_config
-          make -C extensions/pg_guard PG_CONFIG="$PG_CONFIG"
-
-      # ------------------------------------------------------------------ #
-      # Build supatype_mask against MSYS2's PG17 (PGXS emits the .dll suffix).
-      # ------------------------------------------------------------------ #
-      - name: Build supatype_mask
-        run: |
-          PG_CONFIG=/mingw64/bin/pg_config
-          make -C extensions/supatype_mask clean
-          make -C extensions/supatype_mask PG_CONFIG="$PG_CONFIG"
-
-      # ------------------------------------------------------------------ #
-      # Stage archive contents
-      # Layout matches the Linux/macOS archives:
-      #   bin/        PG executables + all required runtime DLLs
-      #   lib/postgresql/  extension DLLs (pg_guard.dll, supatype_mask.dll)
-      #   share/postgresql/ timezone data, locale data (needed by initdb)
-      # ------------------------------------------------------------------ #
-      - name: Stage archive contents
-        run: |
-          STAGING="$(pwd)/staging"
-          mkdir -p "$STAGING/bin" \
-                   "$STAGING/lib/postgresql" \
-                   "$STAGING/share/postgresql"
-
-          # PostgreSQL executables
-          for exe in postgres pg_ctl initdb psql pg_dump pg_restore \
-                     createdb dropdb createuser dropuser pg_isready \
-                     pg_basebackup ecpg; do
-            [ -f "/mingw64/bin/${exe}.exe" ] && cp "/mingw64/bin/${exe}.exe" "$STAGING/bin/"
-          done
-
-          # Runtime DLLs — include only MSYS2/MINGW64 DLLs (skip Windows system DLLs)
-          for exe in "$STAGING/bin/"*.exe; do
-            ldd "$exe" 2>/dev/null \
-              | awk '/\/mingw64\/bin\// { print $3 }' \
-              | while read dll; do
-                  [ -f "$dll" ] && cp -n "$dll" "$STAGING/bin/"
-                done
-          done
-
-          # pg_guard extension DLL
-          find extensions/pg_guard -name "pg_guard.dll" \
-            -exec cp {} "$STAGING/lib/postgresql/" \;
-
-          # supatype_mask: the DLL here, its control and SQL after the share copy below —
-          # `CREATE EXTENSION` needs all three, and pg_guard ships only its library, which is
-          # why that one cannot be created from a native archive.
-          find extensions/supatype_mask -name "supatype_mask.dll" \
-            -exec cp {} "$STAGING/lib/postgresql/" \;
-
-          # PG share data (timezone tables, encoding maps — required by initdb)
-          cp -r /mingw64/share/postgresql/. "$STAGING/share/postgresql/"
-
-          # After that copy, not before: it would overwrite anything already staged here.
-          mkdir -p "$STAGING/share/postgresql/extension"
-          cp extensions/supatype_mask/supatype_mask.control \
-             "$STAGING/share/postgresql/extension/"
-          cp extensions/supatype_mask/supatype_mask--*.sql \
-             "$STAGING/share/postgresql/extension/"
-
-      # ------------------------------------------------------------------ #
-      # pgvector (Windows — pinned source build against pinned PostgreSQL 17)
-      # ------------------------------------------------------------------ #
-      - name: Build pgvector (Windows)
-        run: |
-          STAGING="$(pwd)/staging"
-          mkdir -p "${STAGING}/lib/postgresql" "${STAGING}/share/postgresql/extension"
-
-          git clone --depth 1 --branch v${{ env.PGVECTOR_VERSION }} https://github.com/pgvector/pgvector.git
-          make -C pgvector PG_CONFIG=/mingw64/bin/pg_config -j4
-          find pgvector -name "vector.dll" \
-            -exec cp {} "${STAGING}/lib/postgresql/" \;
-          cp pgvector/vector.control "${STAGING}/share/postgresql/extension/"
-          find pgvector -name "vector--*.sql" \
-            -exec cp {} "${STAGING}/share/postgresql/extension/" \;
-          echo "pgvector: built from pinned release tag"
-
-      # ------------------------------------------------------------------ #
-      # pgjwt (Windows — SQL-only, no compilation needed)
-      # ------------------------------------------------------------------ #
-      - name: Bundle pgjwt (Windows)
-        run: |
-          git clone https://github.com/michelp/pgjwt.git
-          git -C pgjwt checkout ${{ env.PGJWT_COMMIT }}
-          STAGING="$(pwd)/staging"
-          mkdir -p "${STAGING}/share/postgresql/extension"
-          cp pgjwt/pgjwt.control "${STAGING}/share/postgresql/extension/"
-          find pgjwt -name "pgjwt--*.sql" \
-            -exec cp {} "${STAGING}/share/postgresql/extension/" \;
-          echo "pgjwt bundled (Windows)."
+      # The tree is started with only the Windows system directories on PATH, so a DLL it lacks
+      # cannot be found in MSYS2 instead and hide the gap, as it would on any build machine.
+      - name: Start the archive and create its extensions
+        run: bash tests/native-archive/check-windows-runtime.sh staging 55432
 
       # ------------------------------------------------------------------ #
       # Package
@@ -555,10 +469,10 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------- #
-  # pg_keyspace — standalone installable packages (.deb + portable .tar.gz),
+  # pg_keyspace: standalone installable packages (.deb + portable .tar.gz),
   # the way pgrx extensions are normally distributed (cf. pg_graphql). These
   # target a stock PGDG PostgreSQL 17 (prefix /usr/lib/postgresql/17) so anyone
-  # can `dpkg -i` or untar them onto their own Postgres — separate from the
+  # can `dpkg -i` or untar them onto their own Postgres, separate from the
   # full-Postgres native archives above. Attached to the same release below.
   # -------------------------------------------------------------------- #
   pg-keyspace-package:
@@ -674,7 +588,7 @@ jobs:
       AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
-      # The tag is the release, not `PG_VERSION` — that is the PostgreSQL source version, and two
+      # The tag is the release, not `PG_VERSION`, which is the PostgreSQL source version, and two
       # releases of the same source (17.2.1, 17.2.2) would otherwise publish into the same
       # directory. Objects are uploaded `immutable, max-age=1y`, so overwriting one leaves caches
       # serving a fresh checksums file beside a stale archive until the year is out.
@@ -869,7 +783,7 @@ jobs:
           aws configure set default.s3.multipart_chunksize 64MB
           aws configure set default.s3.max_concurrent_requests 1
 
-          # `.com`, not `.io`: the CLI builds its own URL today, so this field is documentation —
+          # `.com`, not `.io`: the CLI builds its own URL today, so this field is documentation,
           # and documentation pointing at a host we do not serve is worse than none.
           printf '{"version":"%s","date":"%s","checksums_url":"https://releases.supatype.com/postgres/v%s/checksums.sha256"}\n' \
             "${RELEASE_VERSION}" "$(date -u +%Y-%m-%d)" "${RELEASE_VERSION}" > latest.json
