@@ -42,7 +42,8 @@ struct Shared {
 
 pub struct Batcher {
     shared: Arc<(Mutex<Shared>, Condvar, Condvar)>, // (state, work-ready, flushed/acked)
-    file: Arc<Mutex<File>>,
+    // No handle on the WAL file here: the flusher thread owns it outright, as
+    // its only writer, and Drop joins that thread before the Batcher is gone.
     commit_window: Duration,
     has_replica: bool,
     // A clone of the primary→standby stream, kept only to shut the socket down on
@@ -83,7 +84,6 @@ impl Batcher {
             Condvar::new(),
             Condvar::new(),
         ));
-        let file = Arc::new(Mutex::new(file));
 
         // Establish the standby link (if any) before starting the flusher.
         let (send_stream, ack_stream, keep_stream, standby) = match replica {
@@ -104,9 +104,8 @@ impl Batcher {
         let has_replica = send_stream.is_some();
 
         let s2 = shared.clone();
-        let f2 = file.clone();
         let win = commit_window;
-        let flusher = thread::spawn(move || flush_loop(s2, f2, win, send_stream));
+        let flusher = thread::spawn(move || flush_loop(s2, file, win, send_stream));
 
         // Ack reader: cumulative acks from the standby advance `replicated_seq`.
         let ack_reader = ack_stream.map(|mut s| {
@@ -131,7 +130,6 @@ impl Batcher {
 
         Ok(Batcher {
             shared,
-            file,
             commit_window,
             has_replica,
             repl_stream: keep_stream,
@@ -207,7 +205,7 @@ impl Drop for Batcher {
 
 fn flush_loop(
     shared: Arc<(Mutex<Shared>, Condvar, Condvar)>,
-    file: Arc<Mutex<File>>,
+    mut file: File,
     window: Duration,
     mut repl_stream: Option<TcpStream>,
 ) {
@@ -239,10 +237,8 @@ fn flush_loop(
         drop(g);
 
         if !batch.is_empty() {
-            let mut f = file.lock().unwrap();
-            f.write_all(&batch).unwrap();
-            fsync(&f);
-            drop(f);
+            file.write_all(&batch).unwrap();
+            fsync(&file);
             // Stream the fsynced batch to the standby (real synchronous rep).
             if let Some(s) = repl_stream.as_mut() {
                 if repl::send_batch(s, batch_seq, &batch).is_err() {
