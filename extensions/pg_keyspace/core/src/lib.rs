@@ -15,6 +15,7 @@
 //! out of scope for this core crate.
 
 pub mod aggr;
+pub mod arity;
 pub mod batcher;
 pub mod bitmap;
 pub mod crc16;
