@@ -1,6 +1,7 @@
 -- migrate:up
 
--- The role the Studio SQL editor connects as (SEC-SQL).
+-- The role the Studio SQL editor connects as (SEC-SQL), and the non-superuser role that owns
+-- the project's data (SQ1a).
 --
 -- Before this, Studio's SQL editor connected as the database's owning role, which on this
 -- image is a superuser (supatype_admin). A superuser session can always switch back to
@@ -13,25 +14,29 @@
 -- still sees masked columns as it did when it was a superuser. Each host sets its password
 -- out of band.
 --
--- What the editor is a member of -- the role that lets it run DDL and read every row -- is
--- set per host, NOT here, because a project database must be owned by a role that is not a
--- superuser (SQ1a):
+-- What it is a member of decides what it can reach, and that must be ONLY the project owner's
+-- ownership rights -- not a role that carries predefined-role memberships. The demoted
+-- `postgres` role is a member of pg_read_all_data (which reads pg_authid, so a superuser's
+-- password hash could be cracked offline), pg_monitor (other sessions' query text) and
+-- pg_signal_backend (cancel other sessions), so the editor must NOT inherit `postgres`.
+-- Instead the project database is owned by a dedicated role, `supatype_owner`, created here
+-- with no login, no superuser and no predefined-role memberships, and the editor is a member
+-- of that and nothing else.
 --
---   * On this image's own databases and on a freshly provisioned project database, the owner
---     (pg_database.datdba) is still a superuser. The migration therefore grants NOTHING: it
---     would be the very escalation this change removes. The host then gives the database a
---     non-superuser owner and grants THAT to the editor -- self-host transfers the stack
---     database to the demoted `postgres` role; Cloud's provisioner creates `<ref>_owner`.
---   * A database already owned by a non-superuser (the bare image's `postgres` database) is
---     inherited straight away.
+--   * Self-host: the database is owned by the superuser supatype_admin. The migration re-owns
+--     it, and the project's own objects in public, to supatype_owner (an existing project
+--     moves too), and grants supatype_owner to the editor. The system schemas supatype_admin
+--     also owns (auth, storage, realtime, graphql, cron, ...) are left alone; they are managed
+--     by their own admin roles and are not the project's data.
+--   * Cloud: the database is owned by the superuser <ref>_role, so this migration does nothing
+--     with ownership; the provisioner creates <ref>_owner (also a plain non-superuser with no
+--     predefined memberships) and grants it to the editor.
+--   * A database already owned by a plain non-superuser is inherited straight away.
 --
--- Membership is granted WITH INHERIT TRUE (the editor uses the owner's rights without SET
--- ROLE) and SET FALSE (so submitted SQL cannot `SET ROLE <owner>` into the owner session).
--- The editor reassigns objects it creates to the owner before commit (REASSIGN OWNED BY
--- supatype_sql_editor TO <owner>), so nothing stays owned by it.
---
--- Runs against a database being created and one that already exists: CREATE ROLE and the
--- grant are both guarded.
+-- Membership is WITH INHERIT TRUE (the editor uses the owner's rights without SET ROLE) and
+-- SET FALSE (so submitted SQL cannot SET ROLE into the owner). The editor reassigns objects it
+-- creates to the owner before commit (REASSIGN OWNED BY supatype_sql_editor TO <owner>). The
+-- migration is idempotent and runs for a new or existing database.
 DO $$
 DECLARE
   owner_role text;
@@ -48,30 +53,25 @@ BEGIN
     FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba
    WHERE d.datname = current_database();
 
-  IF NOT owner_is_superuser THEN
-    -- A non-superuser already owns this database (the bare image's `postgres` database):
-    -- inherit it straight away.
-    EXECUTE format('GRANT %I TO supatype_sql_editor WITH INHERIT TRUE, SET FALSE', owner_role);
+  -- Self-host: a superuser (supatype_admin) owns the database, or a prior run of this migration
+  -- left it owned by the demoted `postgres` role. Either way, move it to the dedicated
+  -- supatype_owner, which carries no predefined-role memberships, and make the editor a member
+  -- of that alone. Cloud's database is owned by <ref>_role, which is neither, so it is skipped.
+  IF owner_role IN ('supatype_admin', 'postgres') THEN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'supatype_owner') THEN
+      CREATE ROLE supatype_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+        NOINHERIT NOREPLICATION NOBYPASSRLS;
+    END IF;
 
-  ELSIF owner_role = 'supatype_admin'
-        AND EXISTS (SELECT FROM pg_roles WHERE rolname = 'postgres' AND NOT rolsuper) THEN
-    -- Self-host (SQ1a): a project database owned by the superuser `supatype_admin` must be
-    -- re-owned by a role that is not a superuser. The demoted `postgres` role is the one the
-    -- image already keeps for exactly this. Move the database, and the project's own objects in
-    -- `public`, from supatype_admin to postgres so an existing project moves too. The system
-    -- schemas (auth, storage, realtime, graphql, cron, ...) that supatype_admin also owns are
-    -- left alone: they are managed by their own admin roles and are not the project's data.
-    -- Cloud reaches neither branch: its database is owned by `<ref>_role`, and its provisioner
-    -- creates `<ref>_owner` and grants it here.
-    EXECUTE format('ALTER DATABASE %I OWNER TO postgres', current_database());
+    EXECUTE format('ALTER DATABASE %I OWNER TO supatype_owner', current_database());
 
     FOR obj IN
       SELECT c.oid::regclass AS ident, c.relkind
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-       WHERE n.nspname = 'public' AND c.relowner = 'supatype_admin'::regrole
+       WHERE n.nspname = 'public' AND pg_get_userbyid(c.relowner) = owner_role
          AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
     LOOP
-      EXECUTE format('ALTER %s %s OWNER TO postgres',
+      EXECUTE format('ALTER %s %s OWNER TO supatype_owner',
         CASE obj.relkind WHEN 'S' THEN 'SEQUENCE'
                          WHEN 'v' THEN 'VIEW'
                          WHEN 'm' THEN 'MATERIALIZED VIEW'
@@ -82,14 +82,21 @@ BEGIN
     FOR obj IN
       SELECT p.oid::regprocedure AS ident
         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-       WHERE n.nspname = 'public' AND p.proowner = 'supatype_admin'::regrole
+       WHERE n.nspname = 'public' AND pg_get_userbyid(p.proowner) = owner_role
     LOOP
-      EXECUTE format('ALTER ROUTINE %s OWNER TO postgres', obj.ident);
+      EXECUTE format('ALTER ROUTINE %s OWNER TO supatype_owner', obj.ident);
     END LOOP;
 
-    EXECUTE 'GRANT postgres TO supatype_sql_editor WITH INHERIT TRUE, SET FALSE';
+    -- Drop any membership a prior run of this migration gave the editor in the demoted
+    -- `postgres` role, so it is left a member of supatype_owner only.
+    EXECUTE 'REVOKE postgres FROM supatype_sql_editor';
+    EXECUTE 'GRANT supatype_owner TO supatype_sql_editor WITH INHERIT TRUE, SET FALSE';
+
+  ELSIF NOT owner_is_superuser THEN
+    -- A plain non-superuser already owns this database: inherit it straight away.
+    EXECUTE format('GRANT %I TO supatype_sql_editor WITH INHERIT TRUE, SET FALSE', owner_role);
   END IF;
-  -- Any other superuser owner (Cloud's `<ref>_role`): the host gives the database a
+  -- Any other superuser owner (Cloud's <ref>_role): the provisioner gives the database a
   -- non-superuser owner and grants it to the editor itself.
 END $$;
 
