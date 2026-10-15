@@ -304,7 +304,15 @@ health_checks_sql() {
 		                WHERE d.defaclnamespace = 'public'::regnamespace
 		                  AND d.defaclobjtype = 'r'
 		                  AND a.grantee IN (SELECT oid FROM pg_roles
-		                                     WHERE rolname IN ('anon', 'authenticated'))))
+		                                     WHERE rolname IN ('anon', 'authenticated')))),
+		  ('20261015140000_sql_editor_auth_storage_rows.sql',
+		   'the SQL editor can read and change rows in auth.users',
+		   CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supatype_sql_editor')
+		          OR to_regclass('auth.users') IS NULL THEN true
+		        ELSE (SELECT rolbypassrls FROM pg_roles WHERE rolname = 'supatype_sql_editor')
+		             AND has_table_privilege('supatype_sql_editor', 'auth.users', 'SELECT')
+		             AND has_table_privilege('supatype_sql_editor', 'auth.users', 'UPDATE')
+		   END)
 		) AS t(migration, description, ok)
 	SQL
 }
