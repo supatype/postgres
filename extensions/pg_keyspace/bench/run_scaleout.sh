@@ -16,6 +16,8 @@ mkdir -p "$OUT"
 pkill -f "pgkeyspaced" 2>/dev/null; sleep 1
 "$BIN" --workers 4 --port $BASE --keys-per-worker 300000 --val-bytes 512 >/tmp/pgks_scale.log 2>&1 &
 DPID=$!
+# Killed, not shut down, the daemon never unlinks its segments: remove them.
+trap 'kill $DPID 2>/dev/null; rm -f /dev/shm/pgks_w[0-9]*_"$DPID"' EXIT
 sleep 1
 for _ in $(seq 1 20); do redis-cli -p $BASE ping >/dev/null 2>&1 && break; sleep 0.3; done
 
