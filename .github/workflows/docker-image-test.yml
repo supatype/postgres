@@ -339,6 +339,13 @@ jobs:
           POSTGRES_PASSWORD: testpassword
         run: sh tests/role-search-path/check.sh pg_test supatype_admin
 
+      # SEC-SQL / SQ1a: the SQL editor inherits only the project owner, which carries no
+      # predefined-role memberships, so it cannot read pg_authid or monitor and signal others.
+      - name: The SQL editor has no superuser-adjacent powers
+        env:
+          POSTGRES_PASSWORD: testpassword
+        run: sh tests/editor-privileges/check.sh pg_test supatype_admin
+
       # A cluster made by an older image still has the backslash; the migration corrects it on the
       # next start. Put it back, forget the migration ran, and restart.
       - name: An existing cluster's role search path is corrected on its next start
