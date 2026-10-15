@@ -224,8 +224,10 @@ scripts/
   supatype                      `supatype <command>` dispatcher (installed on PATH)
   supatype-entrypoint.sh        Image ENTRYPOINT; applies migrations to existing clusters
   build-native.sh               Local native build script (mirrors CI)
+  build-native-windows.sh       Windows archive build, run in MSYS2 by CI and by build-native-windows.ps1
 tests/
   pg_upgrade/                   PostgreSQL upgrade regression tests
+  native-archive/               Windows archive checks: every DLL loads, and it starts with only Windows on PATH
 ```
 
 ---
