@@ -232,7 +232,6 @@ unsafe fn seq_end(e: *mut Entry) {
     (*e).version.fetch_add(1, Ordering::Release);
 }
 
-#[inline]
 /// A clock that is immune to wall-clock *steps* but still reports wall-clock
 /// values (#110).
 ///
@@ -423,7 +422,7 @@ impl Config {
 enum Backing {
     /// POSIX shared memory owned by this handle (core daemon, tests).
     Posix(Shmem),
-    /// A raw region owned by someone else — e.g. a Postgres shared-memory
+    /// A raw region owned by someone else, e.g. a Postgres shared-memory
     /// segment from `ShmemInitStruct`, mapped at the same address in every
     /// backend. The store only borrows it.
     Raw,
@@ -546,7 +545,7 @@ impl Store {
         let shmem = Shmem::attach(name, total)?;
         let base = shmem.base();
         // Refuse a segment laid out differently from the way we are about to
-        // index into it. Mapping it anyway does not fail — it just reads the
+        // index into it. Mapping it anyway does not fail; it just reads the
         // wrong offsets, quietly, forever.
         unsafe { Store::check_header(base, cfg) }.map_err(|why| {
             std::io::Error::new(
@@ -683,7 +682,7 @@ impl Store {
     ///
     /// The header has been written since the first version and never read back.
     /// That is safe only while every process mapping the segment agrees on the
-    /// layout by construction — true inside Postgres, which recreates the
+    /// layout by construction. That is true inside Postgres, which recreates the
     /// segment on every start from Postmaster-level GUCs, and not true of a
     /// segment that outlives the process which created it. Getting it wrong is
     /// silent rather than loud: the offsets simply land in the wrong places and
@@ -764,9 +763,9 @@ impl Store {
     /// key hashes to, so anything above this can never be stored no matter what
     /// is evicted first.
     ///
-    /// This is a *necessary* condition, not a sufficient one — an oversized
+    /// This is a *necessary* condition, not a sufficient one: an oversized
     /// block rounds its capacity up to a power of two, and the partition is
-    /// rarely empty — so a value that passes it may still fail to allocate. Its
+    /// rarely empty, so a value that passes it may still fail to allocate. Its
     /// purpose is to let a command that would *construct* a huge value refuse
     /// before building it: `SETBIT k 4294967295 1` is a 25-byte command that
     /// otherwise allocates and zeroes half a gigabyte on the event loop, stalls
@@ -779,16 +778,16 @@ impl Store {
 
     /// Which partition `key` lives in.
     ///
-    /// Every mutation of a partition — the probe, the slab allocator, and above
+    /// Every mutation of a partition (the probe, the slab allocator, and above
     /// all `evict_one`, which moves the bucket array, the entry array and the
-    /// bump pointer — is confined to that one partition. So a caller that has to
+    /// bump pointer) is confined to that one partition. So a caller that has to
     /// serialise writers itself (the extension's row-cache segment, which has no
     /// owning process) can take one lock per partition rather than one for the
     /// whole segment, and two writers touching different partitions never wait
     /// on each other.
     ///
     /// It MUST agree exactly with where `get`/`set` route, or such a lock would
-    /// guard the wrong arena while the caller believed it was protected — the
+    /// guard the wrong arena while the caller believed it was protected: the
     /// #127 crash wearing a lock. That is what keeps this a thin wrapper over
     /// the same two lines the read and write paths use, rather than a second
     /// implementation of the routing.
@@ -845,7 +844,7 @@ impl Store {
             // An oversized block is `[cap: u64][data...]`; the returned offset
             // points at the data (base+8). Capacity is rounded up to a power of
             // two so a value that grows in place (a large hash gaining fields)
-            // reuses its block until the next doubling — amortized O(1) growth
+            // reuses its block until the next doubling, amortized O(1) growth
             // instead of leaking a fresh region on every write.
             let need = align_up(size, 8) as u64;
             // First-fit reuse from the oversized free list.
@@ -893,7 +892,7 @@ impl Store {
     /// the free list, merging it with any physically adjacent free blocks and
     /// giving space back to the bump pointer when it lands at the top.
     ///
-    /// The naive version — push onto a LIFO list and never merge — leaks
+    /// The naive version (push onto a LIFO list and never merge) leaks
     /// capacity in a way no amount of eviction recovers. Blocks are laid out
     /// contiguously by bump and freed blocks were never coalesced, so a
     /// workload writing growing values (10 MiB, then 20, then 40) consumed
@@ -1122,13 +1121,26 @@ impl Store {
     /// SET a typed value (aggregates): same as `set` but tags the entry's
     /// `kind` so `get_typed` can enforce Redis `WRONGTYPE` semantics.
     pub fn set_typed(&self, key: &[u8], val: &[u8], ttl_micros: i64, kind: u32) -> bool {
-        let hash = fnv1a(key);
-        let p = self.partition_for_hash(hash);
         let exp = if ttl_micros > 0 {
-            now_micros() + ttl_micros
+            now_micros().saturating_add(ttl_micros)
         } else {
             0
         };
+        self.set_typed_at(key, val, exp, kind)
+    }
+
+    /// SET a string with an absolute deadline (unix micros, 0 = none), for a
+    /// caller that already holds the deadline: converting it to a TTL and back
+    /// would read the clock twice and drift by the gap. A deadline already past
+    /// writes the value expired, so the next read misses.
+    pub fn set_at(&self, key: &[u8], val: &[u8], expires_at: i64) -> bool {
+        self.set_typed_at(key, val, expires_at, KIND_STR)
+    }
+
+    /// `set_typed` with an absolute deadline, as `set_at`.
+    pub fn set_typed_at(&self, key: &[u8], val: &[u8], exp: i64, kind: u32) -> bool {
+        let hash = fnv1a(key);
+        let p = self.partition_for_hash(hash);
         unsafe {
             (*self.meta(p)).sets += 1;
             self.set_in(p, hash, key, val, exp, kind)
@@ -1138,7 +1150,7 @@ impl Store {
     /// Store `key` and mark it never-evictable (see `FLAG_PINNED`).
     ///
     /// For entries whose disappearance changes behaviour rather than costing a
-    /// lookup — the row cache's table registrations are the case this exists
+    /// lookup. The row cache's table registrations are the case this exists
     /// for: they live in the same arena as the cached rows, so a busy cache
     /// evicted them and silently stopped caching the very tables it was
     /// configured for.
@@ -1479,7 +1491,7 @@ impl Store {
                 pos += 1;
                 let meta = self.meta(p);
                 if idx >= (*meta).entry_bump {
-                    // nothing allocated past entry_bump — skip this partition's tail
+                    // nothing allocated past entry_bump: skip this partition's tail
                     pos = (p as u64 + 1) * stride;
                     continue;
                 }
@@ -2100,7 +2112,7 @@ mod tests {
     fn attach_takes_a_matching_segment_and_refuses_a_mismatched_one() {
         let cfg = Config::for_capacity(2, 10_000, 128);
         let _owner = Store::create("t_attach_chk", &cfg).unwrap();
-        // The legitimate path still works — this is also the only coverage
+        // The legitimate path still works. This is also the only coverage
         // Store::attach has, since nothing in the tree calls it yet.
         assert!(Store::attach("t_attach_chk", &cfg).is_ok());
         // A smaller layout maps cleanly because it fits inside the segment, so
@@ -2164,6 +2176,31 @@ mod tests {
         assert!(matches!(s.get_typed(b"k"), Some((_, 0, _))));
         // a past expiry deletes the key but still reports it existed
         assert!(s.set_expiry(b"k", 1));
+        assert!(matches!(s.get(b"k"), Lookup::Miss));
+    }
+
+    #[test]
+    fn a_ttl_past_the_clock_range_saturates_instead_of_wrapping() {
+        // A TTL computed against one reading of the clock and added to a later
+        // one used to overflow: the deadline wrapped negative and the key was
+        // born expired (or, in a debug build, the add panicked).
+        let s = store("t_ttl_sat");
+        assert!(s.set(b"k", b"v", i64::MAX - now_micros()));
+        assert!(matches!(s.get_typed(b"k"), Some((_, i64::MAX, _))));
+        assert!(s.set(b"k", b"v", i64::MAX));
+        assert!(matches!(s.get_typed(b"k"), Some((_, i64::MAX, v)) if v == b"v"));
+    }
+
+    #[test]
+    fn set_at_stores_the_deadline_it_is_given() {
+        let s = store("t_set_at");
+        let at = now_micros() + 60_000_000;
+        assert!(s.set_at(b"k", b"v", at));
+        assert!(matches!(s.get_typed(b"k"), Some((_, e, v)) if e == at && v == b"v"));
+        assert!(s.set_at(b"k", b"v", 0));
+        assert!(matches!(s.get_typed(b"k"), Some((_, 0, _))));
+        // A deadline already past writes the value expired.
+        assert!(s.set_at(b"k", b"v", 1));
         assert!(matches!(s.get(b"k"), Lookup::Miss));
     }
 
@@ -3097,7 +3134,7 @@ mod tests {
     /// The extension takes one LWLock per partition over the row-cache segment,
     /// choosing the lock with this function. If it disagreed with the routing
     /// `set`/`get` use, two writers could hold different locks and mutate the
-    /// same arena — the #127 crash, with a lock in front of it saying it could
+    /// same arena: the #127 crash, with a lock in front of it saying it could
     /// not happen. So this asserts against the store's own bookkeeping rather
     /// than against a second copy of the hash: every key is written, and each
     /// partition's live-entry count must equal the number of keys this function

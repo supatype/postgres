@@ -1,4 +1,4 @@
-//! pg_keyspace core — the shared-memory RESP hot path.
+//! pg_keyspace core: the shared-memory RESP hot path.
 //!
 //! This crate is the *performance-critical hot path* of pg_keyspace, shared
 //! verbatim with the pgrx extension: an epoll event loop serving RESP
@@ -8,7 +8,7 @@
 //!
 //! It deliberately does NOT embed Postgres: the read hot path never opens a
 //! transaction and is pure shmem access, so a standalone process attaching the
-//! same segment reproduces its latency exactly — and lets the hot-path latency
+//! same segment reproduces its latency exactly, and lets the hot-path latency
 //! target ("hit < 80µs") be measured on this hardware, against Valkey/Redis.
 //! The Postgres-native pieces (pgrx SQL surface, SPI-backed durability writes,
 //! background-worker registration, planner hook) live in the extension and are
@@ -19,6 +19,7 @@ pub mod batcher;
 pub mod bitmap;
 pub mod crc16;
 pub mod durability;
+pub mod expiry;
 pub mod prob;
 pub mod pubsub;
 pub mod pubsub_shm;
@@ -72,7 +73,7 @@ mod tests {
     /// The extension does not depend on this crate: it compiles the same files
     /// by re-declaring each one with `#[path = "../../core/src/…"]`. So a module
     /// added here and not there still passes `cargo test`, and fails only when
-    /// the extension is built — which needs Postgres headers and pgrx, and so
+    /// the extension is built, which needs Postgres headers and pgrx, and so
     /// happens no earlier than CI.
     ///
     /// That is exactly how `bitmap` reached a pull request: the core crate was
@@ -107,7 +108,7 @@ mod tests {
         let missing: Vec<&&str> = declared.difference(&included).collect();
         assert!(
             missing.is_empty(),
-            "{missing:?} declared in core/src/lib.rs but not in extension/src/lib.rs — \
+            "{missing:?} declared in core/src/lib.rs but not in extension/src/lib.rs; \
              add `#[path = \"../../core/src/<name>.rs\"] mod <name>;` there, or the \
              extension build breaks while every other check stays green"
         );
