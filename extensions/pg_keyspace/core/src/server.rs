@@ -71,6 +71,7 @@ use crate::batcher::{Batcher, Tier};
 use crate::bitmap;
 use crate::crc16;
 use crate::durability::Policy;
+use crate::expiry::{self, ExpireCond, ExpireOpt, Rule, StringCmd};
 use crate::prob;
 use crate::pubsub;
 use crate::resp::{self, Parse};
@@ -95,7 +96,7 @@ pub type PendingWrite = (Vec<u8>, Vec<u8>, i64, u8);
 
 /// Sentinel `expires_at` marking a delete (tombstone) carried through the ring,
 /// so the persistence worker removes the key from the backing table instead of
-/// upserting it — otherwise a deleted key would resurrect on crash recovery.
+/// upserting it; otherwise a deleted key would resurrect on crash recovery.
 pub const DELETE_TOMBSTONE: i64 = -1;
 
 /// This worker's place in the slot->worker map, plus the address of every peer,
@@ -108,7 +109,7 @@ struct Routing {
     endpoints: Vec<String>,
     /// A stable 40-hex-char node id per worker. Cluster clients key their cached
     /// topology on these, so they are derived from the endpoint rather than
-    /// randomised — a worker keeps its id across restarts.
+    /// randomised: a worker keeps its id across restarts.
     node_ids: Vec<String>,
 }
 
@@ -137,7 +138,7 @@ fn node_id_for(endpoint: &str) -> String {
 // ---- COMMAND introspection -----------------------------------------------
 // Cluster clients that do not ship a static command table (redis-py, most
 // notably) call `COMMAND` at connect and extract each command's key positions
-// from the reply. Without it they can route nothing — the slot map alone is not
+// from the reply. Without it they can route nothing; the slot map alone is not
 // enough. Positions here must agree with `key_indices`, which is what the server
 // actually treats as keys.
 
@@ -153,7 +154,7 @@ struct CmdSpec {
     movable: bool,
 }
 
-/// Key at argument 1 — the overwhelming majority of commands.
+/// Key at argument 1: the overwhelming majority of commands.
 const CMD_KEY1_READ: &[&str] = &[
     "GET", "TTL", "PTTL", "TYPE", "STRLEN", "GETRANGE", "EXPIRETIME", "PEXPIRETIME",
     "GETBIT", "BITCOUNT", "BITPOS", "BITFIELD_RO",
@@ -213,7 +214,7 @@ fn command_specs() -> Vec<CmdSpec> {
     add(CMD_MOVABLE_READ, false, 0, 0, 0, true);
     add(CMD_MOVABLE_WRITE, true, 0, 0, 0, true);
     add(&["OBJECT"], false, 2, 2, 1, false);
-    // BITOP <op> dest src… — the operation name sits where a key usually does,
+    // BITOP <op> dest src…: the operation name sits where a key usually does,
     // so the keys start at argument 2 and run to the end.
     add(&["BITOP"], true, 2, -1, 1, false);
     // Sharded pub/sub channels are routed by slot exactly as keys are, and
@@ -272,8 +273,8 @@ pub const PUSH_DEADLINE: Duration = Duration::from_secs(2);
 /// worker retires them. This caps that queue: past it the connection stops
 /// being read until an ack resolves, which is the same backpressure that used
 /// to apply at the very first outstanding write. At roughly five bytes per
-/// `+OK` this is a deep pipeline, and for reads — where the bytes actually
-/// are — it bounds memory rather than command count, which is the useful
+/// `+OK` this is a deep pipeline, and for reads (where the bytes actually
+/// are) it bounds memory rather than command count, which is the useful
 /// thing to bound.
 pub const MAX_HELD_REPLY_BYTES: usize = 1 << 20;
 
@@ -376,7 +377,7 @@ fn shard_of(n: usize, key: &[u8]) -> usize {
 ///
 /// `only` restricts the answer to one tenant; 0 means every tenant. A scoped
 /// connection is given only its own row, because the whole point of the
-/// `{tenant}:` namespace is that one tenant cannot observe another — reporting
+/// `{tenant}:` namespace is that one tenant cannot observe another; reporting
 /// a neighbour's write volume through INFO would be a hole in exactly the
 /// boundary this accounting exists to defend.
 ///
@@ -459,7 +460,7 @@ fn shard_push(
 /// A RESP credential: maps an AUTH username to a Postgres role + tenant.
 ///
 /// `secret` is either a hashed verifier `sha256$<salt_hex>$<hash_hex>` (produced
-/// by `supacache.set_credential`, the recommended path — the plaintext is never
+/// by `supacache.set_credential`, the recommended path; the plaintext is never
 /// stored) or, for local/legacy use, a bare plaintext string. `verify` accepts
 /// both and always compares in constant time.
 #[derive(Clone)]
@@ -469,7 +470,7 @@ pub struct Cred {
     pub tenant: String,
 }
 
-/// Constant-time byte comparison — no early exit on the first mismatch, so it
+/// Constant-time byte comparison: no early exit on the first mismatch, so it
 /// leaks neither which byte differs nor (for equal lengths) how many match.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -605,7 +606,7 @@ struct Conn {
     // held replies are waiting on. While non-empty nothing is flushed, so every
     // reply behind it stays behind it and command order is preserved by `wbuf`
     // alone. Commands ARE still read and applied meanwhile, up to
-    // `MAX_HELD_REPLY_BYTES` of held reply — that is what lets a pipelined
+    // `MAX_HELD_REPLY_BYTES` of held reply. That is what lets a pipelined
     // client put more than one write into a single persist window.
     //
     // One entry per ring, holding the highest sequence seen, because a ring
@@ -676,8 +677,8 @@ pub struct Worker {
     conns: HashMap<RawFd, Conn>,
     args: Vec<(usize, usize)>,
     // when non-empty, every write is enqueued into one of these shared-memory
-    // rings (sharded by key slot) and a dedicated persistence worker drains each
-    // — the RESP path never touches SPI. Multiple rings scale durable writes.
+    // rings (sharded by key slot) and a dedicated persistence worker drains each,
+    // so the RESP path never touches SPI. Multiple rings scale durable writes.
     producers: Vec<ring::Producer>,
     // Per-tenant in-flight accounting, one per ring (#43). Producer-local: the
     // event loop is the only producer, so no shared state and no atomics are
@@ -742,7 +743,7 @@ pub struct Worker {
     // Server-assisted client-side caching: scoped key -> the fds that read it
     // while CLIENT TRACKING was on. A write to a key sends each of those fds an
     // `invalidate` push and drops the entry (the client re-reads to re-track).
-    // Local to this worker — correct because each worker owns an independent
+    // Local to this worker, correct because each worker owns an independent
     // keyspace segment (daemon and in-PG extension alike): a key is only ever
     // read and written on the one worker that owns it, so no invalidation ever
     // needs to cross workers.
@@ -912,7 +913,7 @@ impl Worker {
     /// worker `w` owns. Persisted multi-worker deployments must enable this:
     /// recovery restores each key into the segment its slot range covers, so a
     /// worker that accepted a key it does not own would lose that key on the next
-    /// restart — after having acked the write as durable.
+    /// restart, after having acked the write as durable.
     /// Cap undelivered pub/sub per subscriber; 0 disables it.
     pub fn set_pubsub_buf_limit(&mut self, bytes: usize) {
         self.pubsub_buf_limit = bytes;
@@ -940,7 +941,7 @@ impl Worker {
     /// signal interrupts the wait). `timeout_ms` bounds each poll so the
     /// tick runs even when idle (a Postgres background worker uses this to notice
     /// SIGTERM/SIGHUP). `Tick::Stop` ends the loop; `Tick::Reload(cfg)` swaps the
-    /// auth config live — the hot-reload hook the extension drives on SIGHUP, so
+    /// auth config live. It is the hot-reload hook the extension drives on SIGHUP, so
     /// credential changes need no restart (`None` = switch to no-auth).
     pub fn run_with<F: FnMut() -> Tick>(&mut self, mut tick: F, timeout_ms: i32) -> io::Result<()> {
         let mut events = Events::with_capacity(POLL_MAX);
@@ -992,7 +993,7 @@ impl Worker {
                 } else if self.bus.as_ref().map_or(false, |b| fd == b.wake_fd(self.worker_id)) {
                     // A remote worker published to a channel we subscribe to, or
                     // invalidated a key we may be tracking: drain the inbox and
-                    // apply each locally (never re-broadcast — these are local-only
+                    // apply each locally (never re-broadcast: these are local-only
                     // so a cross-worker message can't ping-pong).
                     let msgs = self.bus.as_ref().unwrap().drain(self.worker_id);
                     for m in msgs {
@@ -1346,7 +1347,7 @@ impl Worker {
 
     /// Pump ciphertext from the socket through the TLS session into `rbuf`
     /// (plaintext). Returns true if the connection was closed (EOF or TLS error).
-    /// Handshake round-trips flow through here too — the response is sent by the
+    /// Handshake round-trips flow through here too; the response is sent by the
     /// subsequent `flush` (which drains `tls.wants_write()`).
     fn tls_read(&mut self, fd: RawFd) -> bool {
         enum Res {
@@ -1521,15 +1522,11 @@ impl Worker {
         let nargs = args.len();
         let mut cmd = args[0].clone();
         cmd.make_ascii_uppercase();
-        // RESP3 wire form for this connection (typed nulls/maps/sets/doubles and
-        // push frames). Read once up front so every reply site — including the
-        // auth-gate nil below — can use the right encoding.
-        let resp3 = self.conns.get(&fd).map(|c| c.resp3).unwrap_or(false);
         let max_bulk = self.max_value_bytes;
 
         // ---- pub/sub: handled before keyed-command scoping. Channels
         // are tenant-scoped for non-exempt authed roles (same `{tenant}:` prefix
-        // as keys); the scoping is transparent — every reply/message frame echoes
+        // as keys); the scoping is transparent: every reply/message frame echoes
         // the client's own unscoped name. ----
         match cmd.as_slice() {
             b"SUBSCRIBE" => return self.handle_subscribe(fd, args, false),
@@ -1551,6 +1548,9 @@ impl Worker {
         // frames, so there is no reply stream to confuse and redis runs any
         // command on a subscribed RESP3 connection. Verified against 7.0.15,
         // where `SET k v` after `HELLO 3` + `SUBSCRIBE` answers +OK.
+        //
+        // `resp3` is also the wire form for every reply below (typed nulls,
+        // maps, sets, doubles and push frames), the auth-gate nil included.
         let (subscribed, resp3) = self
             .conns
             .get(&fd)
@@ -1701,8 +1701,8 @@ impl Worker {
         let who: TenantId = self.conns.get(&fd).map_or(0, |c| c.tenant_id);
         let sync_ack = self.sync_ack;
         // Tenant scope for SCAN/KEYS (None for unauthed/exempt): keys are stored
-        // as `{tenant}:{key}`, so a scoped connection only sees — and only reports
-        // the unscoped form of — keys under its own prefix. Computed before the
+        // as `{tenant}:{key}`, so a scoped connection only sees (and only reports
+        // the unscoped form of) keys under its own prefix. Computed before the
         // `out` borrow below, which takes `self` mutably.
         let scan_prefix = self.conn_prefix(fd);
         // A write to enqueue for persistence, applied after the match so
@@ -1860,84 +1860,31 @@ impl Worker {
                     resp::error(out, "ERR wrong number of arguments for 'set'");
                     return;
                 }
-                // Options are a mix of pairs (EX 10) and bare flags (KEEPTTL, NX).
-                // The old parser stepped two at a time and so never saw a flag at
-                // all: `SET k v KEEPTTL` silently dropped the TTL and `SET k v NX`
-                // silently overwrote. Unknown options are a syntax error, as in
-                // Redis — accepting and ignoring one is how those bugs hid.
-                let mut ttl_micros = 0i64;
-                let mut keep_ttl = false;
-                let (mut only_if_absent, mut only_if_present, mut want_old) = (false, false, false);
-                let mut i = 3;
-                let mut bad_syntax = false;
-                // A MISSING argument after EX is a syntax error; one that is
-                // present but not an integer is "not an integer". redis
-                // distinguishes them and so must this, or `SET k v EX +1` tells
-                // the client its syntax is wrong when its number is.
-                let mut bad_int = false;
-                while i < nargs {
-                    let mut opt = args[i].clone();
-                    opt.make_ascii_uppercase();
-                    // Pair options consume the next argument as a number.
-                    // None = absent, Some(None) = present but malformed.
-                    let mut pair = |factor: i64, absolute: bool| -> Option<Option<i64>> {
-                        let a = args.get(i + 1)?;
-                        let Some(raw) = resp::arg_int(a) else {
-                            return Some(None);
-                        };
-                        Some(Some(if absolute {
-                            // EXAT/PXAT are absolute deadlines; store TTL is relative.
-                            (raw * factor - now_micros()).max(1)
-                        } else {
-                            raw * factor
-                        }))
-                    };
-                    match opt.as_slice() {
-                        b"EX" => match pair(1_000_000, false) {
-                            Some(Some(v)) => { ttl_micros = v; i += 2; }
-                            Some(None) => { bad_int = true; break; }
-                            None => { bad_syntax = true; break; }
-                        },
-                        b"PX" => match pair(1_000, false) {
-                            Some(Some(v)) => { ttl_micros = v; i += 2; }
-                            Some(None) => { bad_int = true; break; }
-                            None => { bad_syntax = true; break; }
-                        },
-                        b"EXAT" => match pair(1_000_000, true) {
-                            Some(Some(v)) => { ttl_micros = v; i += 2; }
-                            Some(None) => { bad_int = true; break; }
-                            None => { bad_syntax = true; break; }
-                        },
-                        b"PXAT" => match pair(1_000, true) {
-                            Some(Some(v)) => { ttl_micros = v; i += 2; }
-                            Some(None) => { bad_int = true; break; }
-                            None => { bad_syntax = true; break; }
-                        },
-                        b"KEEPTTL" => { keep_ttl = true; i += 1; }
-                        b"NX" => { only_if_absent = true; i += 1; }
-                        b"XX" => { only_if_present = true; i += 1; }
-                        b"GET" => { want_old = true; i += 1; }
-                        _ => { bad_syntax = true; break; }
-                    }
-                }
-                if bad_int {
-                    resp::error(out, ERR_NOT_INT);
+                // Options, then the expiry, then the key, in Valkey's order: a
+                // malformed option is a syntax error whatever else is wrong, and
+                // a refused expiry is refused before the key is looked at.
+                // Unknown options are a syntax error too; accepting and ignoring
+                // one is how `SET k v KEEPTTL` once silently dropped the TTL.
+                let Some(opts) = expiry::parse_string_opts(&args[3..], StringCmd::Set) else {
+                    resp::error(out, bitmap::ERR_SYNTAX);
                     return;
-                }
-                if bad_syntax || (only_if_absent && only_if_present) {
-                    resp::error(out, "ERR syntax error");
-                    return;
-                }
+                };
+                // The deadline the user asked for, in store micros (0 = none).
+                let asked = match opts.expire.map(|(opt, arg)| opt.deadline_ms(arg, Rule::Set)) {
+                    None => 0,
+                    Some(Ok(ms)) => expiry::deadline_micros(ms),
+                    Some(Err(why)) => return resp::error(out, &why.message("set")),
+                };
                 // Only the option-bearing forms need the prior value; a plain
                 // `SET k v` must not pay for a lookup and a copy on the hot path.
-                let needs_existing = want_old || only_if_absent || only_if_present || keep_ttl;
+                let needs_existing = opts.get || opts.nx || opts.xx || opts.keep_ttl;
                 let existing = if needs_existing {
                     store.get_typed(&args[1]).map(|(k, e, v)| (k, e, v.to_vec()))
                 } else {
                     None
                 };
                 // GET reports the previous value, and it must be a string.
-                if want_old {
+                if opts.get {
                     if let Some((kind, _, _)) = &existing {
                         if *kind != b's' as u32 {
                             resp::error(
@@ -1949,33 +1896,30 @@ impl Worker {
                     }
                 }
                 let present = existing.is_some();
-                if (only_if_absent && present) || (only_if_present && !present) {
+                if (opts.nx && present) || (opts.xx && !present) {
                     // Not set. GET still reports the old value; otherwise nil.
-                    match (want_old, &existing) {
+                    match (opts.get, &existing) {
                         (true, Some((_, _, v))) => resp::bulk(out, v),
                         _ => resp::null(out, resp3),
                     }
                     return;
                 }
-                // KEEPTTL retains the current deadline; an explicit EX/PX wins.
-                if keep_ttl && ttl_micros == 0 {
-                    if let Some((_, exp, _)) = &existing {
-                        if *exp > 0 {
-                            ttl_micros = (*exp - now_micros()).max(1);
-                        }
-                    }
-                }
-                if !wrote(out, store.set(&args[1], &args[2], ttl_micros)) {
+                // KEEPTTL retains the current deadline. The parser refuses it
+                // alongside EX/PX/EXAT/PXAT, so the two never compete.
+                let exp = match &existing {
+                    Some((_, cur, _)) if opts.keep_ttl => *cur,
+                    _ => asked,
+                };
+                if !wrote(out, store.set_at(&args[1], &args[2], exp)) {
                     return;
                 }
-                match (want_old, &existing) {
+                match (opts.get, &existing) {
                     (true, Some((_, _, v))) => resp::bulk(out, v),
                     (true, None) => resp::null(out, resp3),
                     _ => resp::simple(out, "OK"),
                 }
                 durable_log(&batcher, tier, &args[1], &args[2]);
                 if persist_on {
-                    let exp = if ttl_micros > 0 { now_micros() + ttl_micros } else { 0 };
                     stages.push((args[1].clone(), args[2].clone(), exp, b's'));
                 }
             }
@@ -2075,24 +2019,40 @@ impl Worker {
                 }
             }
             b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" => {
-                if nargs != 3 {
+                if nargs < 3 {
                     resp::error(out, "ERR wrong number of arguments for 'expire'");
                     return;
                 }
-                let n: i64 = match resp::arg_int(&args[2]) {
-                    Some(v) => v,
-                    None => {
-                        resp::error(out, "ERR value is not an integer or out of range");
-                        return;
+                // Valkey's order: the options, the number, the overflow checks,
+                // and only then the key. A refused value is refused even for a
+                // key that does not exist.
+                let cond = match ExpireCond::parse(&args[3..]) {
+                    Ok(c) => c,
+                    Err(e) => return resp::error(out, &e),
+                };
+                let (opt, name) = match cmd.as_slice() {
+                    b"EXPIRE" => (ExpireOpt::Ex, "expire"),
+                    b"PEXPIRE" => (ExpireOpt::Px, "pexpire"),
+                    b"EXPIREAT" => (ExpireOpt::ExAt, "expireat"),
+                    _ => (ExpireOpt::PxAt, "pexpireat"),
+                };
+                let deadline = match opt.deadline_ms(&args[2], Rule::Expire) {
+                    Ok(ms) => ms,
+                    Err(why) => return resp::error(out, &why.message(name)),
+                };
+                // Only a condition needs the current expiry; without one,
+                // `set_expiry` alone answers whether the key exists.
+                if cond != ExpireCond::default() {
+                    let current = match store.get_typed(&args[1]) {
+                        None => return resp::integer(out, 0),
+                        Some((_, exp, _)) => (exp != 0).then(|| exp / 1000),
+                    };
+                    if !cond.allows(deadline, current) {
+                        return resp::integer(out, 0);
                     }
-                };
-                let exp = match cmd.as_slice() {
-                    b"EXPIRE" => now_micros() + n.saturating_mul(1_000_000),
-                    b"PEXPIRE" => now_micros() + n.saturating_mul(1_000),
-                    b"EXPIREAT" => n.saturating_mul(1_000_000),
-                    _ => n.saturating_mul(1_000), // PEXPIREAT (unix millis)
-                };
-                let existed = store.set_expiry(&args[1], exp);
+                }
+                // A deadline at or before now deletes the key, as in Valkey.
+                let existed = store.set_expiry(&args[1], expiry::deadline_micros(deadline));
                 // Persist the new expiry (or a tombstone, if `exp` was in the past
                 // and deleted the key) so it survives crash recovery on the durable
                 // tiers rather than reverting to the last SET's TTL.
@@ -2292,29 +2252,28 @@ impl Worker {
             }
             b"SETEX" | b"PSETEX" => {
                 // SETEX key seconds value / PSETEX key millis value
-                if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'setex'");
-                    return;
-                }
-                let n: i64 = match resp::arg_int(&args[2]) {
-                    Some(v) => v,
-                    None => {
-                        resp::error(out, "ERR value is not an integer or out of range");
-                        return;
-                    }
+                let (opt, name) = match cmd.as_slice() {
+                    b"PSETEX" => (ExpireOpt::Px, "psetex"),
+                    _ => (ExpireOpt::Ex, "setex"),
                 };
-                if n <= 0 {
-                    resp::error(out, "ERR invalid expire time in 'setex' command");
+                if nargs != 4 {
+                    resp::error(out, &format!("ERR wrong number of arguments for '{name}'"));
                     return;
                 }
-                let ttl = if cmd == b"PSETEX" { n * 1_000 } else { n * 1_000_000 };
-                if !wrote(out, store.set(&args[1], &args[3], ttl)) {
+                // SET EX / SET PX underneath, as in Valkey, so the same
+                // boundaries: positive, and no overflow converting the unit or
+                // adding the current time.
+                let exp = match opt.deadline_ms(&args[2], Rule::Set) {
+                    Ok(ms) => expiry::deadline_micros(ms),
+                    Err(why) => return resp::error(out, &why.message(name)),
+                };
+                if !wrote(out, store.set_at(&args[1], &args[3], exp)) {
                     return;
                 }
                 resp::simple(out, "OK");
                 durable_log(&batcher, tier, &args[1], &args[3]);
                 if persist_on {
-                    stages.push((args[1].clone(), args[3].clone(), now_micros() + ttl, b's'));
+                    stages.push((args[1].clone(), args[3].clone(), exp, b's'));
                 }
             }
             b"GETDEL" => {
@@ -2335,39 +2294,32 @@ impl Worker {
             }
             b"GETEX" => {
                 // GETEX key [EX s | PX ms | EXAT ts | PXAT ms | PERSIST]
+                if nargs < 2 {
+                    resp::error(out, "ERR wrong number of arguments for 'getex'");
+                    return;
+                }
+                // Valkey's order: the options (a syntax error even for a missing
+                // key), then the key, its type, and only then the expiry value,
+                // so a missing key answers nil whatever number came with it.
+                let Some(opts) = expiry::parse_string_opts(&args[2..], StringCmd::GetEx) else {
+                    resp::error(out, bitmap::ERR_SYNTAX);
+                    return;
+                };
                 if !check_string(&store, &args[1], out) {
                     return;
                 }
-                let (val, cur_exp) = match store.get_typed(&args[1]) {
-                    Some((_, exp, v)) => (v.to_vec(), exp),
-                    None => {
-                        resp::null(out, resp3);
-                        return;
-                    }
+                let Some((_, _, v)) = store.get_typed(&args[1]) else {
+                    return resp::null(out, resp3);
                 };
-                let mut new_exp: Option<i64> = None; // Some(0)=persist, Some(e)=set
-                if nargs >= 2 {
-                    let opt = args.get(2).map(|a| a.to_ascii_uppercase());
-                    // `?`-free: a malformed TTL has to refuse the command,
-                    // and silently reading it as 0 set an immediate expiry.
-                    let raw_n = args.get(3).map(|a| resp::arg_int(a));
-                    if matches!(raw_n, Some(None)) {
-                        resp::error(out, ERR_NOT_INT);
-                        return;
-                    }
-                    let n = || -> i64 { raw_n.flatten().unwrap_or(0) };
-                    match opt.as_deref() {
-                        Some(b"EX") => new_exp = Some(now_micros() + n() * 1_000_000),
-                        Some(b"PX") => new_exp = Some(now_micros() + n() * 1_000),
-                        Some(b"EXAT") => new_exp = Some(n() * 1_000_000),
-                        Some(b"PXAT") => new_exp = Some(n() * 1_000),
-                        Some(b"PERSIST") => new_exp = Some(0),
-                        _ => {}
-                    }
-                }
+                let val = v.to_vec();
+                // Some(0) clears the expiry; a deadline already past deletes the key.
+                let new_exp = match opts.expire.map(|(opt, arg)| opt.deadline_ms(arg, Rule::Set)) {
+                    Some(Ok(ms)) => Some(expiry::deadline_micros(ms)),
+                    Some(Err(why)) => return resp::error(out, &why.message("getex")),
+                    None => opts.persist.then_some(0),
+                };
                 if let Some(e) = new_exp {
                     store.set_expiry(&args[1], e);
-                    let _ = cur_exp;
                     // Persist the new expiry (GETEX EX/PX/EXAT/PXAT/PERSIST) so it
                     // survives crash recovery on the durable tiers.
                     if persist_on {
@@ -2463,8 +2415,8 @@ impl Worker {
                     return;
                 }
                 let end = off + args[3].len();
-                // Same amplification as SETBIT — `SETRANGE k 536870910 x` is 23
-                // bytes and half a gigabyte — so the same guard, before the
+                // Same amplification as SETBIT: `SETRANGE k 536870910 x` is 23
+                // bytes and half a gigabyte, so the same guard, before the
                 // resize below rather than after it.
                 if !fits_arena(&store, end as u64, out) {
                     return;
@@ -2708,7 +2660,7 @@ impl Worker {
                 }
                 let res = bitmap::apply_bitop(op, &srcs);
                 // An empty result deletes the destination instead of storing a
-                // zero-length value — including when it had a value before.
+                // zero-length value, including when it had a value before.
                 if res.is_empty() {
                     store.del(&args[2]);
                     resp::integer(out, 0);
@@ -2950,10 +2902,12 @@ impl Worker {
                     None => resp::integer(out, -2),          // no such key
                     Some((_, 0, _)) => resp::integer(out, -1), // exists, no expiry
                     Some((_, exp, _)) => {
+                        let ms = exp / 1_000;
                         if cmd == b"PEXPIRETIME" {
-                            resp::integer(out, exp / 1_000);
+                            resp::integer(out, ms);
                         } else {
-                            resp::integer(out, exp / 1_000_000);
+                            // Rounded to the nearest second, as TTL is.
+                            resp::integer(out, (ms + 500) / 1000);
                         }
                     }
                 }
@@ -3082,7 +3036,7 @@ impl Worker {
             // Cluster clients bootstrap by asking for the slot map before they
             // will route anything, so MOVED alone is not enough to make them
             // work: without these they fail at connect. Only served when slot
-            // routing is on (persisted, workers > 1) — advertising a slot map a
+            // routing is on (persisted, workers > 1). Advertising a slot map a
             // single-worker or ephemeral deployment does not enforce would be a
             // lie the client then routes by.
             b"CLUSTER" => {
@@ -3106,7 +3060,7 @@ impl Worker {
                 };
                 let n = r.nworkers;
                 match sub.as_slice() {
-                    // [[start, end, [ip, port, id, metadata]], …] — one range per
+                    // [[start, end, [ip, port, id, metadata]], …], one range per
                     // worker, no replicas (a worker's standby is Postgres's own).
                     b"SLOTS" => {
                         resp::array_header(out, n);
@@ -3152,7 +3106,7 @@ impl Worker {
                             resp::bulk(out, b"online");
                         }
                     }
-                    // nodes.conf line format — lettuce and Jedis parse this one.
+                    // nodes.conf line format; lettuce and Jedis parse this one.
                     b"NODES" => {
                         let mut body = String::new();
                         for w in 0..n {
@@ -4676,8 +4630,8 @@ impl Worker {
             }
             // ---- container scans -----------------------------------
             // Each aggregate is one decoded blob, so a single call returns the
-            // whole (optionally MATCH-filtered) collection with next cursor "0"
-            // — a valid Redis SCAN result. COUNT is a hint and ignored.
+            // whole (optionally MATCH-filtered) collection with next cursor "0",
+            // which is a valid Redis SCAN result. COUNT is a hint and ignored.
             b"HSCAN" => {
                 if nargs < 3 {
                     resp::error(out, "ERR wrong number of arguments for 'hscan'");
@@ -5107,8 +5061,8 @@ impl Worker {
         }
 
         // durable aggregates: a mutation of a hash/list/zset persists
-        // its whole (kind-tagged) blob from the final store state — or a tombstone
-        // if the key was emptied/deleted — so it recovers as the right type.
+        // its whole (kind-tagged) blob from the final store state (or a tombstone
+        // if the key was emptied/deleted), so it recovers as the right type.
         if persist_on && stages.is_empty() && is_aggregate_write(&cmd) && nargs >= 2 {
             stages.push(match store.get_typed(&args[1]) {
                 Some((kind, exp, blob)) => match (blob.len() > INLINE_MAX
@@ -5151,8 +5105,8 @@ impl Worker {
         // `relaxed` write is already acked and has nothing to take back.
         let mut queue_failed = false;
         for ((k, v, e, kind), hold) in plan {
-            // sharded so a given key always lands on the same ring/persist worker
-            // — no cross-worker key conflicts on ON CONFLICT.
+            // sharded so a given key always lands on the same ring/persist worker,
+            // which means no cross-worker key conflicts on ON CONFLICT.
             //
             // Large values are staged by reference: the record carries the
             // entry's version instead of the value, and the persistence worker
@@ -5221,7 +5175,7 @@ impl Worker {
             // Deliberately not clearing `c.ack`: any entry there belongs to an
             // EARLIER command in this pipeline whose reply is still held, and
             // dropping it would flush that reply before its record committed.
-            // This command simply contributes no wait — its reply is an error,
+            // This command simply contributes no wait: its reply is an error,
             // which promises nothing, and `wbuf` still keeps it behind the
             // replies of the commands before it.
         } else if sync_ack && !acks.is_empty() {
@@ -5262,7 +5216,7 @@ impl Worker {
         }
     }
 
-    /// MULTI — open a transaction: subsequent commands queue until EXEC/DISCARD.
+    /// MULTI: open a transaction, and subsequent commands queue until EXEC/DISCARD.
     fn handle_multi(&mut self, fd: RawFd) {
         let c = self.conns.get_mut(&fd).unwrap();
         if c.in_multi {
@@ -5274,7 +5228,7 @@ impl Worker {
         resp::simple(&mut c.wbuf, "OK");
     }
 
-    /// DISCARD — abandon a transaction and drop any WATCHes.
+    /// DISCARD: abandon a transaction and drop any WATCHes.
     fn handle_discard(&mut self, fd: RawFd) {
         let c = self.conns.get_mut(&fd).unwrap();
         if !c.in_multi {
@@ -5287,7 +5241,7 @@ impl Worker {
         resp::simple(&mut c.wbuf, "OK");
     }
 
-    /// WATCH key [key …] — snapshot each (tenant-scoped) key's version so EXEC
+    /// WATCH key [key …]: snapshot each (tenant-scoped) key's version so EXEC
     /// can abort if it changed. Not allowed once inside MULTI.
     fn handle_watch(&mut self, fd: RawFd, args: &[Vec<u8>]) {
         if args.len() < 2 {
@@ -5309,7 +5263,7 @@ impl Worker {
         resp::simple(out, "OK");
     }
 
-    /// EXEC — run the queued commands atomically (nothing else runs on this
+    /// EXEC: run the queued commands atomically (nothing else runs on this
     /// single-threaded worker in between), unless a WATCHed key changed, in which
     /// case the whole transaction aborts with a null array.
     fn handle_exec(&mut self, fd: RawFd) {
@@ -5330,7 +5284,7 @@ impl Worker {
             resp::nil_array(out);
             return;
         }
-        // The array header, then each queued command's reply appended in order —
+        // The array header, then each queued command's reply appended in order;
         // re-dispatching applies auth/tenant scoping at execution time.
         let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
         resp::array_header(out, queued.len());
@@ -5339,7 +5293,7 @@ impl Worker {
         }
     }
 
-    /// RESP `AUTH [user] pass` — resolve the credential and set the connection's
+    /// RESP `AUTH [user] pass`: resolve the credential and set the connection's
     /// role/tenant/exempt state. Computed in two phases so the borrow of
     /// `self.auth` is released before the connection is mutated.
     fn handle_auth(&mut self, fd: RawFd, args: &[Vec<u8>]) {
@@ -5400,7 +5354,7 @@ impl Worker {
         }
     }
 
-    /// HELLO [protover [AUTH user pass] [SETNAME name]] — negotiate the protocol
+    /// HELLO [protover [AUTH user pass] [SETNAME name]]: negotiate the protocol
     /// and reply with the server handshake map. `HELLO 3` switches the connection
     /// to RESP3 (typed replies + push-framed pub/sub); `HELLO 2` (or none) is
     /// RESP2. An optional inline AUTH is applied before the reply.
@@ -5780,7 +5734,7 @@ impl Worker {
                 self.deliver_invalidation(reader, Some(&facing));
             }
         }
-        // BCAST trackers: no per-read table — a write matches the key against each
+        // BCAST trackers: no per-read table; a write matches the key against each
         // broadcasting connection's registered prefixes (empty => whole keyspace).
         if !self.bcast_subs.is_empty() {
             let readers: Vec<RawFd> = self
@@ -5809,7 +5763,7 @@ impl Worker {
     /// relaxed atomic load when client-side caching is unused. Cross-worker
     /// invalidation is conservative: workers own independent keyspace segments, so
     /// a same-named key on another worker may be told to drop a still-valid cache
-    /// entry (it re-fetches — never serves stale data). It is exactly right once a
+    /// entry (it re-fetches and never serves stale data). It is exactly right once a
     /// worker set shares one store.
     fn broadcast_invalidation(&self, key: Option<&[u8]>) {
         if let Some(bus) = &self.bus {
@@ -5853,8 +5807,8 @@ impl Worker {
         self.flush(target);
     }
 
-    /// Invalidate everything (FLUSHALL/FLUSHDB): send a null `invalidate` — Redis's
-    /// "the whole keyspace changed" signal — to every tracking connection (except
+    /// Invalidate everything (FLUSHALL/FLUSHDB): send a null `invalidate` (Redis's
+    /// "the whole keyspace changed" signal) to every tracking connection (except
     /// the caller) and clear the per-read table.
     fn invalidate_all(&mut self, except: RawFd) {
         self.tracked.clear();
@@ -5870,8 +5824,8 @@ impl Worker {
     }
 
     /// Whether a read from `fd` should be recorded in the per-read `tracked`
-    /// table: tracking on, not BCAST, and — under OPTIN — the previous command was
-    /// `CLIENT CACHING YES`; under OPTOUT — it was not `CLIENT CACHING NO`.
+    /// table: tracking on, not BCAST, and, under OPTIN, the previous command was
+    /// `CLIENT CACHING YES`; under OPTOUT, it was not `CLIENT CACHING NO`.
     fn should_record_reads(&self, fd: RawFd) -> bool {
         match self.conns.get(&fd) {
             Some(c) if c.track.on && !c.track.bcast => {
@@ -6077,8 +6031,8 @@ impl Worker {
         self.flush(fd);
     }
 
-    /// Deliver `msg` to every subscriber *on this worker* — direct channel
-    /// subscribers and pattern subscribers whose glob matches — and flush them.
+    /// Deliver `msg` to every subscriber *on this worker* (direct channel
+    /// subscribers and pattern subscribers whose glob matches) and flush them.
     /// Returns the local receiver count. Local-only: it never touches the Bus,
     /// so it is safe to call both for a PUBLISH originating here and for a
     /// message routed in from another worker (no re-broadcast loop).
@@ -6538,7 +6492,7 @@ impl Worker {
     /// The tenant scope prefix (`{tenant}:`) for this connection, or `None` when
     /// no scoping applies (no auth configured, or an exempt/service role). Pub/sub
     /// channels are scoped by the same prefix as keys, so one tenant's
-    /// SUBSCRIBE/PUBLISH cannot reach another's — the isolation keys already have.
+    /// SUBSCRIBE/PUBLISH cannot reach another's: the isolation keys already have.
     fn conn_prefix(&self, fd: RawFd) -> Option<Vec<u8>> {
         if self.auth.is_none() {
             return None;
@@ -6948,8 +6902,8 @@ fn remaining_ttl(exp: i64) -> i64 {
     }
 }
 
-/// A persistence record capturing a key's current stored state — its value,
-/// kind and absolute expiry — or a tombstone if the key is gone. Called after a
+/// A persistence record capturing a key's current stored state (its value,
+/// kind and absolute expiry) or a tombstone if the key is gone. Called after a
 /// TTL-only mutation (EXPIRE/PERSIST/GETEX) so the changed expiry is written
 /// through to the durable tier instead of reverting to the last SET's TTL on
 /// crash recovery; the enqueued record also carries the durable-tier ack.
@@ -6965,7 +6919,7 @@ fn stage_current_state(store: &Store, key: &[u8]) -> PendingWrite {
 /// be readable as a raw blob through `GET`/`INCR`/etc.)
 /// Redis GETRANGE slice: inclusive `[start, end]`, negative indices count from
 /// the end; out-of-range or start>end yields an empty slice.
-/// xorshift64* — a tiny, dependency-free PRNG for the *RAND* commands, which
+/// xorshift64*: a tiny, dependency-free PRNG for the *RAND* commands, which
 /// need no cryptographic quality. Seeded from the clock per call site.
 fn rng_next(state: &mut u64) -> u64 {
     let mut x = *state;
@@ -7350,7 +7304,7 @@ fn lex_le(m: &[u8], hi: &LexBound) -> bool {
 /// operations) only know which positions are keys after reading a count arg.
 fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
     let nargs = args.len();
-    // `CMD numkeys key… [options]` — the keys are the `numkeys` args after the
+    // `CMD numkeys key… [options]`: the keys are the `numkeys` args after the
     // count. Used by ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE/ZUNION/ZINTER/ZDIFF/
     // ZMPOP/SINTERCARD; `dst_first` also scopes the destination at arg 1.
     let numkeyed = |count_pos: usize, dst_first: bool| -> Vec<usize> {
@@ -7402,7 +7356,7 @@ fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
             }
         }
         b"DEL" | b"UNLINK" | b"EXISTS" | b"MGET" | b"TOUCH" => (1..nargs).collect(),
-        // MSET/MSETNX interleave key value key value … — scope every key slot.
+        // MSET/MSETNX interleave key value key value …: scope every key slot.
         b"MSET" | b"MSETNX" => (1..nargs).step_by(2).collect(),
         // RENAME/COPY/LMOVE/RPOPLPUSH/SMOVE take a source and destination key.
         b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" | b"SMOVE" => {
@@ -7417,7 +7371,7 @@ fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
         b"SUNION" | b"SINTER" | b"SDIFF" | b"SUNIONSTORE" | b"SINTERSTORE" | b"SDIFFSTORE" => {
             (1..nargs).collect()
         }
-        // OBJECT <SUBCOMMAND> key — the key is the third argument.
+        // OBJECT <SUBCOMMAND> key: the key is the third argument.
         b"OBJECT" => {
             if nargs > 2 {
                 vec![2]
@@ -7425,9 +7379,9 @@ fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
                 vec![]
             }
         }
-        // BITOP op dst src … — every argument from 2 on is a key.
+        // BITOP op dst src …: every argument from 2 on is a key.
         b"BITOP" => (2..nargs).collect(),
-        // ZRANGESTORE dst src … — destination and source keys.
+        // ZRANGESTORE dst src …: destination and source keys.
         b"ZRANGESTORE" => {
             if nargs > 2 {
                 vec![1, 2]
@@ -7435,9 +7389,9 @@ fn key_indices(cmd: &[u8], args: &[Vec<u8>]) -> Vec<usize> {
                 vec![]
             }
         }
-        // `dst numkeys key…` — destination at arg 1, then `numkeys` source keys.
+        // `dst numkeys key…`: destination at arg 1, then `numkeys` source keys.
         b"ZUNIONSTORE" | b"ZINTERSTORE" | b"ZDIFFSTORE" => numkeyed(2, true),
-        // `numkeys key…` — no destination.
+        // `numkeys key…`: no destination.
         b"ZUNION" | b"ZINTER" | b"ZDIFF" | b"ZMPOP" | b"SINTERCARD" => numkeyed(1, false),
         _ => vec![],
     }
@@ -7543,7 +7497,7 @@ fn is_write_cmd(cmd: &[u8]) -> bool {
 /// unchecked, a 25-byte `SETBIT k 4294967295 1` allocates and zeroes 512 MiB on
 /// the event loop, blocks every other connection on the worker for seconds
 /// (measured: 4.2 s, and an unrelated PING going from 6 ms to 4156 ms), and is
-/// then refused by the arena anyway — a ~20-million-fold amplification from one
+/// then refused by the arena anyway: a ~20-million-fold amplification from one
 /// small command, repeatable, and fatal in a background worker where the OOM
 /// killer takes the whole cluster with it.
 ///
@@ -7565,7 +7519,7 @@ fn is_bitmap_write(cmd: &[u8]) -> bool {
     matches!(cmd, b"SETBIT" | b"BITOP" | b"BITFIELD")
 }
 
-/// Aggregate (hash/list/zset) mutations — their whole blob is persisted from the
+/// Aggregate (hash/list/zset) mutations: their whole blob is persisted from the
 /// final store state after dispatch (durable aggregates).
 fn is_aggregate_write(cmd: &[u8]) -> bool {
     matches!(
@@ -7707,7 +7661,7 @@ fn listen(addr: &str, port: u16) -> io::Result<RawFd> {
             std::mem::size_of::<libc::c_int>() as u32,
         );
         let mut sa: libc::sockaddr_in = std::mem::zeroed();
-        // sin_family is u16 on Linux, u8 on the BSDs/macOS — `as _` picks the
+        // sin_family is u16 on Linux, u8 on the BSDs/macOS, and `as _` picks the
         // right width from the field type. (macOS's extra sin_len stays 0, which
         // bind accepts.)
         sa.sin_family = libc::AF_INET as _;

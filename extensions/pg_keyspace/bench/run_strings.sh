@@ -27,7 +27,7 @@ chk "MSETNX all new -> 1"          "1"       "$($K MSETNX n1 a n2 b)"
 chk "MSETNX with one existing -> 0" "0"      "$($K MSETNX n1 z n3 c)"
 chk "MSETNX did not set n3"         "0"       "$($K EXISTS n3)"
 
-# SET options. These are flags, not pairs — an option parser that stepped two
+# SET options. These are flags, not pairs: an option parser that stepped two
 # arguments at a time never saw them, so KEEPTTL silently dropped the TTL and
 # NX/XX silently did nothing while still replying OK.
 $K DEL so >/dev/null 2>&1
@@ -37,7 +37,10 @@ chk "plain SET clears the TTL"                 "-1"   "$($K SET so v2 >/dev/null
 $K SET so v3 EX 300 >/dev/null
 chk "SET KEEPTTL retains the TTL"              "300"  "$($K SET so v4 KEEPTTL >/dev/null; $K TTL so)"
 chk "SET KEEPTTL still wrote the value"        "v4"   "$($K GET so)"
-chk "SET EX overrides KEEPTTL"                 "100"  "$($K SET so v5 KEEPTTL EX 100 >/dev/null; $K TTL so)"
+# KEEPTTL and EX together is a syntax error in Redis and Valkey, not "EX wins".
+chk "SET KEEPTTL EX is a syntax error"         "ERR syntax error" "$($K SET so v5 KEEPTTL EX 100 2>&1)"
+chk "a refused SET writes nothing"             "v4"   "$($K GET so)"
+chk "SET EX replaces a kept TTL"               "100"  "$($K SET so v5 EX 100 >/dev/null; $K TTL so)"
 chk "SET NX on an existing key -> nil"         ""     "$($K SET so v6 NX)"
 chk "SET NX did not overwrite"                 "v5"   "$($K GET so)"
 $K DEL so2 >/dev/null 2>&1
