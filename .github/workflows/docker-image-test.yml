@@ -658,6 +658,12 @@ jobs:
             || { echo "FAIL: read-through is on with no invalidation worker to make it safe"; exit 1; }
           echo "read-through without decode: warned and forced off"
 
+      # The entrypoint's second pass, as postgres, used to retry the conf write, fail, and log
+      # "pg_keyspace stays disabled" next to a keyspace that was serving. The script asserts both
+      # directions: silent when RESP answers, and the warning when the conf really was not written.
+      - name: The keyspace warning appears only when the keyspace is off
+        run: sh tests/keyspace-conf/check.sh supatype-postgres:test pg_ksconf
+
       - name: Show logs on failure
         if: failure()
         run: |
@@ -685,6 +691,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f pg_test pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard || true
+          docker rm -f pg_test pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard \
+            pg_ksconf-on pg_ksconf-readonly || true
           docker volume rm pg_upgrade_vol || true
           exit 0
