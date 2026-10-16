@@ -68,9 +68,11 @@ supatype_write_cron_database() {
 		return 0
 	fi
 
-	if ! printf '%s\n%s\n' \
+	# 2>/dev/null on the group, not the command: there it comes after the redirect that fails, and
+	# the shell's own "Permission denied" still reaches the log.
+	if ! { printf '%s\n%s\n' \
 		"# Written at container start. The value follows POSTGRES_DB; edits do not survive." \
-		"$line" > "$SUPATYPE_CRON_CONF" 2>/dev/null
+		"$line" > "$SUPATYPE_CRON_CONF"; } 2>/dev/null
 	then
 		supatype_warn "could not write $SUPATYPE_CRON_CONF; pg_cron keeps whatever database it is"
 		supatype_warn "already pointed at, and scheduled jobs in '$db' will not run."
@@ -98,6 +100,15 @@ supatype_keyspace_bool() {
 	esac
 }
 
+# Whether SUPATYPE_KEYSPACE_ENABLED asks for the keyspace. The same spellings as the bootstrap
+# script's check in migrate.sh, which has to agree with this one about when to create the extension.
+supatype_keyspace_enabled() {
+	case "${SUPATYPE_KEYSPACE_ENABLED:-}" in
+		1|true|TRUE|on|ON|yes|YES) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
 # Turn pg_keyspace on from the environment, or leave the image exactly as it was.
 #
 # pg_keyspace registers background workers and requests shared memory at postmaster start, so it
@@ -113,11 +124,14 @@ supatype_keyspace_bool() {
 #
 # With SUPATYPE_KEYSPACE_ENABLED unset the file is left alone, and the image behaves exactly as it
 # did before this existed: the extension ships built but not loaded.
+#
+# The function runs on both passes of the entrypoint. The second, after the gosu re-exec, runs as
+# `postgres`, which cannot write this root-owned file and has nothing to write: the first pass
+# already did. It used to try anyway and report that failure as "pg_keyspace stays disabled" on
+# every start, next to a keyspace that was serving. So the file is compared before it is written,
+# and the warning is kept for a write that fails when the file does not already say the same thing.
 supatype_write_keyspace_conf() {
-	case "${SUPATYPE_KEYSPACE_ENABLED:-}" in
-		1|true|TRUE|on|ON|yes|YES) ;;
-		*) return 0 ;;
-	esac
+	supatype_keyspace_enabled || return 0
 
 	# Defaults are the measured floor for a small stack rather than the extension's own, which
 	# reserve ~689 MiB per worker before rings and row cache -- larger than some deployments'
@@ -145,11 +159,53 @@ supatype_write_keyspace_conf() {
 	# nothing ever drops that row when the table changes, so the stale copy is served until it is
 	# evicted. The extension ignores the setting in that state; the image refuses it out loud,
 	# because an ignored setting looks like a feature that is on.
+	local readthrough_forced_off=no
 	if [ "$rowcache_readthrough" = on ] && [ "$rowcache_decode" = off ]; then
-		supatype_warn "SUPATYPE_KEYSPACE_ROWCACHE_READTHROUGH needs SUPATYPE_KEYSPACE_ROWCACHE_DECODE; forcing it off."
 		rowcache_readthrough=off
+		readthrough_forced_off=yes
 	fi
 
+	local conf
+	conf="$(supatype_render_keyspace_conf)"
+
+	if [ -f "$SUPATYPE_KEYSPACE_CONF" ] && [ "$(cat "$SUPATYPE_KEYSPACE_CONF")" = "$conf" ]; then
+		# Already what the server will read: a restart whose writable layer kept the file, or the
+		# second pass. Only the first pass (root) announces it, so each start says so once.
+		[ "$(id -u)" = '0' ] || return 0
+	# The group carries the 2>/dev/null so the shell's own "Permission denied" for the redirect is
+	# silenced too; on the command itself it applies only after the failing redirect is attempted.
+	elif ! { printf '%s\n' "$conf" > "$SUPATYPE_KEYSPACE_CONF"; } 2>/dev/null; then
+		supatype_warn_keyspace_unwritten
+		return 0
+	fi
+
+	if [ "$readthrough_forced_off" = yes ]; then
+		supatype_warn "SUPATYPE_KEYSPACE_ROWCACHE_READTHROUGH needs SUPATYPE_KEYSPACE_ROWCACHE_DECODE; forcing it off."
+	fi
+	supatype_note "pg_keyspace enabled: RESP on :${port}, durability=${durability}${overrides:+ (${overrides})}, database=${db}"
+	if [ "$rowcache_decode" = on ]; then
+		local allowlisted="${output_plugins}"
+		supatype_pg_knows_setting output_plugin_libraries || allowlisted="not needed on this server"
+		supatype_note "pg_keyspace row cache: decode on (${rowcache_decode_ms}ms), readthrough=${rowcache_readthrough}, max_slot_wal_keep_size=${slot_wal_keep}, output_plugin_libraries=${allowlisted}"
+	fi
+}
+
+# Say what a failed write actually leaves behind. The shipped file does not load pg_keyspace, so a
+# container that could never write it (one run as a non-root user from the start, say) really is
+# without the keyspace. A file an earlier start wrote still loads it, only with those settings
+# rather than the ones the environment now asks for, and "disabled" would be the wrong word.
+supatype_warn_keyspace_unwritten() {
+	if grep -Eq '^[[:space:]]*shared_preload_libraries[[:space:]]*=.*pg_keyspace' "$SUPATYPE_KEYSPACE_CONF" 2>/dev/null; then
+		supatype_warn "could not write $SUPATYPE_KEYSPACE_CONF; pg_keyspace keeps the settings already in it, not the ones SUPATYPE_KEYSPACE_* now asks for."
+	else
+		supatype_warn "could not write $SUPATYPE_KEYSPACE_CONF; pg_keyspace stays disabled."
+	fi
+}
+
+# The keyspace configuration for the settings supatype_write_keyspace_conf resolved, on stdout. It
+# reads that function's locals, which bash scoping makes visible here, so the values are resolved
+# in one place and the file is rendered in another.
+supatype_render_keyspace_conf() {
 	# A single quote would end the literal and leave a file Postgres refuses to start on.
 	local db_lit="${db//\'/\'\'}"
 	local overrides_lit="${overrides//\'/\'\'}"
@@ -200,7 +256,7 @@ supatype_write_keyspace_conf() {
 			#
 			# The invalidation worker retries, so what an operator sees is a background worker
 			# exiting with code 1 once a second forever, next to a keyspace that is otherwise
-			# healthy — it reads like a broken build rather than a missing GUC. Reproduced on
+			# healthy. It reads like a broken build rather than a missing GUC. Reproduced on
 			# PostgreSQL 16.15, fixed by this line, worker up and draining immediately after.
 			#
 			# Set SUPATYPE_KEYSPACE_OUTPUT_PLUGIN_LIBRARIES to the whole list if this deployment
@@ -208,24 +264,14 @@ supatype_write_keyspace_conf() {
 			# adds to anything postgresql.conf set.
 			#
 			# Probed rather than written unconditionally. The allowlist arrived in a minor release,
-			# and on a server that predates it there is nothing to allow — but an unrecognised
+			# and on a server that predates it there is nothing to allow, but an unrecognised
 			# parameter is not ignored, it stops the cluster from starting. So an image pinned to
 			# an older base would be bricked by Mode B rather than merely unable to use it.
 			if supatype_pg_knows_setting output_plugin_libraries; then
 				echo "output_plugin_libraries = '${output_plugins}'"
 			fi
 		fi
-	} > "$SUPATYPE_KEYSPACE_CONF" 2>/dev/null || {
-		supatype_warn "could not write $SUPATYPE_KEYSPACE_CONF; pg_keyspace stays disabled."
-		return 0
 	}
-
-	supatype_note "pg_keyspace enabled: RESP on :${port}, durability=${durability}${overrides:+ (${overrides})}, database=${db}"
-	if [ "$rowcache_decode" = on ]; then
-		local allowlisted="${output_plugins}"
-		supatype_pg_knows_setting output_plugin_libraries || allowlisted="not needed on this server"
-		supatype_note "pg_keyspace row cache: decode on (${rowcache_decode_ms}ms), readthrough=${rowcache_readthrough}, max_slot_wal_keep_size=${slot_wal_keep}, output_plugin_libraries=${allowlisted}"
-	fi
 }
 
 # Named explicitly, by the same rule the runner uses. Without -d, psql would
@@ -271,10 +317,7 @@ supatype_in_recovery() {
 # Non-fatal: a cluster serving RESP without persistence is degraded, not broken, and the worker
 # already says so.
 supatype_create_keyspace_extension() {
-	case "${SUPATYPE_KEYSPACE_ENABLED:-}" in
-		1|true|TRUE|on|ON|yes|YES) ;;
-		*) return 0 ;;
-	esac
+	supatype_keyspace_enabled || return 0
 	if supatype_psql 'CREATE EXTENSION IF NOT EXISTS pg_keyspace' > /dev/null 2>&1; then
 		supatype_note "pg_keyspace extension present; persistence is available on the next start."
 	else
