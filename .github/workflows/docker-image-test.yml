@@ -143,6 +143,15 @@ jobs:
             SELECT pg_drop_replication_slot('ci_wal2json_test');
           "
 
+      - name: Verify postgres was demoted
+        run: |
+          # The demote migration skips itself when `postgres` is the bootstrap
+          # superuser (an operator-made cluster). In this image initdb creates
+          # supatype_admin instead, so here the demotion must actually have run.
+          got=$(docker exec -e PGPASSWORD=testpassword pg_test \
+            psql -U supatype_admin -d postgres -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = 'postgres'")
+          test "$got" = "f" || { echo "FAIL: postgres rolsuper is '$got', expected 'f'"; exit 1; }
+
       - name: Verify the migration ledger records the bootstrap
         env:
           PGDATABASE: supatype_admin
