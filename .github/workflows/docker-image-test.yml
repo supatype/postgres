@@ -191,32 +191,34 @@ jobs:
             "SELECT rolsuper, oid FROM pg_roles WHERE rolname = 'postgres'")
           test "$got" = "t|10" || { echo "FAIL: postgres is '$got', expected 't|10'"; exit 1; }
           # doctor on this cluster: the demotion row passes, since a bootstrap
-          # postgres is exempt, and the password row is the operator's to fix,
-          # so --fix must not claim it and must not try to demote the role.
+          # postgres is exempt, and the password row is a note the operator owns:
+          # it must not fail doctor, --fix must not replay anything for it, and
+          # it must not be handed to --fix as a filename.
           docker cp migrations/db/apply-migrations.sh pg_bootstrap:/usr/local/bin/supatype-migrate
           doctor_in_bootstrap() {
             docker exec -e SUPATYPE_MIGRATION_ROLE=postgres -e SUPATYPE_MIGRATIONS_DIR=/tmp \
               pg_bootstrap /usr/local/bin/supatype-migrate doctor "$@"
           }
-          rc=0; out=$(doctor_in_bootstrap 2>&1) || rc=$?
+          out=$(doctor_in_bootstrap 2>&1) || true
           echo "$out"
-          test "$rc" -ne 0 || { echo "FAIL: doctor exited 0 with a password on the bootstrap superuser"; exit 1; }
           case "$out" in
-            *"OK       postgres is not a superuser"*) ;;
+            *"OK       an ordinary postgres role is not a superuser"*) ;;
             *) echo "FAIL: doctor flagged the bootstrap superuser as undemoted"; exit 1 ;;
           esac
           case "$out" in
-            *"MISSING  a bootstrap superuser postgres has no usable password"*) ;;
-            *) echo "FAIL: doctor did not report the password"; exit 1 ;;
+            *"NOTE     a bootstrap superuser postgres has no usable password (only the operator can change this)"*) ;;
+            *) echo "FAIL: doctor did not note the password"; exit 1 ;;
           esac
-          rc=0; out=$(doctor_in_bootstrap --fix 2>&1) || rc=$?
-          test "$rc" -ne 0 || { echo "FAIL: doctor --fix claimed to repair what only the operator can"; exit 1; }
           case "$out" in
-            *"applying"*) echo "FAIL: doctor --fix replayed a migration for an operator-only check"; exit 1 ;;
+            *"(operator)"*) echo "FAIL: doctor treated the operator note as a migration"; exit 1 ;;
+          esac
+          # The stock image is missing the real migrations, so --fix stops at the
+          # first one it cannot find. What matters is which: a real file, not the note.
+          out=$(doctor_in_bootstrap --fix 2>&1) || true
+          case "$out" in
+            *"(operator)"*|*"applying"*"demote-postgres"*) echo "$out"; echo "FAIL: doctor --fix acted on the operator note"; exit 1 ;;
           esac
           docker exec pg_bootstrap psql -U postgres -d postgres -c "ALTER ROLE postgres PASSWORD NULL" > /dev/null
-          # The other rows stay MISSING here (their migrations never ran on a
-          # stock image), so look at this row rather than the exit status.
           out=$(doctor_in_bootstrap 2>&1) || true
           case "$out" in
             *"OK       a bootstrap superuser postgres has no usable password"*) ;;
@@ -411,7 +413,7 @@ jobs:
           rc=0; out=$(exec_migrate doctor 2>&1) || rc=$?
           test "$rc" -ne 0 || { echo "FAIL: doctor exited 0 with postgres a superuser"; exit 1; }
           case "$out" in
-            *"MISSING  postgres is not a superuser"*) ;;
+            *"MISSING  an ordinary postgres role is not a superuser"*) ;;
             *) echo "$out"; echo "FAIL: doctor did not report postgres as a superuser"; exit 1 ;;
           esac
           exec_migrate doctor --fix

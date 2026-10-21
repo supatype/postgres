@@ -159,7 +159,7 @@ docker exec -e POSTGRES_PASSWORD=... -e POSTGRES_DB=supatype_admin \
   supatype-postgres supatype migrate doctor --fix
 ```
 
-This applies **only** the migrations whose check failed, in filename order, and then re-runs the checks and reports whether it worked. A check that passes is left alone, so this is not a replay of work already done: a failing check means that migration's effect is absent. A check listed as `(operator)` below is not a migration: it is reported, and `--fix` leaves it alone.
+This applies **only** the migrations whose check failed, in filename order, and then re-runs the checks and reports whether it worked. A check that passes is left alone, so this is not a replay of work already done: a failing check means that migration's effect is absent. A check listed as `(operator)` below is not a migration: it is printed as a note, does not fail `doctor`, and `--fix` leaves it alone.
 
 `supatype migrate replay <filename>` remains available for anything outside the checked set; `supatype migrate status` lists every migration flagged `backfilled`.
 
@@ -167,8 +167,8 @@ This applies **only** the migrations whose check failed, in filename order, and 
 
 | Check | Migration | Until repaired |
 |---|---|---|
-| `postgres is not a superuser` | `10000000000000_demote-postgres.sql` | **`postgres` keeps SUPERUSER.** Anything that can log in as it, including the Studio SQL editor if it were ever made a member, has every privilege in the cluster |
-| `a bootstrap superuser postgres has no usable password` | none: `(operator)` | **A superuser login with a known password.** Under an operator such as CloudNativePG, `postgres` is the bootstrap superuser and cannot be demoted. The image leaves it alone and reports it here if it also has a usable password. Only the operator can change that (for CloudNativePG, `enableSuperuserAccess: false`); `doctor --fix` leaves it alone |
+| `an ordinary postgres role is not a superuser` | `10000000000000_demote-postgres.sql` | **`postgres` keeps SUPERUSER.** Anything that can log in as it, including the Studio SQL editor if it were ever made a member, has every privilege in the cluster |
+| `a bootstrap superuser postgres has no usable password` | none: `(operator)` | **A superuser login with a known password.** Under an operator such as CloudNativePG, `postgres` is the bootstrap superuser and cannot be demoted. The image leaves it alone and reports it here if it also has a usable password. Only the operator can change that (for CloudNativePG, `enableSuperuserAccess: false`). Printed as `NOTE`, it does not fail `doctor`, and `doctor --fix` leaves it alone |
 | `pg_guard preloaded for authenticator` | `20260810150000_authenticator_session_preload.sql` | **`pg_guard` does not load for PostgREST sessions.** The `authenticator` role keeps an inherited `session_preload_libraries` naming only `safeupdate`, so privilege enforcement is off across the whole API surface, silently and with no error |
 | `supatype_mask extension present` | `20260809214500_supatype_mask.sql` | A masked-write rejection raises `supatype_mask.deny() is not available` instead of a permission error |
 | `supatype_privileged_role exists` | `20260211120934_supabase_privileged_role.sql` | The `supatype_privileged_role` role does not exist |

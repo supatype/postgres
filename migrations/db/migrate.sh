@@ -65,7 +65,7 @@ EOSQL
         psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U postgres -f "$sql"
     done
     psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U postgres -c "ALTER USER supatype_admin WITH PASSWORD '$PGPASSWORD'"
-    # run migrations as super user. The first migration demotes postgres, unless
+    # run migrations as super user. The demote-postgres migration demotes postgres, unless
     # it is the bootstrap superuser (an operator-made cluster), which it leaves alone.
     #
     # `bootstrap`, not `sync`: this only ever runs against a database being
@@ -81,7 +81,7 @@ EOSQL
     # run init scripts as postgres user
     DBMATE_MIGRATIONS_DIR="$db/init-scripts" DATABASE_URL="postgres://postgres:$connect" dbmate --no-dump-schema migrate
     psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U postgres -c "ALTER USER supatype_admin WITH PASSWORD '$PGPASSWORD'"
-    # run migrations as super user. The first migration demotes postgres; this
+    # run migrations as super user. The demote-postgres migration demotes postgres; this
     # branch created that role just above, so it is never the bootstrap superuser here.
     #
     # dbmate keeps its own schema_migrations table, so this branch does not write

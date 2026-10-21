@@ -40,10 +40,15 @@ do $$
 begin
   if exists (select from pg_roles where rolname = 'postgres' and oid = 10) then
     raise warning 'postgres is the bootstrap superuser and cannot be demoted; leaving it SUPERUSER';
-    if exists (select from pg_authid
-                where rolname = 'postgres' and rolcanlogin and rolpassword is not null
-                  and (rolvaliduntil is null or rolvaliduntil > now())) then
-      raise warning 'the bootstrap superuser postgres has a usable password; it can log in as a superuser';
+    -- pg_authid needs superuser (or pg_read_all_data). Nested rather than
+    -- and-ed: one query naming pg_authid is refused outright for a role that
+    -- cannot see it, and that would abort the bootstrap this skip exists to save.
+    if has_table_privilege('pg_catalog.pg_authid', 'SELECT') then
+      if exists (select from pg_authid
+                  where rolname = 'postgres' and rolcanlogin and rolpassword is not null
+                    and (rolvaliduntil is null or rolvaliduntil > now())) then
+        raise warning 'the bootstrap superuser postgres has a usable password; it can log in as a superuser';
+      end if;
     end if;
   else
     ALTER ROLE postgres NOSUPERUSER CREATEDB CREATEROLE LOGIN REPLICATION BYPASSRLS;

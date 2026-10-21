@@ -201,7 +201,7 @@ backfill_report() {
 	while IFS='|' read -r migration description ok; do
 		[ -n "$migration" ] || continue
 		[ "$ok" = 't' ] && continue
-		if [ "$migration" = '(operator)' ]; then
+		if is_operator_row "$migration"; then
 			echo "$PROG:   NOTE: $description (only the operator can change this)" >&2
 			continue
 		fi
@@ -290,27 +290,17 @@ apply_pending() {
 # in, and a migration must not go on before one that precedes it.
 #
 # A row whose migration column is "(operator)" is a condition no migration can
-# change: doctor reports it, --fix leaves it alone, and the adoption report does
-# not count it as being behind.
+# change: doctor and the adoption report print it as a note, it does not count as
+# missing or set the exit status, and --fix leaves it alone.
 health_checks_sql() {
-	# pg_authid is the one catalog here that needs superuser (or pg_read_all_data).
-	# A role that cannot see it cannot judge the password, so that check passes
-	# rather than taking every other check down with it.
-	if [ "$(psql_value "SELECT has_table_privilege('pg_catalog.pg_authid', 'SELECT')")" = 't' ]; then
-		pw_check="NOT EXISTS (SELECT 1 FROM pg_authid
-		                WHERE rolname = 'postgres' AND oid = 10 AND rolcanlogin AND rolpassword IS NOT NULL
-		                  AND (rolvaliduntil IS NULL OR rolvaliduntil > now()))"
-	else
-		pw_check='true'
-	fi
-	cat <<-SQL
+	cat <<-'SQL'
 		SELECT * FROM (VALUES
 		  ('10000000000000_demote-postgres.sql',
-		   'postgres is not a superuser (a bootstrap superuser cannot be demoted and is left alone)',
+		   'an ordinary postgres role is not a superuser (a bootstrap postgres is exempt: it cannot be demoted)',
 		   NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres' AND rolsuper AND oid <> 10)),
 		  ('(operator)',
 		   'a bootstrap superuser postgres has no usable password',
-		   $pw_check),
+		   :pw_check),
 		  ('20260211120934_supabase_privileged_role.sql',
 		   'supatype_privileged_role exists',
 		   EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supatype_privileged_role')),
@@ -342,8 +332,27 @@ health_checks_sql() {
 }
 
 # Writes "migration|description|t|f" rows to $1.
+#
+# pg_authid is the one catalog the checks read that needs superuser (or
+# pg_read_all_data). A role that cannot see it cannot judge the password, so that
+# check passes for it rather than taking every other check down. The probe is
+# outside the `if` on purpose: a failed probe aborts the run instead of quietly
+# passing the check.
 run_health_checks() {
-	health_checks_sql | psql_admin -tA -F '|' > "$1"
+	can_see_authid=$(psql_value "SELECT has_table_privilege('pg_catalog.pg_authid', 'SELECT')")
+	if [ "$can_see_authid" = 't' ]; then
+		pw_check="NOT EXISTS (SELECT 1 FROM pg_authid
+		                WHERE rolname = 'postgres' AND oid = 10 AND rolcanlogin AND rolpassword IS NOT NULL
+		                  AND (rolvaliduntil IS NULL OR rolvaliduntil > now()))"
+	else
+		pw_check='true'
+	fi
+	health_checks_sql | psql_admin -tA -F '|' -v pw_check="$pw_check" > "$1"
+}
+
+# A "(operator)" row names a condition no migration can change.
+is_operator_row() {
+	[ "$1" = '(operator)' ]
 }
 
 # "assumed applied" -- the ledger says this migration was backfilled rather than
@@ -389,10 +398,8 @@ cmd_doctor() {
 		total=$((total + 1))
 		if [ "$ok" = 't' ]; then
 			echo "  OK       $description"
-		elif [ "$migration" = '(operator)' ]; then
-			failed=$((failed + 1))
-			echo "  MISSING  $description"
-			echo "           only the operator can change this; --fix leaves it alone"
+		elif is_operator_row "$migration"; then
+			echo "  NOTE     $description (only the operator can change this)"
 		else
 			failed=$((failed + 1))
 			# Resolved first: it queries the ledger, and doing that between
@@ -422,9 +429,9 @@ cmd_doctor() {
 	while IFS='|' read -r migration description ok; do
 		[ -n "$migration" ] || continue
 		[ "$ok" = 't' ] && continue
-		[ "$migration" = '(operator)' ] && continue
+		is_operator_row "$migration" && continue
 		echo "$migration"
-	done < "$checks" | sort -u > "$failing"
+	done < "$checks" | sort > "$failing"
 
 	while read -r migration; do
 		[ -n "$migration" ] || continue
@@ -446,9 +453,8 @@ cmd_doctor() {
 		[ -n "$migration" ] || continue
 		if [ "$ok" = 't' ]; then
 			echo "  OK       $description"
-		elif [ "$migration" = '(operator)' ]; then
-			still=$((still + 1))
-			echo "  STILL MISSING  $description (only the operator can change this)"
+		elif is_operator_row "$migration"; then
+			echo "  NOTE     $description (only the operator can change this)"
 		else
 			still=$((still + 1))
 			echo "  STILL MISSING  $description ($migration)"
