@@ -290,6 +290,11 @@ health_checks_sql() {
 		  ('10000000000000_demote-postgres.sql',
 		   'postgres is not a superuser (a bootstrap superuser cannot be demoted and is left alone)',
 		   NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres' AND rolsuper AND oid <> 10)),
+		  ('10000000000000_demote-postgres.sql',
+		   'a bootstrap superuser postgres has no usable password (only the operator can change this)',
+		   NOT EXISTS (SELECT 1 FROM pg_authid
+		                WHERE rolname = 'postgres' AND oid = 10 AND rolcanlogin AND rolpassword IS NOT NULL
+		                  AND (rolvaliduntil IS NULL OR rolvaliduntil > now()))),
 		  ('20260211120934_supabase_privileged_role.sql',
 		   'supatype_privileged_role exists',
 		   EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supatype_privileged_role')),
@@ -398,7 +403,7 @@ cmd_doctor() {
 		[ -n "$migration" ] || continue
 		[ "$ok" = 't' ] && continue
 		echo "$migration"
-	done < "$checks" | sort > "$failing"
+	done < "$checks" | sort -u > "$failing"
 
 	while read -r migration; do
 		[ -n "$migration" ] || continue

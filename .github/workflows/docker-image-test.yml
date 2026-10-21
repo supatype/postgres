@@ -162,8 +162,11 @@ jobs:
           # stock image also gives `postgres` a password, which the migration
           # must call out.
           docker run -d --name pg_bootstrap -e POSTGRES_PASSWORD=testpassword postgres:17-bookworm
+          # -h 127.0.0.1: the stock entrypoint's init-phase server listens on its
+          # socket only, so TCP answering means the real server is up.
           for i in $(seq 1 30); do
-            docker exec pg_bootstrap pg_isready -U postgres -q 2>/dev/null && break
+            docker exec pg_bootstrap pg_isready -h 127.0.0.1 -U postgres -q 2>/dev/null && break
+            [ "$i" -lt 30 ] || { echo "FAIL: postgres:17-bookworm never came up"; docker logs pg_bootstrap; exit 1; }
             sleep 2
           done
           docker exec pg_bootstrap psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
@@ -173,8 +176,8 @@ jobs:
             || { echo "FAIL: the migration aborted on a bootstrap superuser:"; echo "$out"; exit 1; }
           echo "$out" | grep -q "bootstrap superuser and cannot be demoted" \
             || { echo "FAIL: no warning that postgres was left alone:"; echo "$out"; exit 1; }
-          echo "$out" | grep -q "has a password" \
-            || { echo "FAIL: no warning that the bootstrap superuser has a password:"; echo "$out"; exit 1; }
+          echo "$out" | grep -q "has a usable password" \
+            || { echo "FAIL: no warning that the bootstrap superuser has a usable password:"; echo "$out"; exit 1; }
           got=$(docker exec pg_bootstrap psql -U postgres -d postgres -tA -F '|' -c \
             "SELECT rolsuper, oid FROM pg_roles WHERE rolname = 'postgres'")
           test "$got" = "t|10" || { echo "FAIL: postgres is '$got', expected 't|10'"; exit 1; }
@@ -360,6 +363,21 @@ jobs:
           esac
           exec_migrate doctor
           echo "doctor is clean again"
+
+          # The demote row: an ordinary `postgres` that is a superuser again is
+          # reported, and --fix replays the demotion.
+          psql_in "ALTER ROLE postgres SUPERUSER" > /dev/null
+          rc=0; out=$(exec_migrate doctor 2>&1) || rc=$?
+          test "$rc" -ne 0 || { echo "FAIL: doctor exited 0 with postgres a superuser"; exit 1; }
+          case "$out" in
+            *"MISSING  postgres is not a superuser"*) ;;
+            *) echo "$out"; echo "FAIL: doctor did not report postgres as a superuser"; exit 1 ;;
+          esac
+          exec_migrate doctor --fix
+          rolsuper=$(psql_in "SELECT rolsuper FROM pg_roles WHERE rolname = 'postgres'")
+          test "$rolsuper" = "f" || { echo "FAIL: doctor --fix left postgres a superuser ($rolsuper)"; exit 1; }
+          exec_migrate doctor
+          echo "doctor repaired the demotion"
 
       # A table made by hand in public used to be open to the anon key: the image granted every
       # privilege on new tables there to anon and authenticated by default.

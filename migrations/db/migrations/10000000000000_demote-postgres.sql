@@ -31,16 +31,19 @@ end $$;
 -- and the demotion would abort the whole bootstrap. Skip it there, loudly.
 --
 -- The operator is expected to leave that role without a password (for
--- CloudNativePG, enableSuperuserAccess: false). If it has one, a known password
--- opens a superuser login, so that gets a warning of its own. `migrate doctor`
--- reports an ordinary postgres that is still a superuser; a bootstrap one is the
--- operator's to manage.
+-- CloudNativePG, enableSuperuserAccess: false). If it has a usable one (login
+-- allowed, not expired), a known password opens a superuser login, so that
+-- gets a warning of its own. `migrate doctor` keeps watch on both: an ordinary
+-- postgres that is still a superuser, and a bootstrap postgres with a usable
+-- password.
 do $$
 begin
   if exists (select from pg_roles where rolname = 'postgres' and oid = 10) then
     raise warning 'postgres is the bootstrap superuser and cannot be demoted; leaving it SUPERUSER';
-    if exists (select from pg_authid where rolname = 'postgres' and rolpassword is not null) then
-      raise warning 'the bootstrap superuser postgres has a password; it can log in as a superuser';
+    if exists (select from pg_authid
+                where rolname = 'postgres' and rolcanlogin and rolpassword is not null
+                  and (rolvaliduntil is null or rolvaliduntil > now())) then
+      raise warning 'the bootstrap superuser postgres has a usable password; it can log in as a superuser';
     end if;
   else
     ALTER ROLE postgres NOSUPERUSER CREATEDB CREATEROLE LOGIN REPLICATION BYPASSRLS;
