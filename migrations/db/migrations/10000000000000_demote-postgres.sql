@@ -19,7 +19,7 @@ begin
     GRANT ALL ON ALL ROUTINES IN SCHEMA storage TO postgres;
   end if;
 end $$;
--- Postgres 17 refuses to strip SUPERUSER from the role initdb created (oid 10,
+-- Postgres refuses to strip SUPERUSER from the role initdb created (oid 10,
 -- the "bootstrap superuser"):
 --
 --   ERROR:  permission denied to alter role

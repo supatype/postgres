@@ -148,6 +148,15 @@ jobs:
           # The demote migration skips itself when `postgres` is the bootstrap
           # superuser (an operator-made cluster). In this image initdb creates
           # supatype_admin instead, so here the demotion must actually have run.
+          # pg_isready answers while the entrypoint is still running the bootstrap
+          # migrations, so wait for the ledger to record this one.
+          for i in $(seq 1 60); do
+            n=$(docker exec -e PGPASSWORD=testpassword pg_test psql -U supatype_admin -d supatype_admin -tAc \
+              "SELECT count(*) FROM supatype_migrations.applied WHERE filename = '10000000000000_demote-postgres.sql'" 2>/dev/null || true)
+            [ "$n" = "1" ] && break
+            [ "$i" -lt 60 ] || { echo "FAIL: the demote migration never reached the ledger"; exit 1; }
+            sleep 2
+          done
           got=$(docker exec -e PGPASSWORD=testpassword pg_test \
             psql -U supatype_admin -d postgres -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = 'postgres'")
           test "$got" = "f" || { echo "FAIL: postgres rolsuper is '$got', expected 'f'"; exit 1; }
@@ -155,8 +164,8 @@ jobs:
       - name: The demote migration leaves a bootstrap superuser alone
         run: |
           # Under an operator such as CloudNativePG initdb creates `postgres`
-          # itself, so it is the bootstrap superuser (oid 10) and Postgres 17
-          # refuses to demote it. The migration must warn and carry on rather
+          # itself, so it is the bootstrap superuser (oid 10), which Postgres
+          # refuses to demote. The migration must warn and carry on rather
           # than abort the bootstrap. A stock postgres image is the one place
           # `postgres` is oid 10, so run the migration file against one. The
           # stock image also gives `postgres` a password, which the migration
@@ -181,6 +190,38 @@ jobs:
           got=$(docker exec pg_bootstrap psql -U postgres -d postgres -tA -F '|' -c \
             "SELECT rolsuper, oid FROM pg_roles WHERE rolname = 'postgres'")
           test "$got" = "t|10" || { echo "FAIL: postgres is '$got', expected 't|10'"; exit 1; }
+          # doctor on this cluster: the demotion row passes, since a bootstrap
+          # postgres is exempt, and the password row is the operator's to fix,
+          # so --fix must not claim it and must not try to demote the role.
+          docker cp migrations/db/apply-migrations.sh pg_bootstrap:/usr/local/bin/supatype-migrate
+          doctor_in_bootstrap() {
+            docker exec -e SUPATYPE_MIGRATION_ROLE=postgres -e SUPATYPE_MIGRATIONS_DIR=/tmp \
+              pg_bootstrap /usr/local/bin/supatype-migrate doctor "$@"
+          }
+          rc=0; out=$(doctor_in_bootstrap 2>&1) || rc=$?
+          echo "$out"
+          test "$rc" -ne 0 || { echo "FAIL: doctor exited 0 with a password on the bootstrap superuser"; exit 1; }
+          case "$out" in
+            *"OK       postgres is not a superuser"*) ;;
+            *) echo "FAIL: doctor flagged the bootstrap superuser as undemoted"; exit 1 ;;
+          esac
+          case "$out" in
+            *"MISSING  a bootstrap superuser postgres has no usable password"*) ;;
+            *) echo "FAIL: doctor did not report the password"; exit 1 ;;
+          esac
+          rc=0; out=$(doctor_in_bootstrap --fix 2>&1) || rc=$?
+          test "$rc" -ne 0 || { echo "FAIL: doctor --fix claimed to repair what only the operator can"; exit 1; }
+          case "$out" in
+            *"applying"*) echo "FAIL: doctor --fix replayed a migration for an operator-only check"; exit 1 ;;
+          esac
+          docker exec pg_bootstrap psql -U postgres -d postgres -c "ALTER ROLE postgres PASSWORD NULL" > /dev/null
+          # The other rows stay MISSING here (their migrations never ran on a
+          # stock image), so look at this row rather than the exit status.
+          out=$(doctor_in_bootstrap 2>&1) || true
+          case "$out" in
+            *"OK       a bootstrap superuser postgres has no usable password"*) ;;
+            *) echo "$out"; echo "FAIL: doctor still reports a password on the bootstrap superuser"; exit 1 ;;
+          esac
 
       - name: Verify the migration ledger records the bootstrap
         env:

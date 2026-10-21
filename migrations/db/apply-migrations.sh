@@ -201,6 +201,10 @@ backfill_report() {
 	while IFS='|' read -r migration description ok; do
 		[ -n "$migration" ] || continue
 		[ "$ok" = 't' ] && continue
+		if [ "$migration" = '(operator)' ]; then
+			echo "$PROG:   NOTE: $description (only the operator can change this)" >&2
+			continue
+		fi
 		bf_failed=$((bf_failed + 1))
 		echo "$PROG:   MISSING: $description" >&2
 		echo "$PROG:            $migration" >&2
@@ -284,17 +288,29 @@ apply_pending() {
 # are the ones whose absence is silent and consequential. A new one joins the
 # list by adding a row, in filename order -- that is the order --fix applies them
 # in, and a migration must not go on before one that precedes it.
+#
+# A row whose migration column is "(operator)" is a condition no migration can
+# change: doctor reports it, --fix leaves it alone, and the adoption report does
+# not count it as being behind.
 health_checks_sql() {
-	cat <<-'SQL'
+	# pg_authid is the one catalog here that needs superuser (or pg_read_all_data).
+	# A role that cannot see it cannot judge the password, so that check passes
+	# rather than taking every other check down with it.
+	if [ "$(psql_value "SELECT has_table_privilege('pg_catalog.pg_authid', 'SELECT')")" = 't' ]; then
+		pw_check="NOT EXISTS (SELECT 1 FROM pg_authid
+		                WHERE rolname = 'postgres' AND oid = 10 AND rolcanlogin AND rolpassword IS NOT NULL
+		                  AND (rolvaliduntil IS NULL OR rolvaliduntil > now()))"
+	else
+		pw_check='true'
+	fi
+	cat <<-SQL
 		SELECT * FROM (VALUES
 		  ('10000000000000_demote-postgres.sql',
 		   'postgres is not a superuser (a bootstrap superuser cannot be demoted and is left alone)',
 		   NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres' AND rolsuper AND oid <> 10)),
-		  ('10000000000000_demote-postgres.sql',
-		   'a bootstrap superuser postgres has no usable password (only the operator can change this)',
-		   NOT EXISTS (SELECT 1 FROM pg_authid
-		                WHERE rolname = 'postgres' AND oid = 10 AND rolcanlogin AND rolpassword IS NOT NULL
-		                  AND (rolvaliduntil IS NULL OR rolvaliduntil > now()))),
+		  ('(operator)',
+		   'a bootstrap superuser postgres has no usable password',
+		   $pw_check),
 		  ('20260211120934_supabase_privileged_role.sql',
 		   'supatype_privileged_role exists',
 		   EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supatype_privileged_role')),
@@ -373,6 +389,10 @@ cmd_doctor() {
 		total=$((total + 1))
 		if [ "$ok" = 't' ]; then
 			echo "  OK       $description"
+		elif [ "$migration" = '(operator)' ]; then
+			failed=$((failed + 1))
+			echo "  MISSING  $description"
+			echo "           only the operator can change this; --fix leaves it alone"
 		else
 			failed=$((failed + 1))
 			# Resolved first: it queries the ledger, and doing that between
@@ -402,6 +422,7 @@ cmd_doctor() {
 	while IFS='|' read -r migration description ok; do
 		[ -n "$migration" ] || continue
 		[ "$ok" = 't' ] && continue
+		[ "$migration" = '(operator)' ] && continue
 		echo "$migration"
 	done < "$checks" | sort -u > "$failing"
 
@@ -425,6 +446,9 @@ cmd_doctor() {
 		[ -n "$migration" ] || continue
 		if [ "$ok" = 't' ]; then
 			echo "  OK       $description"
+		elif [ "$migration" = '(operator)' ]; then
+			still=$((still + 1))
+			echo "  STILL MISSING  $description (only the operator can change this)"
 		else
 			still=$((still + 1))
 			echo "  STILL MISSING  $description ($migration)"
