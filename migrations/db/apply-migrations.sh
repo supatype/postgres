@@ -287,6 +287,9 @@ apply_pending() {
 health_checks_sql() {
 	cat <<-'SQL'
 		SELECT * FROM (VALUES
+		  ('10000000000000_demote-postgres.sql',
+		   'postgres is not a superuser (a bootstrap superuser cannot be demoted and is left alone)',
+		   NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres' AND rolsuper AND oid <> 10)),
 		  ('20260211120934_supabase_privileged_role.sql',
 		   'supatype_privileged_role exists',
 		   EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supatype_privileged_role')),

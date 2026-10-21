@@ -152,6 +152,33 @@ jobs:
             psql -U supatype_admin -d postgres -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = 'postgres'")
           test "$got" = "f" || { echo "FAIL: postgres rolsuper is '$got', expected 'f'"; exit 1; }
 
+      - name: The demote migration leaves a bootstrap superuser alone
+        run: |
+          # Under an operator such as CloudNativePG initdb creates `postgres`
+          # itself, so it is the bootstrap superuser (oid 10) and Postgres 17
+          # refuses to demote it. The migration must warn and carry on rather
+          # than abort the bootstrap. A stock postgres image is the one place
+          # `postgres` is oid 10, so run the migration file against one. The
+          # stock image also gives `postgres` a password, which the migration
+          # must call out.
+          docker run -d --name pg_bootstrap -e POSTGRES_PASSWORD=testpassword postgres:17-bookworm
+          for i in $(seq 1 30); do
+            docker exec pg_bootstrap pg_isready -U postgres -q 2>/dev/null && break
+            sleep 2
+          done
+          docker exec pg_bootstrap psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE SCHEMA auth" -c "CREATE SCHEMA extensions"
+          out=$(docker exec -i pg_bootstrap psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            < migrations/db/migrations/10000000000000_demote-postgres.sql 2>&1) \
+            || { echo "FAIL: the migration aborted on a bootstrap superuser:"; echo "$out"; exit 1; }
+          echo "$out" | grep -q "bootstrap superuser and cannot be demoted" \
+            || { echo "FAIL: no warning that postgres was left alone:"; echo "$out"; exit 1; }
+          echo "$out" | grep -q "has a password" \
+            || { echo "FAIL: no warning that the bootstrap superuser has a password:"; echo "$out"; exit 1; }
+          got=$(docker exec pg_bootstrap psql -U postgres -d postgres -tA -F '|' -c \
+            "SELECT rolsuper, oid FROM pg_roles WHERE rolname = 'postgres'")
+          test "$got" = "t|10" || { echo "FAIL: postgres is '$got', expected 't|10'"; exit 1; }
+
       - name: Verify the migration ledger records the bootstrap
         env:
           PGDATABASE: supatype_admin
@@ -700,7 +727,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f pg_test pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard \
+          docker rm -f pg_test pg_bootstrap pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard \
             pg_ksconf-on pg_ksconf-readonly || true
           docker volume rm pg_upgrade_vol || true
           exit 0

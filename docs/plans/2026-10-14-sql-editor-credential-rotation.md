@@ -3,9 +3,11 @@
 ## What the credential is
 
 Since SEC-SQL the Studio SQL editor connects as `supatype_sql_editor`, a login role that is not a
-superuser and is a member of the database's non-superuser owner (the demoted `postgres` role on
-self-host, `<ref>_owner` on Cloud). The image creates the role without a password; each host sets
-one out of band. Rotating that password is the subject of this note.
+superuser and is a member of the database's non-superuser owner (`supatype_owner` on self-host,
+`<ref>_owner` on Cloud). It is not a member of `postgres`: the image demotes that role on self-host,
+but under an operator such as CloudNativePG `postgres` is the bootstrap superuser and stays one, so
+the editor must never inherit from it. The image creates the editor role without a password; each
+host sets one out of band. Rotating that password is the subject of this note.
 
 The role's password gates the editor's connection only. It is not the operator's `POSTGRES_PASSWORD`
 and not `AUTHENTICATOR_PASSWORD`, so rotating it never touches direct SQL access or the REST API.

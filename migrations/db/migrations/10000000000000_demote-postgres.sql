@@ -28,12 +28,20 @@ end $$;
 -- In this image initdb creates supatype_admin (POSTGRES_USER), so postgres is
 -- an ordinary role and the demotion goes through. Under an operator such as
 -- CloudNativePG initdb creates postgres itself, the operator owns that role,
--- and the demotion would abort the whole bootstrap. Skip it there: the role
--- has no password under the operator, so leaving it SUPERUSER exposes nothing.
+-- and the demotion would abort the whole bootstrap. Skip it there, loudly.
+--
+-- The operator is expected to leave that role without a password (for
+-- CloudNativePG, enableSuperuserAccess: false). If it has one, a known password
+-- opens a superuser login, so that gets a warning of its own. `migrate doctor`
+-- reports an ordinary postgres that is still a superuser; a bootstrap one is the
+-- operator's to manage.
 do $$
 begin
   if exists (select from pg_roles where rolname = 'postgres' and oid = 10) then
-    raise notice 'postgres is the bootstrap superuser; leaving it alone';
+    raise warning 'postgres is the bootstrap superuser and cannot be demoted; leaving it SUPERUSER';
+    if exists (select from pg_authid where rolname = 'postgres' and rolpassword is not null) then
+      raise warning 'the bootstrap superuser postgres has a password; it can log in as a superuser';
+    end if;
   else
     ALTER ROLE postgres NOSUPERUSER CREATEDB CREATEROLE LOGIN REPLICATION BYPASSRLS;
   end if;
