@@ -1,13 +1,13 @@
-//! pg_keyspace — a Postgres-native RESP keyspace, packaged as a real extension.
+//! pg_keyspace: a Postgres-native RESP keyspace, packaged as a real extension.
 //!
 //! Loaded via `shared_preload_libraries`, this extension:
 //!   * requests a Postgres shared-memory segment in `shmem_request_hook`
 //!     and initialises the keyspace store over it in `shmem_startup_hook`;
 //!   * registers a background worker (a real Postgres backend) that runs the
-//!     epoll RESP event loop against that segment — the read hot path,
+//!     epoll RESP event loop against that segment (the read hot path),
 //!     served on a TCP port for `ioredis`/`redis-cli`;
 //!   * exposes the `supacache.*` SQL surface, which reads the *same*
-//!     segment directly in the calling backend — the in-process ~1-2µs path.
+//!     segment directly in the calling backend: the in-process ~1-2µs path.
 //!
 //! The performance-critical modules are shared verbatim with the standalone
 //! `core` crate (via `#[path]`), so the code measured here is the same code the
@@ -39,6 +39,8 @@ mod resp;
 mod batcher;
 #[path = "../../core/src/durability.rs"]
 mod durability;
+#[path = "../../core/src/expiry.rs"]
+mod expiry;
 #[path = "../../core/src/ring.rs"]
 mod ring;
 #[path = "../../core/src/rowcache_key.rs"]
@@ -68,7 +70,7 @@ use store::{Config, Lookup, Store};
 
 const SEG_NAME: &CStr = c"pg_keyspace_segment";
 const RING_NAME: &CStr = c"pg_keyspace_ring";
-// Mode B row cache lives in its OWN segment — never RESP-addressable (Mode A
+// Mode B row cache lives in its OWN segment, never RESP-addressable (Mode A
 // and Mode B "must not share a code path").
 const ROWCACHE_NAME: &CStr = c"pg_keyspace_rowcache";
 // Cross-process pub/sub routing table and inboxes.
@@ -178,7 +180,7 @@ static GUC_ROWCACHE_MAX_DATABASES: GucSetting<i32> = GucSetting::<i32>::new(32);
 /// before it will serve. Default OFF: pg_keyspace runs standalone as a
 /// plain Postgres-native keyspace + RLS-aware row cache, with no dependency on
 /// supatype_mask. Set ON in the Supatype platform, where RESP must never expose
-/// rows the mask would have rewritten — the worker then fails closed unless mask
+/// rows the mask would have rewritten; the worker then fails closed unless mask
 /// is loaded and outermost. When mask IS present, its load order is checked
 /// either way.
 static GUC_REQUIRE_MASK: GucSetting<bool> = GucSetting::<bool>::new(false);
@@ -208,7 +210,7 @@ static GUC_TLS_USE_PG_CERT: GucSetting<bool> = GucSetting::<bool>::new(false);
 /// Mode B: enable the keys-only logical-decoding invalidation worker,
 /// which consumes a replication slot (output plugin `supacache_keys`) and drops
 /// changed rows from the row cache so it stays coherent with committed writes.
-/// Off by default — it needs `wal_level = logical` and holds a replication slot.
+/// Off by default: it needs `wal_level = logical` and holds a replication slot.
 /// Host advertised in `MOVED` redirects and the `CLUSTER` topology (the workers
 /// bind 0.0.0.0, so they cannot infer an address a remote client can reach).
 /// Deliberately unset by default: a persisted multi-worker cluster refuses to
@@ -402,7 +404,7 @@ fn rowcache_coherent() -> bool {
 /// database. #120 makes every database read-through into it, and a single lock
 /// would then be a cluster-wide serialisation point for row-cache writes: one
 /// database with a cold cache and heavy read-through would stall caching for
-/// every other one. So the lock follows the segment's own partitioning —
+/// every other one. So the lock follows the segment's own partitioning:
 /// `Store::partition_of` names the partition, and each partition has its own
 /// lock. Two writers in different partitions never wait on each other, and a
 /// writer still cannot race another writer in the arena it is mutating, which
@@ -449,7 +451,7 @@ fn rowcache_view() -> Option<Store> {
 // produced by the planner hook (from the query Const), by `rowcache_put`/refill
 // (from the heap tuple), and by the `supacache_keys` decode plugin (from the WAL
 // change), so all three agree for the same logical row regardless of the pk's
-// type — int, uuid, text, etc. (Integers are still their decimal text, e.g. `1`.)
+// type: int, uuid, text, etc. (Integers are still their decimal text, e.g. `1`.)
 //
 // The layout itself lives in `core/rowcache_key.rs`, where it can be unit-tested
 // without standing up a cluster. #117 was a key-layout bug, and a layout that
@@ -1403,7 +1405,7 @@ enum TlsChoice {
 
 /// Decide where the RESP port's certificate comes from.
 ///
-/// `pg_keyspace.tls_cert_file`/`tls_key_file` win whenever they are set — an
+/// `pg_keyspace.tls_cert_file`/`tls_key_file` win whenever they are set; an
 /// explicit cert for the RESP port is always the more specific instruction.
 /// With neither set and `pg_keyspace.tls_use_postgres_cert` on, fall back to
 /// the cluster's own `ssl_cert_file`/`ssl_key_file`: the certificate the
@@ -2433,10 +2435,10 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
 
     // load-order assertion: supatype_mask must be loaded AFTER pg_keyspace
     // (outermost) so the Query is masked before pg_keyspace ever sees it. If the
-    // operator misordered shared_preload_libraries, FAIL CLOSED — park without
+    // operator misordered shared_preload_libraries, FAIL CLOSED: park without
     // binding the RESP port rather than serve on an unverified security posture.
     if let Err(why) = check_load_order() {
-        log!("pg_keyspace worker: REFUSING to start — {why}");
+        log!("pg_keyspace worker: REFUSING to start: {why}");
         while !BackgroundWorker::sigterm_received() {
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -2489,7 +2491,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     }
 
     // TLS: if a cert+key are configured, wrap the RESP wire in TLS. If TLS
-    // was requested but the files fail to load, FAIL CLOSED — park rather than
+    // was requested but the files fail to load, FAIL CLOSED: park rather than
     // fall back to plaintext on an operator who asked for encryption.
     match tls_choice() {
         TlsChoice::Serve { cert, key, from } => match server::load_tls_config(&cert, &key) {
@@ -2498,7 +2500,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
                 log!("pg_keyspace worker: RESP TLS enabled (cert '{cert}' from {from})");
             }
             Err(e) => {
-                log!("pg_keyspace worker: REFUSING to start — TLS requested but cert/key \
+                log!("pg_keyspace worker: REFUSING to start: TLS requested but cert/key \
                       failed to load ({e}); fix {from}");
                 while !BackgroundWorker::sigterm_received() {
                     std::thread::sleep(Duration::from_secs(1));
@@ -2508,7 +2510,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         },
         TlsChoice::Plaintext => {}
         TlsChoice::Refuse(why) => {
-            log!("pg_keyspace worker: REFUSING to start — {why}");
+            log!("pg_keyspace worker: REFUSING to start: {why}");
             while !BackgroundWorker::sigterm_received() {
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -2525,7 +2527,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         Ok(p) => p,
         Err(why) => {
             log!(
-                "pg_keyspace worker {w}: REFUSING to start — \
+                "pg_keyspace worker {w}: REFUSING to start: \
                  pg_keyspace.durability_overrides is invalid: {why}"
             );
             while !BackgroundWorker::sigterm_received() {
@@ -2543,7 +2545,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         // for a standby. Both are worse than saying no.
         if policy.rules().iter().any(|(_, t)| *t == Tier::Replicated) {
             log!(
-                "pg_keyspace worker {w}: REFUSING to start — pg_keyspace.durability_overrides \
+                "pg_keyspace worker {w}: REFUSING to start: pg_keyspace.durability_overrides \
                  names the 'replicated' tier, which cannot yet be mixed with others on one \
                  instance: the persistence worker sets synchronous_commit once per batch, so \
                  a replicated prefix would either charge every other durable write the \
@@ -2570,7 +2572,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     // standby would acknowledge writes as replicated that are only local.
     if matches!(ks_effective_tier(), Tier::Replicated) {
         if let Err(why) = check_sync_standby() {
-            log!("pg_keyspace worker: REFUSING to start — {why}");
+            log!("pg_keyspace worker: REFUSING to start: {why}");
             while !BackgroundWorker::sigterm_received() {
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -2615,7 +2617,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     // `supatype` label. If one was added by hand, FAIL CLOSED.
     if ext_ready && kv_has_supatype_label() {
         log!(
-            "pg_keyspace worker: REFUSING to start — a supatype security label exists on a \
+            "pg_keyspace worker: REFUSING to start: a supatype security label exists on a \
              supacache relation; Mode A tables must not be masked"
         );
         while !BackgroundWorker::sigterm_received() {
@@ -2634,13 +2636,13 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             worker.set_auth_config(auth);
             log!("pg_keyspace worker: AUTH enforced ({n} credentials, ACL + tenant scoping on)");
         }
-        None => log!("pg_keyspace worker: no RESP credentials configured — local/no-auth mode"),
+        None => log!("pg_keyspace worker: no RESP credentials configured, local/no-auth mode"),
     }
 
     // A persisted multi-worker cluster publishes a slot map and redirects
     // clients by address, so it must know an address clients can reach. Guessing
-    // (127.0.0.1) would hand remote clients a topology pointing at themselves —
-    // a confusing connection failure rather than a clear misconfiguration. Fail
+    // (127.0.0.1) would hand remote clients a topology pointing at themselves,
+    // which is a confusing connection failure rather than a clear misconfiguration. Fail
     // closed, as with a bad TLS cert.
     let announce_host = GUC_ANNOUNCE_HOST
         .get()
@@ -2653,7 +2655,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     let routes = ks_addressing() == Addressing::Slot;
     if persisted && routes && worker_count() > 1 && announce_host.is_none() {
         log!(
-            "pg_keyspace worker {w}: REFUSING to start — a persisted tier with \
+            "pg_keyspace worker {w}: REFUSING to start: a persisted tier with \
              pg_keyspace.workers > 1 redirects clients by address, so \
              pg_keyspace.cluster_announce_host must be set to a host your clients \
              can reach (use '127.0.0.1' for a local-only deployment). \
@@ -2698,11 +2700,11 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
                     && kv_has_rows()
                 {
                     log!(
-                        "pg_keyspace worker {w}: REFUSING to start — pg_keyspace.workers is \
+                        "pg_keyspace worker {w}: REFUSING to start: pg_keyspace.workers is \
                          {nworkers} and this keyspace was persisted under {was}, with \
                          pg_keyspace.recovery_addressing = 'owner'. Recovery would place keys \
                          at owner % {nworkers} while a client shards by the key, and those two \
-                         agree only when the new count divides the old one — so keys would be \
+                         agree only when the new count divides the old one, so keys would be \
                          present but on workers no client asks, and the rewrite that follows \
                          is lost at the next restart. Either return to \
                          pg_keyspace.workers = {was}, or run SELECT supacache.rehome({nworkers}) \
@@ -2749,7 +2751,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             // ceiling this refines downwards.
             if !policy.is_uniform() {
                 log!(
-                    "pg_keyspace worker {w}: per-key durability is ON — {}",
+                    "pg_keyspace worker {w}: per-key durability is ON: {}",
                     policy.describe()
                 );
                 worker.set_durability_policy(policy.clone());
@@ -2848,24 +2850,24 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
                         match server::load_tls_config(&cert, &key) {
                             Ok(c) => {
                                 reload.tls = Some(Some(c));
-                                log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} creds) + TLS cert");
+                                log!("pg_keyspace worker: SIGHUP: reloaded auth ({n} creds) + TLS cert");
                             }
                             Err(e) => log!(
-                                "pg_keyspace worker: SIGHUP — reloaded auth ({n} creds); TLS cert \
+                                "pg_keyspace worker: SIGHUP: reloaded auth ({n} creds); TLS cert \
                                  reload FAILED ({e}), keeping the current cert"
                             ),
                         }
                     }
                     // Both arms keep the running cert. The GUCs behind this
                     // choice are `postmaster`-context, so a reload cannot
-                    // legitimately turn TLS off underneath live connections —
+                    // legitimately turn TLS off underneath live connections,
                     // and dropping to plaintext is never the safe reading of
                     // an ambiguous reload anyway.
                     TlsChoice::Plaintext => {
-                        log!("pg_keyspace worker: SIGHUP — reloaded auth ({n} credentials)");
+                        log!("pg_keyspace worker: SIGHUP: reloaded auth ({n} credentials)");
                     }
                     TlsChoice::Refuse(why) => log!(
-                        "pg_keyspace worker: SIGHUP — reloaded auth ({n} creds); TLS cert \
+                        "pg_keyspace worker: SIGHUP: reloaded auth ({n} creds); TLS cert \
                          reload SKIPPED ({why}), keeping the current cert"
                     ),
                 }
@@ -2893,8 +2895,8 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         .to_string();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
     // The RESP worker owns schema creation (once the extension is installed); all
-    // persist workers wait for it. If the tables never appear — no CREATE EXTENSION
-    // — exit cleanly and let the restart timer re-check, rather than erroring.
+    // persist workers wait for it. If the tables never appear (no CREATE EXTENSION),
+    // exit cleanly and let the restart timer re-check, rather than erroring.
     let mut ready = false;
     for _ in 0..100 {
         if pg_table_ready() {
@@ -2929,7 +2931,7 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
         health_release(health);
         return;
     }
-    // This worker owns shard `idx` of every slot worker's ring set — one
+    // This worker owns shard `idx` of every slot worker's ring set: one
     // consumer per ring, so the ring stays strictly SPSC while N slot workers
     // feed a single persistence process. Their keyspaces are disjoint (each slot
     // worker owns its own slot range), so records from different rings can share
@@ -3051,7 +3053,7 @@ pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
 /// calls `pgstat_report_stat` after each command. Without this the persist
 /// worker's row counts accumulate in process-local pending entries and reach
 /// `pg_stat_user_tables` only when the shutdown hook flushes them as the worker
-/// exits — so a running cluster reports zero inserts, zero updates and zero dead
+/// exits, so a running cluster reports zero inserts, zero updates and zero dead
 /// tuples on the supacache tables no matter how much it has written, and
 /// autovacuum, whose thresholds are computed from exactly those counters, never
 /// sees the churn. Restart such a cluster and every write appears at once.
@@ -3171,8 +3173,8 @@ fn pg_table_ready() -> bool {
 /// `CREATE EXTENSION` owns the `supacache` schema (and supplies the SQL surface).
 /// The worker must not create any schema object before then: a free-standing
 /// `supacache` schema makes the later `CREATE EXTENSION` fail with "schema
-/// supacache is not a member of extension". So the worker gates all of its DDL —
-/// schema, backing tables, recovery — on the extension being present, and runs
+/// supacache is not a member of extension". So the worker gates all of its DDL
+/// (schema, backing tables, recovery) on the extension being present, and runs
 /// RESP-only (ephemeral) until it is.
 fn extension_installed() -> bool {
     BackgroundWorker::transaction(|| {
@@ -3535,7 +3537,7 @@ fn ensure_ttl_partition(client: &mut pgrx::spi::SpiClient, bucket: i64) {
 }
 
 /// self-check: Mode A backing tables must carry NO `supatype` security
-/// label — access control for the keyspace is the ACL layer, not masking. If a
+/// label: access control for the keyspace is the ACL layer, not masking. If a
 /// label was added by hand, refuse to serve (fail closed). Returns true if any
 /// `supacache.*` relation has a `supatype` label.
 fn kv_has_supatype_label() -> bool {
@@ -3554,7 +3556,7 @@ fn kv_has_supatype_label() -> bool {
 }
 
 /// Load RESP credentials + keyspace ACL from SQL. Returns None when no
-/// credentials are configured — the worker then runs in local/no-auth mode.
+/// credentials are configured; the worker then runs in local/no-auth mode.
 /// Exempt roles come from `supatype_mask.exempt_roles` so the two never drift.
 fn load_auth_config() -> Option<AuthConfig> {
     use std::panic::AssertUnwindSafe;
@@ -3626,7 +3628,7 @@ const RECOVER_BATCH: i64 = 1_000;
 
 /// How often recovery reports progress. A large keyspace takes minutes, and the
 /// RESP port is not served until recovery finishes, so silence for the whole of
-/// it is indistinguishable from a hang — which is how it has been read before.
+/// it is indistinguishable from a hang, which is how it has been read before.
 const RECOVER_LOG_EVERY: i64 = 100_000;
 
 /// Evictions summed across a store's partitions.
@@ -3718,7 +3720,7 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
             // Through a cursor rather than one unbounded SELECT: SPI materialises
             // a whole result set in the worker, so the old form's peak memory
             // scaled with the persisted key count on top of the segment itself.
-            // Fetching keeps the query plan and access path identical — only the
+            // Fetching keeps the query plan and access path identical; only the
             // delivery changes.
             let mut cur = if by_owner {
                 // `owner % workers = w` partitions the owner space, so every
@@ -3880,7 +3882,7 @@ fn pg_recover(store: &Store, w: usize, nworkers: usize) -> i64 {
     if evicted > 0 {
         let scope = recovery_scope(w, nworkers);
         warning!(
-            "pg_keyspace worker {w}: recovery evicted {evicted} key(s) while loading — \
+            "pg_keyspace worker {w}: recovery evicted {evicted} key(s) while loading: \
              the persisted set for {scope} does not fit in pg_keyspace.keys \
              ({}), so the cache has come back partial",
             GUC_KEYS.get()
@@ -4487,7 +4489,7 @@ fn relay_to_peers(channel: &[u8], payload: &[u8]) -> Result<u64, ()> {
 }
 
 /// The expiry worker: periodically DROP TTL partitions whose whole
-/// time bucket is in the past. This is O(1) DDL per partition — no row-by-row
+/// time bucket is in the past. This is O(1) DDL per partition, with no row-by-row
 /// DELETE, no vacuum churn. Shmem expiry stays lazy-on-read.
 #[no_mangle]
 #[pg_guard]
@@ -4541,7 +4543,7 @@ pub extern "C" fn pg_keyspace_expiry_main(_arg: pg_sys::Datum) {
 // the underlying row changes, or a stale row would be served (masking is still
 // re-applied above, but the *data* would be wrong). We learn what changed from a
 // logical replication slot whose output plugin (`supacache_keys`) emits ONLY
-// `<I|U|D> <relid> <pk>` — never a column value. So this worker cannot store WAL
+// `<I|U|D> <relid> <pk>`, never a column value. So this worker cannot store WAL
 // values even in principle ("decoding worker stores WAL values"): the values
 // never leave the plugin. Changed keys are dropped from the cache; a deleted key
 // stays dropped, and with pg_keyspace.rowcache_refill a still-hot key is re-read
@@ -4777,7 +4779,7 @@ struct Drain {
 /// *consumes*: it advances the slot when the calling transaction commits, which
 /// is before a single change has been applied. A worker that died in that window
 /// lost those invalidations permanently and then served the stale rows forever,
-/// with nothing logged and nothing to notice — it came back healthy, just behind
+/// with nothing logged and nothing to notice: it came back healthy, just behind
 /// reality (#66).
 ///
 /// Delivery is therefore at-least-once, which is safe here because both terminal
@@ -4786,12 +4788,12 @@ struct Drain {
 /// cache state as applying it once.
 ///
 /// The deliberate trade: a change that cannot be applied at all now blocks the
-/// channel — the slot stops advancing and WAL accumulates — instead of being
+/// channel (the slot stops advancing and WAL accumulates) instead of being
 /// consumed and forgotten. A stalled slot is loud, bounded by
 /// `max_slot_wal_keep_size` and recoverable; a cache that quietly disagrees with
 /// the heap is none of those things.
 ///
-/// Only *hot* keys (currently cached) are touched — a change to an uncached row
+/// Only *hot* keys (currently cached) are touched; a change to an uncached row
 /// is ignored, so the cache never fills with cold rows.
 fn drain_invalidations(slot: &str) -> Drain {
     use std::panic::AssertUnwindSafe;
@@ -4886,7 +4888,7 @@ fn drain_invalidations(slot: &str) -> Drain {
     for (action, relid, pk) in changes {
         let key = rc_key(relid, &pk);
         if !matches!(view.get(&key), Lookup::Hit(_)) {
-            continue; // cold key — nothing cached to keep coherent
+            continue; // cold key, nothing cached to keep coherent
         }
         if refill && action != 'D' {
             let pk = pk.clone();
@@ -4922,8 +4924,8 @@ fn drain_invalidations(slot: &str) -> Drain {
 ///
 /// Run through the READ-ONLY SPI path for the same reason slot creation is: this
 /// is not a heap write, and the read-write path would assign the transaction an
-/// xid. A failure is logged and otherwise ignored — the slot simply stays where
-/// it is and the batch replays harmlessly on the next pass — but it is worth
+/// xid. A failure is logged and otherwise ignored (the slot simply stays where
+/// it is and the batch replays harmlessly on the next pass), but it is worth
 /// logging, because a slot that never advances retains WAL until
 /// `max_slot_wal_keep_size` invalidates it.
 fn advance_decode_slot(slot: &str, upto: &str) {
@@ -4952,7 +4954,7 @@ fn advance_decode_slot(slot: &str, upto: &str) {
 ///
 /// Before slots were per-database there was exactly one, named
 /// `pg_keyspace.rowcache_slot` verbatim. After an upgrade nothing consumes it,
-/// and an unconsumed slot pins WAL from its `restart_lsn` **forever** — the
+/// and an unconsumed slot pins WAL from its `restart_lsn` **forever**, the
 /// single worst operational failure this subsystem has, and it would arrive
 /// silently, on a cluster that had done nothing but upgrade.
 ///
@@ -6087,7 +6089,7 @@ fn load_registrations_worker() -> i64 {
 /// A `pkcol = Const` only ever reaches us for a plain Var (RLS `owner = …` and
 /// other expression clauses are filtered by `classify`), and the only implicit
 /// cross-type `=` operators over a plain Var are within the value-preserving
-/// integer family — so this cannot produce a wrong (incoherent) key; at worst a
+/// integer family, so this cannot produce a wrong (incoherent) key; at worst a
 /// non-matching literal misses the cache and falls back to the index path.
 /// The canonical key for this scan, or None if the query does not pin *every*
 /// primary-key column to a constant.
@@ -6516,7 +6518,7 @@ fn quote_ident(s: &str) -> String {
 /// Set while a refill re-reads a row from the heap: the Mode B pathlist hook
 /// checks it and skips substitution, so the re-read hits the real table and not
 /// the very cache entry we are refreshing (a one-shot/custom plan folds a bound
-/// `$1` to a Const, so parameterizing alone is NOT enough to dodge the hook —
+/// `$1` to a Const, so parameterizing alone is NOT enough to dodge the hook;
 /// this flag is). Per-backend and single-threaded, so a plain flag is safe.
 static RC_BYPASS: AtomicBool = AtomicBool::new(false);
 
@@ -6534,7 +6536,7 @@ impl Drop for BypassGuard {
 }
 
 // `toast_flatten_tuple` (access/heaptoast.h) builds a tuple with no out-of-line
-// fields — it is a real exported backend symbol but is not in pgrx's generated
+// fields. It is a real exported backend symbol but is not in pgrx's generated
 // bindings, so declare it directly. Links against the running backend.
 extern "C" {
     fn toast_flatten_tuple(
@@ -6607,7 +6609,7 @@ unsafe fn fetch_row_and_pk(
         let tupdesc = (*tuptable).tupdesc;
         let tup = *(*tuptable).vals.offset(0);
         // If any column is stored out of line (TOASTed), the raw tuple holds a
-        // pointer into the table's toast relation, not the value — caching those
+        // pointer into the table's toast relation, not the value, and caching those
         // bytes would leave a pointer that dangles once the toast chunks are
         // vacuumed. Flatten the tuple so every value is inline and the cached
         // bytes are fully self-contained. `toast_flatten_tuple` pulls in the
@@ -6660,7 +6662,7 @@ unsafe fn fetch_row_and_pk(
 /// Outcome of refilling one row-cache entry from the live table.
 enum Refill {
     Stored,  // the current row was read and cached
-    Gone,    // the row no longer exists (deleted) — caller should invalidate
+    Gone,    // the row no longer exists (deleted); caller should invalidate
     Skipped, // relation not registered / not resolvable
 }
 
@@ -6669,7 +6671,7 @@ enum Refill {
 /// `rowcache_put` surface and the invalidation worker's refill path. Assumes a
 /// transaction is open (SPI usable). The raw bytes are pre-policy; RLS and the
 /// mask re-apply above the Custom Scan on read, so this is the same trust
-/// model as the manual put — the decode stream is still keys-only.
+/// model as the manual put: the decode stream is still keys-only.
 unsafe fn rowcache_refill_locked(relid: pg_sys::Oid, pk_lookup: &[u8]) -> Refill {
     let view = match rowcache_view() {
         Some(v) => v,
@@ -6695,7 +6697,7 @@ unsafe fn rowcache_refill_locked(relid: pg_sys::Oid, pk_lookup: &[u8]) -> Refill
 }
 
 /// Registration metadata for a cached relation: the pk column name, its type
-/// name (SQL-castable), and the relation's `regclass` text — resolved from the
+/// name (SQL-castable), and the relation's `regclass` text, resolved from the
 /// stored attnum. `None` if the relation is not registered / not resolvable.
 struct RegMeta {
     /// pk column names, ascending by attnum -- the same order the decode plugin
@@ -6786,12 +6788,12 @@ unsafe fn rowcache_meta_for_attnums(relid: pg_sys::Oid, attnums: &[i16]) -> Opti
 mod supacache {
     use super::*;
 
-    /// Direct shared-memory read in the calling backend — no socket, no copy
+    /// Direct shared-memory read in the calling backend: no socket, no copy
     /// beyond the returned value. This is the path a `supatype_mask` read
     /// predicate would use for a permission-set lookup.
     ///
     /// STABLE, never IMMUTABLE: forbids anything downstream of a mask
-    /// predicate from being folded/cached by identity — an IMMUTABLE cache read
+    /// predicate from being folded/cached by identity. An IMMUTABLE cache read
     /// would let the planner bake one caller's value into a generic plan.
     /// Reads through the entry's seqlock rather than borrowing the shared
     /// bytes directly: this runs in an ordinary backend, not the worker that
@@ -6809,8 +6811,10 @@ mod supacache {
             Some(s) => s,
             None => return false,
         };
+        // Saturating: an unchecked multiply wrapped a huge TTL negative, which
+        // the store reads as no expiry at all.
         let ttl_micros = if ttl_seconds > 0 {
-            ttl_seconds * 1_000_000
+            ttl_seconds.saturating_mul(1_000_000)
         } else {
             0
         };
@@ -6885,7 +6889,7 @@ mod supacache {
     }
 
     /// Register/replace a RESP AUTH credential, storing a SALTED SHA-256 verifier
-    /// (`sha256$<salt>$<hash>`) — the plaintext secret is never written to the
+    /// (`sha256$<salt>$<hash>`); the plaintext secret is never written to the
     /// table (hardening). The worker verifies with a constant-time compare
     /// and picks up the change on `SELECT pg_reload_conf()` (hot reload). Salt is
     /// 128 bits from `gen_random_uuid()`. Use this instead of inserting into
@@ -7419,7 +7423,7 @@ mod supacache {
         let policy = ks_policy_lossy();
         if !policy.any_persisted() && !force {
             warning!(
-                "supacache.prune_undurable(): refusing — this instance persists nothing, so                  every row in supacache.kv would be deleted. That is what a mistyped or                  unloaded pg_keyspace.durability_overrides looks like. Pass true to confirm"
+                "supacache.prune_undurable(): refusing: this instance persists nothing, so                  every row in supacache.kv would be deleted. That is what a mistyped or                  unloaded pg_keyspace.durability_overrides looks like. Pass true to confirm"
             );
             return 0;
         }
@@ -7451,7 +7455,7 @@ mod supacache {
         }
         if victims.len() as i64 == total && !force {
             warning!(
-                "supacache.prune_undurable(): refusing — this would delete all {total} row(s)                  in supacache.kv, which is what a mistyped pg_keyspace.durability_overrides                  looks like rather than a narrowed one. Check supacache.undurable_rows(),                  then pass true to confirm"
+                "supacache.prune_undurable(): refusing: this would delete all {total} row(s)                  in supacache.kv, which is what a mistyped pg_keyspace.durability_overrides                  looks like rather than a narrowed one. Check supacache.undurable_rows(),                  then pass true to confirm"
             );
             return 0;
         }
@@ -7725,7 +7729,7 @@ mod supacache {
         rowcache_store_registration(relid, &[pk_attnum as i16])
     }
 
-    /// Register a table's whole primary key, whatever its arity — the general
+    /// Register a table's whole primary key, whatever its arity. This is the general
     /// form of `rowcache_register`, and the only one that can register a
     /// composite key.
     ///
@@ -7995,7 +7999,7 @@ mod supacache {
     /// `rowcache_put` for a composite primary key.
     ///
     /// Parts are the canonical text of each pk column, in ascending attnum
-    /// order — the same order `rowcache_registration` reports. Text rather than
+    /// order, the same order `rowcache_registration` reports. Text rather than
     /// a typed value because a composite key has several types and SQL has no
     /// heterogeneous array; each part is cast to its column's type in the
     /// lookup, exactly as the decode worker's parts are.
@@ -8061,7 +8065,7 @@ mod supacache {
     /// Diagnostic: does the *cached* copy of `tbl`'s row `pk` still hold an
     /// out-of-line (TOASTed) value? Reads the stored tuple's info-mask. Returns
     /// None if the row isn't cached. After `rowcache_put` this is always `false`
-    /// even when the live row has external values — proof the cache flattened
+    /// even when the live row has external values, proof the cache flattened
     /// them inline (see `bench/run_toast.sh`).
     #[pg_extern]
     fn rowcache_cached_has_external(tbl: &str, pk: AnyElement) -> Option<bool> {

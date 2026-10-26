@@ -171,7 +171,7 @@ jobs:
           echo "required check does not block the pull request."
 
   # Job 2: RESP conformance + integration. Drives the standalone daemon and a
-  # real redis-server the way the bench harnesses do — no Postgres required.
+  # real redis-server the way the bench harnesses do, with no Postgres required.
   integration:
     name: RESP conformance (daemon + redis)
     runs-on: ubuntu-latest
@@ -245,7 +245,7 @@ jobs:
             >/tmp/pgks_ci_daemon.log 2>&1 &
           dpid=$!
           for _ in $(seq 1 30); do redis-cli -p 6400 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
-          for s in run_hashes.sh run_lists.sh run_zsets.sh run_pubsub.sh run_ttl_scan.sh run_strings.sh run_bitmaps.sh run_keys_admin.sh run_aggr_gaps.sh run_sets.sh run_scans.sh run_zset_ops.sh run_txn.sh run_resp3.sh run_int_parity.sh run_bloom.sh run_cuckoo.sh; do
+          for s in run_hashes.sh run_lists.sh run_zsets.sh run_pubsub.sh run_ttl_scan.sh run_expire_parity.sh run_strings.sh run_bitmaps.sh run_keys_admin.sh run_aggr_gaps.sh run_sets.sh run_scans.sh run_zset_ops.sh run_txn.sh run_resp3.sh run_int_parity.sh run_bloom.sh run_cuckoo.sh; do
             runbench "$s" RESP=6400 REDIS8=6380
           done
           kill $dpid 2>/dev/null || true
@@ -263,7 +263,7 @@ jobs:
 
   # Job 3: macOS. Proves the readiness loop builds and runs on kqueue (mio's
   # macOS backend) and the cross-worker wake self-pipe works, so the darwin
-  # native archive can bundle pg_keyspace. No Postgres — just the core crate,
+  # native archive can bundle pg_keyspace. No Postgres, just the core crate,
   # the daemon, and the RESP/cross-worker conformance harnesses.
   macos:
     name: macOS build + kqueue event loop
@@ -284,10 +284,10 @@ jobs:
 
       - name: Install redis + GNU coreutils
         # The bench harnesses are shared with the Linux jobs and assume a GNU
-        # userland — `timeout` (absent on macOS) and `paste`/`sort` reading
+        # userland: `timeout` (absent on macOS) and `paste`/`sort` reading
         # stdin. coreutils provides them; put its gnubin dir (unprefixed GNU
         # tools) first on PATH so the scripts run unchanged. This only affects
-        # the test harness — the daemon under test is native macOS (kqueue).
+        # the test harness; the daemon under test is native macOS (kqueue).
         run: |
           brew install redis coreutils
           echo "$(brew --prefix)/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
@@ -325,7 +325,7 @@ jobs:
             >/tmp/pgks_ci_daemon.log 2>&1 &
           dpid=$!
           for _ in $(seq 1 30); do redis-cli -p 6400 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
-          for s in run_resp3.sh run_hashes.sh run_lists.sh run_zsets.sh run_sets.sh run_bitmaps.sh run_ttl_scan.sh run_pubsub.sh run_txn.sh run_bloom.sh run_cuckoo.sh; do
+          for s in run_resp3.sh run_hashes.sh run_lists.sh run_zsets.sh run_sets.sh run_bitmaps.sh run_ttl_scan.sh run_expire_parity.sh run_pubsub.sh run_txn.sh run_bloom.sh run_cuckoo.sh; do
             runbench "$s" RESP=6400
           done
           kill $dpid 2>/dev/null || true
@@ -409,7 +409,7 @@ jobs:
       # template (so their relids match) must never see each other's cached
       # rows. Its own cluster and ports; builds the C output plugin itself.
       # Sets the system clock, so it needs CAP_SYS_TIME. It SKIPS rather than
-      # fails where the clock cannot be set — a test that silently does nothing
+      # fails where the clock cannot be set, because a test that silently does nothing
       # is worse than one that says it did nothing. The arithmetic is covered by
       # the store::tests::*clock* unit tests either way.
       - name: TTL survives a wall-clock step
