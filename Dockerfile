@@ -1,11 +1,11 @@
 # ---------------------------------------------------------------------------
-# pg_keyspace builder — compiles the pgrx extension + the keys-only decode
+# pg_keyspace builder: compiles the pgrx extension + the keys-only decode
 # plugin from in-repo source (extensions/pg_keyspace/) against PGDG
 # PostgreSQL 17. Building here (rather than pulling a pre-published .deb) keeps
 # the final image self-contained: it needs no prior GitHub release, and the
 # same Dockerfile produces a working image on both amd64 and arm64 (the release
 # pipeline builds each arch on a native runner). Only the built artifacts are
-# copied into the runtime image below — the Rust toolchain never lands there.
+# copied into the runtime image below; the Rust toolchain never lands there.
 # ---------------------------------------------------------------------------
 FROM postgres:17-bookworm AS pgks-builder
 
@@ -51,6 +51,10 @@ RUN cd /src/pg_keyspace/plugin \
 # ---------------------------------------------------------------------------
 FROM postgres:17-bookworm
 
+# The repository's licence, shipped in the image and declared on it (the PostgreSQL License).
+LABEL org.opencontainers.image.licenses="PostgreSQL"
+COPY LICENSE /LICENSE
+
 ARG PGVECTOR_VERSION=0.8.0
 ARG PG_NET_VERSION=0.14.0
 ARG PG_GRAPHQL_VERSION=1.5.9
@@ -75,7 +79,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-17-wal2json \
   && rm -rf /var/lib/apt/lists/*
 
-# pgvector — OPTFLAGS="" avoids -march=native (AVX-512 SIGILL on older CPUs / GH Actions).
+# pgvector: OPTFLAGS="" avoids -march=native (AVX-512 SIGILL on older CPUs / GH Actions).
 RUN git clone --depth 1 --branch v${PGVECTOR_VERSION} https://github.com/pgvector/pgvector.git /tmp/pgvector \
   && cd /tmp/pgvector && make OPTFLAGS="" && make install && rm -rf /tmp/pgvector
 
@@ -95,13 +99,13 @@ RUN git clone --depth 1 https://github.com/eradman/pg-safeupdate.git /tmp/pg_saf
 RUN git clone --depth 1 https://github.com/pgexperts/pg_plan_filter.git /tmp/plan_filter \
   && cd /tmp/plan_filter && make && make install && rm -rf /tmp/plan_filter
 
-# pg_graphql — pre-built deb (Rust/pgrx — too slow to compile in CI)
+# pg_graphql: pre-built deb (Rust/pgrx, too slow to compile in CI)
 RUN ARCH=$(dpkg --print-architecture) \
   && curl -fsSL "https://github.com/supabase/pg_graphql/releases/download/v${PG_GRAPHQL_VERSION}/pg_graphql-v${PG_GRAPHQL_VERSION}-pg17-${ARCH}-linux-gnu.deb" \
      -o /tmp/pg_graphql.deb \
   && dpkg -i /tmp/pg_graphql.deb && rm /tmp/pg_graphql.deb
 
-# pg_keyspace — Postgres-native RESP keyspace + PostgREST row cache. Compiled
+# pg_keyspace: Postgres-native RESP keyspace + PostgREST row cache. Compiled
 # from in-repo source in the pgks-builder stage above and copied in here, so the
 # image is self-contained (no dependency on a pre-published release) and builds
 # identically on amd64 and arm64. Bundled and creatable, but NOT auto-loaded: it
@@ -109,11 +113,11 @@ RUN ARCH=$(dpkg --print-architecture) \
 # requires that to run). See /etc/postgresql-custom/pg_keyspace.conf to enable it.
 COPY --from=pgks-builder /out/usr/ /usr/
 
-# pg_guard — role/extension privilege enforcement (bundled in extensions/)
+# pg_guard: role/extension privilege enforcement (bundled in extensions/)
 COPY extensions/pg_guard/ /tmp/pg_guard/
 RUN cd /tmp/pg_guard && make clean && make && make install && rm -rf /tmp/pg_guard
 
-# supatype_mask — per-column read masking and write rejection (bundled in extensions/)
+# supatype_mask: per-column read masking and write rejection (bundled in extensions/)
 COPY extensions/supatype_mask/ /tmp/supatype_mask/
 RUN cd /tmp/supatype_mask && make clean && make && make install && rm -rf /tmp/supatype_mask
 
@@ -134,7 +138,7 @@ COPY config/pg_cron.conf /etc/postgresql-custom/pg_cron.conf
 COPY config/extension-custom-scripts/ /etc/postgresql-custom/extension-custom-scripts/
 
 # Bootstrap: the stock postgres entrypoint only runs *.sh / *.sql in this
-# directory itself — not in subfolders — and only when it has just created the
+# directory itself (not in subfolders), and only when it has just created the
 # data directory. migrate.sh applies init-scripts/ + migrations/.
 COPY migrations/db/init-scripts/ /docker-entrypoint-initdb.d/init-scripts/
 COPY migrations/db/migrations/    /docker-entrypoint-initdb.d/migrations/
@@ -171,8 +175,8 @@ ENV POSTGRES_USER=supatype_admin
 # reports healthy mid-migration and dependents wired to `service_healthy` would
 # start and fail to connect. A TCP answer means the real server is up.
 # -d postgres, and not only for tidiness: without it libpq defaults the database to the user name,
-# so every probe logs `FATAL: database "supatype_admin" does not exist`. The check still passed —
-# pg_isready asks whether the server answers, not whether the connection would succeed — but at one
+# so every probe logs `FATAL: database "supatype_admin" does not exist`. The check still passed:
+# pg_isready asks whether the server answers, not whether the connection would succeed. But at one
 # line every five seconds it is most of what this image's log contains, and it buries anything worth
 # reading. It cost two CI cycles of an unreadable `docker logs --tail` to notice.
 HEALTHCHECK --interval=5s --timeout=3s --retries=10 \

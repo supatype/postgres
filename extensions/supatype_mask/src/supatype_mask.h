@@ -27,10 +27,12 @@
 #include <nodes/nodeFuncs.h>
 #include <nodes/parsenodes.h>
 #include <nodes/value.h>
+#include <optimizer/optimizer.h>
 #include <optimizer/planner.h>
 #include <parser/parse_func.h>
 #include <parser/parsetree.h>
 #include <rewrite/rewriteHandler.h>
+#include <rewrite/rewriteManip.h>
 #include <tcop/utility.h>
 #include <utils/acl.h>
 #include <utils/builtins.h>
@@ -40,6 +42,7 @@
 #include <utils/lsyscache.h>
 #include <utils/memutils.h>
 #include <utils/rel.h>
+#include <utils/typcache.h>
 #include <utils/varlena.h>
 
 #pragma GCC diagnostic pop
@@ -62,12 +65,12 @@
 /// Three states, and the difference between the first two matters for cost as well as
 /// behaviour:
 ///
-/// * `read_fn` valid — reads are masked per row.
-/// * `read_fn` invalid, `force_mask` false — a `WRITE`-only label. Reads are
+/// * `read_fn` valid: reads are masked per row.
+/// * `read_fn` invalid, `force_mask` false: a `WRITE`-only label. Reads are
 ///   unrestricted, so nothing is rewritten on the read path at all. A rule that only
 ///   says who may *change* a column should not make every read of it call a predicate
 ///   that always answers true.
-/// * `force_mask` — the fail-closed state. A label that named a predicate which does
+/// * `force_mask`: the fail-closed state. A label that named a predicate which does
 ///   not exist, has the wrong signature, or is `IMMUTABLE` leaves the column masked
 ///   unconditionally rather than exposed. Guessing the other way would turn a typo in a
 ///   label into a silent disclosure.

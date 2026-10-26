@@ -37,7 +37,12 @@ grant service_role      to authenticator;
 grant supatype_admin    to authenticator;
 
 grant usage                     on schema public to postgres, anon, authenticated, service_role;
-alter default privileges in schema public grant all on tables to postgres, anon, authenticated, service_role;
+-- Tables in public are service_role's (and their owner's) by default. anon and authenticated get a
+-- table's privileges only when something grants them: the schema engine writes a model table's
+-- grants from its access rules, so a table made by hand is not open to the anon key.
+-- Sequences keep their grants: a serial column needs USAGE on its sequence for an
+-- insert the table allows, and older schema engines do not grant it on a model's sequences.
+alter default privileges in schema public grant all on tables to postgres, service_role;
 alter default privileges in schema public grant all on functions to postgres, anon, authenticated, service_role;
 alter default privileges in schema public grant all on sequences to postgres, anon, authenticated, service_role;
 
@@ -47,11 +52,12 @@ grant usage                     on schema extensions to postgres, anon, authenti
 -- Set up namespacing
 alter user supatype_admin SET search_path TO public, extensions; -- don't include the "auth" schema
 
--- These are required so that the users receive grants whenever "supatype_admin" creates tables/function
+-- These are required so that the users receive grants whenever "supatype_admin" creates tables/functions,
+-- except that tables are again kept from anon and authenticated (see above).
 alter default privileges for user supatype_admin in schema public grant all
     on sequences to postgres, anon, authenticated, service_role;
 alter default privileges for user supatype_admin in schema public grant all
-    on tables to postgres, anon, authenticated, service_role;
+    on tables to postgres, service_role;
 alter default privileges for user supatype_admin in schema public grant all
     on functions to postgres, anon, authenticated, service_role;
 
