@@ -19,7 +19,8 @@ chk() { if [ "$2" = "$3" ]; then printf "  PASS  %-52s\n" "$1"; pass=$((pass+1))
 # start a 2-worker daemon (ephemeral tier — pub/sub needs no persistence)
 "$DAEMON" --workers 2 --port "$BASE" --keys-per-worker 10000 --val-bytes 64 >/tmp/pgks_xworker.log 2>&1 &
 DPID=$!
-trap 'kill $DPID 2>/dev/null' EXIT
+# Killed, not shut down, the daemon never unlinks its segments: remove them.
+trap 'kill $DPID 2>/dev/null; rm -f /dev/shm/pgks_w[0-9]*_"$DPID"' EXIT
 for _ in $(seq 1 20); do
   redis-cli -p "$W0" PING 2>/dev/null | grep -q PONG && redis-cli -p "$W1" PING 2>/dev/null | grep -q PONG && break
   sleep 0.2

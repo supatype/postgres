@@ -150,7 +150,7 @@ chk "BITCOUNT with a bad unit"    "1" "$($K BITCOUNT bs 0 1 NOPE 2>&1 | grep -c 
 chk "BITPOS with a bit other than 0/1" "1" "$($K BITPOS bs 2 2>&1 | grep -c 'must be 1 or 0')"
 chk "BITOP with an unknown operation" "1" "$($K BITOP NOPE '{bm}dst' '{bm}a' 2>&1 | grep -c 'syntax error')"
 chk "BITOP NOT with two sources"  "1" "$($K BITOP NOT '{bm}dst' '{bm}a' '{bm}b' 2>&1 | grep -c 'single source key')"
-chk "BITPOS with no bit argument"  "1" "$($K BITPOS bs 2>&1 | grep -c 'wrong number of arguments')"
+chk "BITPOS with no bit argument"  "ERR wrong number of arguments for 'bitpos' command" "$($K BITPOS bs 2>&1)"
 chk "BITPOS past the unit argument" "1" "$($K BITPOS bs 1 0 -1 BYTE X 2>&1 | grep -c 'syntax error')"
 chk "BITFIELD with a bad encoding" "1" "$($K BITFIELD bf GET zz 0 2>&1 | grep -c 'Invalid bitfield type')"
 chk "BITFIELD u64 is not supported" "1" "$($K BITFIELD bf GET u64 0 2>&1 | grep -c 'Invalid bitfield type')"

@@ -67,6 +67,7 @@ macro_rules! uint_arg {
 }
 
 use crate::aggr;
+use crate::arity;
 use crate::batcher::{Batcher, Tier};
 use crate::bitmap;
 use crate::crc16;
@@ -638,6 +639,9 @@ struct Conn {
     // then executed atomically on EXEC. `watch` snapshots (scoped key, version)
     // at WATCH time; EXEC aborts (null array) if any snapshot no longer matches.
     in_multi: bool,
+    /// A command was refused while queueing (an arity error), so EXEC must
+    /// discard the transaction with EXECABORT, as Valkey does.
+    multi_failed: bool,
     queued: Vec<Vec<Vec<u8>>>,
     watch: Vec<(Vec<u8>, Option<u64>)>,
     // RESP3 (set by `HELLO 3`): reply nulls/maps/sets/doubles use the RESP3 wire
@@ -661,6 +665,15 @@ impl Conn {
     /// run.
     fn held_reply_bytes(&self) -> usize {
         self.wbuf.len().saturating_sub(self.wpos)
+    }
+
+    /// Leave MULTI however it ends (EXEC, DISCARD, RESET or an abort): nothing
+    /// queued, nothing watched, and no refusal carried into the next one.
+    fn end_transaction(&mut self) {
+        self.in_multi = false;
+        self.multi_failed = false;
+        self.queued.clear();
+        self.watch.clear();
     }
 }
 
@@ -1295,6 +1308,7 @@ impl Worker {
                     psubs: HashSet::new(),
                     ssubs: HashSet::new(),
                     in_multi: false,
+                    multi_failed: false,
                     queued: Vec::new(),
                     watch: Vec::new(),
                     resp3: false,
@@ -1523,6 +1537,13 @@ impl Worker {
         let mut cmd = args[0].clone();
         cmd.make_ascii_uppercase();
         let max_bulk = self.max_value_bytes;
+
+        // ---- arity: first, as in Valkey, so no handler sees a short argv and
+        // the refusal reads the same whatever the command. ----
+        if let Some(msg) = arity::check(&cmd, args) {
+            self.refuse_arity(fd, &cmd, &msg);
+            return;
+        }
 
         // ---- pub/sub: handled before keyed-command scoping. Channels
         // are tenant-scoped for non-exempt authed roles (same `{tenant}:` prefix
@@ -1769,7 +1790,11 @@ impl Worker {
                 // ambiguous against them. Outside subscribe mode, and in RESP3
                 // where pub/sub arrives out of band as push frames, it is the
                 // ordinary `+PONG`. All three verified against redis 7.0.15.
-                if subscribed && !resp3 {
+                // COMMAND INFO gives PING an arity of -1; the cap of one
+                // argument is PING's own check, in the usual words.
+                if nargs > 2 {
+                    resp::error(out, &arity::message(&cmd));
+                } else if subscribed && !resp3 {
                     resp::array_header(out, 2);
                     resp::bulk(out, b"pong");
                     resp::bulk(out, if nargs >= 2 { &args[1] } else { b"" });
@@ -1844,7 +1869,7 @@ impl Worker {
             }
             b"GET" => {
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'get'");
+                    resp::error(out, &arity::message(b"get"));
                     return;
                 }
                 if !check_string(&store, &args[1], out) {
@@ -1857,7 +1882,7 @@ impl Worker {
             }
             b"SET" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'set'");
+                    resp::error(out, &arity::message(b"set"));
                     return;
                 }
                 // Options, then the expiry, then the key, in Valkey's order: a
@@ -2002,7 +2027,7 @@ impl Worker {
             }
             b"TTL" | b"PTTL" => {
                 if nargs != 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'ttl'");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 match store.get_typed(&args[1]) {
@@ -2020,7 +2045,7 @@ impl Worker {
             }
             b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'expire'");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 // Valkey's order: the options, the number, the overflow checks,
@@ -2063,7 +2088,7 @@ impl Worker {
             }
             b"PERSIST" => {
                 if nargs != 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'persist'");
+                    resp::error(out, &arity::message(b"persist"));
                     return;
                 }
                 // 1 only if the key exists AND had a TTL to remove.
@@ -2079,7 +2104,7 @@ impl Worker {
             }
             b"SCAN" => {
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'scan'");
+                    resp::error(out, &arity::message(b"scan"));
                     return;
                 }
                 // Deliberately NOT resp::arg_int (#150). Redis reads a SCAN
@@ -2130,7 +2155,7 @@ impl Worker {
             }
             b"KEYS" => {
                 if nargs != 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'keys'");
+                    resp::error(out, &arity::message(b"keys"));
                     return;
                 }
                 let pattern = &args[1];
@@ -2188,7 +2213,7 @@ impl Worker {
             }
             b"MGET" => {
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'mget'");
+                    resp::error(out, &arity::message(b"mget"));
                     return;
                 }
                 resp::array_header(out, nargs - 1);
@@ -2202,7 +2227,7 @@ impl Worker {
             }
             b"MSET" => {
                 if nargs < 3 || (nargs - 1) % 2 != 0 {
-                    resp::error(out, "ERR wrong number of arguments for 'mset'");
+                    resp::error(out, &arity::message(b"mset"));
                     return;
                 }
                 let mut i = 1;
@@ -2220,7 +2245,7 @@ impl Worker {
             }
             b"MSETNX" => {
                 if nargs < 3 || (nargs - 1) % 2 != 0 {
-                    resp::error(out, "ERR wrong number of arguments for 'msetnx'");
+                    resp::error(out, &arity::message(b"msetnx"));
                     return;
                 }
                 // All-or-nothing: set only if NONE of the keys already exist.
@@ -2257,7 +2282,7 @@ impl Worker {
                     _ => (ExpireOpt::Ex, "setex"),
                 };
                 if nargs != 4 {
-                    resp::error(out, &format!("ERR wrong number of arguments for '{name}'"));
+                    resp::error(out, &arity::message(name.as_bytes()));
                     return;
                 }
                 // SET EX / SET PX underneath, as in Valkey, so the same
@@ -2295,7 +2320,7 @@ impl Worker {
             b"GETEX" => {
                 // GETEX key [EX s | PX ms | EXAT ts | PXAT ms | PERSIST]
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'getex'");
+                    resp::error(out, &arity::message(b"getex"));
                     return;
                 }
                 // Valkey's order: the options (a syntax error even for a missing
@@ -2330,7 +2355,7 @@ impl Worker {
             }
             b"APPEND" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'append'");
+                    resp::error(out, &arity::message(b"append"));
                     return;
                 }
                 if !check_string(&store, &args[1], out) {
@@ -2363,7 +2388,7 @@ impl Worker {
             }
             b"GETRANGE" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'getrange'");
+                    resp::error(out, &arity::message(b"getrange"));
                     return;
                 }
                 if !check_string(&store, &args[1], out) {
@@ -2384,7 +2409,7 @@ impl Worker {
             }
             b"SETRANGE" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'setrange'");
+                    resp::error(out, &arity::message(b"setrange"));
                     return;
                 }
                 if !check_string(&store, &args[1], out) {
@@ -2447,7 +2472,7 @@ impl Worker {
             // bad offset, not the wrong type.
             b"SETBIT" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'setbit'");
+                    resp::error(out, &arity::message(b"setbit"));
                     return;
                 }
                 let off = match bitmap::bit_offset(&args[2], max_bulk, 1, false) {
@@ -2489,7 +2514,7 @@ impl Worker {
             }
             b"GETBIT" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'getbit'");
+                    resp::error(out, &arity::message(b"getbit"));
                     return;
                 }
                 let off = match bitmap::bit_offset(&args[2], max_bulk, 1, false) {
@@ -2555,7 +2580,7 @@ impl Worker {
             b"BITPOS" => {
                 // BITPOS key bit [start [end [BYTE|BIT]]]
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'bitpos'");
+                    resp::error(out, &arity::message(b"bitpos"));
                     return;
                 }
                 // Past the unit argument there is nothing left to mean, and
@@ -2632,7 +2657,7 @@ impl Worker {
             b"BITOP" => {
                 // BITOP AND|OR|XOR|NOT destkey srckey [srckey …]
                 if nargs < 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'bitop'");
+                    resp::error(out, &arity::message(b"bitop"));
                     return;
                 }
                 let op = match bitmap::parse_bitop(&args[1]) {
@@ -2680,7 +2705,7 @@ impl Worker {
             }
             b"BITFIELD" | b"BITFIELD_RO" => {
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'bitfield'");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let readonly = cmd.as_slice() == b"BITFIELD_RO";
@@ -2734,7 +2759,7 @@ impl Worker {
             }
             b"INCRBYFLOAT" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'incrbyfloat'");
+                    resp::error(out, &arity::message(b"incrbyfloat"));
                     return;
                 }
                 if !check_string(&store, &args[1], out) {
@@ -2778,7 +2803,7 @@ impl Worker {
             // ---- key-space management -----------------------------
             b"RENAME" | b"RENAMENX" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'rename'");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let src = args[1].clone();
@@ -2818,7 +2843,7 @@ impl Worker {
             b"COPY" => {
                 // COPY source destination [REPLACE] [DB n]
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'copy'");
+                    resp::error(out, &arity::message(b"copy"));
                     return;
                 }
                 let replace = args[3..]
@@ -2895,7 +2920,7 @@ impl Worker {
             }
             b"EXPIRETIME" | b"PEXPIRETIME" => {
                 if nargs != 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'expiretime'");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 match store.get_typed(&args[1]) {
@@ -2943,7 +2968,7 @@ impl Worker {
             // ---- server / admin -----------------------------------
             b"ECHO" => {
                 if nargs != 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'echo'");
+                    resp::error(out, &arity::message(b"echo"));
                     return;
                 }
                 resp::bulk(out, &args[1]);
@@ -3224,7 +3249,7 @@ impl Worker {
             // ---- TYPE + hashes ------------------------------------
             b"TYPE" => {
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'type'");
+                    resp::error(out, &arity::message(b"type"));
                 } else {
                     let t = match store.get_typed(&args[1]) {
                         None => "none",
@@ -3236,7 +3261,7 @@ impl Worker {
             b"HSET" | b"HMSET" => {
                 // HSET key field value [field value ...]
                 if nargs < 4 || (nargs - 2) % 2 != 0 {
-                    resp::error(out, "ERR wrong number of arguments for 'hset'");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let (mut h, exp) = match load_hash(&store, &args[1], out) {
@@ -3262,7 +3287,7 @@ impl Worker {
             }
             b"HSETNX" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'hsetnx'");
+                    resp::error(out, &arity::message(b"hsetnx"));
                     return;
                 }
                 let (mut h, exp) = match load_hash(&store, &args[1], out) {
@@ -3281,7 +3306,7 @@ impl Worker {
             }
             b"HGET" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'hget'");
+                    resp::error(out, &arity::message(b"hget"));
                     return;
                 }
                 let raw = match hash_raw(&store, &args[1], out) {
@@ -3295,7 +3320,7 @@ impl Worker {
             }
             b"HMGET" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'hmget'");
+                    resp::error(out, &arity::message(b"hmget"));
                     return;
                 }
                 let raw = match hash_raw(&store, &args[1], out) {
@@ -3312,7 +3337,7 @@ impl Worker {
             }
             b"HDEL" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'hdel'");
+                    resp::error(out, &arity::message(b"hdel"));
                     return;
                 }
                 let (mut h, exp) = match load_hash(&store, &args[1], out) {
@@ -3364,7 +3389,7 @@ impl Worker {
             }
             b"HEXISTS" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'hexists'");
+                    resp::error(out, &arity::message(b"hexists"));
                     return;
                 }
                 let raw = match hash_raw(&store, &args[1], out) {
@@ -3375,7 +3400,7 @@ impl Worker {
             }
             b"HSTRLEN" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'hstrlen'");
+                    resp::error(out, &arity::message(b"hstrlen"));
                     return;
                 }
                 let raw = match hash_raw(&store, &args[1], out) {
@@ -3389,7 +3414,7 @@ impl Worker {
             }
             b"HINCRBY" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'hincrby'");
+                    resp::error(out, &arity::message(b"hincrby"));
                     return;
                 }
                 let by: i64 = match resp::arg_int(&args[3]) {
@@ -3423,7 +3448,7 @@ impl Worker {
             // ---- lists --------------------------------------------
             b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let xonly = cmd == b"LPUSHX" || cmd == b"RPUSHX";
@@ -3451,7 +3476,7 @@ impl Worker {
             }
             b"LPOP" | b"RPOP" => {
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 // optional count argument (Redis 6.2+): returns an array
@@ -3510,7 +3535,7 @@ impl Worker {
             }
             b"LINDEX" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'lindex'");
+                    resp::error(out, &arity::message(b"lindex"));
                     return;
                 }
                 let i: i64 = int_arg!(out, &args[2]);
@@ -3534,7 +3559,7 @@ impl Worker {
             }
             b"LRANGE" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'lrange'");
+                    resp::error(out, &arity::message(b"lrange"));
                     return;
                 }
                 let start: i64 = int_arg!(out, &args[2]);
@@ -3558,7 +3583,7 @@ impl Worker {
             }
             b"LSET" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'lset'");
+                    resp::error(out, &arity::message(b"lset"));
                     return;
                 }
                 let i: i64 = int_arg!(out, &args[2]);
@@ -3583,7 +3608,7 @@ impl Worker {
             }
             b"LTRIM" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'ltrim'");
+                    resp::error(out, &arity::message(b"ltrim"));
                     return;
                 }
                 let start: i64 = int_arg!(out, &args[2]);
@@ -3607,7 +3632,7 @@ impl Worker {
                 // `NX CH INCR` are both accepted by redis), so they are read as
                 // a set until the first token that is not one.
                 if nargs < 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'zadd'");
+                    resp::error(out, &arity::message(b"zadd"));
                     return;
                 }
                 let mut i = 2;
@@ -3743,7 +3768,7 @@ impl Worker {
             }
             b"ZSCORE" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'zscore'");
+                    resp::error(out, &arity::message(b"zscore"));
                     return;
                 }
                 let raw = match zset_raw(&store, &args[1], out) {
@@ -3757,7 +3782,7 @@ impl Worker {
             }
             b"ZMSCORE" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'zmscore'");
+                    resp::error(out, &arity::message(b"zmscore"));
                     return;
                 }
                 let raw = match zset_raw(&store, &args[1], out) {
@@ -3781,7 +3806,7 @@ impl Worker {
             }
             b"ZREM" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'zrem'");
+                    resp::error(out, &arity::message(b"zrem"));
                     return;
                 }
                 let (mut z, exp) = match load_zset(&store, &args[1], out) {
@@ -3801,7 +3826,7 @@ impl Worker {
             }
             b"ZINCRBY" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'zincrby'");
+                    resp::error(out, &arity::message(b"zincrby"));
                     return;
                 }
                 let by = match aggr::parse_score(&args[2]) {
@@ -3845,7 +3870,7 @@ impl Worker {
             }
             b"ZRANK" | b"ZREVRANK" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let raw = match zset_raw(&store, &args[1], out) {
@@ -3866,7 +3891,7 @@ impl Worker {
             }
             b"ZRANGE" | b"ZREVRANGE" => {
                 if nargs < 4 {
-                    resp::error(out, "ERR wrong number of arguments");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let start: i64 = int_arg!(out, &args[2]);
@@ -3904,7 +3929,7 @@ impl Worker {
             }
             b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE" => {
                 if nargs < 4 {
-                    resp::error(out, "ERR wrong number of arguments");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let rev = cmd == b"ZREVRANGEBYSCORE";
@@ -3954,7 +3979,7 @@ impl Worker {
             }
             b"ZCOUNT" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'zcount'");
+                    resp::error(out, &arity::message(b"zcount"));
                     return;
                 }
                 let (min, max) = match (aggr::ScoreBound::parse(&args[2]), aggr::ScoreBound::parse(&args[3])) {
@@ -3973,7 +3998,7 @@ impl Worker {
             // ---- aggregate gaps: hash ------------------------------
             b"HINCRBYFLOAT" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'hincrbyfloat'");
+                    resp::error(out, &arity::message(b"hincrbyfloat"));
                     return;
                 }
                 let by = match aggr::parse_score(&args[3]) {
@@ -4012,7 +4037,7 @@ impl Worker {
             b"HRANDFIELD" => {
                 // HRANDFIELD key [count [WITHVALUES]]
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'hrandfield'");
+                    resp::error(out, &arity::message(b"hrandfield"));
                     return;
                 }
                 let (h, _) = match load_hash(&store, &args[1], out) {
@@ -4058,7 +4083,7 @@ impl Worker {
             b"LINSERT" => {
                 // LINSERT key BEFORE|AFTER pivot element
                 if nargs != 5 {
-                    resp::error(out, "ERR wrong number of arguments for 'linsert'");
+                    resp::error(out, &arity::message(b"linsert"));
                     return;
                 }
                 let before = match args[2].to_ascii_uppercase().as_slice() {
@@ -4093,7 +4118,7 @@ impl Worker {
             b"LREM" => {
                 // LREM key count element
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'lrem'");
+                    resp::error(out, &arity::message(b"lrem"));
                     return;
                 }
                 let count: i64 =
@@ -4140,7 +4165,7 @@ impl Worker {
             b"LPOS" => {
                 // LPOS key element [RANK rank] [COUNT num]
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'lpos'");
+                    resp::error(out, &arity::message(b"lpos"));
                     return;
                 }
                 let mut rank: i64 = 1;
@@ -4210,13 +4235,13 @@ impl Worker {
                 // RPOPLPUSH src dst == LMOVE src dst RIGHT LEFT
                 let (from_left, to_left) = if cmd == b"RPOPLPUSH" {
                     if nargs != 3 {
-                        resp::error(out, "ERR wrong number of arguments for 'rpoplpush'");
+                        resp::error(out, &arity::message(b"rpoplpush"));
                         return;
                     }
                     (false, true)
                 } else {
                     if nargs != 5 {
-                        resp::error(out, "ERR wrong number of arguments for 'lmove'");
+                        resp::error(out, &arity::message(b"lmove"));
                         return;
                     }
                     let f = match args[3].to_ascii_uppercase().as_slice() {
@@ -4308,7 +4333,7 @@ impl Worker {
             b"ZPOPMIN" | b"ZPOPMAX" => {
                 // key [count]
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'zpopmin'");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let count_given = nargs >= 3;
@@ -4340,7 +4365,7 @@ impl Worker {
             b"ZRANDMEMBER" => {
                 // ZRANDMEMBER key [count [WITHSCORES]]
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'zrandmember'");
+                    resp::error(out, &arity::message(b"zrandmember"));
                     return;
                 }
                 let (z, _) = match load_zset(&store, &args[1], out) {
@@ -4378,7 +4403,7 @@ impl Worker {
             // ---- sets ----------------------------------------------
             b"SADD" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'sadd'");
+                    resp::error(out, &arity::message(b"sadd"));
                     return;
                 }
                 let (mut s, exp) = match load_set(&store, &args[1], out) {
@@ -4398,7 +4423,7 @@ impl Worker {
             }
             b"SREM" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'srem'");
+                    resp::error(out, &arity::message(b"srem"));
                     return;
                 }
                 let (mut s, exp) = match load_set(&store, &args[1], out) {
@@ -4418,7 +4443,7 @@ impl Worker {
             }
             b"SCARD" => {
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'scard'");
+                    resp::error(out, &arity::message(b"scard"));
                     return;
                 }
                 let raw = match set_raw(&store, &args[1], out) {
@@ -4429,7 +4454,7 @@ impl Worker {
             }
             b"SISMEMBER" => {
                 if nargs != 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'sismember'");
+                    resp::error(out, &arity::message(b"sismember"));
                     return;
                 }
                 let raw = match set_raw(&store, &args[1], out) {
@@ -4441,7 +4466,7 @@ impl Worker {
             }
             b"SMISMEMBER" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'smismember'");
+                    resp::error(out, &arity::message(b"smismember"));
                     return;
                 }
                 let raw = match set_raw(&store, &args[1], out) {
@@ -4456,7 +4481,7 @@ impl Worker {
             }
             b"SMEMBERS" => {
                 if nargs != 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'smembers'");
+                    resp::error(out, &arity::message(b"smembers"));
                     return;
                 }
                 let (s, _) = match load_set(&store, &args[1], out) {
@@ -4471,7 +4496,7 @@ impl Worker {
             b"SPOP" => {
                 // SPOP key [count]
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'spop'");
+                    resp::error(out, &arity::message(b"spop"));
                     return;
                 }
                 let (mut s, exp) = match load_set(&store, &args[1], out) {
@@ -4518,7 +4543,7 @@ impl Worker {
             b"SRANDMEMBER" => {
                 // SRANDMEMBER key [count]  (count < 0 allows repeats)
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments for 'srandmember'");
+                    resp::error(out, &arity::message(b"srandmember"));
                     return;
                 }
                 let (s, _) = match load_set(&store, &args[1], out) {
@@ -4549,7 +4574,7 @@ impl Worker {
             b"SMOVE" => {
                 // SMOVE source destination member
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'smove'");
+                    resp::error(out, &arity::message(b"smove"));
                     return;
                 }
                 // Validate both types before mutating either side.
@@ -4584,7 +4609,7 @@ impl Worker {
             }
             b"SUNION" | b"SINTER" | b"SDIFF" => {
                 if nargs < 2 {
-                    resp::error(out, "ERR wrong number of arguments");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let mut sets: Vec<aggr::Set> = Vec::with_capacity(nargs - 1);
@@ -4602,7 +4627,7 @@ impl Worker {
             }
             b"SUNIONSTORE" | b"SINTERSTORE" | b"SDIFFSTORE" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let mut sets: Vec<aggr::Set> = Vec::with_capacity(nargs - 2);
@@ -4634,7 +4659,7 @@ impl Worker {
             // which is a valid Redis SCAN result. COUNT is a hint and ignored.
             b"HSCAN" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'hscan'");
+                    resp::error(out, &arity::message(b"hscan"));
                     return;
                 }
                 let (pattern, novalues) = scan_opts(args, 3, true);
@@ -4659,7 +4684,7 @@ impl Worker {
             }
             b"SSCAN" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'sscan'");
+                    resp::error(out, &arity::message(b"sscan"));
                     return;
                 }
                 let (pattern, _) = scan_opts(args, 3, false);
@@ -4681,7 +4706,7 @@ impl Worker {
             }
             b"ZSCAN" => {
                 if nargs < 3 {
-                    resp::error(out, "ERR wrong number of arguments for 'zscan'");
+                    resp::error(out, &arity::message(b"zscan"));
                     return;
                 }
                 let (pattern, _) = scan_opts(args, 3, false);
@@ -4849,7 +4874,7 @@ impl Worker {
             }
             b"ZLEXCOUNT" => {
                 if nargs != 4 {
-                    resp::error(out, "ERR wrong number of arguments for 'zlexcount'");
+                    resp::error(out, &arity::message(b"zlexcount"));
                     return;
                 }
                 let (lo, hi) = match (parse_lex(&args[2]), parse_lex(&args[3])) {
@@ -4872,7 +4897,7 @@ impl Worker {
             }
             b"ZRANGEBYLEX" | b"ZREVRANGEBYLEX" => {
                 if nargs < 4 {
-                    resp::error(out, "ERR wrong number of arguments");
+                    resp::error(out, &arity::message(&cmd));
                     return;
                 }
                 let rev = cmd == b"ZREVRANGEBYLEX";
@@ -4921,7 +4946,7 @@ impl Worker {
             b"ZRANGESTORE" => {
                 // ZRANGESTORE dst src min max [BYSCORE|BYLEX] [REV] [LIMIT off cnt]
                 if nargs < 5 {
-                    resp::error(out, "ERR wrong number of arguments for 'zrangestore'");
+                    resp::error(out, &arity::message(b"zrangestore"));
                     return;
                 }
                 let byscore = args[5..].iter().any(|a| a.eq_ignore_ascii_case(b"BYSCORE"));
@@ -5235,10 +5260,26 @@ impl Worker {
             resp::error(&mut c.wbuf, "ERR DISCARD without MULTI");
             return;
         }
-        c.in_multi = false;
-        c.queued.clear();
-        c.watch.clear();
+        c.end_transaction();
         resp::simple(&mut c.wbuf, "OK");
+    }
+
+    /// Refuse a command for its argument count, as Valkey does. Inside MULTI the
+    /// refusal is answered at once rather than queued, and it dooms the
+    /// transaction: EXEC then discards everything with EXECABORT. A refused EXEC
+    /// is itself answered through that abort path, and ends the transaction.
+    fn refuse_arity(&mut self, fd: RawFd, cmd: &[u8], msg: &str) {
+        let Some(c) = self.conns.get_mut(&fd) else { return };
+        if cmd == b"EXEC" {
+            c.end_transaction();
+            let why = msg.strip_prefix("ERR ").unwrap_or(msg);
+            resp::error(&mut c.wbuf, &format!("EXECABORT Transaction discarded because of: {why}"));
+            return;
+        }
+        if c.in_multi {
+            c.multi_failed = true;
+        }
+        resp::error(&mut c.wbuf, msg);
     }
 
     /// WATCH key [key …]: snapshot each (tenant-scoped) key's version so EXEC
@@ -5246,7 +5287,7 @@ impl Worker {
     fn handle_watch(&mut self, fd: RawFd, args: &[Vec<u8>]) {
         if args.len() < 2 {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-            resp::error(out, "ERR wrong number of arguments for 'watch'");
+            resp::error(out, &arity::message(b"watch"));
             return;
         }
         if self.conns.get(&fd).map(|c| c.in_multi).unwrap_or(false) {
@@ -5272,11 +5313,19 @@ impl Worker {
             resp::error(out, "ERR EXEC without MULTI");
             return;
         }
-        let (queued, watch) = {
+        let (queued, watch, failed) = {
             let c = self.conns.get_mut(&fd).unwrap();
-            c.in_multi = false;
-            (std::mem::take(&mut c.queued), std::mem::take(&mut c.watch))
+            let taken = (std::mem::take(&mut c.queued), std::mem::take(&mut c.watch), c.multi_failed);
+            c.end_transaction();
+            taken
         };
+        // A command refused while queueing dooms the transaction, and Valkey
+        // reports that ahead of any WATCH abort.
+        if failed {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, "EXECABORT Transaction discarded because of previous errors.");
+            return;
+        }
         // Abort if any WATCHed key's version no longer matches its snapshot.
         let aborted = watch.iter().any(|(k, snap)| self.store.version(k) != *snap);
         if aborted {
@@ -5326,7 +5375,7 @@ impl Worker {
         let c = self.conns.get_mut(&fd).unwrap();
         match r {
             R::NoCfg => resp::simple(&mut c.wbuf, "OK"),
-            R::BadArgs => resp::error(&mut c.wbuf, "ERR wrong number of arguments for 'auth'"),
+            R::BadArgs => resp::error(&mut c.wbuf, &arity::message(b"auth")),
             R::Wrong => resp::error(
                 &mut c.wbuf,
                 "WRONGPASS invalid username-password pair or user is disabled.",
@@ -5499,9 +5548,7 @@ impl Worker {
             Some(c) => c,
             None => return,
         };
-        c.in_multi = false;
-        c.queued.clear();
-        c.watch.clear();
+        c.end_transaction();
         c.track = Tracking::default();
         c.name.clear();
         // Back to RESP2: RESET undoes HELLO 3, so a client that resets and then
@@ -5543,7 +5590,7 @@ impl Worker {
             Some(b"SETNAME") => {
                 let Some(name) = args.get(2) else {
                     let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-                    resp::error(out, "ERR wrong number of arguments for 'client|setname' command");
+                    resp::error(out, &arity::message(b"client|setname"));
                     return;
                 };
                 // Redis's own rule: printable ASCII excluding space, so the name
@@ -5868,7 +5915,8 @@ impl Worker {
     fn handle_subscribe(&mut self, fd: RawFd, args: &[Vec<u8>], pattern: bool) {
         if args.len() < 2 {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-            resp::error(out, "ERR wrong number of arguments");
+            let name: &[u8] = if pattern { b"psubscribe" } else { b"subscribe" };
+            resp::error(out, &arity::message(name));
             return;
         }
         if !self.pubsub_authed(fd) {
@@ -6004,7 +6052,7 @@ impl Worker {
     fn handle_publish(&mut self, fd: RawFd, args: &[Vec<u8>]) {
         if args.len() != 3 {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-            resp::error(out, "ERR wrong number of arguments for 'publish'");
+            resp::error(out, &arity::message(b"publish"));
             return;
         }
         if !self.pubsub_authed(fd) {
@@ -6124,7 +6172,7 @@ impl Worker {
     fn handle_ssubscribe(&mut self, fd: RawFd, args: &[Vec<u8>]) {
         if args.len() < 2 {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-            resp::error(out, "ERR wrong number of arguments for 'ssubscribe' command");
+            resp::error(out, &arity::message(b"ssubscribe"));
             self.flush(fd);
             return;
         }
@@ -6216,7 +6264,7 @@ impl Worker {
     fn handle_spublish(&mut self, fd: RawFd, args: &[Vec<u8>]) {
         if args.len() != 3 {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-            resp::error(out, "ERR wrong number of arguments for 'spublish' command");
+            resp::error(out, &arity::message(b"spublish"));
             self.flush(fd);
             return;
         }
@@ -6351,7 +6399,7 @@ impl Worker {
     fn handle_pubsub(&mut self, fd: RawFd, args: &[Vec<u8>]) {
         if args.len() < 2 {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-            resp::error(out, "ERR wrong number of arguments for 'pubsub' command");
+            resp::error(out, &arity::message(b"pubsub"));
             self.flush(fd);
             return;
         }
@@ -6469,7 +6517,7 @@ impl Worker {
             // one of these strings should not have to special-case us.
             b"NUMPAT" => resp::error(
                 out,
-                "ERR wrong number of arguments for 'pubsub|numpat' command",
+                &arity::message(b"pubsub|numpat"),
             ),
             b"SHARDCHANNELS" | b"CHANNELS" => resp::error(
                 out,

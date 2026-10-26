@@ -18,7 +18,8 @@ redis-cli -p "$REDIS" PING 2>/dev/null | grep -q PONG || { echo "  SKIP  no redi
 
 "$DAEMON" --workers 1 --port "$PORT" --keys-per-worker 100000 --shmem-mb 128 >/tmp/pgks_bigzset.log 2>&1 &
 DPID=$!
-trap 'kill $DPID 2>/dev/null' EXIT
+# Killed, not shut down, the daemon never unlinks its segments: remove them.
+trap 'kill $DPID 2>/dev/null; rm -f /dev/shm/pgks_w[0-9]*_"$DPID"' EXIT
 for _ in $(seq 1 20); do redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
 redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG || { echo "  FAIL  daemon did not start"; exit 1; }
 

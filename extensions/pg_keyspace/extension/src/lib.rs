@@ -55,6 +55,8 @@ mod pubsub_shm;
 mod repl;
 #[path = "../../core/src/aggr.rs"]
 mod aggr;
+#[path = "../../core/src/arity.rs"]
+mod arity;
 #[path = "../../core/src/bitmap.rs"]
 mod bitmap;
 #[path = "../../core/src/share.rs"]
