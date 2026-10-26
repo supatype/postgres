@@ -8,8 +8,9 @@ SECURITY LABEL FOR supatype ON COLUMN public.posts.salary
   IS 'MASK READ public.can_read_posts__salary WRITE public.can_write_posts__salary';
 ```
 
-From then on, every reference to `posts.salary` — in the target list, in a `WHERE`
-clause, through a view, inside a subquery, in `COPY posts TO` — is rewritten to
+From then on, every reference to `posts.salary` is rewritten to the expression below.
+That covers the target list, a `WHERE` clause, a view, a subquery, `COPY posts TO`, and
+the column's slot in a whole-row reference such as `to_jsonb(posts)`:
 
 ```sql
 CASE WHEN public.can_read_posts__salary(posts) THEN posts.salary ELSE NULL END
@@ -23,13 +24,13 @@ unauthorised read is a null.
 ## Why a planner hook and not privileges or views
 
 `GET /posts` with no `select` parameter sends `SELECT posts.*`. That names every column,
-so it succeeds only if the role holds `SELECT` on every column — a column `REVOKE` makes
+so it succeeds only if the role holds `SELECT` on every column. A column `REVOKE` makes
 PostgREST answer **403 for the whole table** rather than returning a filtered row. So a
 read restriction cannot be a privilege: the column has to be present and masked.
 
 Masking is a per-row expression, and the only things in Postgres that put an expression
 where a column was are a view and a query rewrite. `CREATE VIEW v AS SELECT * FROM t`
-does not store `*` — Postgres expands it at creation and stores a fixed target list, so a
+does not store `*`: Postgres expands it at creation and stores a fixed target list, so a
 column added later is invisible to the API until something re-runs `CREATE OR REPLACE
 VIEW`. Every view is a snapshot of the column list.
 
@@ -54,7 +55,7 @@ CREATE FUNCTION can_read_posts__salary(posts posts) RETURNS boolean
 
 ### Row-independent predicates (once per scan, not once per row)
 
-The whole-row form above is called **once per row per masked column** — correct
+The whole-row form above is called **once per row per masked column**. That is correct
 for a value-dependent rule (`author_id = auth.uid()`), but wasteful for the common
 case where the answer depends only on the session (a role- or claim-level rule that
 ignores the row). On a full scan of a masked table that is the dominant cost: a
@@ -73,7 +74,7 @@ Measured on a 100k-row table, 3 masked columns, with a per-`current_user` table
 lookup as the predicate body: **1117 ms per-row → 18 ms row-independent** (96× →
 1.7×, i.e. the cost of the `CASE` branches alone). The InitPlan is still evaluated
 at run time on every execution, and `IMMUTABLE` is still refused, so a plan cached
-for one caller re-runs it for the next caller's session — no cross-caller leak, the
+for one caller re-runs it for the next caller's session. There is no cross-caller leak, the
 same guarantee as the per-row form.
 
 The whole-row overload wins when both `pred(t)` and `pred()` exist, so making a rule
@@ -94,11 +95,11 @@ CREATE EXTENSION supatype_mask;
 ```
 
 Preloading without the extension still masks; a rejection then raises
-`supatype_mask.deny() is not available` instead of the intended error. The reverse — the
-extension without the preload — does nothing at all. Dropping the extension therefore does
+`supatype_mask.deny() is not available` instead of the intended error. The reverse, the
+extension without the preload, does nothing at all. Dropping the extension therefore does
 **not** unmask anything, which is the right way round.
 
-`shared_preload_libraries`, not `session_preload_libraries` — see below.
+`shared_preload_libraries`, not `session_preload_libraries`: see below.
 
 ## Configuration
 
@@ -115,7 +116,7 @@ make the whole mechanism a no-op.
 ## Tamper resistance
 
 Both settings are `PGC_SIGHUP` and the library is in `shared_preload_libraries`, so
-**there is no SQL statement that disables masking for a role, a database or a session** —
+**there is no SQL statement that disables masking for a role, a database or a session**,
 not even for a superuser. This is deliberate, and it is the same posture `pg_guard` takes
 with all of its own settings.
 
@@ -128,10 +129,10 @@ Two routes were open before and are now closed:
 
 | Route | Why it mattered | Now |
 |---|---|---|
-| `ALTER ROLE authenticated SET supatype_mask.enabled = off` | Permanent, invisible, unmasks every column for the whole API surface in one statement | `PGC_SIGHUP` — refused |
+| `ALTER ROLE authenticated SET supatype_mask.enabled = off` | Permanent, invisible, unmasks every column for the whole API surface in one statement | `PGC_SIGHUP`, so refused |
 | `ALTER ROLE authenticated SET session_preload_libraries = 'pg_guard'` | Narrows the preload for just the data-plane role, so the library never loads for it | Library is in `shared_preload_libraries` (`PGC_POSTMASTER`), which cannot be set per role or per database |
 
-What remains is `ALTER SYSTEM SET shared_preload_libraries` plus a **server restart** —
+What remains is `ALTER SYSTEM SET shared_preload_libraries` plus a **server restart**:
 superuser only, written to `postgresql.auto.conf` on disk, and it takes every other
 preloaded extension down with it. Loud and global rather than silent and targeted, which
 is the distinction that matters. A superuser is exempt from masking anyway, and can
@@ -143,7 +144,10 @@ equally `DISABLE ROW LEVEL SECURITY`; this is no weaker than RLS against the sam
 |---|---|
 | `SELECT`, any reference | masked to NULL per row |
 | `WHERE`, `ORDER BY`, `GROUP BY`, joins, subqueries | masked, so a qual cannot be used as an oracle |
-| `sum(salary)` etc. | rejected per unreadable row, so a total is either correct or an error — never quietly partial |
+| `sum(salary)`, `max(salary)`, `string_agg(salary::text, ',')` etc. | rejected per unreadable row, so a total is either correct or an error, never quietly partial |
+| aggregate over a subquery (`jsonb_agg((SELECT q.salary FROM t q ...))`) | the subquery's own reads mask to NULL; the aggregate consumes what the subquery returns |
+| window aggregate (`sum(salary) OVER (...)`, `count(*) FILTER (WHERE salary > 0) OVER ()`) | rejected per unreadable row, like `sum(salary)` |
+| window `PARTITION BY` / `ORDER BY` on the column, ranking functions, `lag`, `first_value` | masked to NULL: unreadable rows tie, so no rank or order reaches the caller |
 | `UPDATE`, caller may write | accepted |
 | `UPDATE`, caller cannot read | old value preserved silently |
 | `UPDATE`, caller can read but not write | rejected |
@@ -151,13 +155,28 @@ equally `DISABLE ROW LEVEL SECURITY`; this is no weaker than RLS against the sam
 | `COPY t TO` | rewritten through the planner, so masked |
 | `COPY t FROM` | refused |
 | `MERGE` | refused |
-| whole-row reference (`to_jsonb(t)`, `SELECT t FROM t`) | refused |
+| whole-row reference (`to_jsonb(t)`, `SELECT t FROM t`, `f(t)`) | the masked row: each masked column in it masked as above |
+| whole-row reference inside an aggregate (`jsonb_agg(t)`) | rejected per unreadable row, like `sum(salary)` |
 
 **The UPDATE round-trip is the case this exists for.** A client GETs a row, `salary`
 comes back null because it is masked, the user edits the title, and the client PATCHes
 the whole object back including `salary: null`. Without coercion the real salary is gone,
 silently, with a 200. "Could not read it" and "saw it and changed it" have to be
 distinguishable, or one of them destroys data and the other breaks whole-object clients.
+
+**An aggregate is scoped to its own query level.** A column consumed by an aggregate
+directly, or read from inside a subquery the aggregate wraps but owned by the aggregate's
+level, is rejected per unreadable row. A column a subquery reads for itself is masked like
+any other read, because the aggregate only sees what the subquery returns. That is the
+shape pg_graphql uses for a nested relation (the child connection is a subquery inside the
+parent's `jsonb_agg`), and it is why nested relations work over masked tables. The cost is
+that `sum((SELECT q.salary FROM t q WHERE ...))` skips the rows the subquery masked rather
+than erroring; nothing the role may not read is disclosed either way.
+
+**A whole-row reference is rebuilt from its columns.** `t` becomes
+`ROW(t.id, <mask of t.salary>, ...)::t`, so a PostgREST computed column `f(t)`,
+`to_jsonb(t)` and `SELECT t FROM t` see exactly what a column-by-column select would. On
+the nullable side of an outer join an unmatched row stays a NULL row.
 
 **INSERT is the honest limitation.** There is no old row, so the write predicate is
 evaluated against `NULL::t`. An identity-only rule (`Role<"admin">`) answers correctly; a
@@ -170,7 +189,7 @@ Every undecidable case masks rather than exposes:
 
 - a label naming a predicate that does not exist
 - a predicate that does not return boolean
-- a predicate declared `IMMUTABLE` — see below
+- a predicate declared `IMMUTABLE` (see below)
 - an unparseable label
 
 Each logs a `WARNING` naming the column. A malformed label is normally rejected at
@@ -179,7 +198,7 @@ label was written while the library was not loaded.
 
 **Why `IMMUTABLE` is refused.** A masking predicate reads the caller's claims, so it is
 `STABLE` at best. Declared immutable, the planner is entitled to fold it wherever its
-arguments are constant — which the INSERT path does deliberately — and a folded answer
+arguments are constant (which the INSERT path does deliberately), and a folded answer
 baked into a cached plan is a cross-caller leak. Five lines of catalog check; the whole
 design rests on them.
 
@@ -213,6 +232,6 @@ non-admin would leak the column with no error and no log line.
 
 ## Licence
 
-Apache 2.0 — see [LICENSE](./LICENSE). Deliberately not the repository root's
+Apache 2.0, see [LICENSE](./LICENSE). Deliberately not the repository root's
 PostgreSQL License: this directory is original work intended to be publishable to PGXN on
 its own terms, the same arrangement `pg_guard` has.

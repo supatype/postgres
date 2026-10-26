@@ -26,6 +26,20 @@ typedef struct RelMask {
   MaskEntry     *entry;
 } RelMask;
 
+/// One query level: its masked relations, and whether the walk is inside an
+/// aggregate (plain or window) written at this level.
+///
+/// The aggregate flag is per level because a subquery is its own scope. An aggregate
+/// over a subquery consumes what the subquery returns, which is already masked, so a
+/// column the subquery reads for itself is masked like any other read. Only a column
+/// whose path up to its own level passes through an aggregate is consumed by one.
+/// Carrying a single flag across levels refused every nested relation pg_graphql
+/// builds, since each child connection is a subquery inside the parent's `jsonb_agg`.
+typedef struct MaskLevel {
+  List *rels;
+  bool  in_aggregate;
+} MaskLevel;
+
 /// `levels` is innermost-first: a `Var` with `varlevelsup = k` belongs to
 /// `list_nth(levels, k)`. Carrying a stack rather than re-walking once per query level
 /// keeps this to a single traversal and makes outer references correct -- a masked
@@ -34,7 +48,6 @@ typedef struct MaskCtx {
   List  *levels;
   Query *curquery; // the Query being masked now; carries hasSubLinks when a
                    // row-independent predicate is emitted as a `(SELECT pred())`
-  bool   in_aggref;
 } MaskCtx;
 
 static Node *mask_mutator(Node *node, void *context);
@@ -52,10 +65,10 @@ relation_restricts_reads(const MaskEntry *entry) {
 }
 
 static RelMask *
-find_rel(List *level, Index varno) {
+find_rel(const MaskLevel *level, Index varno) {
   ListCell *lc;
 
-  foreach (lc, level) {
+  foreach (lc, level->rels) {
     RelMask *rm = (RelMask *) lfirst(lc);
     if (rm->varno == varno) return rm;
   }
@@ -63,11 +76,28 @@ find_rel(List *level, Index varno) {
   return NULL;
 }
 
-static List *
+static MaskLevel *
+current_level(MaskCtx *ctx) {
+  return (MaskLevel *) linitial(ctx->levels);
+}
+
+/// Whether a reference `levelsup` levels out reaches its value through an aggregate:
+/// one written at its own level, or at any level between it and the reference.
+static bool
+reference_is_aggregated(MaskCtx *ctx, Index levelsup) {
+  Index i;
+
+  for (i = 0; i <= levelsup; i++)
+    if (((MaskLevel *) list_nth(ctx->levels, i))->in_aggregate) return true;
+
+  return false;
+}
+
+static MaskLevel *
 build_level(Query *query) {
-  List     *level = NIL;
-  ListCell *lc;
-  Index     varno = 0;
+  MaskLevel *level = (MaskLevel *) palloc0(sizeof(MaskLevel));
+  ListCell  *lc;
+  Index      varno = 0;
 
   foreach (lc, query->rtable) {
     RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
@@ -80,11 +110,11 @@ build_level(Query *query) {
     entry = supatype_mask_lookup(rte->relid);
     if (entry->ncols == 0) continue;
 
-    rm        = (RelMask *) palloc(sizeof(RelMask));
-    rm->varno = varno;
-    rm->rte   = rte;
-    rm->entry = entry;
-    level     = lappend(level, rm);
+    rm          = (RelMask *) palloc(sizeof(RelMask));
+    rm->varno   = varno;
+    rm->rte     = rte;
+    rm->entry   = entry;
+    level->rels = lappend(level->rels, rm);
   }
 
   return level;
@@ -206,7 +236,7 @@ build_read_mask(MaskCtx *ctx, RelMask *rm, Var *var, MaskedColumn *col) {
   // it in a predicate that always answers true would cost a call per row for nothing.
   if (!col->force_mask && !OidIsValid(col->read_fn)) return (Node *) var;
 
-  if (ctx->in_aggref)
+  if (reference_is_aggregated(ctx, var->varlevelsup))
     fallback = supatype_mask_build_deny(
         var->vartype, var->vartypmod, var->varcollid,
         psprintf("column %s is masked for this role and cannot be aggregated",
@@ -374,7 +404,7 @@ static RelMask *
 result_rel(Query *query, MaskCtx *ctx) {
   if (query->resultRelation == 0) return NULL;
 
-  return find_rel((List *) linitial(ctx->levels), query->resultRelation);
+  return find_rel(current_level(ctx), query->resultRelation);
 }
 
 /// An assignment list is not a projection.
@@ -503,57 +533,164 @@ mask_query(Query *query, MaskCtx *ctx) {
   return query;
 }
 
+/// One column of a whole-row reference, as the reference would have read it: masked
+/// if the column is, otherwise the plain `Var`.
+static Node *
+mask_row_column(MaskCtx *ctx, RelMask *rm, const Var *rowvar, AttrNumber attnum,
+                Form_pg_attribute att) {
+  Var          *colvar;
+  MaskedColumn *col;
+
+  colvar = makeVar(rowvar->varno, attnum, att->atttypid, att->atttypmod,
+                   att->attcollation, rowvar->varlevelsup);
+  colvar->varnullingrels = bms_copy(rowvar->varnullingrels);
+
+  col = supatype_mask_column(rm->entry, attnum);
+  if (col == NULL) return (Node *) colvar;
+
+  return build_read_mask(ctx, rm, colvar, col);
+}
+
+/// `ROW(t.a, <mask of t.b>, ...)::t`, in the column order of the row type.
+///
+/// A dropped column keeps its slot in the row type, so it is filled the way the parser
+/// fills one when coercing a record to a named composite: a NULL of type int4.
+static RowExpr *
+build_masked_row_expr(MaskCtx *ctx, RelMask *rm, const Var *rowvar) {
+  Relation  rel;
+  TupleDesc desc;
+  RowExpr  *row  = makeNode(RowExpr);
+  List     *args = NIL;
+  int       attno;
+
+  rel  = relation_open(rm->rte->relid, NoLock);
+  desc = RelationGetDescr(rel);
+
+  for (attno = 1; attno <= desc->natts; attno++) {
+    Form_pg_attribute att = TupleDescAttr(desc, attno - 1);
+
+    if (att->attisdropped)
+      args = lappend(args, makeNullConst(INT4OID, -1, InvalidOid));
+    else
+      args = lappend(args, mask_row_column(ctx, rm, rowvar, (AttrNumber) attno, att));
+  }
+
+  relation_close(rel, NoLock);
+
+  row->args       = args;
+  row->row_typeid = rowvar->vartype;
+  row->row_format = COERCE_IMPLICIT_CAST;
+  row->colnames   = NIL; // a named composite takes its field names from the catalog
+  row->location   = rowvar->location;
+
+  return row;
+}
+
+/// A whole-row reference, rebuilt from its columns with every masked one masked.
+///
+/// `to_jsonb(t)`, a PostgREST computed column `f(t)` and `SELECT t FROM t` then see the
+/// same values a column-by-column select would, so the reference works rather than
+/// refusing, and nothing the role may not read reaches the function or the client.
+///
+/// On the nullable side of an outer join an unmatched row is a NULL row, which a
+/// `ROW()` of NULL columns is not, so the original reference decides nullness. Testing
+/// a datum for NULL reads none of its fields.
+static Node *
+build_masked_row(MaskCtx *ctx, RelMask *rm, Var *rowvar) {
+  RowExpr  *row = build_masked_row_expr(ctx, rm, rowvar);
+  NullTest *unmatched;
+  CaseWhen *when;
+  CaseExpr *caseexpr;
+
+  if (bms_is_empty(rowvar->varnullingrels)) return (Node *) row;
+
+  unmatched               = makeNode(NullTest);
+  unmatched->arg          = (Expr *) rowvar;
+  unmatched->nulltesttype = IS_NULL;
+  unmatched->argisrow     = false;
+  unmatched->location     = -1;
+
+  when         = makeNode(CaseWhen);
+  when->expr   = (Expr *) unmatched;
+  when->result = (Expr *) makeNullConst(rowvar->vartype, -1, InvalidOid);
+
+  caseexpr             = makeNode(CaseExpr);
+  caseexpr->casetype   = rowvar->vartype;
+  caseexpr->casecollid = InvalidOid;
+  caseexpr->arg        = NULL;
+  caseexpr->args       = list_make1(when);
+  caseexpr->defresult  = (Expr *) row;
+
+  return (Node *) caseexpr;
+}
+
+static Node *
+mask_var(MaskCtx *ctx, Var *var) {
+  RelMask      *rm;
+  MaskedColumn *col;
+
+  if (var->varlevelsup >= (Index) list_length(ctx->levels)) return (Node *) var;
+
+  rm = find_rel((MaskLevel *) list_nth(ctx->levels, var->varlevelsup), var->varno);
+  if (rm == NULL) return (Node *) var;
+
+  // Only a read restriction makes a whole-row reference a disclosure. A table whose
+  // labels restrict writes only has nothing to hide, so `to_jsonb(t)` is left alone.
+  if (var->varattno == 0)
+    return relation_restricts_reads(rm->entry) ? build_masked_row(ctx, rm, var)
+                                               : (Node *) var;
+
+  // System columns carry no data of the row's own.
+  if (var->varattno < 0) return (Node *) var;
+
+  col = supatype_mask_column(rm->entry, var->varattno);
+  if (col == NULL) return (Node *) var;
+
+  return build_read_mask(ctx, rm, var, col);
+}
+
+/// Whether the node may fold many rows' inputs into one answer, so masking its input
+/// to NULL would make it quietly partial: a plain aggregate, or a window function
+/// (`sum(x) OVER ()`), FILTER included.
+///
+/// The built-in non-aggregate window functions are the exception: `lag(x)` and
+/// `first_value(x)` return one row's value, which is then the masked value a plain
+/// select returns, and the ranking functions take no argument. A non-aggregate window
+/// function from outside the catalog could fold its frame, so it is refused like an
+/// aggregate rather than trusted.
+static bool
+consumes_rows(const Node *node) {
+  const WindowFunc *wfunc;
+
+  if (IsA(node, Aggref)) return true;
+  if (!IsA(node, WindowFunc)) return false;
+
+  wfunc = (const WindowFunc *) node;
+  return wfunc->winagg || wfunc->winfnoid >= FirstNormalObjectId;
+}
+
+static Node *
+mask_aggregate(Node *node, MaskCtx *ctx) {
+  MaskLevel *level = current_level(ctx);
+  bool       saved = level->in_aggregate;
+  Node      *result;
+
+  level->in_aggregate = true;
+  result           = expression_tree_mutator(node, mask_mutator, ctx);
+  level->in_aggregate = saved;
+
+  return result;
+}
+
 static Node *
 mask_mutator(Node *node, void *context) {
   MaskCtx *ctx = (MaskCtx *) context;
 
   if (node == NULL) return NULL;
 
-  if (IsA(node, Var)) {
-    Var          *var = (Var *) node;
-    List         *level;
-    RelMask      *rm;
-    MaskedColumn *col;
+  if (IsA(node, Var)) return mask_var(ctx, (Var *) node);
 
-    if (var->varlevelsup >= (Index) list_length(ctx->levels)) return node;
-
-    level = (List *) list_nth(ctx->levels, var->varlevelsup);
-    rm    = find_rel(level, var->varno);
-    if (rm == NULL) return node;
-
-    // Only a read restriction makes a whole-row reference a disclosure. A table whose
-    // labels restrict writes only has nothing to hide, so `to_jsonb(t)` still works.
-    if (var->varattno == 0) {
-      if (!relation_restricts_reads(rm->entry)) return node;
-
-      ereport(ERROR,
-              errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-              errmsg("whole-row reference to \"%s\" is not supported because the "
-                     "table has masked columns",
-                     rm->rte->eref ? rm->rte->eref->aliasname : "?"),
-              errdetail("A whole-row reference would expand to the unmasked column."),
-              errhint("Select the columns explicitly."));
-    }
-
-    // System columns carry no data of the row's own.
-    if (var->varattno < 0) return node;
-
-    col = supatype_mask_column(rm->entry, var->varattno);
-    if (col == NULL) return node;
-
-    return build_read_mask(ctx, rm, var, col);
-  }
-
-  if (IsA(node, Aggref)) {
-    bool  saved = ctx->in_aggref;
-    Node *result;
-
-    ctx->in_aggref = true;
-    result         = expression_tree_mutator(node, mask_mutator, context);
-    ctx->in_aggref = saved;
-
-    return result;
-  }
+  if (consumes_rows(node)) return mask_aggregate(node, ctx);
 
   if (IsA(node, Query)) return (Node *) mask_query((Query *) node, ctx);
 
@@ -564,9 +701,8 @@ Query *
 supatype_mask_rewrite(Query *query) {
   MaskCtx ctx;
 
-  ctx.levels    = NIL;
-  ctx.curquery  = NULL;
-  ctx.in_aggref = false;
+  ctx.levels   = NIL;
+  ctx.curquery = NULL;
 
   return mask_query(query, &ctx);
 }
