@@ -346,6 +346,39 @@ jobs:
           POSTGRES_PASSWORD: testpassword
         run: sh tests/editor-privileges/check.sh pg_test supatype_admin
 
+      # SQ5: the SQL editor reads and changes rows in auth and storage, and cannot change their
+      # shape, owner or policies.
+      - name: The SQL editor can change rows in auth and storage, and nothing else there
+        env:
+          POSTGRES_PASSWORD: testpassword
+        run: sh tests/editor-auth-dml/check.sh pg_test supatype_admin
+
+      # A cluster made before SQ5 has none of those grants; the migration adds them on the next
+      # start. Take them away, forget the migration ran, and restart.
+      - name: An existing cluster's SQL editor gets auth and storage rows on its next start
+        env:
+          POSTGRES_PASSWORD: testpassword
+        run: |
+          set -euo pipefail
+          sh tests/editor-auth-dml/check.sh pg_v2 supatype_admin
+          docker exec -e PGPASSWORD=testpassword -i pg_v2 \
+            psql -v ON_ERROR_STOP=1 -U supatype_admin -d supatype_admin -tAqc "
+              ALTER ROLE supatype_sql_editor NOBYPASSRLS;
+              REVOKE ALL ON ALL TABLES IN SCHEMA auth, storage FROM supatype_sql_editor;
+              REVOKE ALL ON ALL SEQUENCES IN SCHEMA auth, storage FROM supatype_sql_editor;
+              REVOKE USAGE ON SCHEMA auth, storage FROM supatype_sql_editor;
+              DELETE FROM supatype_migrations.applied
+               WHERE filename = '20261015140000_sql_editor_auth_storage_rows.sql';" > /dev/null
+          if sh tests/editor-auth-dml/check.sh pg_v2 supatype_admin; then
+            echo "FAIL: the check passed with the grants taken away"; exit 1
+          fi
+          docker restart pg_v2 > /dev/null
+          for i in $(seq 1 90); do
+            docker exec pg_v2 pg_isready -h 127.0.0.1 -U supatype_admin -q 2>/dev/null && break
+            sleep 2
+          done
+          sh tests/editor-auth-dml/check.sh pg_v2 supatype_admin
+
       # A cluster made by an older image still has the backslash; the migration corrects it on the
       # next start. Put it back, forget the migration ran, and restart.
       - name: An existing cluster's role search path is corrected on its next start
