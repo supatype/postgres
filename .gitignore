@@ -34,11 +34,14 @@ nixos.qcow2
 .lsp
 .clj-kondo
 
-# pg_guard / PGXS build artifacts (never commit — breaks Linux Docker builds)
+# pg_guard / PGXS build artifacts. Never commit them: a stale one breaks the Linux Docker build,
+# and a committed pg_guard.dll was shipped in the Windows archive in place of a fresh build.
 extensions/pg_guard/src/*.o
 extensions/pg_guard/.deps/
 extensions/pg_guard/**/*.so
 extensions/pg_guard/**/*.dylib
+extensions/pg_guard/**/*.dll
+extensions/pg_guard/**/*.a
 
 extensions/supatype_mask/src/*.o
 extensions/supatype_mask/src/*.bc
