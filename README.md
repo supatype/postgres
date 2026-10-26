@@ -168,7 +168,7 @@ This applies **only** the migrations whose check failed, in filename order, and 
 | Check | Migration | Until repaired |
 |---|---|---|
 | `an ordinary postgres role is not a superuser` | `10000000000000_demote-postgres.sql` | **`postgres` keeps SUPERUSER.** Anything that can log in as it, including the Studio SQL editor if it were ever made a member, has every privilege in the cluster |
-| `a bootstrap superuser postgres has no usable password` | none: `(operator)` | **A superuser login with a known password.** Under an operator such as CloudNativePG, `postgres` is the bootstrap superuser and cannot be demoted. The image leaves it alone and reports it here if it also has a usable password. Only the operator can change that (for CloudNativePG, `enableSuperuserAccess: false`). Printed as `NOTE`, it does not fail `doctor`, and `doctor --fix` leaves it alone |
+| `a bootstrap superuser postgres has no usable password` | none: `(operator)` | **A superuser login with a known password.** Under an operator such as CloudNativePG, `postgres` is the bootstrap superuser and cannot be demoted. The image leaves it alone and reports it here if it also has a usable password. Only the operator can change that (for CloudNativePG, `enableSuperuserAccess: false`). Printed as `NOTE`, it does not fail `doctor`, and `doctor --fix` leaves it alone. A migration role that cannot read `pg_authid` cannot check this; the row then says `not checked` and is a `NOTE` too |
 | `pg_guard preloaded for authenticator` | `20260810150000_authenticator_session_preload.sql` | **`pg_guard` does not load for PostgREST sessions.** The `authenticator` role keeps an inherited `session_preload_libraries` naming only `safeupdate`, so privilege enforcement is off across the whole API surface, silently and with no error |
 | `supatype_mask extension present` | `20260809214500_supatype_mask.sql` | A masked-write rejection raises `supatype_mask.deny() is not available` instead of a permission error |
 | `supatype_privileged_role exists` | `20260211120934_supabase_privileged_role.sql` | The `supatype_privileged_role` role does not exist |
@@ -199,6 +199,27 @@ What stays as it was:
 - Migrations run against a temporary server that listens on the Unix socket only, before the real server starts, so nothing outside the container can connect mid-migration.
 
 ---
+
+### Under an operator (CloudNativePG)
+
+An operator such as CloudNativePG starts `postgres` through its own instance manager, so neither the image's entrypoint nor `/docker-entrypoint-initdb.d/` runs. The operator runs `initdb` itself, which makes `postgres` the bootstrap superuser (Postgres refuses to demote that role, and the demote migration leaves it alone, see above), and it creates `supatype_admin` ahead of the bootstrap when that role is declared under `managed.roles` with a password from a Secret. What the entrypoint would have done then falls to a Job the platform runs against the socket, once the cluster is ready:
+
+```bash
+# first boot: roles, schemas, every migration, and the service passwords
+POSTGRES_DB=app POSTGRES_HOST=/controller/run \
+AUTHENTICATOR_PASSWORD=... SUPATYPE_SQL_EDITOR_PASSWORD=... \
+  /docker-entrypoint-initdb.d/00-supatype-bootstrap.sh
+
+# every later start, and after every image upgrade
+POSTGRES_DB=app POSTGRES_HOST=/controller/run supatype migrate sync
+```
+
+- `supatype_admin` under `managed.roles` needs `login: true` and `superuser: true`: every migration runs as it, as does the image's own first boot, where it is `POSTGRES_USER`. Set `enableSuperuserAccess: false` as well, so the bootstrap `postgres`, which cannot be demoted, has no password.
+- `POSTGRES_PASSWORD` stays unset: the operator owns `supatype_admin`'s password, and the bootstrap leaves the role as it found it. Set, it would be written over the operator's, and the operator would not put its own back until its Secret next changed.
+- `AUTHENTICATOR_PASSWORD` is required, since there is no `POSTGRES_PASSWORD` to fall back to. Without it the bootstrap refuses to start, before it has touched the database.
+- The bootstrap runs as the `postgres` OS user and connects as both `postgres` and `supatype_admin` over the socket. The operator's own `pg_hba` rule for the socket is `local all all peer map=local`, so `pg_ident` needs the line `local postgres supatype_admin` (map `local`, OS user `postgres`, role `supatype_admin`) beside the operator's `local postgres postgres`.
+- The image is Debian-based: set `postgresUID` and `postgresGID` to 999.
+- `config_file` and `hba_file` cannot be passed under an operator. Every setting in [config/](config/) is a plain parameter, including `cron.database_name`, which the entrypoint would otherwise write from `POSTGRES_DB`.
 
 ## Repository structure
 

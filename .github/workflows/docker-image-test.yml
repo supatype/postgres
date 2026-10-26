@@ -38,6 +38,7 @@ jobs:
         run: |
           docker run -d --name pg_test \
             -e POSTGRES_PASSWORD=testpassword \
+            -e SUPATYPE_SQL_EDITOR_PASSWORD=editorpassword \
             -p 5432:5432 \
             supatype-postgres:test
           echo "Waiting for PostgreSQL to be ready..."
@@ -224,6 +225,68 @@ jobs:
             *"OK       a bootstrap superuser postgres has no usable password"*) ;;
             *) echo "$out"; echo "FAIL: doctor still reports a password on the bootstrap superuser"; exit 1 ;;
           esac
+
+      - name: Bootstrap under an operator leaves the admin password alone
+        run: |
+          # CloudNativePG runs initdb itself, makes supatype_admin ahead of the
+          # bootstrap with a password from its own Secret, lets the postgres OS
+          # user in over the socket as either role (peer), passes every setting
+          # as a plain parameter rather than through the image's config file,
+          # and runs the image's bootstrap from a Job that carries no
+          # POSTGRES_PASSWORD. The bootstrap must leave supatype_admin's
+          # password as it found it: '' is stored as no password, and the
+          # operator would not notice. The image's entrypoint is not involved,
+          # as it is not under the operator.
+          docker run -d --name pg_operator --user postgres --entrypoint sh supatype-postgres:test -c '
+            set -e
+            initdb -D /var/lib/postgresql/data -U postgres --auth-local=peer
+            echo "local all all peer map=m" > /tmp/hba
+            printf "m postgres postgres\nm postgres supatype_admin\n" > /tmp/ident
+            libs=$(sed -n "s/^shared_preload_libraries = '"'"'\(.*\)'"'"'$/\1/p" /etc/postgresql/postgresql.conf)
+            [ -n "$libs" ] || { echo "FAIL: no shared_preload_libraries line in the image config"; exit 1; }
+            exec postgres -D /var/lib/postgresql/data -c hba_file=/tmp/hba -c ident_file=/tmp/ident \
+              -c "shared_preload_libraries=$libs" -c cron.database_name=app
+          '
+          for i in $(seq 1 30); do
+            docker exec pg_operator pg_isready -U postgres -q 2>/dev/null && break
+            [ "$i" -lt 30 ] || { echo "FAIL: the operator-shaped server never came up"; docker logs pg_operator; exit 1; }
+            sleep 2
+          done
+          as_postgres() { docker exec pg_operator psql -U postgres -d app -v ON_ERROR_STOP=1 -tA -F '|' "$@"; }
+          docker exec pg_operator psql -U postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE supatype_admin SUPERUSER LOGIN CREATEDB CREATEROLE REPLICATION BYPASSRLS PASSWORD 'adminpw'" \
+            -c "CREATE ROLE app LOGIN" -c "CREATE DATABASE app OWNER app" > /dev/null
+          admin_hash() { as_postgres -c "SELECT rolpassword FROM pg_authid WHERE rolname = 'supatype_admin'"; }
+          before=$(admin_hash)
+          bootstrap() { docker exec -e POSTGRES_DB=app "$@" pg_operator /docker-entrypoint-initdb.d/00-supatype-bootstrap.sh; }
+
+          # No password for authenticator from anywhere: refuse before touching anything.
+          out=$(bootstrap 2>&1) && { echo "$out"; echo "FAIL: bootstrap ran with no authenticator password"; exit 1; }
+          echo "$out" | grep -q "neither AUTHENTICATOR_PASSWORD nor POSTGRES_PASSWORD is set" \
+            || { echo "$out"; echo "FAIL: bootstrap refused for some other reason"; exit 1; }
+          test "$(as_postgres -c "SELECT to_regclass('supatype_migrations.applied') IS NULL AND to_regnamespace('auth') IS NULL")" = "t" \
+            || { echo "FAIL: the refused bootstrap changed the database"; exit 1; }
+
+          out=$(bootstrap -e AUTHENTICATOR_PASSWORD=authpw 2>&1) || { echo "$out" | tail -30; echo "FAIL: bootstrap under an operator failed"; exit 1; }
+          test "$(admin_hash)" = "$before" || { echo "FAIL: the bootstrap changed supatype_admin's password"; exit 1; }
+          got=$(as_postgres -c "SELECT rolname, rolsuper, rolpassword IS NOT NULL FROM pg_authid
+                                WHERE rolname IN ('postgres', 'authenticator') ORDER BY 1")
+          test "$got" = "$(printf 'authenticator|f|t\npostgres|t|f')" \
+            || { echo "$got"; echo "FAIL: role passwords after an operator bootstrap are not as expected"; exit 1; }
+          # The Job the operator path runs on later starts; clean here means the
+          # bootstrap recorded every migration it ran.
+          out=$(docker exec -e POSTGRES_DB=app pg_operator supatype migrate sync 2>&1)
+          echo "$out" | grep -q "no pending migrations." \
+            || { echo "$out"; echo "FAIL: sync after an operator bootstrap was not clean"; exit 1; }
+
+      - name: The bootstrap keeps every password out of the container log
+        run: |
+          # The image logs DDL verbatim, and ALTER USER ... PASSWORD is DDL. Each
+          # session that sets a password turns statement logging off first.
+          if docker logs pg_test 2>&1 | grep -q "testpassword\|editorpassword"; then
+            docker logs pg_test 2>&1 | grep -n "testpassword\|editorpassword" | cut -c1-120
+            echo "FAIL: a password appears in the container log"; exit 1
+          fi
 
       - name: Verify the migration ledger records the bootstrap
         env:
@@ -788,7 +851,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f pg_test pg_bootstrap pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard \
+          docker rm -f pg_test pg_bootstrap pg_operator pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard \
             pg_ksconf-on pg_ksconf-readonly || true
           docker volume rm pg_upgrade_vol || true
           exit 0

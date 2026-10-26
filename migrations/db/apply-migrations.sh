@@ -299,7 +299,7 @@ health_checks_sql() {
 		   'an ordinary postgres role is not a superuser (a bootstrap postgres is exempt: it cannot be demoted)',
 		   NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres' AND rolsuper AND oid <> 10)),
 		  ('(operator)',
-		   'a bootstrap superuser postgres has no usable password',
+		   :'pw_desc',
 		   :pw_check),
 		  ('20260211120934_supabase_privileged_role.sql',
 		   'supatype_privileged_role exists',
@@ -334,20 +334,22 @@ health_checks_sql() {
 # Writes "migration|description|t|f" rows to $1.
 #
 # pg_authid is the one catalog the checks read that needs superuser (or
-# pg_read_all_data). A role that cannot see it cannot judge the password, so that
-# check passes for it rather than taking every other check down. The probe is
-# outside the `if` on purpose: a failed probe aborts the run instead of quietly
-# passing the check.
+# pg_read_all_data). A role that cannot see it cannot judge the password, so for
+# it the row says so and is printed as a note, rather than passing unexamined or
+# taking every other check down. The probe is outside the `if` on purpose: a
+# failed probe aborts the run instead of quietly passing the check.
 run_health_checks() {
 	can_see_authid=$(psql_value "SELECT has_table_privilege('pg_catalog.pg_authid', 'SELECT')")
+	pw_desc='a bootstrap superuser postgres has no usable password'
 	if [ "$can_see_authid" = 't' ]; then
 		pw_check="NOT EXISTS (SELECT 1 FROM pg_authid
 		                WHERE rolname = 'postgres' AND oid = 10 AND rolcanlogin AND rolpassword IS NOT NULL
 		                  AND (rolvaliduntil IS NULL OR rolvaliduntil > now()))"
 	else
-		pw_check='true'
+		pw_desc="$pw_desc: not checked, $MIGRATION_ROLE cannot read pg_authid"
+		pw_check='false'
 	fi
-	health_checks_sql | psql_admin -tA -F '|' -v pw_check="$pw_check" > "$1"
+	health_checks_sql | psql_admin -tA -F '|' -v pw_check="$pw_check" -v pw_desc="$pw_desc" > "$1"
 }
 
 # A "(operator)" row names a condition no migration can change.
