@@ -143,6 +143,88 @@ jobs:
             SELECT pg_drop_replication_slot('ci_wal2json_test');
           "
 
+      - name: Verify postgres was demoted
+        run: |
+          # The demote migration skips itself when `postgres` is the bootstrap
+          # superuser (an operator-made cluster). In this image initdb creates
+          # supatype_admin instead, so here the demotion must actually have run.
+          # pg_isready answers while the entrypoint is still running the bootstrap
+          # migrations, so wait for the ledger to record this one.
+          for i in $(seq 1 60); do
+            n=$(docker exec -e PGPASSWORD=testpassword pg_test psql -U supatype_admin -d supatype_admin -tAc \
+              "SELECT count(*) FROM supatype_migrations.applied WHERE filename = '10000000000000_demote-postgres.sql'" 2>/dev/null || true)
+            [ "$n" = "1" ] && break
+            [ "$i" -lt 60 ] || { echo "FAIL: the demote migration never reached the ledger"; exit 1; }
+            sleep 2
+          done
+          got=$(docker exec -e PGPASSWORD=testpassword pg_test \
+            psql -U supatype_admin -d postgres -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = 'postgres'")
+          test "$got" = "f" || { echo "FAIL: postgres rolsuper is '$got', expected 'f'"; exit 1; }
+
+      - name: The demote migration leaves a bootstrap superuser alone
+        run: |
+          # Under an operator such as CloudNativePG initdb creates `postgres`
+          # itself, so it is the bootstrap superuser (oid 10), which Postgres
+          # refuses to demote. The migration must warn and carry on rather
+          # than abort the bootstrap. A stock postgres image is the one place
+          # `postgres` is oid 10, so run the migration file against one. The
+          # stock image also gives `postgres` a password, which the migration
+          # must call out.
+          docker run -d --name pg_bootstrap -e POSTGRES_PASSWORD=testpassword postgres:17-bookworm
+          # -h 127.0.0.1: the stock entrypoint's init-phase server listens on its
+          # socket only, so TCP answering means the real server is up.
+          for i in $(seq 1 30); do
+            docker exec pg_bootstrap pg_isready -h 127.0.0.1 -U postgres -q 2>/dev/null && break
+            [ "$i" -lt 30 ] || { echo "FAIL: postgres:17-bookworm never came up"; docker logs pg_bootstrap; exit 1; }
+            sleep 2
+          done
+          docker exec pg_bootstrap psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE SCHEMA auth" -c "CREATE SCHEMA extensions"
+          out=$(docker exec -i pg_bootstrap psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            < migrations/db/migrations/10000000000000_demote-postgres.sql 2>&1) \
+            || { echo "FAIL: the migration aborted on a bootstrap superuser:"; echo "$out"; exit 1; }
+          echo "$out" | grep -q "bootstrap superuser and cannot be demoted" \
+            || { echo "FAIL: no warning that postgres was left alone:"; echo "$out"; exit 1; }
+          echo "$out" | grep -q "has a usable password" \
+            || { echo "FAIL: no warning that the bootstrap superuser has a usable password:"; echo "$out"; exit 1; }
+          got=$(docker exec pg_bootstrap psql -U postgres -d postgres -tA -F '|' -c \
+            "SELECT rolsuper, oid FROM pg_roles WHERE rolname = 'postgres'")
+          test "$got" = "t|10" || { echo "FAIL: postgres is '$got', expected 't|10'"; exit 1; }
+          # doctor on this cluster: the demotion row passes, since a bootstrap
+          # postgres is exempt, and the password row is a note the operator owns:
+          # it must not fail doctor, --fix must not replay anything for it, and
+          # it must not be handed to --fix as a filename.
+          docker cp migrations/db/apply-migrations.sh pg_bootstrap:/usr/local/bin/supatype-migrate
+          doctor_in_bootstrap() {
+            docker exec -e SUPATYPE_MIGRATION_ROLE=postgres -e SUPATYPE_MIGRATIONS_DIR=/tmp \
+              pg_bootstrap /usr/local/bin/supatype-migrate doctor "$@"
+          }
+          out=$(doctor_in_bootstrap 2>&1) || true
+          echo "$out"
+          case "$out" in
+            *"OK       an ordinary postgres role is not a superuser"*) ;;
+            *) echo "FAIL: doctor flagged the bootstrap superuser as undemoted"; exit 1 ;;
+          esac
+          case "$out" in
+            *"NOTE     a bootstrap superuser postgres has no usable password (only the operator can change this)"*) ;;
+            *) echo "FAIL: doctor did not note the password"; exit 1 ;;
+          esac
+          case "$out" in
+            *"(operator)"*) echo "FAIL: doctor treated the operator note as a migration"; exit 1 ;;
+          esac
+          # The stock image is missing the real migrations, so --fix stops at the
+          # first one it cannot find. What matters is which: a real file, not the note.
+          out=$(doctor_in_bootstrap --fix 2>&1) || true
+          case "$out" in
+            *"(operator)"*|*"applying"*"demote-postgres"*) echo "$out"; echo "FAIL: doctor --fix acted on the operator note"; exit 1 ;;
+          esac
+          docker exec pg_bootstrap psql -U postgres -d postgres -c "ALTER ROLE postgres PASSWORD NULL" > /dev/null
+          out=$(doctor_in_bootstrap 2>&1) || true
+          case "$out" in
+            *"OK       a bootstrap superuser postgres has no usable password"*) ;;
+            *) echo "$out"; echo "FAIL: doctor still reports a password on the bootstrap superuser"; exit 1 ;;
+          esac
+
       - name: Verify the migration ledger records the bootstrap
         env:
           PGDATABASE: supatype_admin
@@ -324,6 +406,21 @@ jobs:
           esac
           exec_migrate doctor
           echo "doctor is clean again"
+
+          # The demote row: an ordinary `postgres` that is a superuser again is
+          # reported, and --fix replays the demotion.
+          psql_in "ALTER ROLE postgres SUPERUSER" > /dev/null
+          rc=0; out=$(exec_migrate doctor 2>&1) || rc=$?
+          test "$rc" -ne 0 || { echo "FAIL: doctor exited 0 with postgres a superuser"; exit 1; }
+          case "$out" in
+            *"MISSING  an ordinary postgres role is not a superuser"*) ;;
+            *) echo "$out"; echo "FAIL: doctor did not report postgres as a superuser"; exit 1 ;;
+          esac
+          exec_migrate doctor --fix
+          rolsuper=$(psql_in "SELECT rolsuper FROM pg_roles WHERE rolname = 'postgres'")
+          test "$rolsuper" = "f" || { echo "FAIL: doctor --fix left postgres a superuser ($rolsuper)"; exit 1; }
+          exec_migrate doctor
+          echo "doctor repaired the demotion"
 
       # A table made by hand in public used to be open to the anon key: the image granted every
       # privilege on new tables there to anon and authenticated by default.
@@ -691,7 +788,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f pg_test pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard \
+          docker rm -f pg_test pg_bootstrap pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard \
             pg_ksconf-on pg_ksconf-readonly || true
           docker volume rm pg_upgrade_vol || true
           exit 0
