@@ -2,9 +2,9 @@
 # build-native-extensions.sh: build the upstream extensions every native archive carries, and
 # install them into a staged PostgreSQL.
 #
-# One list for every build path: the build job in .github/workflows/native-archives.yml (Linux and
-# macOS), scripts/build-native.sh and scripts/build-native-windows.sh all run this script, so the
-# pins below are the only place a native extension version is set. They match what the Dockerfile
+# One list for every build path: scripts/build-native.sh (Linux and macOS) and
+# scripts/build-native-windows.sh run this script, locally and in CI, so the pins below are the
+# only place a native extension version is set. They match what the Dockerfile
 # installs, which is what keeps native dev and the image behaving the same.
 #
 # Every extension installs through PGXS, which takes its directories from the staged pg_config
@@ -24,6 +24,9 @@
 # Environment: BUILD_DIR (scratch, default a new temporary directory), JOBS (default nproc).
 set -euo pipefail
 
+# The pins, between the markers below: the CI build job keys its compiler cache on a hash of
+# exactly these lines.
+# pins: begin
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.0}"
 WAL2JSON_VERSION="${WAL2JSON_VERSION:-2.7}"
 PG_CRON_VERSION="${PG_CRON_VERSION:-1.6.8}"
@@ -37,9 +40,11 @@ POSTGIS_SHA256="${POSTGIS_SHA256:-ed8dc6679f1e06f7b113592b04cde2a7e00f1b1e681294
 # Linux only, for pg_net: see build_linux_libcurl.
 CURL_VERSION="${CURL_VERSION:-8.23.0}"
 CURL_SHA256="${CURL_SHA256:-e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49}"
+# pins: end
 
 info() { echo "[build-native-extensions] $*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+# shellcheck source=scripts/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 [ $# -eq 2 ] || { echo "Usage: $(basename "$0") <pg_config> <linux|darwin|windows>" >&2; exit 2; }
 PG_CONFIG=$1
@@ -63,14 +68,6 @@ fetch() {
 	git -C "${dir}" checkout -q FETCH_HEAD
 }
 
-# build_pgxs <name> [make-variable=value...]: build and install a fetched extension.
-build_pgxs() {
-	local dir="${SRC}/$1"
-	shift
-	make -C "${dir}" -j"${JOBS}" PG_CONFIG="${PG_CONFIG}" "$@"
-	make -C "${dir}" install PG_CONFIG="${PG_CONFIG}" "$@"
-}
-
 # OPTFLAGS empty, as in the Dockerfile: pgvector otherwise compiles with -march=native, so the
 # library carries whatever instructions the build machine's CPU has (AVX-512 on a CI runner) and
 # `CREATE EXTENSION vector` crashes the backend with an illegal instruction on a CPU without them.
@@ -78,7 +75,7 @@ build_pgxs() {
 build_pgvector() {
 	info "pgvector ${PGVECTOR_VERSION}"
 	fetch https://github.com/pgvector/pgvector.git "v${PGVECTOR_VERSION}" pgvector
-	build_pgxs pgvector OPTFLAGS=
+	build_pgxs "${SRC}/pgvector" OPTFLAGS=
 }
 
 # Realtime streams database changes through a wal2json logical replication slot. It is an output
@@ -87,23 +84,23 @@ build_pgvector() {
 build_wal2json() {
 	info "wal2json ${WAL2JSON_VERSION}"
 	fetch https://github.com/eulerto/wal2json.git "wal2json_${WAL2JSON_VERSION//./_}" wal2json
-	build_pgxs wal2json
+	build_pgxs "${SRC}/wal2json"
 }
 
 build_small_extensions() {
 	info "pg_cron ${PG_CRON_VERSION}"
 	fetch https://github.com/citusdata/pg_cron.git "v${PG_CRON_VERSION}" pg_cron
-	build_pgxs pg_cron
+	build_pgxs "${SRC}/pg_cron"
 
 	info "pg_safeupdate ${PG_SAFEUPDATE_VERSION}"
 	fetch https://github.com/eradman/pg-safeupdate.git "${PG_SAFEUPDATE_VERSION}" pg_safeupdate
-	build_pgxs pg_safeupdate
+	build_pgxs "${SRC}/pg_safeupdate"
 
 	info "pg_plan_filter ${PG_PLAN_FILTER_COMMIT}"
 	fetch https://github.com/pgexperts/pg_plan_filter.git "${PG_PLAN_FILTER_COMMIT}" pg_plan_filter
 	# Its OBJS names $(WIN32RES), a version resource only PostgreSQL's own tree can build, so a
 	# PGXS build on Windows stops at "No rule to make target 'win32ver.rc'". Empty elsewhere anyway.
-	build_pgxs pg_plan_filter WIN32RES=
+	build_pgxs "${SRC}/pg_plan_filter" WIN32RES=
 
 	info "pgjwt (SQL only)"
 	fetch https://github.com/michelp/pgjwt.git "${PGJWT_COMMIT}" pgjwt
@@ -113,7 +110,7 @@ build_small_extensions() {
 build_pg_net() {
 	info "pg_net ${PG_NET_VERSION}"
 	fetch https://github.com/supabase/pg_net.git "v${PG_NET_VERSION}" pg_net
-	build_pgxs pg_net "$@"
+	build_pgxs "${SRC}/pg_net" "$@"
 }
 
 # pg_net needs libcurl 7.83 or later and the Linux archive is built on Ubuntu 22.04, which ships

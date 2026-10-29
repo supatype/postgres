@@ -33,7 +33,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 info() { echo "[build-native-windows] $*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+# shellcheck source=scripts/lib.sh
+source "${SCRIPT_DIR}/lib.sh"
 
 [ $# -eq 1 ] || { echo "Usage: $(basename "$0") <staging-dir>" >&2; exit 2; }
 [ "${MSYSTEM:-}" = "MINGW64" ] || die "run this in an MSYS2 MINGW64 shell."
@@ -71,14 +72,6 @@ build_postgres() {
 		make -j"${JOBS}" world-bin >"${BUILD_DIR}/make.log"
 		make install-world-bin >"${BUILD_DIR}/install.log"
 	)
-}
-
-# build_pgxs <source-dir>: build and install an extension against the PostgreSQL just built.
-# `clean` first, so a library left in the source tree is never mistaken for a fresh build.
-build_pgxs() {
-	make -C "$1" clean PG_CONFIG="${PG_CONFIG}" >/dev/null
-	make -C "$1" -j"${JOBS}" PG_CONFIG="${PG_CONFIG}"
-	make -C "$1" install PG_CONFIG="${PG_CONFIG}"
 }
 
 build_extensions() {

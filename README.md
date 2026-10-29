@@ -246,8 +246,10 @@ migrations/
 scripts/
   supatype                      `supatype <command>` dispatcher (installed on PATH)
   supatype-entrypoint.sh        Image ENTRYPOINT; applies migrations to existing clusters
-  build-native.sh               Local native build script (mirrors CI)
+  build-native.sh               Linux and macOS archive build, run by CI and locally
   build-native-windows.sh       Windows archive build, run in MSYS2 by CI and by build-native-windows.ps1
+  build-native-extensions.sh    The upstream extensions every native archive carries, and their pins
+  lib.sh                        Helpers the native build scripts share
 tests/
   pg_upgrade/                   PostgreSQL upgrade regression tests
   native-archive/               Native archive checks: every Windows DLL loads, and an archive starts the way `supatype dev` starts it, creates its extensions and decodes with wal2json
@@ -299,7 +301,7 @@ pg_cron, pg_net, pg_plan_filter and pg_safeupdate only work preloaded, the way `
 
 Extension libraries live in the server's `$libdir` (`lib/postgresql/`). The Linux archives are self-contained above glibc: every other shared library they load (ICU, OpenSSL, readline, GEOS, PROJ, libcurl and the rest) is in `lib/`, and every program and module finds it through an `$ORIGIN` RUNPATH, so they run on any distribution with glibc 2.35 (Ubuntu 22.04) or later and its C++ runtime. A linux-arm64 build cross-compiled from an x86_64 host has none of the C or Rust extensions; CI builds that target on a native arm64 runner instead.
 
-To build a native archive locally:
+To build a native archive locally, the same way CI does (`--help` lists the options, such as `--ccache`):
 
 ```bash
 ./scripts/build-native.sh --target linux-amd64
