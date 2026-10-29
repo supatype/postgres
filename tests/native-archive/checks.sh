@@ -47,6 +47,41 @@ dev_server_options() {
 		"-c cron.use_background_workers=on -c max_worker_processes=16"
 }
 
+# image_preload [library...]: the image's shared_preload_libraries, read from
+# config/postgresql.conf and comma-separated, less the named libraries (the ones a platform's
+# archive does not carry). Fails when the setting cannot be found.
+image_preload() {
+	local conf line lib libs kept=()
+	conf="$(dirname "${BASH_SOURCE[0]}")/../../config/postgresql.conf"
+	line=$(sed -n "s/^shared_preload_libraries *= *'\([^']*\)'.*/\1/p" "$conf")
+	[ -n "$line" ] || { echo "no shared_preload_libraries in $conf" >&2; return 1; }
+	IFS=', ' read -ra libs <<<"$line"
+	for lib in "${libs[@]}"; do
+		[[ " $* " == *" $lib "* ]] || kept+=("$lib")
+	done
+	(IFS=,; echo "${kept[*]}")
+}
+
+# start_server <shared_preload_libraries> [server-option...]: start the server in $data on $port
+# with pg_ctl and the dev settings, or print the end of its log and fail. Not through `step`: the
+# server inherits pg_ctl's output handles, so capturing them would wait for the server to exit,
+# and pg_ctl's own output goes to a file instead.
+# shellcheck disable=SC2154 # data and port are set by the script that sources this one
+start_server() {
+	local preload=$1 ctl="$data.ctl" options
+	shift
+	options="-p $port -c listen_addresses=127.0.0.1 $(dev_server_options "$preload") $*"
+	if pg pg_ctl -D "$data" -o "$options" -l "$data/server.log" -w -t 60 start >"$ctl" 2>&1; then
+		echo "ok      pg_ctl start with $preload preloaded"
+		rm -f "$ctl"
+		return 0
+	fi
+	echo "FAIL    pg_ctl start with $preload preloaded"
+	cat "$ctl" "$data/server.log" 2>/dev/null | tail -20 | sed 's/^/        /'
+	rm -f "$ctl"
+	return 1
+}
+
 # Realtime streams database changes through a wal2json logical replication slot. wal2json is an
 # output plugin, not an extension, so nothing else here would notice it missing: the archive
 # would start, every extension would create, and `supatype dev` would report "database changes

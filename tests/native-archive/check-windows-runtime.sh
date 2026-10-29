@@ -23,8 +23,8 @@ export PGPASSWORD=smoke-test-password
 # the CLI creates when the archive carries it, and the rest the image carries that build on
 # Windows. pg_net does not (it has no Windows event loop) and pg_keyspace does not (no pgrx target).
 extensions=(plpgsql pgcrypto unaccent vector supatype_mask pgjwt pg_stat_statements pg_cron postgis postgis_topology)
-# Preloaded the way config/postgresql.conf preloads them for the image.
-preload=pg_stat_statements,pg_cron,plan_filter,safeupdate,supatype_mask
+# Preloaded the way config/postgresql.conf preloads them for the image, less pg_net.
+preload=$(image_preload pg_net)
 
 # pg <program> [args]: one of the archive's programs, with only Windows on PATH.
 pg() {
@@ -49,18 +49,7 @@ step "initdb" pg initdb -D "$data" -U postgres --pwfile="$pwfile" \
 	--auth=scram-sha-256 --encoding=UTF8 --no-locale || { rm -f "$pwfile"; exit 1; }
 rm -f "$pwfile"
 
-# Not through `step`: the server inherits pg_ctl's output handles, so capturing them would wait for
-# the server to exit. pg_ctl's own output goes to a file instead.
-if pg pg_ctl -D "$data" -o "-p $port -c listen_addresses=127.0.0.1 $(dev_server_options "$preload")" \
-	-l "$data/server.log" -w -t 60 start >"$data.ctl" 2>&1; then
-	echo "ok      pg_ctl start with $preload preloaded"
-	rm -f "$data.ctl"
-else
-	echo "FAIL    pg_ctl start with $preload preloaded"
-	cat "$data.ctl" "$data/server.log" 2>/dev/null | tail -20 | sed 's/^/        /'
-	rm -f "$data.ctl"
-	exit 1
-fi
+start_server "$preload" || exit 1
 
 run_sql_checks "${extensions[@]}" -- plan_filter safeupdate || exit 1
 
