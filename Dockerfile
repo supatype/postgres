@@ -59,6 +59,10 @@ ARG PGVECTOR_VERSION=0.8.0
 ARG PG_NET_VERSION=0.14.0
 ARG PG_GRAPHQL_VERSION=1.5.9
 ARG PGJWT_COMMIT=f3d82fd30151e754e19ce5d6a06c71c20689ce3d
+# The native archives build wal2json 2.7 from source (scripts/build-native-extensions.sh), so the
+# image pins the same release: realtime decodes its output, and native dev and the image must
+# emit the same JSON. The glob matches any PGDG packaging revision of that release.
+ARG WAL2JSON_VERSION=2.7
 
 # PGDG apt repo (for pg_cron, postgis, wal2json, pgsodium)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -76,7 +80,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-server-dev-17 \
     postgresql-17-postgis-3 \
     postgresql-17-cron \
-    postgresql-17-wal2json \
+    "postgresql-17-wal2json=${WAL2JSON_VERSION}-*" \
   && rm -rf /var/lib/apt/lists/*
 
 # pgvector: OPTFLAGS="" avoids -march=native (AVX-512 SIGILL on older CPUs / GH Actions).
