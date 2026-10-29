@@ -15,9 +15,8 @@ env:
   PG_URL: "https://ftp.postgresql.org/pub/source/v17.2/postgresql-17.2.tar.gz"
   PG_SHA256: "51d8cdd6a5220fa8c0a3b12f2d0eeb50fcf5e0bdb7b37904a9cdff5cf1e61c36"
   INSTALL_PREFIX: "/usr/local/supatype-pg"
-  # Extension versions: these must match the Dockerfile ARGs
-  PGVECTOR_VERSION: "0.8.0"
-  PGJWT_COMMIT: "f3d82fd30151e754e19ce5d6a06c71c20689ce3d"
+  # Extension versions are pinned in scripts/build-native-extensions.sh, which every native build
+  # runs, so that they match the Dockerfile in one place.
   # Hetzner Object Storage, env only: configure-aws-credentials calls AWS STS.
   AWS_ACCESS_KEY_ID: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
@@ -70,14 +69,26 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update -qq
+          # bison and flex named rather than assumed: PostgreSQL 17's configure refuses to run
+          # without them, and only the runner image happens to carry them today. libcurl for
+          # pg_net; GEOS, PROJ, libxml2 and json-c for PostGIS; patchelf to point the archive at
+          # the libraries bundled into it.
           sudo apt-get install -y --no-install-recommends \
             build-essential \
+            bison \
+            flex \
+            patchelf \
             libssl-dev \
             libreadline-dev \
             zlib1g-dev \
             libicu-dev \
             libzstd-dev \
-            uuid-dev
+            uuid-dev \
+            libcurl4-openssl-dev \
+            libgeos-dev \
+            libproj-dev \
+            libxml2-dev \
+            libjson-c-dev
 
       - name: Install dependencies (macOS)
         if: matrix.platform == 'darwin'
@@ -158,12 +169,33 @@ jobs:
           else
             JOBS=$(sysctl -n hw.logicalcpu)
           fi
-          make -j"${JOBS}"
+          # `world-bin`, not the default target: the server, the client programs and contrib,
+          # without the documentation. The default target leaves contrib out, and with it
+          # pgcrypto, unaccent and every other module the schema engine creates. The Windows
+          # archive has always been built this way.
+          make -j"${JOBS}" world-bin
 
       - name: Install PostgreSQL (staged)
         working-directory: postgresql-${{ env.PG_VERSION }}
         run: |
-          make install DESTDIR="$(pwd)/../pg-install"
+          make install-world-bin DESTDIR="$(pwd)/../pg-install"
+
+      # ------------------------------------------------------------------ #
+      # Every extension below installs into the server's $libdir and extension
+      # directory, which pg_config reports for the staged tree (it is relocatable).
+      # The libraries used to be copied into lib/ instead, where the server never
+      # looks: no bundled extension could be created, and preloading supatype_mask,
+      # which the CLI does whenever the library is in the archive, stopped the
+      # server starting.
+      # ------------------------------------------------------------------ #
+      - name: Locate the staged install
+        run: |
+          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
+          {
+            echo "PG_CONFIG=${PG_CONFIG}"
+            echo "PKGLIBDIR=$("${PG_CONFIG}" --pkglibdir)"
+            echo "EXTDIR=$("${PG_CONFIG}" --sharedir)/extension"
+          } >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------------ #
       # Build pg_guard extension (bundled in extensions/pg_guard/)
@@ -171,20 +203,14 @@ jobs:
       - name: Build and bundle pg_guard
         if: matrix.platform == 'linux' || matrix.platform == 'darwin'
         run: |
-          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
           make -C extensions/pg_guard PG_CONFIG="${PG_CONFIG}"
-          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
-          mkdir -p "${LIB_DIR}"
-          find extensions/pg_guard \( -name "pg_guard.so" -o -name "pg_guard.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          echo "pg_guard bundled into lib dir."
+          make -C extensions/pg_guard install PG_CONFIG="${PG_CONFIG}"
 
       # ------------------------------------------------------------------ #
       # supatype_mask: per-column read masking and write rejection
       #
       # Bundled with its `.control` and SQL, not just the library: `CREATE EXTENSION`
-      # needs all three. (The pg_guard step above copies only the shared object, which
-      # is why that extension cannot be created from a native archive.)
+      # needs all three, and PGXS installs them together.
       #
       # Without this, field-level access rules could not be enforced on the native
       # provider at all (the default `supatype dev`), so a schema declaring them fell
@@ -194,55 +220,24 @@ jobs:
       - name: Build and bundle supatype_mask
         if: matrix.platform == 'linux' || matrix.platform == 'darwin'
         run: |
-          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
-          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
-          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
-          mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
           # PG_CONFIG on `clean` too: a PGXS makefile resolves `$(PG_CONFIG) --pgxs` for every target,
           # so `clean` without it fails with "make: pg_config: No such file or directory" wherever the
           # runner image carries no system PostgreSQL, which is every platform here except
           # linux-amd64, the one that passed and made this look platform-specific.
           make -C extensions/supatype_mask clean PG_CONFIG="${PG_CONFIG}"
           make -C extensions/supatype_mask PG_CONFIG="${PG_CONFIG}"
-          find extensions/supatype_mask \
-            \( -name "supatype_mask.so" -o -name "supatype_mask.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          cp extensions/supatype_mask/supatype_mask.control "${SHARE_DIR}/"
-          cp extensions/supatype_mask/supatype_mask--*.sql "${SHARE_DIR}/"
-          echo "supatype_mask bundled into lib + share/postgresql/extension."
+          make -C extensions/supatype_mask install PG_CONFIG="${PG_CONFIG}"
 
       # ------------------------------------------------------------------ #
-      # pgvector: vector similarity search (C extension, native targets only)
+      # Upstream extensions: pgvector, wal2json, pg_cron, pg_net, pg_safeupdate,
+      # pg_plan_filter, pgjwt and (Linux) PostGIS. Pinned in the script, which
+      # the local builds run too, so there is one list of native versions.
       # ------------------------------------------------------------------ #
-      - name: Build and bundle pgvector
+      - name: Build and bundle the upstream extensions
         if: matrix.platform == 'linux' || matrix.platform == 'darwin'
-        run: |
-          # Build from an explicit tagged release for reproducible archives.
-          git clone --depth 1 --branch v${{ env.PGVECTOR_VERSION }} \
-            https://github.com/pgvector/pgvector.git
-          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
-          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
-          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
-          mkdir -p "${SHARE_DIR}"
-          make -C pgvector PG_CONFIG="${PG_CONFIG}" -j4
-          find pgvector \( -name "vector.so" -o -name "vector.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          cp pgvector/vector.control "${SHARE_DIR}/"
-          find pgvector -name "vector--*.sql" -exec cp {} "${SHARE_DIR}/" \;
-          echo "pgvector bundled."
-
-      # ------------------------------------------------------------------ #
-      # pgjwt: JWT generation/verification in SQL (SQL-only, all targets)
-      # ------------------------------------------------------------------ #
-      - name: Bundle pgjwt
-        run: |
-          git clone https://github.com/michelp/pgjwt.git
-          git -C pgjwt checkout ${{ env.PGJWT_COMMIT }}
-          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
-          mkdir -p "${SHARE_DIR}"
-          cp pgjwt/pgjwt.control "${SHARE_DIR}/"
-          find pgjwt -name "pgjwt--*.sql" -exec cp {} "${SHARE_DIR}/" \;
-          echo "pgjwt bundled."
+        env:
+          BUILD_DIR: ${{ runner.temp }}
+        run: bash scripts/build-native-extensions.sh "${PG_CONFIG}" "${{ matrix.platform }}"
 
       # ------------------------------------------------------------------ #
       # pg_keyspace: Postgres-native RESP keyspace + PostgREST row cache
@@ -268,10 +263,6 @@ jobs:
         if: matrix.platform == 'linux' || matrix.platform == 'darwin'
         run: |
           set -euo pipefail
-          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
-          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
-          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
-          mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
 
           # `cargo pgrx package` builds against --pg-config directly, but it still
           # requires PGRX_HOME to exist ("$PGRX_HOME does not exist" otherwise).
@@ -290,20 +281,37 @@ jobs:
           # staged build those are the pg-install/... paths, not ${INSTALL_PREFIX}, so
           # derive them from pg_config rather than assuming the prefix.
           PKGROOT="extensions/pg_keyspace/extension/target/release/pg_keyspace-pg17"
-          LIBSRC="${PKGROOT}$(${PG_CONFIG} --pkglibdir)"
-          SHARESRC="${PKGROOT}$(${PG_CONFIG} --sharedir)/extension"
+          LIBSRC="${PKGROOT}${PKGLIBDIR}"
+          SHARESRC="${PKGROOT}${EXTDIR}"
           find "${LIBSRC}" \( -name "pg_keyspace.so" -o -name "pg_keyspace.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          cp "${SHARESRC}/pg_keyspace.control" "${SHARE_DIR}/"
-          cp "${SHARESRC}"/pg_keyspace--*.sql "${SHARE_DIR}/"
+            -exec cp {} "${PKGLIBDIR}/" \;
+          cp "${SHARESRC}/pg_keyspace.control" "${EXTDIR}/"
+          cp "${SHARESRC}"/pg_keyspace--*.sql "${EXTDIR}/"
 
-          # keys-only logical-decode plugin (Mode B row cache), beside the .so.
+          # keys-only logical-decode plugin (Mode B row cache), beside the extension.
           make -C extensions/pg_keyspace/plugin clean PG_CONFIG="${PG_CONFIG}" || true
           make -C extensions/pg_keyspace/plugin PG_CONFIG="${PG_CONFIG}"
-          find extensions/pg_keyspace/plugin \
-            \( -name "supacache_keys.so" -o -name "supacache_keys.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          echo "pg_keyspace bundled into lib + share/postgresql/extension."
+          make -C extensions/pg_keyspace/plugin install PG_CONFIG="${PG_CONFIG}"
+
+      # ------------------------------------------------------------------ #
+      # Copy every library the archive loads, other than glibc and the C++
+      # runtime, into lib/ and give every ELF file a RUNPATH to it, so the
+      # archive starts on distributions other than the runner's. It used to need
+      # the runner's libicu70 and libreadline8, and did not start on Fedora 40.
+      # ------------------------------------------------------------------ #
+      - name: Bundle shared libraries (Linux)
+        if: matrix.platform == 'linux'
+        run: bash scripts/bundle-linux-libraries.sh "pg-install${{ env.INSTALL_PREFIX }}"
+
+      # ------------------------------------------------------------------ #
+      # Start the staged tree the way native `supatype dev` does: every library
+      # the image preloads, wal_level=logical, every extension it creates, and a
+      # wal2json round trip. Linux only for now: the macOS archive has not been
+      # run through it yet.
+      # ------------------------------------------------------------------ #
+      - name: Start the archive and check what native dev needs (Linux)
+        if: matrix.platform == 'linux'
+        run: bash tests/native-archive/check-unix-runtime.sh "pg-install${{ env.INSTALL_PREFIX }}" 55432
 
       # ------------------------------------------------------------------ #
       # macOS: Developer ID + notarization (Phase 10.6 B7; same secrets as server-release)
@@ -326,6 +334,8 @@ jobs:
           security import cert.p12 -k ci.keychain -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
           security set-keychain-settings -t 3600 -u ci.keychain
           security unlock-keychain -p ci-keychain ci.keychain
+          # Split on purpose: each existing keychain is its own argument after ci.keychain.
+          # shellcheck disable=SC2046
           security list-keychains -d user -s ci.keychain $(security list-keychains -d user | sed 's/\"//g')
           security set-key-partition-list -S apple-tool:,apple: -s -k ci-keychain ci.keychain
           SIGN_ID="Developer ID Application: Supatype Inc (${APPLE_TEAM_ID})"
@@ -424,6 +434,10 @@ jobs:
             mingw-w64-x86_64-zstd
             mingw-w64-x86_64-zlib
             mingw-w64-x86_64-readline
+            mingw-w64-x86_64-geos
+            mingw-w64-x86_64-proj
+            mingw-w64-x86_64-json-c
+            mingw-w64-x86_64-libxml2
             make
             bison
             flex
@@ -433,7 +447,8 @@ jobs:
             curl
             tar
 
-      # PG_VERSION, PG_SHA256, PGVECTOR_VERSION and PGJWT_COMMIT come from the workflow env.
+      # PG_VERSION and PG_SHA256 come from the workflow env; the extension pins live in
+      # scripts/build-native-extensions.sh.
       # The script fails when any program or library in the tree cannot load.
       - name: Build PostgreSQL ${{ env.PG_VERSION }} and extensions
         run: bash scripts/build-native-windows.sh staging

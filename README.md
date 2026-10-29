@@ -43,7 +43,7 @@ Default superuser is `supatype_admin` (set via `POSTGRES_USER`).
 |---|---|
 | [PostGIS](https://postgis.net/) | Geography and geometry types, spatial queries |
 | [pgvector](https://github.com/pgvector/pgvector) | Vector embeddings and similarity search |
-| [pg_graphql](https://github.com/supabase/pg_graphql) | GraphQL API directly over your schema |
+| [pg_graphql](https://github.com/supabase/pg_graphql) | GraphQL API directly over your schema (image only: no native archive carries it, see [Native archives](#native-archives)) |
 | [pg_net](https://github.com/supabase/pg_net) | Async HTTP requests from triggers and functions |
 | [pgjwt](https://github.com/michelp/pgjwt) | JWT generation and verification in SQL |
 | [pg_cron](https://github.com/citusdata/pg_cron) | Scheduled jobs inside PostgreSQL |
@@ -250,7 +250,7 @@ scripts/
   build-native-windows.sh       Windows archive build, run in MSYS2 by CI and by build-native-windows.ps1
 tests/
   pg_upgrade/                   PostgreSQL upgrade regression tests
-  native-archive/               Windows archive checks: every DLL loads, and it starts with only Windows on PATH
+  native-archive/               Native archive checks: every Windows DLL loads, and an archive starts the way `supatype dev` starts it, creates its extensions and decodes with wal2json
 ```
 
 ---
@@ -280,7 +280,24 @@ For deployments that run PostgreSQL natively (no Docker), pre-built archives are
 | macOS Intel | `supatype-pg-17-darwin-amd64.tar.gz` |
 | Windows x64 | `supatype-pg-17-windows-amd64.zip` |
 
-pg_guard is bundled in all archives (except the cross-compiled linux-arm64 build where cross-compilation of the extension is not supported).
+Every archive carries the server, the client programs and contrib (pgcrypto, unaccent, pg_stat_statements and the rest). The extensions on top of that, at the same versions as the image (pinned in `scripts/build-native-extensions.sh`):
+
+| Extension | Linux | macOS | Windows | Notes |
+|---|---|---|---|---|
+| pg_guard, supatype_mask | yes | yes | yes | Built from this repo |
+| pgvector, pgjwt | yes | yes | yes | |
+| wal2json | yes | yes | yes | The output plugin realtime decodes with |
+| pg_cron, pg_safeupdate, pg_plan_filter | yes | yes | yes | |
+| pg_net | yes | yes | no | Its event loop is epoll or kqueue; there is no Windows one |
+| PostGIS (no raster, no protobuf) | yes | no | yes | GEOS, PROJ and their data are bundled; macOS does not bundle them yet |
+| pg_keyspace, supacache_keys | yes | yes | no | pgrx has no Windows target |
+| pg_graphql | no | no | no | Docker image only, see below |
+
+pg_cron, pg_net, pg_plan_filter and pg_safeupdate only work preloaded, the way `config/postgresql.conf` preloads them for the image, and pg_cron also needs `cron.database_name`; whoever starts the server (native `supatype dev`) has to pass those settings. Realtime needs `wal_level = logical`.
+
+**pg_graphql is Docker-only.** It is a pgrx extension, and the image installs the upstream release package, which targets a PGDG Postgres rather than these archives. The `/graphql/v1` endpoint therefore answers only on a stack running the `supatype/postgres` image; native dev has no GraphQL.
+
+Extension libraries live in the server's `$libdir` (`lib/postgresql/`). The Linux archives are self-contained above glibc: every other shared library they load (ICU, OpenSSL, readline, GEOS, PROJ, libcurl and the rest) is in `lib/`, and every program and module finds it through an `$ORIGIN` RUNPATH, so they run on any distribution with glibc 2.35 (Ubuntu 22.04) or later and its C++ runtime. A linux-arm64 build cross-compiled from an x86_64 host has none of the C or Rust extensions; CI builds that target on a native arm64 runner instead.
 
 To build a native archive locally:
 

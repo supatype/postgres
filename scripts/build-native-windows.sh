@@ -19,16 +19,14 @@
 # Environment overrides:
 #   PG_VERSION        PostgreSQL version (default 17.2)
 #   PG_SHA256         SHA-256 of the source tarball
-#   PGVECTOR_VERSION  pgvector tag (default 0.8.0)
-#   PGJWT_COMMIT      pgjwt commit
 #   BUILD_DIR         scratch space (default: a new temporary directory)
 #   JOBS              parallel make jobs (default: nproc)
+# The upstream extension pins live in scripts/build-native-extensions.sh, and its own overrides
+# (PGVECTOR_VERSION and the rest) pass through.
 set -euo pipefail
 
 PG_VERSION="${PG_VERSION:-17.2}"
 PG_SHA256="${PG_SHA256:-51d8cdd6a5220fa8c0a3b12f2d0eeb50fcf5e0bdb7b37904a9cdff5cf1e61c36}"
-PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.0}"
-PGJWT_COMMIT="${PGJWT_COMMIT:-f3d82fd30151e754e19ce5d6a06c71c20689ce3d}"
 JOBS="${JOBS:-$(nproc)}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -89,17 +87,13 @@ build_extensions() {
 	info "supatype_mask"
 	build_pgxs "${REPO_ROOT}/extensions/supatype_mask"
 
-	info "pgvector ${PGVECTOR_VERSION}"
-	git clone -q --depth 1 --branch "v${PGVECTOR_VERSION}" https://github.com/pgvector/pgvector.git "${BUILD_DIR}/pgvector"
-	build_pgxs "${BUILD_DIR}/pgvector"
-
 	# pg_keyspace is not built: it is a pgrx extension and pgrx has no Windows target. `supatype
 	# dev` on Windows finds no library and starts the Valkey sidecar instead.
 
-	info "pgjwt (SQL only)"
-	git clone -q https://github.com/michelp/pgjwt.git "${BUILD_DIR}/pgjwt"
-	git -C "${BUILD_DIR}/pgjwt" checkout -q "${PGJWT_COMMIT}"
-	cp "${BUILD_DIR}/pgjwt/pgjwt.control" "${BUILD_DIR}"/pgjwt/pgjwt--*.sql "${PREFIX}/share/postgresql/extension/"
+	# pgvector, wal2json, pg_cron, pg_safeupdate, pg_plan_filter, pgjwt and PostGIS, pinned in
+	# the script every native build shares. bundle_dlls below picks up the DLLs PostGIS needs.
+	BUILD_DIR="${BUILD_DIR}" JOBS="${JOBS}" \
+		bash "${REPO_ROOT}/scripts/build-native-extensions.sh" "${PG_CONFIG}" windows
 }
 
 # imported_dlls <pe>...: the DLL names the files import, lower-case, one per line.
