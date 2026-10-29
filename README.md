@@ -2,7 +2,7 @@
 
 PostgreSQL 17 with a curated set of extensions and security hardening for the [Supatype](https://github.com/supatype/supatype) platform. This is the default Postgres image for **`supatype dev`**, **self-host Compose**, and cloud project databases.
 
-**Product:** [github.com/supatype](https://github.com/supatype) · **Docs:** [supatype.github.io/supatype](https://supatype.github.io/supatype/)
+**Product:** [github.com/supatype](https://github.com/supatype) · **Docs:** [supatype.com/docs](https://www.supatype.com/docs/)
 
 Published as a multi-arch Docker image and native binary archives for all major platforms.
 
@@ -53,11 +53,12 @@ Default superuser is `supatype_admin` (set via `POSTGRES_USER`).
 | [pg_guard](extensions/pg_guard/) | Role and extension privilege enforcement (bundled) |
 | [pg_keyspace](extensions/pg_keyspace/) | RESP (Redis/Valkey-compatible) keyspace in shared memory + PostgREST row cache (bundled, opt-in) |
 | [supatype_mask](extensions/supatype_mask/) | Per-column read masking and write rejection, enforced in the planner (bundled) |
+| [pg_topics](extensions/pg_topics/) | A table as a Kafka topic for stock Kafka clients (source only: not built into the image yet) |
 
 ### Auto-loaded libraries
 
 ```
-shared_preload_libraries = 'pg_stat_statements, pg_cron, pg_net, plan_filter, safeupdate'
+shared_preload_libraries = 'pg_stat_statements, pg_cron, pg_net, plan_filter, safeupdate, supatype_mask'
 session_preload_libraries = 'pg_guard'
 ```
 
@@ -236,6 +237,7 @@ config/
 extensions/
   pg_guard/                     Bundled pg_guard C extension source
   pg_keyspace/                  Bundled RESP keyspace + row cache (Rust/pgrx; built in-image)
+  pg_topics/                    Kafka-protocol topics (Rust/pgrx; not built into the image yet)
   supatype_mask/                Bundled column masking C extension source
 migrations/
   db/
