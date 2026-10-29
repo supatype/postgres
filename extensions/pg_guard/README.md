@@ -122,7 +122,7 @@ select current_setting('is_superuser');
 (1 row)
 
 create event trigger evtrig on ddl_command_end
-execute procedure func(); -- func must be owned by the superuser
+execute procedure func(); -- func must not be owned by a superuser
 CREATE EVENT TRIGGER
 ```
 
