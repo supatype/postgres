@@ -12,14 +12,19 @@ set -euo pipefail
 root=$(cd "$1" && pwd)
 port=${2:-55432}
 data=$(mktemp -d)
-failed=0
+
+# shellcheck source=tests/native-archive/checks.sh
+source "$(dirname "${BASH_SOURCE[0]}")/checks.sh"
 
 clean_path="/c/Windows/System32:/c/Windows"
 export PGPASSWORD=smoke-test-password
 
 # Extensions the schema engine creates (pgcrypto, unaccent, vector), the field masking extension
-# the CLI creates when the archive carries it, and pgjwt.
-extensions=(plpgsql pgcrypto unaccent vector supatype_mask pgjwt)
+# the CLI creates when the archive carries it, and the rest the image carries that build on
+# Windows. pg_net does not (it has no Windows event loop) and pg_keyspace does not (no pgrx target).
+extensions=(plpgsql pgcrypto unaccent vector supatype_mask pgjwt pg_stat_statements pg_cron postgis postgis_topology)
+# Preloaded the way config/postgresql.conf preloads them for the image, less pg_net.
+preload=$(image_preload pg_net)
 
 # pg <program> [args]: one of the archive's programs, with only Windows on PATH.
 pg() {
@@ -34,19 +39,6 @@ stop() {
 }
 trap stop EXIT
 
-step() {
-	local label=$1
-	shift
-	if out=$("$@" 2>&1); then
-		echo "ok      $label"
-	else
-		echo "FAIL    $label (exit $?)"
-		echo "$out" | tail -5 | sed 's/^/        /'
-		failed=$((failed + 1))
-		return 1
-	fi
-}
-
 for program in postgres initdb pg_ctl psql; do
 	step "$program --version" pg "$program" --version || true
 done
@@ -57,45 +49,12 @@ step "initdb" pg initdb -D "$data" -U postgres --pwfile="$pwfile" \
 	--auth=scram-sha-256 --encoding=UTF8 --no-locale || { rm -f "$pwfile"; exit 1; }
 rm -f "$pwfile"
 
-# Not through `step`: the server inherits pg_ctl's output handles, so capturing them would wait for
-# the server to exit. pg_ctl's own output goes to a file instead.
-if pg pg_ctl -D "$data" -o "-p $port -c listen_addresses=127.0.0.1" -l "$data/server.log" \
-	-w -t 60 start >"$data.ctl" 2>&1; then
-	echo "ok      pg_ctl start"
-	rm -f "$data.ctl"
-else
-	echo "FAIL    pg_ctl start"
-	cat "$data.ctl" "$data/server.log" 2>/dev/null | tail -20 | sed 's/^/        /'
-	rm -f "$data.ctl"
-	exit 1
-fi
+start_server "$preload" || exit 1
 
-psql_run() {
-	pg psql -h 127.0.0.1 -p "$port" -U postgres -d postgres -v ON_ERROR_STOP=1 -tAc "$1"
-}
-
-# expect_true <label> <sql>: the query must answer `t`.
-expect_true() {
-	local got
-	if got=$(psql_run "$2" 2>&1) && [ "$got" = "t" ]; then
-		echo "ok      $1"
-	else
-		echo "FAIL    $1: $(echo "$got" | tail -1)"
-		failed=$((failed + 1))
-	fi
-}
-
-step "connect with a password" psql_run "SELECT 1" || exit 1
-for ext in "${extensions[@]}"; do
-	step "CREATE EXTENSION $ext" psql_run "CREATE EXTENSION IF NOT EXISTS \"$ext\"" || true
-done
-expect_true "gen_random_uuid()" "SELECT gen_random_uuid() IS NOT NULL"
-expect_true "unaccent()" "SELECT unaccent('H' || chr(244) || 'tel') = 'Hotel'"
-expect_true "vector distance" "SELECT '[1,2]'::vector <-> '[1,3]'::vector = 1"
-expect_true "ICU collation" "SELECT 'a' < 'b' COLLATE \"und-x-icu\""
+run_sql_checks "${extensions[@]}" -- plan_filter safeupdate || exit 1
 
 if [ "$failed" -ne 0 ]; then
 	echo "$failed check(s) failed for $root"
 	exit 1
 fi
-echo "the archive at $root starts and creates every extension native dev uses"
+echo "the archive at $root starts, creates every extension native dev uses and decodes with wal2json"
