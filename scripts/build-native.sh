@@ -317,13 +317,16 @@ build_keyspace() {
   build_pgxs "${KEYSPACE_DIR}/plugin"
 }
 
-# Native Linux only. Bundling copies every non-glibc library the archive loads into lib/ and
-# points every ELF file at it, so it starts on a distribution other than the build machine's;
-# the check then starts it the way native `supatype dev` does.
+# Native builds only. On Linux, bundling copies every non-glibc library the archive loads into
+# lib/ and points every ELF file at it, so it starts on a distribution other than the build
+# machine's. On Linux and macOS alike, the check then starts the tree the way native
+# `supatype dev` does.
 bundle_and_check() {
-  [[ "${IS_CROSS}" == false && "${HOST_PLATFORM}" == linux ]] || return 0
-  info "=== Step 9: Bundle shared libraries ==="
-  bash "${SCRIPT_DIR}/bundle-linux-libraries.sh" "${STAGE_ROOT}"
+  [[ "${IS_CROSS}" == false ]] || return 0
+  if [[ "${HOST_PLATFORM}" == linux ]]; then
+    info "=== Step 9: Bundle shared libraries ==="
+    bash "${SCRIPT_DIR}/bundle-linux-libraries.sh" "${STAGE_ROOT}"
+  fi
   info "=== Step 10: Runtime check ==="
   bash "${REPO_ROOT}/tests/native-archive/check-unix-runtime.sh" "${STAGE_ROOT}"
 }

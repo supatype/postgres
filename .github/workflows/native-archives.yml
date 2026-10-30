@@ -24,7 +24,7 @@ jobs:
   # -------------------------------------------------------------------- #
   # Linux and macOS: scripts/build-native.sh, the script a local build runs,
   # does everything up to the staged tree (dependencies, PostgreSQL, every
-  # extension, and on Linux the library bundling and the runtime check), so
+  # extension, the library bundling on Linux, and the runtime check), so
   # the steps cannot drift from it. The workflow only adds what needs CI
   # secrets: signing between staging and packaging, and notarization.
   # -------------------------------------------------------------------- #
@@ -40,8 +40,10 @@ jobs:
 
           # Native ARM64 runner so pg_guard + pgvector (PGXS) compile against the
           # same staged postgres as linux-amd64 (cross-compiling those extensions was skipped).
+          # 22.04, like linux-amd64: the archive needs the build machine's glibc or later, and
+          # built on 24.04 it needed 2.39 where the README promises 2.35.
           - target: linux-arm64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             platform: linux
 
           - target: darwin-arm64
@@ -73,8 +75,9 @@ jobs:
       # Compiler cache. ccache answers from a compilation's own inputs, so a
       # hit can never ship an object built from other sources or headers. The
       # key names what the cache was filled from (the target, the PostgreSQL
-      # version and the upstream extension pins); when any of them changes the
-      # nearest older cache is restored, and PostgreSQL itself still hits.
+      # version, the upstream extension pins and the commit). A cache is never
+      # updated in place, so the commit makes every run save a fresh one; a run
+      # restores the newest whose prefix matches, and PostgreSQL itself still hits.
       # ------------------------------------------------------------------ #
       - name: Hash the upstream extension pins
         id: pins
@@ -86,8 +89,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-${{ matrix.target }}-pg${{ env.PG_VERSION }}-${{ steps.pins.outputs.hash }}
+          key: ccache-${{ matrix.target }}-pg${{ env.PG_VERSION }}-${{ steps.pins.outputs.hash }}-${{ github.sha }}
           restore-keys: |
+            ccache-${{ matrix.target }}-pg${{ env.PG_VERSION }}-${{ steps.pins.outputs.hash }}-
             ccache-${{ matrix.target }}-pg${{ env.PG_VERSION }}-
             ccache-${{ matrix.target }}-
 
@@ -132,6 +136,13 @@ jobs:
 
       - name: Package the archive and its checksum
         run: bash scripts/build-native.sh --target "${{ matrix.target }}" --package-only
+
+      # The packaged archive, unpacked in a clean Fedora container: another distribution's
+      # libraries, no /usr/share/proj, and CA certificates where Ubuntu does not keep them, with
+      # pg_net fetching from a local HTTPS server whose CA only Fedora's bundle trusts.
+      - name: Check the archive on another distribution (Linux)
+        if: matrix.platform == 'linux'
+        run: bash tests/native-archive/check-linux-portable.sh "${ARCHIVE_NAME}"
 
       - name: Notarize Postgres archive (macOS)
         if: matrix.platform == 'darwin'
@@ -264,7 +275,7 @@ jobs:
           - arch: amd64
             os: ubuntu-22.04
           - arch: arm64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

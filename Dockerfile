@@ -55,16 +55,9 @@ FROM postgres:17-bookworm
 LABEL org.opencontainers.image.licenses="PostgreSQL"
 COPY LICENSE /LICENSE
 
-ARG PGVECTOR_VERSION=0.8.0
-ARG PG_NET_VERSION=0.14.0
 ARG PG_GRAPHQL_VERSION=1.5.9
-ARG PGJWT_COMMIT=f3d82fd30151e754e19ce5d6a06c71c20689ce3d
-# The native archives build wal2json 2.7 from source (scripts/build-native-extensions.sh), so the
-# image pins the same release: realtime decodes its output, and native dev and the image must
-# emit the same JSON. The glob matches any PGDG packaging revision of that release.
-ARG WAL2JSON_VERSION=2.7
 
-# PGDG apt repo (for pg_cron, postgis, wal2json, pgsodium)
+# PGDG apt repo (for PostGIS), and what the extension builds below need
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates gnupg lsb-release \
   && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
@@ -79,29 +72,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4-openssl-dev \
     postgresql-server-dev-17 \
     postgresql-17-postgis-3 \
-    postgresql-17-cron \
-    "postgresql-17-wal2json=${WAL2JSON_VERSION}-*" \
   && rm -rf /var/lib/apt/lists/*
 
-# pgvector: OPTFLAGS="" avoids -march=native (AVX-512 SIGILL on older CPUs / GH Actions).
-RUN git clone --depth 1 --branch v${PGVECTOR_VERSION} https://github.com/pgvector/pgvector.git /tmp/pgvector \
-  && cd /tmp/pgvector && make OPTFLAGS="" && make install && rm -rf /tmp/pgvector
-
-# pg_net (async HTTP from triggers)
-RUN git clone --depth 1 --branch v${PG_NET_VERSION} https://github.com/supabase/pg_net.git /tmp/pg_net \
-  && cd /tmp/pg_net && make && make install && rm -rf /tmp/pg_net
-
-# pgjwt (JWT verification in SQL)
-RUN git clone https://github.com/michelp/pgjwt.git /tmp/pgjwt \
-  && cd /tmp/pgjwt && git checkout ${PGJWT_COMMIT} && make install && rm -rf /tmp/pgjwt
-
-# pg_safeupdate (prevents UPDATE/DELETE without WHERE)
-RUN git clone --depth 1 https://github.com/eradman/pg-safeupdate.git /tmp/pg_safeupdate \
-  && cd /tmp/pg_safeupdate && make && make install && rm -rf /tmp/pg_safeupdate
-
-# pg_plan_filter (query cost limits for shared tenancy)
-RUN git clone --depth 1 https://github.com/pgexperts/pg_plan_filter.git /tmp/plan_filter \
-  && cd /tmp/plan_filter && make && make install && rm -rf /tmp/plan_filter
+# pgvector, wal2json, pg_cron, pg_safeupdate, pg_plan_filter, pgjwt and pg_net, built by the script
+# the native archives build them with, at the pins in that script, so the image and native dev run
+# the same versions from one place. wal2json used to be PGDG's package pinned to a release, which
+# stops installing as soon as PGDG drops that release; pg_cron, pg_safeupdate and pg_plan_filter
+# were unpinned. PostGIS stays PGDG's package above, which carries raster.
+COPY scripts/build-native-extensions.sh scripts/lib.sh /tmp/native-build/
+RUN BUILD_DIR=/tmp/native-build/work \
+    bash /tmp/native-build/build-native-extensions.sh /usr/lib/postgresql/17/bin/pg_config image \
+  && rm -rf /tmp/native-build
 
 # pg_graphql: pre-built deb (Rust/pgrx, too slow to compile in CI)
 RUN ARCH=$(dpkg --print-architecture) \

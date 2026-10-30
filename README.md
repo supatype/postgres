@@ -250,9 +250,10 @@ scripts/
   build-native-windows.sh       Windows archive build, run in MSYS2 by CI and by build-native-windows.ps1
   build-native-extensions.sh    The upstream extensions every native archive carries, and their pins
   lib.sh                        Helpers the native build scripts share
+  linux-postgres-wrapper.sh     bin/postgres in the Linux archives: points OpenSSL at the host's CA bundle
 tests/
   pg_upgrade/                   PostgreSQL upgrade regression tests
-  native-archive/               Native archive checks: every Windows DLL loads, and an archive starts the way `supatype dev` starts it, creates its extensions and decodes with wal2json
+  native-archive/               Native archive checks: every Windows DLL loads, and an archive starts the way `supatype dev` starts it, creates its extensions and decodes with wal2json, and a Linux archive does the same in a clean Fedora container
 ```
 
 ---
@@ -282,7 +283,7 @@ For deployments that run PostgreSQL natively (no Docker), pre-built archives are
 | macOS Intel | `supatype-pg-17-darwin-amd64.tar.gz` |
 | Windows x64 | `supatype-pg-17-windows-amd64.zip` |
 
-Every archive carries the server, the client programs and contrib (pgcrypto, unaccent, pg_stat_statements and the rest). The extensions on top of that, at the same versions as the image (pinned in `scripts/build-native-extensions.sh`):
+Every archive carries the server, the client programs and contrib (pgcrypto, unaccent, pg_stat_statements and the rest). The extensions on top of that, at the same versions as the image (pinned in `scripts/build-native-extensions.sh`, which the Dockerfile runs too; the image's PostGIS is PGDG's package instead):
 
 | Extension | Linux | macOS | Windows | Notes |
 |---|---|---|---|---|
@@ -299,7 +300,7 @@ pg_cron, pg_net, pg_plan_filter and pg_safeupdate only work preloaded, the way `
 
 **pg_graphql is Docker-only.** It is a pgrx extension, and the image installs the upstream release package, which targets a PGDG Postgres rather than these archives. The `/graphql/v1` endpoint therefore answers only on a stack running the `supatype/postgres` image; native dev has no GraphQL.
 
-Extension libraries live in the server's `$libdir` (`lib/postgresql/`). The Linux archives are self-contained above glibc: every other shared library they load (ICU, OpenSSL, readline, GEOS, PROJ, libcurl and the rest) is in `lib/`, and every program and module finds it through an `$ORIGIN` RUNPATH, so they run on any distribution with glibc 2.35 (Ubuntu 22.04) or later and its C++ runtime. A linux-arm64 build cross-compiled from an x86_64 host has none of the C or Rust extensions; CI builds that target on a native arm64 runner instead.
+Extension libraries live in the server's `$libdir` (`lib/postgresql/`). The Linux archives are self-contained above glibc: every other shared library they load (ICU, OpenSSL, readline, GEOS, PROJ, libcurl and the rest) is in `lib/`, and every program and module finds it through an `$ORIGIN` RUNPATH, so they run on any distribution with glibc 2.35 (Ubuntu 22.04) or later and its C++ runtime. Both Linux archives are built on Ubuntu 22.04 for that reason, linux-arm64 on a native arm64 runner; one cross-compiled from an x86_64 host has none of the C or Rust extensions. The archive's OpenSSL was built to look for CA certificates in Ubuntu's `/usr/lib/ssl`, so `bin/postgres` is a small script that starts the server (`bin/postgres.bin`) with `SSL_CERT_FILE` set to the host's CA bundle, the first of the usual locations that exists, unless `SSL_CERT_FILE` or `SSL_CERT_DIR` is already set: without it, pg_net's HTTPS requests fail certificate verification on Fedora, RHEL and anything else that keeps them elsewhere.
 
 To build a native archive locally, the same way CI does (`--help` lists the options, such as `--ccache`):
 

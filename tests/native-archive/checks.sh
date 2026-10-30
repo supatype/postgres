@@ -8,6 +8,10 @@
 
 failed=0
 
+# PROJ finds its data through these before anything else, so a value inherited from the machine
+# running the checks could answer for data the archive lacks.
+unset PROJ_DATA PROJ_LIB
+
 step() {
 	local label=$1
 	shift
@@ -111,6 +115,41 @@ expect_error() {
 	fi
 }
 
+# check_pg_net_https <url>: pg_net fetches the URL and gets a 200. The URL is HTTPS with a
+# certificate from a CA only the host trusts, so this passes only when the archive's libcurl finds
+# the host's CA certificates, wherever that distribution keeps them.
+check_pg_net_https() {
+	local id status="" try
+	if ! id=$(psql_run "SELECT net.http_get('$1')" 2>&1); then
+		echo "FAIL    pg_net HTTPS request: $id"
+		failed=$((failed + 1))
+		return
+	fi
+	for try in $(seq 1 40); do
+		status=$(psql_run "SELECT coalesce(status_code::text, 'error: ' || error_msg) FROM net._http_response WHERE id = $id" 2>&1) || true
+		[ -z "$status" ] || break
+		sleep 0.25
+	done
+	if [ "$status" = 200 ]; then
+		echo "ok      pg_net HTTPS request to $1"
+	else
+		echo "FAIL    pg_net HTTPS request to $1: ${status:-no response after $try tries}"
+		failed=$((failed + 1))
+	fi
+}
+
+# probe_postgis: geometry, and ST_Transform, which reads PROJ's database. On a machine with its own
+# PROJ data (/usr/share/proj on the build machine) the transform would find that and pass with the
+# archive's missing, so the file is checked as well; in a clean container, the transform alone
+# proves the archive's own is found.
+# shellcheck disable=SC2154 # root is set by the script that sources this one
+probe_postgis() {
+	expect_true "PostGIS geometry" "SELECT ST_AsText(ST_Point(1, 2)) = 'POINT(1 2)'"
+	step "the archive carries PROJ data" test -f "$root/share/proj/proj.db" || true
+	expect_true "PostGIS ST_Transform (PROJ data)" \
+		"SELECT round(ST_X(ST_Transform(ST_SetSRID(ST_Point(1, 0), 4326), 3857))) = 111319"
+}
+
 # probe <extension-or-library>: show that it works, not only that it loads.
 probe() {
 	case "$1" in
@@ -124,13 +163,9 @@ probe() {
 	pg_net)
 		expect_true "pg_net worker running" "SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type LIKE 'pg_net%'"
 		expect_true "pg_net queues a request" "SELECT net.http_get('http://127.0.0.1:9') > 0"
+		[ -z "${NATIVE_ARCHIVE_HTTPS_URL:-}" ] || check_pg_net_https "$NATIVE_ARCHIVE_HTTPS_URL"
 		;;
-	postgis)
-		expect_true "PostGIS geometry" "SELECT ST_AsText(ST_Point(1, 2)) = 'POINT(1 2)'"
-		# Reads PROJ's database, so this fails when share/proj is missing or cannot be found.
-		expect_true "PostGIS ST_Transform (PROJ data)" \
-			"SELECT round(ST_X(ST_Transform(ST_SetSRID(ST_Point(1, 0), 4326), 3857))) = 111319"
-		;;
+	postgis) probe_postgis ;;
 	safeupdate)
 		step "write a row for pg_safeupdate" psql_run "CREATE TABLE safeupdate_probe (id int); INSERT INTO safeupdate_probe VALUES (1)" || true
 		expect_error "pg_safeupdate refuses DELETE without WHERE" "DELETE FROM safeupdate_probe" "requires a WHERE clause"

@@ -21,7 +21,8 @@ lib="${root}/lib"
 baseline='^(linux-vdso|ld-linux[^ ]*|libc|libm|libdl|libpthread|librt|libresolv|libutil|libanl|libgcc_s|libstdc\+\+)\.so'
 
 info() { echo "[bundle-linux-libraries] $*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+# shellcheck source=scripts/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 command -v patchelf >/dev/null || die "patchelf is required"
 
 # elf_files: every dynamically linked ELF file in the archive, one per line.
@@ -73,3 +74,10 @@ done < <(elf_files)
 leaks=$(env -u LD_LIBRARY_PATH bash -c "$(declare -f elf_files outside_dependencies); root='${root}' baseline='${baseline}' outside_dependencies")
 [ -z "${leaks}" ] || die "still loaded from outside the archive: ${leaks}"
 info "every program and module loads only baseline libraries from the host"
+
+# Last, because it is a script rather than ELF: bin/postgres becomes scripts/linux-postgres-wrapper.sh,
+# which points the archive's OpenSSL at the host's CA certificates, and the server moves to
+# bin/postgres.bin beside it. Run again on the same tree, it only refreshes the wrapper.
+info "wrapping bin/postgres so pg_net's HTTPS finds the host's CA certificates"
+[ -e "${root}/bin/postgres.bin" ] || mv "${root}/bin/postgres" "${root}/bin/postgres.bin"
+install -m 755 "$(dirname "${BASH_SOURCE[0]}")/linux-postgres-wrapper.sh" "${root}/bin/postgres"

@@ -2,10 +2,11 @@
 # build-native-extensions.sh: build the upstream extensions every native archive carries, and
 # install them into a staged PostgreSQL.
 #
-# One list for every build path: scripts/build-native.sh (Linux and macOS) and
-# scripts/build-native-windows.sh run this script, locally and in CI, so the pins below are the
-# only place a native extension version is set. They match what the Dockerfile
-# installs, which is what keeps native dev and the image behaving the same.
+# One list for every build path: scripts/build-native.sh (Linux and macOS),
+# scripts/build-native-windows.sh and the Dockerfile run this script, so the pins below are the
+# only place these extension versions are set, and native dev and the image run the same builds.
+# The one exception is PostGIS in the image, which is PGDG's package (with raster) rather than
+# this script's build.
 #
 # Every extension installs through PGXS, which takes its directories from the staged pg_config
 # (it is relocatable), so libraries land in the server's $libdir and SQL beside the other
@@ -17,10 +18,11 @@
 #   linux     + pg_net, PostGIS
 #   darwin    + pg_net
 #   windows   + PostGIS
+#   image     + pg_net against the system libcurl (the Dockerfile; PostGIS comes from PGDG)
 # pg_net has no Windows event loop (epoll on Linux, kqueue on macOS, nothing else). PostGIS on
 # macOS needs GEOS, PROJ and json-c bundled and relinked into the archive, which is not done yet.
 #
-# Usage: build-native-extensions.sh <pg_config> <linux|darwin|windows>
+# Usage: build-native-extensions.sh <pg_config> <linux|darwin|windows|image>
 # Environment: BUILD_DIR (scratch, default a new temporary directory), JOBS (default nproc).
 set -euo pipefail
 
@@ -32,7 +34,7 @@ WAL2JSON_VERSION="${WAL2JSON_VERSION:-2.7}"
 PG_CRON_VERSION="${PG_CRON_VERSION:-1.6.8}"
 PG_NET_VERSION="${PG_NET_VERSION:-0.14.0}"
 PG_SAFEUPDATE_VERSION="${PG_SAFEUPDATE_VERSION:-1.7}"
-# pg_plan_filter has never been tagged; this is the commit the Dockerfile's clone of HEAD gets.
+# pg_plan_filter has never been tagged; this is the commit that was its HEAD when it was pinned.
 PG_PLAN_FILTER_COMMIT="${PG_PLAN_FILTER_COMMIT:-c1afc73dacae8688456bdeef72ed6a3030c500ba}"
 PGJWT_COMMIT="${PGJWT_COMMIT:-f3d82fd30151e754e19ce5d6a06c71c20689ce3d}"
 POSTGIS_VERSION="${POSTGIS_VERSION:-3.6.4}"
@@ -46,10 +48,10 @@ info() { echo "[build-native-extensions] $*"; }
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-[ $# -eq 2 ] || { echo "Usage: $(basename "$0") <pg_config> <linux|darwin|windows>" >&2; exit 2; }
+[ $# -eq 2 ] || { echo "Usage: $(basename "$0") <pg_config> <linux|darwin|windows|image>" >&2; exit 2; }
 PG_CONFIG=$1
 PLATFORM=$2
-case "${PLATFORM}" in linux|darwin|windows) ;; *) die "unknown platform ${PLATFORM}" ;; esac
+case "${PLATFORM}" in linux|darwin|windows|image) ;; *) die "unknown platform ${PLATFORM}" ;; esac
 [ -x "${PG_CONFIG}" ] || die "pg_config not found at ${PG_CONFIG}"
 
 if [ -z "${JOBS:-}" ]; then
@@ -115,8 +117,10 @@ build_pg_net() {
 
 # pg_net needs libcurl 7.83 or later and the Linux archive is built on Ubuntu 22.04, which ships
 # 7.81, so Linux builds a pinned libcurl into the archive's lib/ and pg_net against it. Only what
-# HTTP needs is enabled, and certificates are verified against OpenSSL's own default store rather
-# than a bundle path from the build machine.
+# HTTP needs is enabled, and certificates are verified against OpenSSL's default store rather
+# than a bundle path from the build machine. That store is /usr/lib/ssl, Ubuntu's, so on any other
+# distribution the archive's bin/postgres (scripts/linux-postgres-wrapper.sh) points OpenSSL at the
+# host's CA bundle.
 build_linux_libcurl() {
 	local tarball="${SRC}/curl-${CURL_VERSION}.tar.gz" prefix="${SRC}/curl-install"
 	info "libcurl ${CURL_VERSION}"
@@ -194,7 +198,7 @@ case "${PLATFORM}" in
 			build_pg_net PG_LDFLAGS="-L${CURL_PREFIX}/lib"
 		build_postgis
 		;;
-	darwin)
+	darwin|image)
 		build_pg_net
 		;;
 	windows)
