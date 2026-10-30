@@ -20,5 +20,8 @@ if [ -z "${SSL_CERT_FILE:-}" ] && [ -z "${SSL_CERT_DIR:-}" ]; then
 fi
 
 # Under this script's own name, so the server still calls itself postgres in its messages and
-# resolves its share and lib directories from bin/, as it would without the wrapper.
-exec -a "$0" "$(dirname "$0")/postgres.bin" "$@"
+# resolves its share and lib directories from bin/, as it would without the wrapper. postgres.bin
+# is found beside the script itself, not beside the name it was called by: bin/postgres may be a
+# symlink from somewhere else, such as /usr/local/bin.
+here=$(dirname "$(readlink -f "$0")")
+exec -a "$0" "${here}/postgres.bin" "$@"
