@@ -142,9 +142,10 @@ print_summary() {
   echo ""
 }
 
-# sha256 <args>: sha256sum where there is one, else macOS's shasum, with the same arguments.
+# sha256 <args>: shasum on macOS, GNU sha256sum elsewhere, with the same arguments. Newer macOS
+# images ship their own sha256sum, which takes -c but not --check, so its presence says nothing.
 sha256() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
+  if [[ "$(uname -s)" == "Darwin" ]]; then shasum -a 256 "$@"; else sha256sum "$@"; fi
 }
 
 install_linux_deps() {
