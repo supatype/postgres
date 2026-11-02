@@ -11,19 +11,23 @@ permissions:
 
 env:
   PG_VERSION: "17.2"
-  PG_TARBALL: "postgresql-17.2.tar.gz"
-  PG_URL: "https://ftp.postgresql.org/pub/source/v17.2/postgresql-17.2.tar.gz"
   PG_SHA256: "51d8cdd6a5220fa8c0a3b12f2d0eeb50fcf5e0bdb7b37904a9cdff5cf1e61c36"
   INSTALL_PREFIX: "/usr/local/supatype-pg"
-  # Extension versions: these must match the Dockerfile ARGs
-  PGVECTOR_VERSION: "0.8.0"
-  PGJWT_COMMIT: "f3d82fd30151e754e19ce5d6a06c71c20689ce3d"
+  # Extension versions are pinned in scripts/build-native-extensions.sh, which every native build
+  # runs, so that they match the Dockerfile in one place.
   # Hetzner Object Storage, env only: configure-aws-credentials calls AWS STS.
   AWS_ACCESS_KEY_ID: ${{ secrets.CDN_AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.CDN_AWS_SECRET_ACCESS_KEY }}
   AWS_DEFAULT_REGION: ${{ secrets.CDN_AWS_REGION }}
 
 jobs:
+  # -------------------------------------------------------------------- #
+  # Linux and macOS: scripts/build-native.sh, the script a local build runs,
+  # does everything up to the staged tree (dependencies, PostgreSQL, every
+  # extension, the library bundling on Linux, and the runtime check), so
+  # the steps cannot drift from it. The workflow only adds what needs CI
+  # secrets: signing between staging and packaging, and notarization.
+  # -------------------------------------------------------------------- #
   build:
     name: Build PG17 (${{ matrix.target }})
     strategy:
@@ -33,19 +37,18 @@ jobs:
           - target: linux-amd64
             os: ubuntu-22.04
             platform: linux
-            arch: amd64
 
           # Native ARM64 runner so pg_guard + pgvector (PGXS) compile against the
           # same staged postgres as linux-amd64 (cross-compiling those extensions was skipped).
+          # 22.04, like linux-amd64: the archive needs the build machine's glibc or later, and
+          # built on 24.04 it needed 2.39 where the README promises 2.35.
           - target: linux-arm64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             platform: linux
-            arch: arm64
 
           - target: darwin-arm64
             os: macos-14
             platform: darwin
-            arch: arm64
 
           # macos-13 retired 2025-12-04; the last Intel runner label is macos-15-intel.
           # `darwin-amd64`, matching `linux-amd64` and `windows-amd64`: the archive name comes from
@@ -55,255 +58,45 @@ jobs:
           - target: darwin-amd64
             os: macos-15-intel
             platform: darwin
-            arch: x86_64
 
     runs-on: ${{ matrix.os }}
+
+    env:
+      ARCHIVE_NAME: supatype-pg-17-${{ matrix.target }}.tar.gz
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 1G
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------------ #
-      # Install build dependencies
+      # Compiler cache. ccache answers from a compilation's own inputs, so a
+      # hit can never ship an object built from other sources or headers. The
+      # key names what the cache was filled from (the target, the PostgreSQL
+      # version, the upstream extension pins and the commit). A cache is never
+      # updated in place, so the commit makes every run save a fresh one; a run
+      # restores the newest whose prefix matches, and PostgreSQL itself still hits.
       # ------------------------------------------------------------------ #
-      - name: Install dependencies (Linux)
-        if: matrix.platform == 'linux'
+      - name: Hash the upstream extension pins
+        id: pins
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            libssl-dev \
-            libreadline-dev \
-            zlib1g-dev \
-            libicu-dev \
-            libzstd-dev \
-            uuid-dev
+          hash=$(sed -n '/^# pins: begin$/,/^# pins: end$/p' scripts/build-native-extensions.sh | shasum -a 256 | cut -c1-16)
+          echo "hash=${hash}" >> "$GITHUB_OUTPUT"
 
-      - name: Install dependencies (macOS)
-        if: matrix.platform == 'darwin'
-        run: |
-          brew install openssl readline icu4c zstd
+      - name: Restore the compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.target }}-pg${{ env.PG_VERSION }}-${{ steps.pins.outputs.hash }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.target }}-pg${{ env.PG_VERSION }}-${{ steps.pins.outputs.hash }}-
+            ccache-${{ matrix.target }}-pg${{ env.PG_VERSION }}-
+            ccache-${{ matrix.target }}-
 
-      - name: Set macOS Intel deployment target
-        if: matrix.platform == 'darwin' && matrix.arch == 'x86_64'
-        run: |
-          # Xcode 16.4's SDK exposes strchrnul as macOS 15.4+, and PG17 builds
-          # with -Werror=unguarded-availability-new on this runner.
-          echo "MACOSX_DEPLOYMENT_TARGET=15.4" >> "$GITHUB_ENV"
-
-      # ------------------------------------------------------------------ #
-      # Download & verify PG17 source
-      # ------------------------------------------------------------------ #
-      - name: Download PostgreSQL ${{ env.PG_VERSION }} source
-        run: |
-          curl -fsSL "${{ env.PG_URL }}" -o "${{ env.PG_TARBALL }}"
-
-      - name: Verify SHA256 checksum (Linux)
-        if: matrix.platform == 'linux'
-        run: |
-          echo "${{ env.PG_SHA256 }}  ${{ env.PG_TARBALL }}" | sha256sum --check
-
-      - name: Verify SHA256 checksum (macOS)
-        if: matrix.platform == 'darwin'
-        run: |
-          echo "${{ env.PG_SHA256 }}  ${{ env.PG_TARBALL }}" | shasum -a 256 --check
-
-      - name: Extract source
-        run: |
-          tar -xzf "${{ env.PG_TARBALL }}"
-
-      # ------------------------------------------------------------------ #
-      # Configure
-      # ------------------------------------------------------------------ #
-      - name: Configure (Linux)
-        if: matrix.platform == 'linux'
-        working-directory: postgresql-${{ env.PG_VERSION }}
-        run: |
-          ./configure \
-            --prefix=${{ env.INSTALL_PREFIX }} \
-            --with-openssl \
-            --with-uuid=e2fs \
-            --with-icu \
-            --with-zstd \
-            --disable-rpath
-
-      - name: Configure (macOS)
-        if: matrix.platform == 'darwin'
-        working-directory: postgresql-${{ env.PG_VERSION }}
-        run: |
-          OPENSSL_PREFIX="$(brew --prefix openssl)"
-          ICU4C_PREFIX="$(brew --prefix icu4c)"
-          READLINE_PREFIX="$(brew --prefix readline)"
-          ZSTD_PREFIX="$(brew --prefix zstd)"
-          # icu4c (and other keg-only formulae) are not on pkg-config's default path.
-          export PKG_CONFIG_PATH="${ICU4C_PREFIX}/lib/pkgconfig:${OPENSSL_PREFIX}/lib/pkgconfig:${READLINE_PREFIX}/lib/pkgconfig:${ZSTD_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
-          ./configure \
-            --prefix=${{ env.INSTALL_PREFIX }} \
-            --with-openssl \
-            --with-uuid=e2fs \
-            --with-icu \
-            --with-zstd \
-            --disable-rpath \
-            --with-libraries="${OPENSSL_PREFIX}/lib:${ICU4C_PREFIX}/lib:${READLINE_PREFIX}/lib:${ZSTD_PREFIX}/lib" \
-            --with-includes="${OPENSSL_PREFIX}/include:${ICU4C_PREFIX}/include:${READLINE_PREFIX}/include:${ZSTD_PREFIX}/include"
-
-      # ------------------------------------------------------------------ #
-      # Build & staged install
-      # ------------------------------------------------------------------ #
-      - name: Build PostgreSQL
-        working-directory: postgresql-${{ env.PG_VERSION }}
-        run: |
-          if [[ "${{ matrix.platform }}" == "linux" ]]; then
-            JOBS=$(nproc)
-          else
-            JOBS=$(sysctl -n hw.logicalcpu)
-          fi
-          make -j"${JOBS}"
-
-      - name: Install PostgreSQL (staged)
-        working-directory: postgresql-${{ env.PG_VERSION }}
-        run: |
-          make install DESTDIR="$(pwd)/../pg-install"
-
-      # ------------------------------------------------------------------ #
-      # Build pg_guard extension (bundled in extensions/pg_guard/)
-      # ------------------------------------------------------------------ #
-      - name: Build and bundle pg_guard
-        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
-        run: |
-          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
-          make -C extensions/pg_guard PG_CONFIG="${PG_CONFIG}"
-          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
-          mkdir -p "${LIB_DIR}"
-          find extensions/pg_guard \( -name "pg_guard.so" -o -name "pg_guard.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          echo "pg_guard bundled into lib dir."
-
-      # ------------------------------------------------------------------ #
-      # supatype_mask: per-column read masking and write rejection
-      #
-      # Bundled with its `.control` and SQL, not just the library: `CREATE EXTENSION`
-      # needs all three. (The pg_guard step above copies only the shared object, which
-      # is why that extension cannot be created from a native archive.)
-      #
-      # Without this, field-level access rules could not be enforced on the native
-      # provider at all (the default `supatype dev`), so a schema declaring them fell
-      # back to generated `api` views while the same schema on `supatype/postgres` used
-      # the planner rewrite. Same source, two mechanisms, purely because of packaging.
-      # ------------------------------------------------------------------ #
-      - name: Build and bundle supatype_mask
-        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
-        run: |
-          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
-          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
-          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
-          mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
-          # PG_CONFIG on `clean` too: a PGXS makefile resolves `$(PG_CONFIG) --pgxs` for every target,
-          # so `clean` without it fails with "make: pg_config: No such file or directory" wherever the
-          # runner image carries no system PostgreSQL, which is every platform here except
-          # linux-amd64, the one that passed and made this look platform-specific.
-          make -C extensions/supatype_mask clean PG_CONFIG="${PG_CONFIG}"
-          make -C extensions/supatype_mask PG_CONFIG="${PG_CONFIG}"
-          find extensions/supatype_mask \
-            \( -name "supatype_mask.so" -o -name "supatype_mask.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          cp extensions/supatype_mask/supatype_mask.control "${SHARE_DIR}/"
-          cp extensions/supatype_mask/supatype_mask--*.sql "${SHARE_DIR}/"
-          echo "supatype_mask bundled into lib + share/postgresql/extension."
-
-      # ------------------------------------------------------------------ #
-      # pgvector: vector similarity search (C extension, native targets only)
-      # ------------------------------------------------------------------ #
-      - name: Build and bundle pgvector
-        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
-        run: |
-          # Build from an explicit tagged release for reproducible archives.
-          git clone --depth 1 --branch v${{ env.PGVECTOR_VERSION }} \
-            https://github.com/pgvector/pgvector.git
-          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
-          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
-          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
-          mkdir -p "${SHARE_DIR}"
-          make -C pgvector PG_CONFIG="${PG_CONFIG}" -j4
-          find pgvector \( -name "vector.so" -o -name "vector.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          cp pgvector/vector.control "${SHARE_DIR}/"
-          find pgvector -name "vector--*.sql" -exec cp {} "${SHARE_DIR}/" \;
-          echo "pgvector bundled."
-
-      # ------------------------------------------------------------------ #
-      # pgjwt: JWT generation/verification in SQL (SQL-only, all targets)
-      # ------------------------------------------------------------------ #
-      - name: Bundle pgjwt
-        run: |
-          git clone https://github.com/michelp/pgjwt.git
-          git -C pgjwt checkout ${{ env.PGJWT_COMMIT }}
-          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
-          mkdir -p "${SHARE_DIR}"
-          cp pgjwt/pgjwt.control "${SHARE_DIR}/"
-          find pgjwt -name "pgjwt--*.sql" -exec cp {} "${SHARE_DIR}/" \;
-          echo "pgjwt bundled."
-
-      # ------------------------------------------------------------------ #
-      # pg_keyspace: Postgres-native RESP keyspace + PostgREST row cache
-      # (Rust/pgrx). Built from in-repo source against the staged PG so the
-      # native archive ships the same extension as the supatype/postgres image.
-      #
-      # LINUX + macOS. pg_keyspace's event loop is readiness-driven via mio
-      # (epoll on Linux, kqueue on macOS), so it builds on both. Windows is still
-      # excluded, because pgrx has no supported Windows target, so that archive ships
-      # the other extensions but not pg_keyspace.
-      # ------------------------------------------------------------------ #
-      - name: Install clang for pgrx bindgen (Linux)
-        if: matrix.platform == 'linux'
-        run: sudo apt-get install -y --no-install-recommends clang libclang-dev llvm-dev
-        # macOS runners already ship clang/libclang with the Xcode command-line
-        # tools, so no extra install step is needed there.
-
-      - name: Install cargo-pgrx
-        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
-        run: cargo install cargo-pgrx --version 0.12.9 --locked
-
-      - name: Build and bundle pg_keyspace
-        if: matrix.platform == 'linux' || matrix.platform == 'darwin'
-        run: |
-          set -euo pipefail
-          PG_CONFIG="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/bin/pg_config"
-          LIB_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/lib"
-          SHARE_DIR="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}/share/postgresql/extension"
-          mkdir -p "${LIB_DIR}" "${SHARE_DIR}"
-
-          # `cargo pgrx package` builds against --pg-config directly, but it still
-          # requires PGRX_HOME to exist ("$PGRX_HOME does not exist" otherwise).
-          # We must NOT create it with `cargo pgrx init`: init runs initdb, which
-          # fails against a staged (DESTDIR) Postgres whose binaries resolve libpq
-          # at an absolute install prefix that isn't installed yet (the macOS
-          # "Library not loaded: .../libpq.5.dylib" failure). So build a minimal
-          # PGRX_HOME that registers pg17 -> this pg_config, with no initdb involved.
-          export PGRX_HOME="${HOME}/.pgrx"
-          mkdir -p "${PGRX_HOME}"
-          printf '[configs]\npg17 = "%s"\n' "${PG_CONFIG}" > "${PGRX_HOME}/config.toml"
-          ( cd extensions/pg_keyspace/extension && cargo pgrx package --pg-config "${PG_CONFIG}" )
-
-          # pgrx lays the package tree under target/release/pg_keyspace-pg17 at the
-          # paths pg_config REPORTS. PostgreSQL's pg_config is relocatable, so for a
-          # staged build those are the pg-install/... paths, not ${INSTALL_PREFIX}, so
-          # derive them from pg_config rather than assuming the prefix.
-          PKGROOT="extensions/pg_keyspace/extension/target/release/pg_keyspace-pg17"
-          LIBSRC="${PKGROOT}$(${PG_CONFIG} --pkglibdir)"
-          SHARESRC="${PKGROOT}$(${PG_CONFIG} --sharedir)/extension"
-          find "${LIBSRC}" \( -name "pg_keyspace.so" -o -name "pg_keyspace.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          cp "${SHARESRC}/pg_keyspace.control" "${SHARE_DIR}/"
-          cp "${SHARESRC}"/pg_keyspace--*.sql "${SHARE_DIR}/"
-
-          # keys-only logical-decode plugin (Mode B row cache), beside the .so.
-          make -C extensions/pg_keyspace/plugin clean PG_CONFIG="${PG_CONFIG}" || true
-          make -C extensions/pg_keyspace/plugin PG_CONFIG="${PG_CONFIG}"
-          find extensions/pg_keyspace/plugin \
-            \( -name "supacache_keys.so" -o -name "supacache_keys.dylib" \) \
-            -exec cp {} "${LIB_DIR}/" \;
-          echo "pg_keyspace bundled into lib + share/postgresql/extension."
+      - name: Build PostgreSQL ${{ env.PG_VERSION }} and extensions
+        run: bash scripts/build-native.sh --target "${{ matrix.target }}" --ccache --stage-only
 
       # ------------------------------------------------------------------ #
       # macOS: Developer ID + notarization (Phase 10.6 B7; same secrets as server-release)
@@ -320,15 +113,18 @@ jobs:
             echo "::notice::APPLE_CERT_BASE64 unset, skipping macOS codesign for Postgres bundle."
             exit 0
           fi
-          ROOT="$(pwd)/pg-install${{ env.INSTALL_PREFIX }}"
           echo "$APPLE_CERT_BASE64" | base64 --decode > cert.p12
           security create-keychain -p ci-keychain ci.keychain
           security import cert.p12 -k ci.keychain -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
           security set-keychain-settings -t 3600 -u ci.keychain
           security unlock-keychain -p ci-keychain ci.keychain
+          # Split on purpose: each existing keychain is its own argument after ci.keychain.
+          # shellcheck disable=SC2046
           security list-keychains -d user -s ci.keychain $(security list-keychains -d user | sed 's/\"//g')
           security set-key-partition-list -S apple-tool:,apple: -s -k ci-keychain ci.keychain
           SIGN_ID="Developer ID Application: Supatype Inc (${APPLE_TEAM_ID})"
+          # Where build-native.sh left the staged tree: its default BUILD_DIR, then pg-install.
+          ROOT="${GITHUB_WORKSPACE}/pg-build/pg-install${INSTALL_PREFIX}"
           find "$ROOT" -type f ! -name "*.sql" ! -name "*.txt" ! -name "*.sample" | while IFS= read -r f; do
             case "$(file -b "$f" 2>/dev/null)" in
               Mach-O*)
@@ -338,14 +134,15 @@ jobs:
           done
           rm -f cert.p12
 
-      # ------------------------------------------------------------------ #
-      # Package archive
-      # ------------------------------------------------------------------ #
-      - name: Create archive
-        run: |
-          FILENAME="supatype-pg-17-${{ matrix.target }}.tar.gz"
-          tar -czf "${FILENAME}" -C pg-install${{ env.INSTALL_PREFIX }} .
-          echo "ARCHIVE_NAME=${FILENAME}" >> "$GITHUB_ENV"
+      - name: Package the archive and its checksum
+        run: bash scripts/build-native.sh --target "${{ matrix.target }}" --package-only
+
+      # The packaged archive, unpacked in a clean Fedora container: another distribution's
+      # libraries, no /usr/share/proj, and CA certificates where Ubuntu does not keep them, with
+      # pg_net fetching from a local HTTPS server whose CA only Fedora's bundle trusts.
+      - name: Check the archive on another distribution (Linux)
+        if: matrix.platform == 'linux'
+        run: bash tests/native-archive/check-linux-portable.sh "${ARCHIVE_NAME}"
 
       - name: Notarize Postgres archive (macOS)
         if: matrix.platform == 'darwin'
@@ -359,24 +156,13 @@ jobs:
             echo "::notice::Apple notary secrets unset, skipping notarization for Postgres bundle."
             exit 0
           fi
-          ARCH="${{ env.ARCHIVE_NAME }}"
-          zip -j "${ARCH}.notary.zip" "${ARCH}"
-          xcrun notarytool submit "${ARCH}.notary.zip" \
+          zip -j "${ARCHIVE_NAME}.notary.zip" "${ARCHIVE_NAME}"
+          xcrun notarytool submit "${ARCHIVE_NAME}.notary.zip" \
             --apple-id "$APPLE_NOTARY_APPLE_ID" \
             --password "$APPLE_NOTARY_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait --timeout 20m
-          rm -f "${ARCH}.notary.zip"
-
-      - name: Generate checksum (Linux)
-        if: matrix.platform == 'linux'
-        run: |
-          sha256sum "${{ env.ARCHIVE_NAME }}" > "${{ env.ARCHIVE_NAME }}.sha256"
-
-      - name: Generate checksum (macOS)
-        if: matrix.platform == 'darwin'
-        run: |
-          shasum -a 256 "${{ env.ARCHIVE_NAME }}" > "${{ env.ARCHIVE_NAME }}.sha256"
+          rm -f "${ARCHIVE_NAME}.notary.zip"
 
       # ------------------------------------------------------------------ #
       # Upload artifact for release job
@@ -424,6 +210,10 @@ jobs:
             mingw-w64-x86_64-zstd
             mingw-w64-x86_64-zlib
             mingw-w64-x86_64-readline
+            mingw-w64-x86_64-geos
+            mingw-w64-x86_64-proj
+            mingw-w64-x86_64-json-c
+            mingw-w64-x86_64-libxml2
             make
             bison
             flex
@@ -433,7 +223,8 @@ jobs:
             curl
             tar
 
-      # PG_VERSION, PG_SHA256, PGVECTOR_VERSION and PGJWT_COMMIT come from the workflow env.
+      # PG_VERSION and PG_SHA256 come from the workflow env; the extension pins live in
+      # scripts/build-native-extensions.sh.
       # The script fails when any program or library in the tree cannot load.
       - name: Build PostgreSQL ${{ env.PG_VERSION }} and extensions
         run: bash scripts/build-native-windows.sh staging
@@ -484,7 +275,7 @@ jobs:
           - arch: amd64
             os: ubuntu-22.04
           - arch: arm64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

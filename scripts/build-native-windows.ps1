@@ -51,12 +51,18 @@ $Packages = @(
     "mingw-w64-x86_64-gcc", "mingw-w64-x86_64-binutils", "mingw-w64-x86_64-pkgconf",
     "mingw-w64-x86_64-icu", "mingw-w64-x86_64-openssl", "mingw-w64-x86_64-zstd",
     "mingw-w64-x86_64-zlib", "mingw-w64-x86_64-readline",
+    "mingw-w64-x86_64-geos", "mingw-w64-x86_64-proj", "mingw-w64-x86_64-json-c",
+    "mingw-w64-x86_64-libxml2",
     "make", "bison", "flex", "diffutils", "perl", "git", "curl", "tar"
 ) -join " "
 
 $env:MSYSTEM = "MINGW64"
 $env:CHERE_INVOKING = "1"
 Push-Location $RepoRoot
+# The two bash calls below are judged by their exit code. Under "Stop", Windows PowerShell 5.1
+# turns any line they write to stderr into a terminating error once output is redirected
+# (`*> build.log`), so pacman's "is up to date -- skipping" warning ended the build.
+$ErrorActionPreference = "Continue"
 try {
     Write-Host "[supatype-postgres] Installing the MSYS2 build packages..."
     & $Bash -lc "pacman -S --noconfirm --needed $Packages"
@@ -67,6 +73,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "build-native-windows.sh failed (exit $LASTEXITCODE)" }
 } finally {
     Pop-Location
+    $ErrorActionPreference = "Stop"
 }
 
 $Zip = Join-Path $OutDir $ArchiveName
