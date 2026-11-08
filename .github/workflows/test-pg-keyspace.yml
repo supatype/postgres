@@ -268,7 +268,7 @@ jobs:
   # the daemon, and the RESP/cross-worker conformance harnesses.
   macos:
     name: macOS build + kqueue event loop
-    runs-on: macos-14
+    runs-on: macos-15
     needs: changes
     if: needs.changes.outputs.pgks == 'true'
     steps:
