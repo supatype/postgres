@@ -281,7 +281,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             extensions/pg_keyspace/core/target
-          key: pgks-macos-${{ hashFiles('extensions/pg_keyspace/core/Cargo.lock') }}
+          key: pgks-macos-15-${{ hashFiles('extensions/pg_keyspace/core/Cargo.lock') }}
 
       - name: Install redis + GNU coreutils
         # The bench harnesses are shared with the Linux jobs and assume a GNU
