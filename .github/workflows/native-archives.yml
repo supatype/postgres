@@ -47,7 +47,7 @@ jobs:
             platform: linux
 
           - target: darwin-arm64
-            os: macos-14
+            os: macos-15
             platform: darwin
 
           # macos-13 retired 2025-12-04; the last Intel runner label is macos-15-intel.
