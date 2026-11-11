@@ -48,10 +48,12 @@ restart_pg() {
   su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o '-p $PORT -k /tmp' -w start" >/dev/null 2>&1
   for i in $(seq 1 60); do psql_ "SELECT 1" | grep -q "^1$" && break; sleep 1; done
 }
+# A worker is up when it answers PING: PONG, or NOAUTH once credentials are loaded, since
+# every command but AUTH, HELLO, QUIT and RESET then waits for a login.
 wait_workers() {
   local up=0 w i
   for w in $(seq 0 $((WORKERS-1))); do
-    for i in $(seq 1 40); do redis-cli -p $((RESP+w)) PING 2>/dev/null | grep -q PONG && { up=$((up+1)); break; }; sleep 1; done
+    for i in $(seq 1 40); do redis-cli -p $((RESP+w)) PING 2>/dev/null | grep -qE 'PONG|NOAUTH' && { up=$((up+1)); break; }; sleep 1; done
   done
   echo $up
 }

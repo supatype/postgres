@@ -48,10 +48,12 @@ restart_pg() {
 }
 # Every worker's port, not just worker 0's: they come up seconds apart, and a
 # subscriber that connects before its worker is listening proves nothing.
+# A worker is up when it answers PING: PONG, or NOAUTH once credentials are loaded, since
+# every command but AUTH, HELLO, QUIT and RESET then waits for a login.
 wait_workers() {
   local up=0 w i
   for w in $(seq 0 $((WORKERS-1))); do
-    for i in $(seq 1 40); do redis-cli -p $((RESP+w)) PING 2>/dev/null | grep -q PONG && { up=$((up+1)); break; }; sleep 1; done
+    for i in $(seq 1 40); do redis-cli -p $((RESP+w)) PING 2>/dev/null | grep -qE 'PONG|NOAUTH' && { up=$((up+1)); break; }; sleep 1; done
   done
   echo $up
 }
