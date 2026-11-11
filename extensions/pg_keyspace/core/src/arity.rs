@@ -36,6 +36,7 @@ const ARITY: &[(&str, i32)] = &[
     ("CLIENT|CACHING", 3),
     ("CLIENT|GETNAME", 2),
     ("CLIENT|ID", 2),
+    ("CLIENT|KILL", -3),
     ("CLIENT|NO-EVICT", 3),
     ("CLIENT|NO-TOUCH", 3),
     ("CLIENT|SETINFO", 4),

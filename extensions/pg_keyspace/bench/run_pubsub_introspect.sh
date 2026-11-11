@@ -101,8 +101,11 @@ for i in $(seq 1 30); do
 done
 chk "three subscribers registered, none on worker 0" "3" \
     "$(grep -l subscribe $OUT.w1.out $OUT.w2.out $OUT.w2p.out 2>/dev/null | wc -l | tr -d ' ')"
+# CLIENT LIST has no cmd= field, and CLIENT LIST used to answer OK, so a
+# 'cmd=subscribe' count was 0 whatever the truth. TYPE pubsub lists exactly the
+# connections holding a subscription.
 chk "worker 0 has no subscribers of its own" "0" \
-    "$(redis-cli -p $RESP CLIENT LIST 2>/dev/null | grep -c 'cmd=subscribe')"
+    "$(redis-cli -p $RESP CLIENT LIST TYPE pubsub 2>/dev/null | grep -c '^id=')"
 
 chk "worker 0 lists channels held on workers 1 and 2" "alpha,beta" \
     "$(redis-cli -p $RESP PUBSUB CHANNELS 2>&1 | sort | paste -sd,)"

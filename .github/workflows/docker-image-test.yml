@@ -824,6 +824,14 @@ jobs:
       - name: The keyspace warning appears only when the keyspace is off
         run: sh tests/keyspace-conf/check.sh supatype-postgres:test pg_ksconf
 
+      # With a credential loaded, an unauthenticated client could still PING, KEYS, SCAN and
+      # FLUSHALL, because only keyed commands were gated (0.9.2 release test). The script checks
+      # the full gate, SUPATYPE_KEYSPACE_PASSWORD across a password change, require_auth with no
+      # credential, listen_address, that an image without the password is unchanged, and that a
+      # SUPATYPE_KEYSPACE_DATABASE naming another database gets the extension and credential.
+      - name: The keyspace refuses every command until AUTH
+        run: sh tests/keyspace-auth/check.sh supatype-postgres:test pg_ksauth
+
       - name: Show logs on failure
         if: failure()
         run: |

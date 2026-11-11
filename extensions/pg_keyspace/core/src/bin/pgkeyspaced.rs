@@ -1,4 +1,4 @@
-//! pgkeyspaced — the standalone daemon. Spawns N slot workers, each a
+//! pgkeyspaced, the standalone daemon. Spawns N slot workers, each a
 //! shared-nothing epoll loop on its own port backed by its own shared-memory
 //! segment ("no locks, no atomics, no cache line ping-pong on the hot
 //! path"). N=1 is the single-worker configuration the latency benchmarks
@@ -171,7 +171,8 @@ fn main() {
                         eprintln!("worker {w}: listen {host}:{port} failed: {e}");
                         std::process::exit(1);
                     });
-                worker.set_bus(bus, w as usize);
+                worker.set_worker_index(w as usize);
+                worker.set_bus(bus);
                 println!("worker {w} listening on {host}:{port}");
                 if let Err(e) = worker.run() {
                     eprintln!("worker {w} exited: {e}");

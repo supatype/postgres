@@ -145,12 +145,16 @@ RUN chmod +x /docker-entrypoint-initdb.d/00-supatype-bootstrap.sh
 # this: everything in that directory is executed on first boot.
 COPY scripts/supatype /usr/local/bin/supatype
 COPY migrations/db/apply-migrations.sh /usr/local/libexec/supatype/migrate
+# Creates pg_keyspace's database and extension; the bootstrap and the entrypoint run it on
+# every start. The RESP password is the extension's own job, through pg_keyspace.password_file.
+COPY scripts/keyspace-setup.sh /usr/local/libexec/supatype/keyspace-setup
 
 # Wraps the stock entrypoint to apply migrations to a data directory that already
 # exists, which the stock entrypoint skips -- see the script, and #138.
 COPY scripts/supatype-entrypoint.sh /usr/local/bin/supatype-entrypoint.sh
 RUN chmod +x /usr/local/bin/supatype \
              /usr/local/libexec/supatype/migrate \
+             /usr/local/libexec/supatype/keyspace-setup \
              /usr/local/bin/supatype-entrypoint.sh
 
 ENV POSTGRES_USER=supatype_admin
