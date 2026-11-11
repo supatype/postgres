@@ -3451,8 +3451,6 @@ fn ensure_rowcache_catalogue() -> bool {
     table_exists("supacache.rowcache_reg")
 }
 
-/// Create the `supacache` schema and the hash-partitioned `supacache.kv`
-/// backing table if absent. Idempotent; runs in one transaction.
 /// The RESP credential -> role/tenant map. Shared by the worker's schema setup
 /// and `supacache.set_credential`, which may run first (see there).
 const RESP_CREDENTIAL_DDL: &str = "CREATE TABLE IF NOT EXISTS supacache.resp_credential (\
@@ -3530,6 +3528,8 @@ fn credential_verifier(secret: &str) -> Option<String> {
     .flatten()
 }
 
+/// Create the `supacache` schema and the hash-partitioned `supacache.kv`
+/// backing table if absent. Idempotent; runs in one transaction.
 fn pg_ensure_schema() {
     BackgroundWorker::transaction(|| {
         let _ = Spi::run("CREATE SCHEMA IF NOT EXISTS supacache");
@@ -3754,15 +3754,12 @@ fn load_auth_config() -> Option<AuthConfig> {
 /// `supatype_mask.exempt_roles`, the roles that bypass the keyspace ACL and
 /// tenant scoping, read from the mask's own setting so the two never drift.
 fn exempt_roles() -> HashSet<String> {
-    let raw = unsafe {
-        let s = pg_sys::GetConfigOption(c"supatype_mask.exempt_roles".as_ptr(), true, false);
-        if s.is_null() {
-            String::new()
-        } else {
-            CStr::from_ptr(s).to_string_lossy().into_owned()
-        }
-    };
-    raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    pg_setting(c"supatype_mask.exempt_roles")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// The largest password file read. A password is a line; this only stops a
@@ -3811,10 +3808,9 @@ fn sync_file_credential(password: &str) -> Result<bool, ()> {
         .flatten();
         // A plaintext row that happens to match is still rewritten: the table
         // should hold a verifier, never the password.
-        let current = stored.filter(|s| s.starts_with("sha256$")).is_some_and(|s| {
-            let cred = Cred { secret: s, role: String::new(), tenant: String::new() };
-            cred.verify(password.as_bytes())
-        });
+        let current = stored
+            .filter(|s| s.starts_with("sha256$"))
+            .is_some_and(|s| server::verify_secret(&s, password.as_bytes()));
         if current {
             return Ok(false);
         }

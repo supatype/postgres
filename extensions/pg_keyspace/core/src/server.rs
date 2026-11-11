@@ -497,28 +497,33 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 impl Cred {
     /// True if `presented` matches this credential's secret.
     pub fn verify(&self, presented: &[u8]) -> bool {
-        if let Some(rest) = self.secret.strip_prefix("sha256$") {
-            // sha256$<salt_hex>$<hash_hex>
-            let mut parts = rest.splitn(2, '$');
-            let (salt_hex, hash_hex) = match (parts.next(), parts.next()) {
-                (Some(s), Some(h)) => (s, h),
-                _ => return false,
-            };
-            let (salt, expected) = match (hex_decode(salt_hex), hex_decode(hash_hex)) {
-                (Some(s), Some(h)) => (s, h),
-                _ => return false,
-            };
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&salt);
-            hasher.update(presented);
-            let got = hasher.finalize();
-            ct_eq(got.as_slice(), &expected)
-        } else {
-            // legacy plaintext (local/dev)
-            ct_eq(self.secret.as_bytes(), presented)
-        }
+        verify_secret(&self.secret, presented)
     }
+}
+
+/// True if `presented` matches a stored secret: a `sha256$<salt>$<hash>`
+/// verifier, or a legacy plaintext secret (local/dev).
+pub fn verify_secret(secret: &str, presented: &[u8]) -> bool {
+    let Some(rest) = secret.strip_prefix("sha256$") else {
+        // legacy plaintext (local/dev)
+        return ct_eq(secret.as_bytes(), presented);
+    };
+    // sha256$<salt_hex>$<hash_hex>
+    let mut parts = rest.splitn(2, '$');
+    let (salt_hex, hash_hex) = match (parts.next(), parts.next()) {
+        (Some(s), Some(h)) => (s, h),
+        _ => return false,
+    };
+    let (salt, expected) = match (hex_decode(salt_hex), hex_decode(hash_hex)) {
+        (Some(s), Some(h)) => (s, h),
+        _ => return false,
+    };
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&salt);
+    hasher.update(presented);
+    let got = hasher.finalize();
+    ct_eq(got.as_slice(), &expected)
 }
 
 /// One keyspace ACL rule: a role may read/write keys under `prefix`.
@@ -605,11 +610,11 @@ pub enum Tick {
 }
 
 enum Deny {
-    NoAuth,
     Perm,
     Nil,
 }
 
+const NOAUTH: &str = "NOAUTH Authentication required.";
 const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is disabled.";
 /// Redis's refusal of a HELLO that neither follows a login nor carries one.
 const HELLO_NOAUTH: &str = "NOAUTH HELLO must be called with the client already authenticated, \
@@ -621,6 +626,12 @@ const HELLO_NOAUTH: &str = "NOAUTH HELLO must be called with the client already 
 /// a login when auth is in force.
 fn runs_before_auth(cmd: &[u8]) -> bool {
     matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
+}
+
+/// Redis's rule for a client name and `CLIENT SETINFO` values: printable ASCII
+/// without space, so each stays one field in `CLIENT LIST`.
+fn one_client_field(value: &[u8]) -> bool {
+    value.iter().all(|b| (b'!'..=b'~').contains(b))
 }
 
 /// The user a connection is before it logs in, as in Redis.
@@ -722,11 +733,10 @@ enum ListFilter {
 
 impl ListFilter {
     fn matches(&self, c: &Conn) -> bool {
-        let pubsub = !c.subs.is_empty() || !c.psubs.is_empty() || !c.ssubs.is_empty();
         match self {
             ListFilter::All => true,
             ListFilter::Ids(ids) => ids.contains(&c.id),
-            ListFilter::Pubsub(want) => pubsub == *want,
+            ListFilter::Pubsub(want) => c.subscribed() == *want,
             ListFilter::Nothing => false,
         }
     }
@@ -799,6 +809,14 @@ struct Tracking {
     /// to this connection itself.
     /// A RESP2 connection may only track when it redirects to another client.
     redirect: u64,
+}
+
+impl Tracking {
+    /// The REDIRECT target as `CLIENT GETREDIR` and `CLIENT LIST` show it:
+    /// -1 while tracking is off.
+    fn redir(&self) -> i64 {
+        if self.on { self.redirect as i64 } else { -1 }
+    }
 }
 
 struct Conn {
@@ -891,6 +909,12 @@ impl Conn {
     /// The RESP user this connection is, `default` until it logs in.
     fn user_name(&self) -> &str {
         self.user.as_deref().unwrap_or(DEFAULT_USER)
+    }
+
+    /// Subscribed to any channel, pattern or shard channel: RESP2 subscribe
+    /// mode, and `TYPE pubsub` in `CLIENT LIST`.
+    fn subscribed(&self) -> bool {
+        !self.subs.is_empty() || !self.psubs.is_empty() || !self.ssubs.is_empty()
     }
 
     /// Bytes already written into this connection's reply buffer but not yet
@@ -1849,9 +1873,16 @@ impl Worker {
         // client that never authenticated could still PING, DBSIZE, list every
         // key name with KEYS or SCAN, and FLUSHALL (0.9.2 release test). Only
         // the commands Redis flags no-auth get past it.
-        if self.auth_in_force() && !self.conn_authed(fd) && !runs_before_auth(&cmd) {
+        // One lookup for the gate and the subscribe-mode check below: the
+        // pub/sub handlers between them return, so nothing read here changes.
+        let (authed, subscribed, resp3) = self
+            .conns
+            .get(&fd)
+            .map(|c| (c.authed, c.subscribed(), c.resp3))
+            .unwrap_or((false, false, false));
+        if self.auth_in_force() && !authed && !runs_before_auth(&cmd) {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-            resp::error(out, "NOAUTH Authentication required.");
+            resp::error(out, NOAUTH);
             return;
         }
 
@@ -1882,16 +1913,6 @@ impl Worker {
         //
         // `resp3` is also the wire form for every reply below (typed nulls,
         // maps, sets, doubles and push frames), the auth-gate nil included.
-        let (subscribed, resp3) = self
-            .conns
-            .get(&fd)
-            .map(|c| {
-                (
-                    !c.subs.is_empty() || !c.psubs.is_empty() || !c.ssubs.is_empty(),
-                    c.resp3,
-                )
-            })
-            .unwrap_or((false, false));
         if subscribed && !resp3 && !matches!(cmd.as_slice(), b"PING" | b"QUIT" | b"RESET") {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
             // Redis names the S-variants here now that they exist, and so does
@@ -1978,7 +1999,6 @@ impl Worker {
             if let Err(d) = self.apply_auth(fd, &cmd, &key_idxs, &mut eff) {
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                 match d {
-                    Deny::NoAuth => resp::error(out, "NOAUTH Authentication required."),
                     Deny::Perm => resp::error(
                         out,
                         "NOPERM this user has no permissions to access one of the keys used as arguments",
@@ -5730,11 +5750,14 @@ impl Worker {
         } else {
             (DEFAULT_USER.as_bytes(), &args[1])
         };
-        let check = self.check_login(user, pass);
-        let granted = !matches!(check, LoginCheck::Refused);
-        if let LoginCheck::Granted(login) = check {
-            self.log_in(fd, login);
-        }
+        let granted = match self.check_login(user, pass) {
+            LoginCheck::Refused => false,
+            LoginCheck::Granted(login) => {
+                self.log_in(fd, login);
+                true
+            }
+            LoginCheck::Open => true,
+        };
         let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
         if granted {
             resp::simple(out, "OK");
@@ -5807,8 +5830,8 @@ impl Worker {
             return;
         }
         let c = self.conns.get_mut(&fd).unwrap();
-        c.resp3 = proto == 3;
         let resp3 = proto == 3;
+        c.resp3 = resp3;
         let client_id = c.id;
         let out = &mut c.wbuf;
         resp::map_header(out, 7, resp3);
@@ -5914,7 +5937,7 @@ impl Worker {
                 // Redis's own rule: printable ASCII excluding space, so the name
                 // stays one field in CLIENT LIST output. An empty name is legal
                 // and means "unset".
-                if name.iter().any(|&b| !(b'!'..=b'~').contains(&b)) {
+                if !one_client_field(&name) {
                     let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                     resp::error(
                         out,
@@ -5972,7 +5995,7 @@ impl Worker {
             (b"LIST", _) => return self.handle_client_list(fd, &args[2..]),
             (b"SETINFO", _) => return self.handle_client_setinfo(fd, args),
             (b"GETREDIR", _) => Ok(Some(self.conns.get(&fd).map_or(-1, |c| {
-                if c.track.on { c.track.redirect as i64 } else { -1 }
+                c.track.redir()
             }))),
             // This server never evicts a client, so NO-EVICT is already true.
             (b"NO-EVICT", Some(b"ON" | b"OFF")) => Ok(None),
@@ -6021,7 +6044,7 @@ impl Worker {
             }
         };
         // The same rule as a client name: one field in CLIENT LIST.
-        if value.iter().any(|&b| !(b'!'..=b'~').contains(&b)) {
+        if !one_client_field(&value) {
             let msg = format!(
                 "ERR {} cannot contain spaces, newlines or special characters.",
                 String::from_utf8_lossy(&attr).to_ascii_lowercase()
@@ -6080,7 +6103,7 @@ impl Worker {
             if c.in_multi { c.queued.len() as i64 } else { -1 },
             c.watch.len(),
             c.user_name(),
-            if c.track.on { c.track.redirect as i64 } else { -1 },
+            c.track.redir(),
             if c.resp3 { 3 } else { 2 },
             lossy(&c.lib_name),
             lossy(&c.lib_ver),
@@ -7083,10 +7106,8 @@ impl Worker {
         eff: &mut [Vec<u8>],
     ) -> Result<(), Deny> {
         let cfg = self.auth.as_ref().unwrap();
+        // The dispatch gate has refused every connection that has not logged in.
         let conn = &self.conns[&fd];
-        if !conn.authed {
-            return Err(Deny::NoAuth);
-        }
         if conn.exempt {
             return Ok(()); // service_role / superuser: no scope, no ACL
         }
@@ -9518,7 +9539,7 @@ mod tests {
     fn a_half_closed_connection_that_never_logged_in_is_closed() {
         let (worker, port) = gate_worker("halfclose_noauth", true);
         let got = serve(worker, port, |p| half_close(p, &["PING"]));
-        assert_eq!(got, (vec!["-NOAUTH Authentication required.".to_string()], true));
+        assert_eq!(got, (vec![NOAUTH.to_string()], true));
     }
 
     #[test]

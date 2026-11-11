@@ -168,15 +168,22 @@ sql() {
 	docker exec -e PGPASSWORD=testpassword "$1" psql -h 127.0.0.1 -U supatype_admin -d "${3:-supatype}" -tAc "$2"
 }
 
+# fresh <container>: remove a case's container and the volume, so the next case boots from empty.
+fresh() {
+	docker rm -f "$1" > /dev/null
+	docker volume rm "$volume" > /dev/null
+}
+
 # Each command on its own connection, so one command's state (MULTI, a subscription) cannot change
 # what the next is told, and the first line of each reply.
 refused_everywhere() {
 	got=''
+	want=''
 	for word in PING 'KEYS *' FLUSHALL 'SCAN 0' DBSIZE INFO 'CLIENT ID' RANDOMKEY 'SUBSCRIBE ch'; do
 		# shellcheck disable=SC2086 # each word is a command line, split on purpose
 		got="$got$(talk "$1" 127.0.0.1 "$(c $word)" | head -n 1)|"
+		want="$want$noauth|"
 	done
-	want="$noauth|$noauth|$noauth|$noauth|$noauth|$noauth|$noauth|$noauth|$noauth|"
 	expect "$2: PING KEYS FLUSHALL SCAN DBSIZE INFO CLIENT RANDOMKEY SUBSCRIBE refused without AUTH" "$want" "$got"
 }
 
@@ -266,8 +273,7 @@ own=$(docker exec "$closed" hostname -i | awk '{print $1}')
 expect "listen_address 127.0.0.1: nothing answers on $own" "" "$(talk "$closed" "$own" PING)"
 
 # ---- 4. no password: unchanged -----------------------------------------------------------------
-docker rm -f "$closed" > /dev/null
-docker volume rm "$volume" > /dev/null
+fresh "$closed"
 start "$open_c" ''
 ready "$open_c" "no password"
 own=$(docker exec "$open_c" hostname -i | awk '{print $1}')
@@ -277,8 +283,7 @@ expect "no password: RESP serves without AUTH on $own, as before" "$(lines +PONG
 # ---- 5. the keyspace in its own database -------------------------------------------------------
 # The worker connects to SUPATYPE_KEYSPACE_DATABASE, so that is where the extension and the
 # credential have to be. They used to go to POSTGRES_DB, and the worker found neither.
-docker rm -f "$open_c" > /dev/null
-docker volume rm "$volume" > /dev/null
+fresh "$open_c"
 ks_db=kscache
 start "$otherdb" "$secret1"
 ready "$otherdb" "own database"
@@ -298,8 +303,7 @@ got=$(talk "$otherdb" 127.0.0.1 "$login" "$(c SET k v)" | head -n 2)
 expect "own database, restarted: the credential is set again and AUTH works" "$(lines +OK +OK)" "$got"
 
 # ---- 6. the password from a file ---------------------------------------------------------------
-docker rm -f "$otherdb" > /dev/null
-docker volume rm "$volume" > /dev/null
+fresh "$otherdb"
 ks_db=''
 pw_file=/tmp/keyspace-password
 start_with_password_file "$fromfile" "$secret2"
@@ -339,8 +343,7 @@ case "$(docker logs "$fromfile" 2>&1)" in
 	*"pg_keyspace.password_file '$pw_file' holds no password"*) ok "password file, emptied: the log says it holds no password" ;;
 	*) fail "password file, emptied: no 'holds no password' in the log" ;;
 esac
-docker rm -f "$fromfile" > /dev/null
-docker volume rm "$volume" > /dev/null
+fresh "$fromfile"
 
 # refused_start <container> <label> <log text>: the container stopped on its own, saying why.
 refused_start() {
@@ -353,8 +356,7 @@ refused_start() {
 		*"$3"*) ok "$2: the log says '$3'" ;;
 		*) fail "$2: no '$3' in the log" ;;
 	esac
-	docker rm -f "$1" > /dev/null
-	docker volume rm "$volume" > /dev/null
+	fresh "$1"
 }
 
 # A file with no password in it would otherwise read as no password at all, and leave the keyspace
