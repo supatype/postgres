@@ -9537,14 +9537,14 @@ mod tests {
 
     #[test]
     fn a_half_closed_connection_that_never_logged_in_is_closed() {
-        let (worker, port) = gate_worker("halfclose_noauth", true);
+        let (worker, port) = gate_worker("halfnoauth", true);
         let got = serve(worker, port, |p| half_close(p, &["PING"]));
         assert_eq!(got, (vec![NOAUTH.to_string()], true));
     }
 
     #[test]
     fn a_half_closed_connection_with_a_command_cut_short_is_closed() {
-        let (worker, port) = gate_worker("halfclose_cut", false);
+        let (worker, port) = gate_worker("halfcut", false);
         let got = serve(worker, port, |p| half_close(p, &["*2", "$3", "GET"]));
         assert_eq!(got, (Vec::new(), true));
     }
