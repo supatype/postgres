@@ -205,11 +205,21 @@ psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
 # Only when the keyspace was actually enabled: SUPATYPE_KEYSPACE_ENABLED is what put pg_keyspace
 # into shared_preload_libraries, and creating the extension without the library loaded is an error
 # rather than a no-op.
+#
+# `supatype keyspace-setup` also creates SUPATYPE_KEYSPACE_DATABASE and the extension in it when
+# that names another database (the worker connects there). The entrypoint runs it again on every
+# later start. The RESP password is not set here: the extension reads it from
+# pg_keyspace.password_file itself. Outside the image (AMI, native) there is no `supatype` command,
+# and the extension alone is created here, as before.
 case "${SUPATYPE_KEYSPACE_ENABLED:-}" in
   1|true|TRUE|on|ON|yes|YES)
-    psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
-        -c 'CREATE EXTENSION IF NOT EXISTS pg_keyspace' \
-      || echo "$0: WARNING: could not create pg_keyspace in $PGDATABASE; RESP will serve without persistence." >&2
+    if command -v supatype > /dev/null 2>&1; then
+        SUPATYPE_MIGRATION_ROLE=supatype_admin POSTGRES_DB="$PGDATABASE" supatype keyspace-setup || true
+    else
+        psql -v ON_ERROR_STOP=1 --no-password --no-psqlrc -U supatype_admin \
+            -c 'CREATE EXTENSION IF NOT EXISTS pg_keyspace' \
+          || echo "$0: WARNING: could not create pg_keyspace in $PGDATABASE; RESP will serve without persistence." >&2
+    fi
     ;;
 esac
 

@@ -497,28 +497,33 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 impl Cred {
     /// True if `presented` matches this credential's secret.
     pub fn verify(&self, presented: &[u8]) -> bool {
-        if let Some(rest) = self.secret.strip_prefix("sha256$") {
-            // sha256$<salt_hex>$<hash_hex>
-            let mut parts = rest.splitn(2, '$');
-            let (salt_hex, hash_hex) = match (parts.next(), parts.next()) {
-                (Some(s), Some(h)) => (s, h),
-                _ => return false,
-            };
-            let (salt, expected) = match (hex_decode(salt_hex), hex_decode(hash_hex)) {
-                (Some(s), Some(h)) => (s, h),
-                _ => return false,
-            };
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&salt);
-            hasher.update(presented);
-            let got = hasher.finalize();
-            ct_eq(got.as_slice(), &expected)
-        } else {
-            // legacy plaintext (local/dev)
-            ct_eq(self.secret.as_bytes(), presented)
-        }
+        verify_secret(&self.secret, presented)
     }
+}
+
+/// True if `presented` matches a stored secret: a `sha256$<salt>$<hash>`
+/// verifier, or a legacy plaintext secret (local/dev).
+pub fn verify_secret(secret: &str, presented: &[u8]) -> bool {
+    let Some(rest) = secret.strip_prefix("sha256$") else {
+        // legacy plaintext (local/dev)
+        return ct_eq(secret.as_bytes(), presented);
+    };
+    // sha256$<salt_hex>$<hash_hex>
+    let mut parts = rest.splitn(2, '$');
+    let (salt_hex, hash_hex) = match (parts.next(), parts.next()) {
+        (Some(s), Some(h)) => (s, h),
+        _ => return false,
+    };
+    let (salt, expected) = match (hex_decode(salt_hex), hex_decode(hash_hex)) {
+        (Some(s), Some(h)) => (s, h),
+        _ => return false,
+    };
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&salt);
+    hasher.update(presented);
+    let got = hasher.finalize();
+    ct_eq(got.as_slice(), &expected)
 }
 
 /// One keyspace ACL rule: a role may read/write keys under `prefix`.
@@ -538,6 +543,49 @@ pub struct AuthConfig {
     pub exempt: HashSet<String>, // roles that bypass ACL + scoping
 }
 
+/// The RESP user `pg_keyspace.password_file` sets the password of.
+pub const FILE_CRED_USER: &str = "supatype";
+/// The role that user acts as: exempt (`supatype_mask.exempt_roles`), so it
+/// sees the raw keyspace and needs no ACL rows. Its tenant is empty.
+pub const FILE_CRED_ROLE: &str = "service_role";
+
+/// The password a `pg_keyspace.password_file` holds: its contents less one
+/// trailing newline (`\n` or `\r\n`), which is what an editor or `echo` leaves.
+/// Nothing else is trimmed, because spaces can be part of a password. A file
+/// with nothing but whitespace in it is an error, not an empty password: read
+/// as no password, it would leave the keyspace open to every client.
+pub fn password_from_file(bytes: &[u8]) -> Result<String, String> {
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let body = body.strip_suffix(b"\r").unwrap_or(body);
+    let text = std::str::from_utf8(body).map_err(|_| "is not UTF-8 text".to_string())?;
+    if text.trim().is_empty() {
+        return Err("holds no password".into());
+    }
+    Ok(text.to_string())
+}
+
+/// The auth config a worker serves with when `pg_keyspace.password_file` is
+/// set: the credentials from the table, with `supatype` taken from the file
+/// alone. `password` is None when the file could not be used, and then
+/// `supatype` has no password at all rather than whatever the table last held,
+/// so a broken file closes that login instead of keeping an old one open.
+///
+/// Each worker builds this from the file itself, so a password the file holds
+/// works on every worker at once, whichever of them writes the table.
+pub fn with_file_credential(
+    cfg: Option<AuthConfig>,
+    exempt: HashSet<String>,
+    password: Option<&str>,
+) -> Option<AuthConfig> {
+    let mut cfg = cfg.unwrap_or(AuthConfig { creds: HashMap::new(), acl: HashMap::new(), exempt });
+    cfg.creds.remove(FILE_CRED_USER);
+    if let Some(pw) = password {
+        let cred = Cred { secret: pw.to_string(), role: FILE_CRED_ROLE.into(), tenant: String::new() };
+        cfg.creds.insert(FILE_CRED_USER.into(), cred);
+    }
+    (!cfg.creds.is_empty()).then_some(cfg)
+}
+
 /// A live config swap applied by `run_with` (SIGHUP hot-reload). Each field is
 /// `Some(new)` to change it or `None` to leave it as-is; the inner `Option` is
 /// the value itself (e.g. `Some(None)` clears auth -> no-auth mode).
@@ -545,6 +593,9 @@ pub struct AuthConfig {
 pub struct Reload {
     pub auth: Option<Option<AuthConfig>>,
     pub tls: Option<Option<Arc<rustls::ServerConfig>>>,
+    /// `pg_keyspace.require_auth`, which is a SIGHUP setting like the
+    /// credentials it guards.
+    pub require_auth: Option<bool>,
 }
 
 /// Per-iteration control returned by the `run_with` tick closure.
@@ -559,9 +610,179 @@ pub enum Tick {
 }
 
 enum Deny {
-    NoAuth,
     Perm,
     Nil,
+}
+
+const NOAUTH: &str = "NOAUTH Authentication required.";
+const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is disabled.";
+/// Redis's refusal of a HELLO that neither follows a login nor carries one.
+const HELLO_NOAUTH: &str = "NOAUTH HELLO must be called with the client already authenticated, \
+     otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate the \
+     client and select the RESP protocol version at the same time";
+
+/// The commands Redis flags `no-auth`: the ways to log in (AUTH, HELLO with
+/// its inline AUTH) and the ways out (QUIT, RESET). Everything else waits for
+/// a login when auth is in force.
+fn runs_before_auth(cmd: &[u8]) -> bool {
+    matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
+}
+
+/// Redis's rule for a client name and `CLIENT SETINFO` values: printable ASCII
+/// without space, so each stays one field in `CLIENT LIST`.
+fn one_client_field(value: &[u8]) -> bool {
+    value.iter().all(|b| (b'!'..=b'~').contains(b))
+}
+
+/// The user a connection is before it logs in, as in Redis.
+const DEFAULT_USER: &str = "default";
+
+/// Room for one `CLIENT LIST` line, so a reply's buffer is sized once.
+const CLIENT_LINE_BYTES: usize = 256;
+
+/// `CLIENT ID`s carry the slot worker's index above this bit, so two workers,
+/// which are separate processes with their own counters, never hand out the
+/// same id: 2^40 connections per worker before a sequence could reach it.
+const CLIENT_ID_WORKER_SHIFT: u32 = 40;
+
+/// What a login resolved to: the role and tenant the connection takes on.
+struct Login {
+    user: String,
+    role: String,
+    tenant: String,
+    exempt: bool,
+}
+
+/// `SELECT <db>`: there is one database, 0, and anything else is out of range,
+/// in Redis's words, rather than an OK that switched nothing.
+fn select_reply(out: &mut Vec<u8>, db: &[u8]) {
+    match resp::arg_int(db) {
+        Some(0) => resp::simple(out, "OK"),
+        Some(_) => resp::error(out, "ERR DB index is out of range"),
+        None => resp::error(out, "ERR value is not an integer or out of range"),
+    }
+}
+
+/// The parameters `CONFIG GET` can answer truthfully. Everything else about
+/// this server is a `pg_keyspace.*` setting in postgresql.conf, so a pattern
+/// that matches none of these gets Redis's empty reply, not a guess.
+const CONFIG_KNOWN: &[(&str, &str)] = &[("databases", "1")];
+
+/// `CONFIG GET <pattern> ...`; SET, RESETSTAT and REWRITE are refused.
+fn config_reply(out: &mut Vec<u8>, args: &[Vec<u8>], resp3: bool) {
+    let sub = args[1].to_ascii_uppercase();
+    match sub.as_slice() {
+        b"GET" => {
+            let pats: Vec<Vec<u8>> = args[2..].iter().map(|p| p.to_ascii_lowercase()).collect();
+            let hits: Vec<&(&str, &str)> = CONFIG_KNOWN
+                .iter()
+                .filter(|(k, _)| pats.iter().any(|p| glob_match(p, k.as_bytes())))
+                .collect();
+            resp::map_header(out, hits.len(), resp3);
+            for (k, v) in hits {
+                resp::bulk(out, k.as_bytes());
+                resp::bulk(out, v.as_bytes());
+            }
+        }
+        b"SET" | b"RESETSTAT" | b"REWRITE" => resp::error(
+            out,
+            &format!(
+                "ERR CONFIG {} is not supported: pg_keyspace is configured by its \
+                 pg_keyspace.* settings in postgresql.conf",
+                String::from_utf8_lossy(&sub)
+            ),
+        ),
+        _ => resp::error(out, &unknown_subcommand("CONFIG", &args[1])),
+    }
+}
+
+/// Redis's reply to a subcommand it does not have, naming it as it was typed.
+fn unknown_subcommand(cmd: &str, sub: &[u8]) -> String {
+    format!("ERR unknown subcommand '{}'. Try {cmd} HELP.", String::from_utf8_lossy(sub))
+}
+
+/// `ip:port` of a connection's peer (`peer`) or of its local end, for
+/// `CLIENT LIST`. Empty when the socket cannot say, rather than a made-up one.
+fn sock_addr(fd: RawFd, peer: bool) -> String {
+    let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let p = &mut sa as *mut _ as *mut libc::sockaddr;
+    let rc = unsafe {
+        if peer {
+            libc::getpeername(fd, p, &mut len)
+        } else {
+            libc::getsockname(fd, p, &mut len)
+        }
+    };
+    if rc != 0 || i32::from(sa.sin_family) != libc::AF_INET {
+        return String::new();
+    }
+    let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+    format!("{ip}:{}", u16::from_be(sa.sin_port))
+}
+
+/// Which connections a `CLIENT LIST` shows.
+enum ListFilter {
+    All,
+    Ids(Vec<u64>),
+    /// TYPE normal (`false`) or pubsub (`true`).
+    Pubsub(bool),
+    /// TYPE master or replica: this server has neither.
+    Nothing,
+}
+
+impl ListFilter {
+    fn matches(&self, c: &Conn) -> bool {
+        match self {
+            ListFilter::All => true,
+            ListFilter::Ids(ids) => ids.contains(&c.id),
+            ListFilter::Pubsub(want) => c.subscribed() == *want,
+            ListFilter::Nothing => false,
+        }
+    }
+}
+
+/// The filter of `CLIENT LIST [TYPE t] [ID id ...]`, or Redis's error for it.
+fn client_list_filter(args: &[Vec<u8>]) -> Result<ListFilter, String> {
+    let Some(first) = args.first() else { return Ok(ListFilter::All) };
+    match first.to_ascii_uppercase().as_slice() {
+        b"TYPE" if args.len() == 2 => match args[1].to_ascii_uppercase().as_slice() {
+            b"NORMAL" => Ok(ListFilter::Pubsub(false)),
+            b"PUBSUB" => Ok(ListFilter::Pubsub(true)),
+            b"MASTER" | b"REPLICA" | b"SLAVE" => Ok(ListFilter::Nothing),
+            _ => Err(format!("ERR Unknown client type '{}'", String::from_utf8_lossy(&args[1]))),
+        },
+        b"ID" if args.len() >= 2 => args[1..]
+            .iter()
+            .map(|a| resp::arg_int(a).filter(|&n| n > 0).map(|n| n as u64))
+            .collect::<Option<Vec<u64>>>()
+            .map(ListFilter::Ids)
+            .ok_or_else(|| "ERR Invalid client ID".to_string()),
+        _ => Err("ERR syntax error".into()),
+    }
+}
+
+/// The filters of one `CLIENT KILL`, all of which a connection must match.
+struct KillFilter {
+    id: Option<u64>,
+    user: Option<String>,
+    /// Leave the calling connection alone (Redis's default, `SKIPME yes`).
+    skipme: bool,
+}
+
+impl KillFilter {
+    fn matches(&self, is_caller: bool, c: &Conn) -> bool {
+        !(self.skipme && is_caller)
+            && self.id.map_or(true, |id| c.id == id)
+            && self.user.as_ref().map_or(true, |u| c.user_name() == u)
+    }
+}
+
+enum LoginCheck {
+    /// No auth in force: AUTH is accepted and changes nothing.
+    Open,
+    Granted(Login),
+    Refused,
 }
 
 /// Per-connection CLIENT TRACKING state (server-assisted client-side caching).
@@ -583,9 +804,19 @@ struct Tracking {
     /// One-shot `CLIENT CACHING` flag consumed by the next command: `Some(true)`
     /// opts the next read in, `Some(false)` opts it out.
     caching: Option<bool>,
-    /// REDIRECT target client id (== fd); 0 delivers to this connection itself.
+    /// REDIRECT target's `CLIENT ID`, looked up at each delivery so a target
+    /// that has closed is gone for good, even once its fd is reused; 0 delivers
+    /// to this connection itself.
     /// A RESP2 connection may only track when it redirects to another client.
-    redirect: RawFd,
+    redirect: u64,
+}
+
+impl Tracking {
+    /// The REDIRECT target as `CLIENT GETREDIR` and `CLIENT LIST` show it:
+    /// -1 while tracking is off.
+    fn redir(&self) -> i64 {
+        if self.on { self.redirect as i64 } else { -1 }
+    }
 }
 
 struct Conn {
@@ -594,6 +825,9 @@ struct Conn {
     wpos: usize,
     want_write: bool,
     closing: bool,
+    /// The client shut down its sending side: what it already sent is
+    /// answered, and then the connection closes (R2-FF1).
+    peer_closed: bool,
     // auth state (only meaningful when the worker has an AuthConfig)
     authed: bool,
     role: String,
@@ -656,9 +890,33 @@ struct Conn {
     /// a null rather than an empty string -- the two are different replies and
     /// clients that label their connections read the difference.
     name: Vec<u8>,
+    /// `CLIENT ID`. Never reused, unlike the fd it used to be: a connection
+    /// opened after another closed was handed the same id, so `CLIENT KILL ID`
+    /// or `TRACKING REDIRECT` could reach the wrong client.
+    id: u64,
+    /// The RESP user this connection logged in as. None is `default`, which
+    /// every connection is until it logs in, as in Redis; kept as None so an
+    /// accept or a RESET allocates nothing. What `CLIENT KILL USER` matches.
+    user: Option<String>,
+    /// When the connection was accepted, for `age=` in `CLIENT LIST`.
+    since: Instant,
+    /// `CLIENT SETINFO LIB-NAME` / `LIB-VER`, shown back by `CLIENT LIST`.
+    lib_name: Vec<u8>,
+    lib_ver: Vec<u8>,
 }
 
 impl Conn {
+    /// The RESP user this connection is, `default` until it logs in.
+    fn user_name(&self) -> &str {
+        self.user.as_deref().unwrap_or(DEFAULT_USER)
+    }
+
+    /// Subscribed to any channel, pattern or shard channel: RESP2 subscribe
+    /// mode, and `TYPE pubsub` in `CLIENT LIST`.
+    fn subscribed(&self) -> bool {
+        !self.subs.is_empty() || !self.psubs.is_empty() || !self.ssubs.is_empty()
+    }
+
     /// Bytes already written into this connection's reply buffer but not yet
     /// sent. While a durable ack is outstanding `flush` holds all of it, so this
     /// is how far ahead of its commits a pipelining client has been allowed to
@@ -717,6 +975,10 @@ pub struct Worker {
     durability: Option<Policy>,
     // when set, RESP AUTH is required and keys are ACL-checked + tenant-scoped.
     auth: Option<AuthConfig>,
+    // `pg_keyspace.require_auth`: AUTH is required even with no credential
+    // loaded, so a server that has none yet refuses everything rather than
+    // serving everyone.
+    require_auth: bool,
     // durable tier: hold each write's RESP reply until its ring record commits.
     sync_ack: bool,
     // Cluster routing. When set, this worker serves only the keys whose CRC16
@@ -765,6 +1027,11 @@ pub struct Worker {
     // prefixes instead of the per-read `tracked` table. Kept as a set so the
     // write path pays nothing when no connection is broadcasting.
     bcast_subs: HashSet<RawFd>,
+    // The last `CLIENT ID` handed out by this worker; see `next_client_id`.
+    client_seq: u64,
+    // `CLIENT ID` -> fd for every live connection, kept in step at accept and
+    // close, so finding a connection by id is not a scan of every connection.
+    client_fds: HashMap<u64, RawFd>,
 }
 
 impl Worker {
@@ -799,6 +1066,7 @@ impl Worker {
             tenant_names: HashMap::new(),
             durability: None,
             auth: None,
+            require_auth: false,
             sync_ack: false,
             routing: None,
             max_value_bytes: resp::DEFAULT_MAX_BULK_LEN,
@@ -811,20 +1079,21 @@ impl Worker {
             worker_id: 0,
             tracked: HashMap::new(),
             bcast_subs: HashSet::new(),
+            client_seq: 0,
+            client_fds: HashMap::new(),
         })
     }
 
-    /// Join a cross-worker pub/sub Bus as worker `worker_id`. The Bus's wake fd
-    /// is registered with this worker's poller so remote deliveries wake it
-    /// promptly. Only used by the multi-worker daemon; the in-PG extension runs
-    /// a single worker and never calls this.
-    pub fn set_bus(&mut self, bus: Arc<pubsub::Bus>, worker_id: usize) {
-        let wfd = bus.wake_fd(worker_id);
+    /// Join a cross-worker pub/sub Bus as the worker `set_worker_index` named
+    /// (call that first). The Bus's wake fd is registered with this worker's
+    /// poller so remote deliveries wake it promptly. The multi-worker daemon and
+    /// the extension's slot workers both use it.
+    pub fn set_bus(&mut self, bus: Arc<pubsub::Bus>) {
+        let wfd = bus.wake_fd(self.worker_id);
         let _ = self
             .registry
             .register(&mut SourceFd(&wfd), Token(wfd as usize), Interest::READABLE);
         self.bus = Some(bus);
-        self.worker_id = worker_id;
     }
 
     /// Durable tier: hold each write's reply until its ring record has committed.
@@ -946,6 +1215,29 @@ impl Worker {
         self.auth = Some(auth);
     }
 
+    /// Which slot worker this is. Sets the high bits of every `CLIENT ID` it
+    /// hands out, and its index on the cross-worker Bus (`set_bus`).
+    pub fn set_worker_index(&mut self, w: usize) {
+        self.worker_id = w;
+    }
+
+    /// A `CLIENT ID` no other connection to any worker has had: the worker's
+    /// index above a per-worker sequence that only ever counts up.
+    fn next_client_id(&mut self) -> u64 {
+        self.client_seq += 1;
+        ((self.worker_id as u64) << CLIENT_ID_WORKER_SHIFT) | self.client_seq
+    }
+
+    /// The live connection with this `CLIENT ID`.
+    fn fd_of_client(&self, id: u64) -> Option<RawFd> {
+        self.client_fds.get(&id).copied()
+    }
+
+    /// Require AUTH even when no credential is loaded (`pg_keyspace.require_auth`).
+    pub fn set_require_auth(&mut self, on: bool) {
+        self.require_auth = on;
+    }
+
     pub fn run(&mut self) -> io::Result<()> {
         self.run_with(|| Tick::Continue, -1)
     }
@@ -973,6 +1265,9 @@ impl Worker {
                     }
                     if let Some(t) = r.tls {
                         self.tls_config = t;
+                    }
+                    if let Some(on) = r.require_auth {
+                        self.require_auth = on;
                     }
                 }
                 Tick::Continue => {}
@@ -1026,7 +1321,7 @@ impl Worker {
                     }
                 } else {
                     if ev.is_readable() {
-                        self.on_readable(fd);
+                        self.on_readable(fd, ev.is_read_closed());
                     }
                     if self.conns.contains_key(&fd) && ev.is_writable() {
                         self.flush(fd);
@@ -1287,6 +1582,8 @@ impl Worker {
                 },
                 None => None,
             };
+            let id = self.next_client_id();
+            self.client_fds.insert(id, cfd);
             self.conns.insert(
                 cfd,
                 Conn {
@@ -1295,6 +1592,7 @@ impl Worker {
                     wpos: 0,
                     want_write: false,
                     closing: false,
+                    peer_closed: false,
                     authed: false,
                     role: String::new(),
                     tenant: String::new(),
@@ -1314,12 +1612,24 @@ impl Worker {
                     resp3: false,
                     track: Tracking::default(),
                     name: Vec::new(),
+                    id,
+                    user: None,
+                    since: Instant::now(),
+                    lib_name: Vec::new(),
+                    lib_ver: Vec::new(),
                 },
             );
         }
     }
 
-    fn on_readable(&mut self, fd: RawFd) {
+    /// Reads what the client sent and answers it. `read_closed` is the
+    /// poller's word that the client has shut down its sending side.
+    ///
+    /// 0.9.2 release test round 2 (R2-FF1): commands and the end of stream
+    /// arrive in one read when a client sends and then half-closes. The read
+    /// loop stops at a short read, and the poller is edge-triggered, so the end
+    /// of stream was never read and the connection stayed open for good.
+    fn on_readable(&mut self, fd: RawFd, read_closed: bool) {
         let is_tls = self.conns.get(&fd).map(|c| c.tls.is_some()).unwrap_or(false);
         if is_tls {
             if self.tls_read(fd) {
@@ -1338,8 +1648,8 @@ impl Worker {
                         break; // drained the socket
                     }
                 } else if r == 0 {
-                    self.close(fd);
-                    return;
+                    self.conns.get_mut(&fd).unwrap().peer_closed = true;
+                    break;
                 } else {
                     let e = io::Error::last_os_error();
                     match e.raw_os_error() {
@@ -1353,6 +1663,11 @@ impl Worker {
                 }
             }
         }
+        if read_closed {
+            if let Some(c) = self.conns.get_mut(&fd) {
+                c.peer_closed = true;
+            }
+        }
         self.process(fd);
         if self.conns.contains_key(&fd) {
             self.flush(fd);
@@ -1360,7 +1675,8 @@ impl Worker {
     }
 
     /// Pump ciphertext from the socket through the TLS session into `rbuf`
-    /// (plaintext). Returns true if the connection was closed (EOF or TLS error).
+    /// (plaintext). Returns true if the connection was closed (a TLS error). An
+    /// end of stream marks the client half-closed, as the plaintext path does.
     /// Handshake round-trips flow through here too; the response is sent by the
     /// subsequent `flush` (which drains `tls.wants_write()`).
     fn tls_read(&mut self, fd: RawFd) -> bool {
@@ -1407,8 +1723,8 @@ impl Worker {
                         Err(_) => break,
                     }
                 }
-                if eof && c.rbuf.is_empty() {
-                    res = Res::Close;
+                if eof {
+                    c.peer_closed = true;
                 }
             }
             res
@@ -1520,9 +1836,15 @@ impl Worker {
                 }
             }
         }
-        if consumed_total > 0 {
-            if let Some(c) = self.conns.get_mut(&fd) {
+        if let Some(c) = self.conns.get_mut(&fd) {
+            if consumed_total > 0 {
                 c.rbuf.drain(..consumed_total);
+            }
+            // Everything a half-closed client sent is answered: close once the
+            // replies are written. What is left in `rbuf` is a command it
+            // never finished, which nothing more will complete.
+            if c.peer_closed && !c.backlogged && !c.parked && c.held_reply_bytes() < MAX_HELD_REPLY_BYTES {
+                c.closing = true;
             }
         }
     }
@@ -1542,6 +1864,25 @@ impl Worker {
         // the refusal reads the same whatever the command. ----
         if let Some(msg) = arity::check(&cmd, args) {
             self.refuse_arity(fd, &cmd, &msg);
+            return;
+        }
+
+        // ---- auth gate: every command, not only the keyed ones ----
+        // Redis's order: arity, then authentication, then everything else. The
+        // gate used to cover only commands with keys (below) and pub/sub, so a
+        // client that never authenticated could still PING, DBSIZE, list every
+        // key name with KEYS or SCAN, and FLUSHALL (0.9.2 release test). Only
+        // the commands Redis flags no-auth get past it.
+        // One lookup for the gate and the subscribe-mode check below: the
+        // pub/sub handlers between them return, so nothing read here changes.
+        let (authed, subscribed, resp3) = self
+            .conns
+            .get(&fd)
+            .map(|c| (c.authed, c.subscribed(), c.resp3))
+            .unwrap_or((false, false, false));
+        if self.auth_in_force() && !authed && !runs_before_auth(&cmd) {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, NOAUTH);
             return;
         }
 
@@ -1572,16 +1913,6 @@ impl Worker {
         //
         // `resp3` is also the wire form for every reply below (typed nulls,
         // maps, sets, doubles and push frames), the auth-gate nil included.
-        let (subscribed, resp3) = self
-            .conns
-            .get(&fd)
-            .map(|c| {
-                (
-                    !c.subs.is_empty() || !c.psubs.is_empty() || !c.ssubs.is_empty(),
-                    c.resp3,
-                )
-            })
-            .unwrap_or((false, false));
         if subscribed && !resp3 && !matches!(cmd.as_slice(), b"PING" | b"QUIT" | b"RESET") {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
             // Redis names the S-variants here now that they exist, and so does
@@ -1657,9 +1988,10 @@ impl Worker {
             return;
         }
 
-        // ---- auth gate + forced tenant scoping for keyed commands ----
-        // `eff` holds the args actually used below; key positions are rewritten
-        // to `{tenant}:{key}` for non-exempt authenticated roles.
+        // ---- keyspace ACL + forced tenant scoping for keyed commands ----
+        // The gate at the top has already refused an unauthenticated
+        // connection. `eff` holds the args actually used below; key positions
+        // are rewritten to `{tenant}:{key}` for non-exempt authenticated roles.
         let mut eff: Vec<Vec<u8>> = Vec::new();
         let key_idxs = key_indices(&cmd, args);
         if self.auth.is_some() && !key_idxs.is_empty() {
@@ -1667,7 +1999,6 @@ impl Worker {
             if let Err(d) = self.apply_auth(fd, &cmd, &key_idxs, &mut eff) {
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                 match d {
-                    Deny::NoAuth => resp::error(out, "NOAUTH Authentication required."),
                     Deny::Perm => resp::error(
                         out,
                         "NOPERM this user has no permissions to access one of the keys used as arguments",
@@ -1810,7 +2141,11 @@ impl Worker {
             }
             // AUTH, HELLO and CLIENT are handled above this match, below the
             // subscribe-context gate.
-            b"CONFIG" | b"SELECT" => resp::simple(out, "OK"),
+            // Both used to answer OK to anything: SELECT 5 claimed a switch to
+            // a database that does not exist, and CONFIG GET returned OK where
+            // a client expects pairs (0.9.2 release test).
+            b"SELECT" => select_reply(out, &args[1]),
+            b"CONFIG" => config_reply(out, args, resp3),
             b"COMMAND" => {
                 let specs = command_specs();
                 match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
@@ -3206,9 +3541,20 @@ impl Worker {
                             ),
                         ),
                     },
-                    // DEBUG SLEEP would block the single-threaded loop, so it is a
-                    // no-op OK rather than an actual stall.
-                    _ => resp::simple(out, "OK"),
+                    // DEBUG SLEEP would block the single-threaded loop, so only a
+                    // sleep of nothing is done. Everything else used to answer
+                    // OK too, a sleep or a RELOAD that never happened.
+                    Some(b"SLEEP") if args.get(2).map(Vec::as_slice) == Some(b"0") => {
+                        resp::simple(out, "OK")
+                    }
+                    Some(sub) => resp::error(
+                        out,
+                        &format!(
+                            "ERR DEBUG {} is not supported",
+                            String::from_utf8_lossy(sub)
+                        ),
+                    ),
+                    None => resp::error(out, &arity::message(b"debug")),
                 }
             }
             b"FLUSHALL" | b"FLUSHDB" => {
@@ -5342,64 +5688,81 @@ impl Worker {
         }
     }
 
-    /// RESP `AUTH [user] pass`: resolve the credential and set the connection's
-    /// role/tenant/exempt state. Computed in two phases so the borrow of
-    /// `self.auth` is released before the connection is mutated.
-    fn handle_auth(&mut self, fd: RawFd, args: &[Vec<u8>]) {
-        enum R {
-            Ok(String, String, bool),
-            Wrong,
-            BadArgs,
-            NoCfg,
-        }
-        let r = match &self.auth {
-            None => R::NoCfg,
-            Some(cfg) => {
-                if args.len() < 2 {
-                    R::BadArgs
-                } else {
-                    let (user, pass): (String, &Vec<u8>) = if args.len() >= 3 {
-                        (String::from_utf8_lossy(&args[1]).into_owned(), &args[2])
-                    } else {
-                        ("default".to_string(), &args[1])
-                    };
-                    match cfg.creds.get(&user) {
-                        Some(c) if c.verify(pass.as_slice()) => {
-                            R::Ok(c.role.clone(), c.tenant.clone(), cfg.exempt.contains(&c.role))
-                        }
-                        _ => R::Wrong,
-                    }
-                }
-            }
+    /// Whether this worker requires AUTH: a credential is loaded, or
+    /// `pg_keyspace.require_auth` is on with none loaded yet (fail closed).
+    fn auth_in_force(&self) -> bool {
+        self.auth.is_some() || self.require_auth
+    }
+
+    /// Whether `fd` has logged in.
+    fn conn_authed(&self, fd: RawFd) -> bool {
+        self.conns.get(&fd).is_some_and(|c| c.authed)
+    }
+
+    /// Check a username and secret against the loaded credentials. One check
+    /// for AUTH and for HELLO's inline AUTH, so the two cannot disagree.
+    fn check_login(&self, user: &[u8], pass: &[u8]) -> LoginCheck {
+        let cfg = match &self.auth {
+            Some(cfg) => cfg,
+            // require_auth with no credential loaded: no secret can match.
+            None if self.require_auth => return LoginCheck::Refused,
+            None => return LoginCheck::Open,
         };
-        let c = self.conns.get_mut(&fd).unwrap();
-        match r {
-            R::NoCfg => resp::simple(&mut c.wbuf, "OK"),
-            R::BadArgs => resp::error(&mut c.wbuf, &arity::message(b"auth")),
-            R::Wrong => resp::error(
-                &mut c.wbuf,
-                "WRONGPASS invalid username-password pair or user is disabled.",
-            ),
-            R::Ok(role, tenant, exempt) => {
-                c.authed = true;
-                c.role = role;
-                // Exempt roles are unscoped, so they have no tenant to charge
-                // ring bytes to and are not policed -- the same carve-out the
-                // key prefix already makes for them.
-                c.tenant_id = if exempt || tenant.is_empty() {
-                    0
-                } else {
-                    share::tenant_id(&tenant)
-                };
-                let id = c.tenant_id;
-                c.tenant = tenant;
-                c.exempt = exempt;
-                resp::simple(&mut c.wbuf, "OK");
-                if id != 0 {
-                    let name = self.conns[&fd].tenant.clone();
-                    self.tenant_names.insert(id, name);
-                }
+        let user = String::from_utf8_lossy(user);
+        match cfg.creds.get(user.as_ref()) {
+            Some(c) if c.verify(pass) => LoginCheck::Granted(Login {
+                user: user.into_owned(),
+                role: c.role.clone(),
+                tenant: c.tenant.clone(),
+                exempt: cfg.exempt.contains(&c.role),
+            }),
+            _ => LoginCheck::Refused,
+        }
+    }
+
+    /// Mark `fd` logged in as `login`'s role and tenant.
+    fn log_in(&mut self, fd: RawFd, login: Login) {
+        // Exempt roles are unscoped, so they have no tenant to charge ring
+        // bytes to and are not policed -- the same carve-out the key prefix
+        // already makes for them.
+        let id = if login.exempt || login.tenant.is_empty() {
+            0
+        } else {
+            share::tenant_id(&login.tenant)
+        };
+        if id != 0 {
+            self.tenant_names.insert(id, login.tenant.clone());
+        }
+        if let Some(c) = self.conns.get_mut(&fd) {
+            c.authed = true;
+            c.role = login.role;
+            c.tenant = login.tenant;
+            c.tenant_id = id;
+            c.exempt = login.exempt;
+            c.user = Some(login.user);
+        }
+    }
+
+    /// RESP `AUTH [user] pass`. Arity has been checked, so the secret is there.
+    fn handle_auth(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        let (user, pass): (&[u8], &[u8]) = if args.len() >= 3 {
+            (&args[1], &args[2])
+        } else {
+            (DEFAULT_USER.as_bytes(), &args[1])
+        };
+        let granted = match self.check_login(user, pass) {
+            LoginCheck::Refused => false,
+            LoginCheck::Granted(login) => {
+                self.log_in(fd, login);
+                true
             }
+            LoginCheck::Open => true,
+        };
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        if granted {
+            resp::simple(out, "OK");
+        } else {
+            resp::error(out, WRONGPASS);
         }
     }
 
@@ -5439,48 +5802,14 @@ impl Worker {
         while i < args.len() {
             match args[i].to_ascii_uppercase().as_slice() {
                 b"AUTH" if i + 2 < args.len() => {
-                    let user = String::from_utf8_lossy(&args[i + 1]).into_owned();
-                    // Resolve the credential without holding a `conns` borrow.
-                    enum A {
-                        NoCfg,
-                        Ok(String, String, bool),
-                        Wrong,
-                    }
-                    let outcome = match &self.auth {
-                        None => A::NoCfg,
-                        Some(cfg) => match cfg.creds.get(&user) {
-                            Some(c) if c.verify(args[i + 2].as_slice()) => {
-                                A::Ok(c.role.clone(), c.tenant.clone(), cfg.exempt.contains(&c.role))
-                            }
-                            _ => A::Wrong,
-                        },
-                    };
-                    match outcome {
-                        A::Wrong => {
+                    match self.check_login(&args[i + 1], &args[i + 2]) {
+                        LoginCheck::Refused => {
                             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-                            resp::error(
-                                out,
-                                "WRONGPASS invalid username-password pair or user is disabled.",
-                            );
+                            resp::error(out, WRONGPASS);
                             return;
                         }
-                        A::Ok(role, tenant, exempt) => {
-                            let id = if exempt || tenant.is_empty() {
-                                0
-                            } else {
-                                share::tenant_id(&tenant)
-                            };
-                            if id != 0 {
-                                self.tenant_names.insert(id, tenant.clone());
-                            }
-                            let c = self.conns.get_mut(&fd).unwrap();
-                            c.authed = true;
-                            c.role = role;
-                            c.tenant = tenant;
-                            c.tenant_id = id;
-                            c.exempt = exempt;
-                        }
-                        A::NoCfg => {} // no auth configured: HELLO AUTH is a no-op OK
+                        LoginCheck::Granted(login) => self.log_in(fd, login),
+                        LoginCheck::Open => {} // no auth configured: HELLO AUTH is a no-op OK
                     }
                     i += 3;
                 }
@@ -5492,9 +5821,19 @@ impl Worker {
                 }
             }
         }
-        self.conns.get_mut(&fd).unwrap().resp3 = proto == 3;
+        // Redis answers a HELLO from a client that is still not logged in with
+        // its own NOAUTH, and leaves the protocol alone: the handshake map is
+        // not something to hand out before authentication.
+        if self.auth_in_force() && !self.conn_authed(fd) {
+            let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+            resp::error(out, HELLO_NOAUTH);
+            return;
+        }
+        let c = self.conns.get_mut(&fd).unwrap();
         let resp3 = proto == 3;
-        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        c.resp3 = resp3;
+        let client_id = c.id;
+        let out = &mut c.wbuf;
         resp::map_header(out, 7, resp3);
         resp::bulk(out, b"server");
         resp::bulk(out, b"redis");
@@ -5503,7 +5842,7 @@ impl Worker {
         resp::bulk(out, b"proto");
         resp::integer(out, proto);
         resp::bulk(out, b"id");
-        resp::integer(out, fd as i64);
+        resp::integer(out, client_id as i64);
         resp::bulk(out, b"mode");
         resp::bulk(out, b"standalone");
         resp::bulk(out, b"role");
@@ -5543,7 +5882,7 @@ impl Worker {
         // RESET only where a password is configured; with no auth there is no
         // authenticated state to drop, and clearing `authed` would lock out a
         // no-auth connection that had done nothing wrong.
-        let requires_auth = self.auth.is_some();
+        let requires_auth = self.auth_in_force();
         let c = match self.conns.get_mut(&fd) {
             Some(c) => c,
             None => return,
@@ -5560,19 +5899,21 @@ impl Worker {
             c.tenant.clear();
             c.tenant_id = 0;
             c.exempt = false;
+            c.user = None;
         }
         resp::simple(&mut c.wbuf, "RESET");
     }
 
     /// CLIENT subcommands. TRACKING ON/OFF drives server-assisted client-side
-    /// caching; the rest are the benign ones clients send at connect (ID, GETNAME,
-    /// SETNAME, SETINFO, NO-EVICT, …), answered OK.
+    /// caching and KILL closes connections; the rest are in `handle_client_more`,
+    /// each answering for itself.
     fn handle_client(&mut self, fd: RawFd, args: &[Vec<u8>]) {
         match args.get(1).map(|a| a.to_ascii_uppercase()).as_deref() {
             Some(b"ID") => {
-                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-                resp::integer(out, fd as i64);
+                let c = self.conns.get_mut(&fd).unwrap();
+                resp::integer(&mut c.wbuf, c.id as i64);
             }
+            Some(b"KILL") => self.handle_client_kill(fd, &args[2..]),
             Some(b"GETNAME") => {
                 let c = self.conns.get_mut(&fd).unwrap();
                 // Unset is a NULL, not an empty string. This replied with an
@@ -5596,7 +5937,7 @@ impl Worker {
                 // Redis's own rule: printable ASCII excluding space, so the name
                 // stays one field in CLIENT LIST output. An empty name is legal
                 // and means "unset".
-                if name.iter().any(|&b| !(b'!'..=b'~').contains(&b)) {
+                if !one_client_field(&name) {
                     let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                     resp::error(
                         out,
@@ -5633,12 +5974,229 @@ impl Worker {
                 c.track.caching = Some(yes);
                 resp::simple(&mut c.wbuf, "OK");
             }
-            _ => {
-                // SETINFO / NO-EVICT / NO-TOUCH / UNPAUSE / …
+            _ => self.handle_client_more(fd, args),
+        }
+    }
+
+    /// The CLIENT subcommands beyond the ones a connection needs to run, each
+    /// answering for itself. They used to share a catch-all that said OK to
+    /// anything, so `CLIENT LIST` answered OK, `CLIENT PAUSE` claimed a pause
+    /// that never happened, and a typo was accepted (0.9.2 release test).
+    fn handle_client_more(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        let sub = args[1].to_ascii_uppercase();
+        let arg = args.get(2).map(|a| a.to_ascii_uppercase());
+        let reply: Result<Option<i64>, String> = match (sub.as_slice(), arg.as_deref()) {
+            (b"INFO", _) => {
+                let mut line = String::with_capacity(CLIENT_LINE_BYTES);
+                self.write_client_line(&mut line, fd);
                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-                resp::simple(out, "OK");
+                return resp::bulk(out, line.as_bytes());
+            }
+            (b"LIST", _) => return self.handle_client_list(fd, &args[2..]),
+            (b"SETINFO", _) => return self.handle_client_setinfo(fd, args),
+            (b"GETREDIR", _) => Ok(Some(self.conns.get(&fd).map_or(-1, |c| {
+                c.track.redir()
+            }))),
+            // This server never evicts a client, so NO-EVICT is already true.
+            (b"NO-EVICT", Some(b"ON" | b"OFF")) => Ok(None),
+            // Every read here refreshes the key's recency; there is no way to
+            // read without touching, so only the default can be agreed to.
+            (b"NO-TOUCH", Some(b"OFF")) => Ok(None),
+            (b"NO-TOUCH", Some(b"ON")) => Err("ERR CLIENT NO-TOUCH ON is not supported: \
+                 every read refreshes the key's recency"
+                .into()),
+            (b"REPLY", Some(b"ON")) => Ok(None),
+            (b"REPLY", Some(b"OFF" | b"SKIP")) => Err(format!(
+                "ERR CLIENT REPLY {} is not supported: every command is answered",
+                String::from_utf8_lossy(arg.as_deref().unwrap_or_default())
+            )),
+            (b"NO-EVICT" | b"NO-TOUCH" | b"REPLY", _) => Err("ERR syntax error".into()),
+            // Nothing is ever paused, so there is nothing to resume.
+            (b"UNPAUSE", _) => Ok(None),
+            // No command here blocks, so no client is ever unblocked.
+            (b"UNBLOCK", Some(_)) => Ok(Some(0)),
+            (b"PAUSE" | b"TRACKINGINFO", _) => Err(format!(
+                "ERR CLIENT {} is not supported",
+                String::from_utf8_lossy(&sub)
+            )),
+            _ => Err(unknown_subcommand("CLIENT", &args[1])),
+        };
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        match reply {
+            Ok(Some(n)) => resp::integer(out, n),
+            Ok(None) => resp::simple(out, "OK"),
+            Err(msg) => resp::error(out, &msg),
+        }
+    }
+
+    /// `CLIENT SETINFO LIB-NAME|LIB-VER <value>`, kept so `CLIENT LIST` can show
+    /// it back, as Redis does.
+    fn handle_client_setinfo(&mut self, fd: RawFd, args: &[Vec<u8>]) {
+        let attr = args[2].to_ascii_uppercase();
+        let value = args[3].clone();
+        let c = self.conns.get_mut(&fd).unwrap();
+        let slot = match attr.as_slice() {
+            b"LIB-NAME" => &mut c.lib_name,
+            b"LIB-VER" => &mut c.lib_ver,
+            _ => {
+                let msg = format!("ERR Unrecognized option '{}'", String::from_utf8_lossy(&args[2]));
+                return resp::error(&mut c.wbuf, &msg);
+            }
+        };
+        // The same rule as a client name: one field in CLIENT LIST.
+        if !one_client_field(&value) {
+            let msg = format!(
+                "ERR {} cannot contain spaces, newlines or special characters.",
+                String::from_utf8_lossy(&attr).to_ascii_lowercase()
+            );
+            return resp::error(&mut c.wbuf, &msg);
+        }
+        *slot = value;
+        resp::simple(&mut c.wbuf, "OK");
+    }
+
+    /// `CLIENT LIST [TYPE normal|pubsub|master|replica] [ID id ...]`: one line
+    /// per connection on this worker, ordered by id.
+    fn handle_client_list(&mut self, fd: RawFd, filter: &[Vec<u8>]) {
+        let keep = match client_list_filter(filter) {
+            Ok(k) => k,
+            Err(msg) => {
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                return resp::error(out, &msg);
+            }
+        };
+        let mut fds: Vec<(u64, RawFd)> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| keep.matches(c))
+            .map(|(&f, c)| (c.id, f))
+            .collect();
+        fds.sort_unstable();
+        let mut body = String::with_capacity(fds.len() * CLIENT_LINE_BYTES);
+        for &(_, f) in &fds {
+            self.write_client_line(&mut body, f);
+        }
+        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+        resp::bulk(out, body.as_bytes());
+    }
+
+    /// One `CLIENT LIST` line in Redis's format, with only the fields this
+    /// worker knows. Redis's idle, flags, buffer and memory fields are left
+    /// out rather than filled with numbers that would look measured.
+    fn write_client_line(&self, buf: &mut String, fd: RawFd) {
+        use std::fmt::Write as _;
+        let Some(c) = self.conns.get(&fd) else { return };
+        let lossy = String::from_utf8_lossy;
+        // Writing to a String cannot fail.
+        let _ = writeln!(
+            buf,
+            "id={} addr={} laddr={} fd={fd} name={} age={} db=0 sub={} psub={} ssub={} \
+             multi={} watch={} user={} redir={} resp={} lib-name={} lib-ver={}",
+            c.id,
+            sock_addr(fd, true),
+            sock_addr(fd, false),
+            lossy(&c.name),
+            c.since.elapsed().as_secs(),
+            c.subs.len(),
+            c.psubs.len(),
+            c.ssubs.len(),
+            if c.in_multi { c.queued.len() as i64 } else { -1 },
+            c.watch.len(),
+            c.user_name(),
+            c.track.redir(),
+            if c.resp3 { 3 } else { 2 },
+            lossy(&c.lib_name),
+            lossy(&c.lib_ver),
+        );
+    }
+
+    /// `CLIENT KILL <filter> <value> ...` with Redis's ID, USER and SKIPME
+    /// filters: every live connection matching all of them is closed, and the
+    /// reply is how many, as Redis's filter form answers. The caller is skipped
+    /// unless `SKIPME no`, and is then closed once its reply is written.
+    ///
+    /// The other forms (the old `CLIENT KILL addr:port`, ADDR, LADDR, TYPE,
+    /// MAXAGE) are refused with an error. They used to fall through to the
+    /// catch-all that answers OK, so a caller was told connections were closed
+    /// when none was (0.9.2 release test).
+    fn handle_client_kill(&mut self, fd: RawFd, filters: &[Vec<u8>]) {
+        let filter = match self.parse_kill_filter(filters) {
+            Ok(f) => f,
+            Err(msg) => {
+                let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
+                resp::error(out, &msg);
+                return;
+            }
+        };
+        // With an ID, the one connection it can be, from the id index; only a
+        // USER-only filter has to look at every connection.
+        let candidates: Vec<RawFd> = match filter.id {
+            Some(id) => self.fd_of_client(id).into_iter().collect(),
+            None => self.conns.keys().copied().collect(),
+        };
+        let victims: Vec<RawFd> = candidates
+            .into_iter()
+            .filter(|v| self.conns.get(v).is_some_and(|c| filter.matches(*v == fd, c)))
+            .collect();
+        let c = self.conns.get_mut(&fd).unwrap();
+        resp::integer(&mut c.wbuf, victims.len() as i64);
+        for v in victims {
+            if v == fd {
+                self.conns.get_mut(&fd).unwrap().closing = true;
+            } else {
+                // Shut the socket rather than tear the connection down here:
+                // the poller then reports it readable at EOF, and the ordinary
+                // close path runs, with all of its unsubscribe and untrack
+                // bookkeeping, at a point where nothing else holds the fd.
+                unsafe { libc::shutdown(v, libc::SHUT_RDWR) };
             }
         }
+    }
+
+    /// The filters of a `CLIENT KILL`, or the error Redis gives for them.
+    fn parse_kill_filter(&self, args: &[Vec<u8>]) -> Result<KillFilter, String> {
+        if args.len() == 1 {
+            return Err("ERR CLIENT KILL <addr> is not supported; use CLIENT KILL ID <id> or USER <name>".into());
+        }
+        if args.len() % 2 != 0 {
+            return Err("ERR syntax error".into());
+        }
+        let mut f = KillFilter { id: None, user: None, skipme: true };
+        for pair in args.chunks(2) {
+            let value = &pair[1];
+            match pair[0].to_ascii_uppercase().as_slice() {
+                b"ID" => match resp::arg_int(value) {
+                    Some(id) if id > 0 => f.id = Some(id as u64),
+                    _ => return Err("ERR client-id should be greater than 0".into()),
+                },
+                b"USER" => {
+                    let user = String::from_utf8_lossy(value).into_owned();
+                    if !self.user_exists(&user) {
+                        return Err(format!("ERR No such user '{user}'"));
+                    }
+                    f.user = Some(user);
+                }
+                b"SKIPME" => match value.to_ascii_uppercase().as_slice() {
+                    b"YES" => f.skipme = true,
+                    b"NO" => f.skipme = false,
+                    _ => return Err("ERR syntax error".into()),
+                },
+                b"ADDR" | b"LADDR" | b"TYPE" | b"MAXAGE" => {
+                    let name = String::from_utf8_lossy(&pair[0]).to_ascii_uppercase();
+                    return Err(format!(
+                        "ERR CLIENT KILL {name} is not supported; use the ID, USER or SKIPME filters"
+                    ));
+                }
+                _ => return Err("ERR syntax error".into()),
+            }
+        }
+        Ok(f)
+    }
+
+    /// Whether `user` is a RESP user here: one with a credential, or `default`,
+    /// which Redis always has and which every connection is before it logs in.
+    fn user_exists(&self, user: &str) -> bool {
+        user == DEFAULT_USER || self.auth.as_ref().is_some_and(|a| a.creds.contains_key(user))
     }
 
     /// `CLIENT TRACKING ON|OFF [REDIRECT id] [PREFIX p ...] [BCAST] [OPTIN] [OPTOUT]
@@ -5674,8 +6232,9 @@ impl Worker {
                             let id: i64 = resp::arg_int(&args[i + 1])
                                 .unwrap_or(-1);
                             // 0 means "no redirect"; otherwise the id must be a live
-                            // client (our client id is its fd).
-                            if id != 0 && !self.conns.contains_key(&(id as RawFd)) {
+                            // client. The id is what is kept, not its fd: see `redirect`.
+                            let live = id == 0 || (id > 0 && self.fd_of_client(id as u64).is_some());
+                            if !live {
                                 let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
                                 resp::error(
                                     out,
@@ -5683,7 +6242,7 @@ impl Worker {
                                 );
                                 return;
                             }
-                            t.redirect = id as RawFd;
+                            t.redirect = id as u64;
                             i += 2;
                         }
                         b"PREFIX" if i + 1 < args.len() => {
@@ -5827,7 +6386,10 @@ impl Worker {
     /// or `None` for the whole-keyspace (FLUSH) signal.
     fn deliver_invalidation(&mut self, reader: RawFd, facing: Option<&[u8]>) {
         let target = match self.conns.get(&reader) {
-            Some(c) if c.track.redirect != 0 => c.track.redirect,
+            Some(c) if c.track.redirect != 0 => match self.fd_of_client(c.track.redirect) {
+                Some(target) => target,
+                None => return, // the target has closed; its fd may be someone else's now
+            },
             Some(_) => reader,
             None => return,
         };
@@ -5896,20 +6458,6 @@ impl Worker {
         });
     }
 
-    /// True if the connection may run pub/sub commands (authed, or no auth
-    /// configured). Writes NOAUTH and returns false otherwise.
-    fn pubsub_authed(&mut self, fd: RawFd) -> bool {
-        if self.auth.is_none() {
-            return true;
-        }
-        if self.conns.get(&fd).map(|c| c.authed).unwrap_or(false) {
-            return true;
-        }
-        let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
-        resp::error(out, "NOAUTH Authentication required.");
-        false
-    }
-
     /// SUBSCRIBE / PSUBSCRIBE: register the connection on each channel/pattern and
     /// reply with a confirmation carrying the running subscription count.
     fn handle_subscribe(&mut self, fd: RawFd, args: &[Vec<u8>], pattern: bool) {
@@ -5917,10 +6465,6 @@ impl Worker {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
             let name: &[u8] = if pattern { b"psubscribe" } else { b"subscribe" };
             resp::error(out, &arity::message(name));
-            return;
-        }
-        if !self.pubsub_authed(fd) {
-            self.flush(fd);
             return;
         }
         let word: &[u8] = if pattern { b"psubscribe" } else { b"subscribe" };
@@ -6055,10 +6599,6 @@ impl Worker {
             resp::error(out, &arity::message(b"publish"));
             return;
         }
-        if !self.pubsub_authed(fd) {
-            self.flush(fd);
-            return;
-        }
         let channel = self.scope_name(fd, &args[1]); // tenant-scoped internally
         let msg = args[2].clone();
         // Deliver to subscribers on this worker, then (if part of a scale-out
@@ -6176,10 +6716,6 @@ impl Worker {
             self.flush(fd);
             return;
         }
-        if !self.pubsub_authed(fd) {
-            self.flush(fd);
-            return;
-        }
         for ch in &args[1..] {
             let eff = self.scope_name(fd, ch);
             if !self.shard_owner_ok(fd, &eff) {
@@ -6265,10 +6801,6 @@ impl Worker {
         if args.len() != 3 {
             let out = &mut self.conns.get_mut(&fd).unwrap().wbuf;
             resp::error(out, &arity::message(b"spublish"));
-            self.flush(fd);
-            return;
-        }
-        if !self.pubsub_authed(fd) {
             self.flush(fd);
             return;
         }
@@ -6526,13 +7058,7 @@ impl Worker {
                     String::from_utf8_lossy(&args[1])
                 ),
             ),
-            _ => resp::error(
-                out,
-                &format!(
-                    "ERR unknown subcommand '{}'. Try PUBSUB HELP.",
-                    String::from_utf8_lossy(&args[1])
-                ),
-            ),
+            _ => resp::error(out, &unknown_subcommand("PUBSUB", &args[1])),
         }
         self.flush(fd);
     }
@@ -6580,10 +7106,8 @@ impl Worker {
         eff: &mut [Vec<u8>],
     ) -> Result<(), Deny> {
         let cfg = self.auth.as_ref().unwrap();
+        // The dispatch gate has refused every connection that has not logged in.
         let conn = &self.conns[&fd];
-        if !conn.authed {
-            return Err(Deny::NoAuth);
-        }
         if conn.exempt {
             return Ok(()); // service_role / superuser: no scope, no ACL
         }
@@ -6760,7 +7284,9 @@ impl Worker {
         // Deregister before closing: the fd must still be valid for deregister.
         let _ = self.registry.deregister(&mut SourceFd(&fd));
         unsafe { libc::close(fd) };
-        self.conns.remove(&fd);
+        if let Some(c) = self.conns.remove(&fd) {
+            self.client_fds.remove(&c.id);
+        }
     }
 
     /// Drop this fd from every channel, pattern and shard channel it holds,
@@ -7685,6 +8211,7 @@ pub fn load_tls_config(cert_path: &str, key_path: &str) -> io::Result<Arc<rustls
 // ---- socket / poller helpers --------------------------------------------
 
 fn listen(addr: &str, port: u16) -> io::Result<RawFd> {
+    let ip = ipv4_addr(addr)?;
     unsafe {
         // SOCK_NONBLOCK on socket() is a Linux extension; create the socket and
         // set O_NONBLOCK portably instead (macOS has no SOCK_NONBLOCK).
@@ -7714,7 +8241,7 @@ fn listen(addr: &str, port: u16) -> io::Result<RawFd> {
         // bind accepts.)
         sa.sin_family = libc::AF_INET as _;
         sa.sin_port = port.to_be();
-        sa.sin_addr.s_addr = inet_addr(addr);
+        sa.sin_addr.s_addr = ip;
         if libc::bind(
             fd,
             &sa as *const _ as *const libc::sockaddr,
@@ -7767,13 +8294,19 @@ fn set_nonblocking(fd: RawFd) {
     }
 }
 
-fn inet_addr(addr: &str) -> u32 {
-    // supports dotted-quad only (127.0.0.1 / 0.0.0.0)
-    let mut bytes = [0u8; 4];
-    for (i, part) in addr.split('.').enumerate().take(4) {
-        bytes[i] = part.parse().unwrap_or(0);
-    }
-    u32::from_ne_bytes(bytes)
+/// An IPv4 dotted quad in network byte order, ready for `sin_addr`. Anything
+/// else is refused: this used to read every unparseable part as 0, so `::1`,
+/// `localhost` or a typo bound 0.0.0.0, which is the opposite of what an
+/// operator narrowing the listen address asked for. The socket is AF_INET, so
+/// IPv6 is not supported.
+fn ipv4_addr(addr: &str) -> io::Result<u32> {
+    let ip: std::net::Ipv4Addr = addr.trim().parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{addr}' is not an IPv4 address (only dotted quads such as 127.0.0.1 are supported)"),
+        )
+    })?;
+    Ok(u32::from_ne_bytes(ip.octets()))
 }
 
 fn set_nodelay(fd: RawFd) {
@@ -7841,6 +8374,67 @@ mod auth_tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
         assert!(ct_eq(b"", b""));
+    }
+
+    // ---- pg_keyspace.password_file ----
+
+    #[test]
+    fn a_password_file_loses_one_trailing_newline_and_nothing_else() {
+        assert_eq!(password_from_file(b"pw\n").as_deref(), Ok("pw"));
+        assert_eq!(password_from_file(b"pw\r\n").as_deref(), Ok("pw"));
+        assert_eq!(password_from_file(b"pw").as_deref(), Ok("pw"));
+        assert_eq!(password_from_file(b"pw\n\n").as_deref(), Ok("pw\n"));
+        assert_eq!(password_from_file(b" pw with spaces ").as_deref(), Ok(" pw with spaces "));
+    }
+
+    #[test]
+    fn a_password_file_with_no_password_in_it_is_an_error() {
+        for empty in [&b""[..], b"\n", b"\r\n", b"  \t\n"] {
+            let got = password_from_file(empty);
+            assert!(got.as_ref().is_err_and(|e| e.contains("holds no password")), "{empty:?}: {got:?}");
+        }
+        assert!(password_from_file(b"\xff\xfe\n").is_err(), "not UTF-8");
+    }
+
+    fn table_config() -> AuthConfig {
+        let mut creds = HashMap::new();
+        creds.insert(FILE_CRED_USER.to_string(), cred("old-password"));
+        creds.insert("alice".to_string(), cred("alice-pw"));
+        AuthConfig { creds, acl: HashMap::new(), exempt: HashSet::new() }
+    }
+
+    fn exempt() -> HashSet<String> {
+        [FILE_CRED_ROLE.to_string()].into_iter().collect()
+    }
+
+    /// The file is the only source of the `supatype` password: whatever the
+    /// table says for that user is replaced, and other credentials are kept.
+    #[test]
+    fn the_file_credential_replaces_the_tables_and_keeps_the_others() {
+        let cfg = with_file_credential(Some(table_config()), exempt(), Some("new-password")).unwrap();
+        let file = &cfg.creds[FILE_CRED_USER];
+        assert!(file.verify(b"new-password"));
+        assert!(!file.verify(b"old-password"), "the table's old password still works");
+        assert_eq!((file.role.as_str(), file.tenant.as_str()), (FILE_CRED_ROLE, ""));
+        assert!(cfg.creds["alice"].verify(b"alice-pw"));
+    }
+
+    /// A file that cannot be used leaves `supatype` with no password at all,
+    /// not the last one the table held.
+    #[test]
+    fn an_unusable_file_takes_the_supatype_credential_away() {
+        let cfg = with_file_credential(Some(table_config()), exempt(), None).unwrap();
+        assert!(!cfg.creds.contains_key(FILE_CRED_USER));
+        assert!(cfg.creds.contains_key("alice"));
+        assert!(with_file_credential(None, exempt(), None).is_none());
+    }
+
+    /// With no table (extension not created yet) the file alone is enough.
+    #[test]
+    fn the_file_credential_needs_no_table() {
+        let cfg = with_file_credential(None, exempt(), Some("pw")).unwrap();
+        assert!(cfg.creds[FILE_CRED_USER].verify(b"pw"));
+        assert!(cfg.exempt.contains(FILE_CRED_ROLE), "service_role must stay exempt");
     }
 
     #[test]
@@ -7971,7 +8565,10 @@ mod tests {
 
     fn send(port: u16, lines: &[&str]) -> Vec<String> {
         let s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        // Two seconds, not half of one: the suite shares one process, and under its
+        // load an expected reply can take longer. A held reply still reads as
+        // nothing, only later.
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut w = &s;
         for l in lines {
             write!(w, "{l}\r\n").unwrap();
@@ -8277,5 +8874,678 @@ mod tests {
             durable.is_empty(),
             "a durable write must wait for its record to commit, got {durable:?}"
         );
+    }
+
+    // ---- the auth gate (0.9.2 release test: unauthenticated keyless commands) ----
+    //
+    // With a credential loaded, the gate used to cover only commands that take
+    // keys, plus pub/sub. An unauthenticated client could still PING, DBSIZE,
+    // list every key name with KEYS or SCAN, and FLUSHALL the lot.
+
+    /// The username and secret every gate test authenticates with.
+    const SVC: (&str, &str) = ("svc", "s3cret");
+
+    /// A worker on 127.0.0.1 with `svc` as an exempt service credential, or
+    /// with no credentials at all when `creds` is false.
+    fn gate_worker(tag: &str, creds: bool) -> (Worker, u16) {
+        let seg = format!("pgks_t_gate_{tag}_{}", std::process::id());
+        let cfg = Config::for_capacity(1, 512, 64);
+        let store = Arc::new(Store::create(&seg, &cfg).expect("shmem"));
+        let mut worker =
+            Worker::new(store, None, Tier::Ephemeral, "127.0.0.1", 0).expect("listen");
+        let port = bound_port(worker.listen_fd);
+        if creds {
+            let mut map = HashMap::new();
+            let (user, pass) = SVC;
+            map.insert(
+                user.to_string(),
+                Cred { secret: pass.into(), role: "service_role".into(), tenant: String::new() },
+            );
+            worker.set_auth_config(AuthConfig {
+                creds: map,
+                acl: HashMap::new(),
+                exempt: ["service_role".to_string()].into_iter().collect(),
+            });
+        }
+        (worker, port)
+    }
+
+    /// Serve `worker` until `client` returns, and hand back what it returned.
+    fn serve<T: Send + 'static>(
+        mut worker: Worker,
+        port: u16,
+        client: impl FnOnce(u16) -> T + Send + 'static,
+    ) -> T {
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let h = std::thread::spawn(move || {
+            let out = client(port);
+            flag.store(true, Ordering::SeqCst);
+            out
+        });
+        let _ = worker.run_with(
+            || if done.load(Ordering::SeqCst) { Tick::Stop } else { Tick::Continue },
+            5,
+        );
+        h.join().expect("client thread")
+    }
+
+    /// Every command an unauthenticated client may not run, keyless ones
+    /// included. One per line so a failure names the command.
+    const REFUSED_UNAUTHENTICATED: &[&str] = &[
+        "PING", "ECHO hi", "DBSIZE", "KEYS *", "SCAN 0", "RANDOMKEY", "FLUSHALL", "FLUSHDB",
+        "DEBUG OBJECT k", "CONFIG GET maxmemory", "INFO", "CLIENT ID", "CLIENT SETNAME x",
+        "CLUSTER INFO", "CLUSTER SLOTS", "MEMORY USAGE k", "COMMAND COUNT", "SELECT 0", "TIME",
+        "MULTI", "WATCH k", "UNWATCH", "SUBSCRIBE ch", "PSUBSCRIBE ch*", "PUBLISH ch m",
+        "PUBSUB CHANNELS", "GET k", "SET k v",
+    ];
+
+    const NOAUTH: &str = "-NOAUTH Authentication required.";
+    const WRONGPASS: &str = "-WRONGPASS invalid username-password pair or user is disabled.";
+
+    /// Each refused command on a fresh connection, so one command's state
+    /// (MULTI, a subscription) cannot change what the next one is told.
+    fn replies_unauthenticated(port: u16) -> Vec<(String, Vec<String>)> {
+        REFUSED_UNAUTHENTICATED
+            .iter()
+            .map(|c| (c.to_string(), send(port, &[c])))
+            .collect()
+    }
+
+    fn assert_all_refused(got: &[(String, Vec<String>)]) {
+        let leaked: Vec<_> =
+            got.iter().filter(|(_, r)| r.first().map(String::as_str) != Some(NOAUTH)).collect();
+        assert!(leaked.is_empty(), "ran without AUTH: {leaked:?}");
+    }
+
+    #[test]
+    fn every_command_but_the_handshake_is_refused_before_auth() {
+        let (worker, port) = gate_worker("keyless", true);
+        let got = serve(worker, port, replies_unauthenticated);
+        assert_all_refused(&got);
+    }
+
+    #[test]
+    fn the_handshake_commands_still_run_before_auth() {
+        let (worker, port) = gate_worker("handshake", true);
+        let got = serve(worker, port, |p| (send(p, &["QUIT"]), send(p, &["RESET"])));
+        assert_eq!(got.0, vec!["+OK"]);
+        assert_eq!(got.1, vec!["+RESET"]);
+    }
+
+    #[test]
+    fn auth_then_opens_every_command() {
+        let (worker, port) = gate_worker("authed", true);
+        let got = serve(worker, port, |p| {
+            send(p, &["AUTH svc s3cret", "PING", "SET k v", "DBSIZE", "FLUSHALL", "DBSIZE"])
+        });
+        assert_eq!(got, vec!["+OK", "+PONG", "+OK", ":1", "+OK", ":0"]);
+    }
+
+    #[test]
+    fn a_wrong_password_leaves_the_gate_shut() {
+        let (worker, port) = gate_worker("wrongpass", true);
+        let got = serve(worker, port, |p| send(p, &["AUTH svc nope", "PING"]));
+        assert_eq!(got, vec![WRONGPASS, NOAUTH]);
+    }
+
+    /// Redis refuses a bare HELLO from an unauthenticated client with its own
+    /// NOAUTH, and accepts `HELLO <proto> AUTH user pass` as the login.
+    #[test]
+    fn hello_needs_auth_and_hello_auth_logs_in() {
+        let (worker, port) = gate_worker("hello", true);
+        let got = serve(worker, port, |p| {
+            (send(p, &["HELLO 3", "PING"]), send(p, &["HELLO 3 AUTH svc s3cret", "PING"]))
+        });
+        assert!(
+            got.0[0].starts_with("-NOAUTH HELLO must be called with the client already authenticated"),
+            "bare HELLO: {:?}",
+            got.0
+        );
+        assert_eq!(got.0[1], NOAUTH, "a refused HELLO must not log in");
+        assert_eq!(got.1[0], "%7", "HELLO 3 AUTH answers with the RESP3 handshake map");
+    }
+
+    /// Before login an unknown command is refused like any other, so an
+    /// unauthenticated client cannot probe which commands exist. After login it
+    /// gets the ordinary unknown-command error, not NOAUTH.
+    #[test]
+    fn an_unknown_command_is_noauth_before_login_and_unknown_after() {
+        let (worker, port) = gate_worker("unknown", true);
+        let got = serve(worker, port, |p| {
+            (send(p, &["NOSUCHCMD x"]), send(p, &["AUTH svc s3cret", "NOSUCHCMD x"]))
+        });
+        assert_eq!(got.0, vec![NOAUTH]);
+        assert_eq!(got.1[0], "+OK");
+        assert!(
+            got.1[1].starts_with("-ERR unknown command 'NOSUCHCMD'"),
+            "after AUTH: {:?}",
+            got.1
+        );
+    }
+
+    /// RESET drops the login, so the gate shuts again behind it.
+    #[test]
+    fn reset_logs_out() {
+        let (worker, port) = gate_worker("reset", true);
+        let got = serve(worker, port, |p| send(p, &["AUTH svc s3cret", "RESET", "PING"]));
+        assert_eq!(got, vec!["+OK", "+RESET", NOAUTH]);
+    }
+
+    /// `pg_keyspace.require_auth`: with no credential loaded the server fails
+    /// closed, refusing everything and accepting no password.
+    #[test]
+    fn require_auth_with_no_credentials_refuses_everything() {
+        let (mut worker, port) = gate_worker("required", false);
+        worker.set_require_auth(true);
+        let got = serve(worker, port, |p| {
+            let logins = send(p, &["AUTH svc s3cret", "AUTH s3cret", "HELLO 3 AUTH svc s3cret"]);
+            (replies_unauthenticated(p), logins)
+        });
+        assert_all_refused(&got.0);
+        assert_eq!(got.1, vec![WRONGPASS, WRONGPASS, WRONGPASS]);
+    }
+
+    /// The compatibility half: off and with no credentials, nothing changes.
+    #[test]
+    fn no_credentials_and_require_auth_off_stays_open() {
+        let (worker, port) = gate_worker("open", false);
+        let got = serve(worker, port, |p| send(p, &["PING", "AUTH anything", "DBSIZE"]));
+        assert_eq!(got, vec!["+PONG", "+OK", ":0"]);
+    }
+
+    /// A reload can turn the requirement on under live connections.
+    #[test]
+    fn a_reload_applies_require_auth() {
+        let (mut worker, port) = gate_worker("reload", false);
+        // Each step waits on the one before it rather than on a clock: the
+        // reload happens after the first PING is answered, and the second
+        // PING is sent after the reload is applied.
+        let [done, pinged, reloaded] = [(); 3].map(|_| Arc::new(AtomicBool::new(false)));
+        let (d, p, r) = (done.clone(), pinged.clone(), reloaded.clone());
+        let h = std::thread::spawn(move || {
+            let before = send(port, &["PING"]);
+            p.store(true, Ordering::SeqCst);
+            while !r.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let after = send(port, &["PING"]);
+            d.store(true, Ordering::SeqCst);
+            (before, after)
+        });
+        let _ = worker.run_with(
+            || {
+                if done.load(Ordering::SeqCst) {
+                    return Tick::Stop;
+                }
+                if pinged.load(Ordering::SeqCst) && !reloaded.load(Ordering::SeqCst) {
+                    // Applied by run_with before its next poll, so before the
+                    // client can see the flag and send again.
+                    reloaded.store(true, Ordering::SeqCst);
+                    return Tick::Reload(Reload { require_auth: Some(true), ..Reload::default() });
+                }
+                Tick::Continue
+            },
+            5,
+        );
+        let (before, after) = h.join().expect("client thread");
+        assert_eq!(before, vec!["+PONG"]);
+        assert_eq!(after, vec![NOAUTH]);
+    }
+
+    // ---- listen address ----
+
+    /// Only IPv4 dotted quads are bindable. Anything else used to parse as
+    /// 0.0.0.0, so a typo or an IPv6 address silently listened everywhere.
+    #[test]
+    fn an_address_that_is_not_ipv4_is_refused_rather_than_read_as_any() {
+        for (i, bad) in ["::1", "localhost", "127.0.0", "127.0.0.1.5", "", "256.0.0.1"]
+            .iter()
+            .enumerate()
+        {
+            let seg = format!("pgks_t_addr_{i}_{}", std::process::id());
+            let cfg = Config::for_capacity(1, 512, 64);
+            let store = Arc::new(Store::create(&seg, &cfg).expect("shmem"));
+            assert!(
+                Worker::new(store, None, Tier::Ephemeral, bad, 0).is_err(),
+                "'{bad}' must not bind"
+            );
+        }
+    }
+
+    /// A specific address binds only that address: 127.0.0.2 is another
+    /// loopback address on Linux, and nothing answers there.
+    #[test]
+    fn a_specific_address_is_the_only_one_served() {
+        let (worker, port) = gate_worker("bind", false);
+        let got = serve(worker, port, move |p| {
+            let other = TcpStream::connect(("127.0.0.2", p)).is_ok();
+            (send(p, &["PING"]), other)
+        });
+        assert_eq!(got.0, vec!["+PONG"]);
+        assert!(!got.1, "127.0.0.2 answered on a worker bound to 127.0.0.1");
+    }
+
+    // ---- CLIENT ID and CLIENT KILL (0.9.2 release test) ----
+    //
+    // CLIENT ID was the socket's fd, so a connection opened after another
+    // closed was handed the same id, and CLIENT KILL fell through to the
+    // catch-all that answers OK, closing nothing.
+
+    /// One open connection, for tests that need several at once. One socket,
+    /// written through the reader: a cloned handle would be a second fd, and
+    /// the CLIENT ID test depends on which fd numbers the server is handed.
+    struct Client {
+        r: BufReader<TcpStream>,
+    }
+
+    impl Client {
+        fn open(port: u16) -> Client {
+            let s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            s.set_read_timeout(Some(REPLY_WAIT)).unwrap();
+            Client { r: BufReader::new(s) }
+        }
+
+        /// Send one inline command and read the first line of its reply.
+        fn ask(&mut self, line: &str) -> String {
+            let s = self.r.get_mut();
+            write!(s, "{line}\r\n").unwrap();
+            s.flush().unwrap();
+            let mut out = String::new();
+            match self.r.read_line(&mut out) {
+                Ok(0) | Err(_) => String::new(),
+                Ok(_) => out.trim_end().to_string(),
+            }
+        }
+
+        /// Whether the server has closed this connection: a read sees EOF.
+        fn closed(&mut self) -> bool {
+            let mut out = String::new();
+            matches!(self.r.read_line(&mut out), Ok(0))
+        }
+
+        fn id(&mut self) -> String {
+            self.ask("CLIENT ID")
+        }
+    }
+
+    /// Unique per connection, also when a closed connection's fd is reused.
+    #[test]
+    fn client_id_is_never_handed_out_twice() {
+        let (worker, port) = gate_worker("clientid", false);
+        let ids = serve(worker, port, |p| {
+            let mut first = Client::open(p);
+            let mut ids = vec![first.id()];
+            drop(first);
+            std::thread::sleep(Duration::from_millis(100));
+            // Several held open at once, so one of them is accepted on the
+            // server-side fd the first gave back, whatever the test's own
+            // client sockets take.
+            let mut later: Vec<Client> = (0..6).map(|_| Client::open(p)).collect();
+            ids.extend(later.iter_mut().map(Client::id));
+            ids
+        });
+        assert!(ids.iter().all(|i| i.starts_with(':')), "{ids:?}");
+        let unique: HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "CLIENT ID repeated: {ids:?}");
+    }
+
+    /// The ids CLIENT ID hands out are the ids REDIRECT accepts.
+    #[test]
+    fn tracking_redirect_takes_a_client_id() {
+        let (worker, port) = gate_worker("redirect", false);
+        let got = serve(worker, port, |p| {
+            let mut sink = Client::open(p);
+            let id = sink.id();
+            let mut reader = Client::open(p);
+            reader.ask(&format!("CLIENT TRACKING ON REDIRECT {}", &id[1..]))
+        });
+        assert_eq!(got, "+OK");
+    }
+
+    #[test]
+    fn client_kill_id_closes_that_connection_and_counts_it() {
+        let (worker, port) = gate_worker("killid", false);
+        let got = serve(worker, port, |p| {
+            let mut victim = Client::open(p);
+            let id = victim.id();
+            let mut killer = Client::open(p);
+            let reply = killer.ask(&format!("CLIENT KILL ID {}", &id[1..]));
+            std::thread::sleep(Duration::from_millis(100));
+            (reply, victim.closed(), killer.ask("PING"))
+        });
+        assert_eq!(got.0, ":1");
+        assert!(got.1, "the killed connection is still open");
+        assert_eq!(got.2, "+PONG", "the caller survives");
+    }
+
+    /// SKIPME defaults to yes: the caller is not killed with the rest.
+    #[test]
+    fn client_kill_user_skips_the_caller_by_default() {
+        let (worker, port) = gate_worker("killuser", true);
+        let got = serve(worker, port, |p| {
+            let mut others: Vec<Client> = (0..2).map(|_| Client::open(p)).collect();
+            for c in others.iter_mut() {
+                c.ask("AUTH svc s3cret");
+            }
+            let mut killer = Client::open(p);
+            killer.ask("AUTH svc s3cret");
+            let reply = killer.ask("CLIENT KILL USER svc");
+            std::thread::sleep(Duration::from_millis(100));
+            let closed: Vec<bool> = others.iter_mut().map(Client::closed).collect();
+            (reply, closed, killer.ask("PING"))
+        });
+        assert_eq!(got.0, ":2");
+        assert_eq!(got.1, vec![true, true]);
+        assert_eq!(got.2, "+PONG");
+    }
+
+    /// `SKIPME no` includes the caller, which gets its count and is then closed.
+    #[test]
+    fn client_kill_skipme_no_includes_the_caller() {
+        let (worker, port) = gate_worker("killme", true);
+        let got = serve(worker, port, |p| {
+            let mut other = Client::open(p);
+            other.ask("AUTH svc s3cret");
+            let mut killer = Client::open(p);
+            killer.ask("AUTH svc s3cret");
+            let reply = killer.ask("CLIENT KILL USER svc SKIPME no");
+            std::thread::sleep(Duration::from_millis(100));
+            (reply, other.closed(), killer.closed())
+        });
+        assert_eq!(got, (":2".to_string(), true, true));
+    }
+
+    /// Only connections logged in as that user: an unauthenticated one is
+    /// `default`, and a user with no credential is refused as Redis refuses it.
+    #[test]
+    fn client_kill_user_matches_only_that_user() {
+        let (worker, port) = gate_worker("killnobody", true);
+        let got = serve(worker, port, |p| {
+            let mut anon = Client::open(p);
+            let mut killer = Client::open(p);
+            killer.ask("AUTH svc s3cret");
+            let svc = killer.ask("CLIENT KILL USER svc");
+            let nosuch = killer.ask("CLIENT KILL USER nosuch");
+            (svc, nosuch, anon.ask("QUIT"))
+        });
+        assert_eq!(got.0, ":0");
+        assert_eq!(got.1, "-ERR No such user 'nosuch'");
+        assert_eq!(got.2, "+OK", "the unauthenticated connection was not killed");
+    }
+
+    /// The forms not implemented are refused, never answered with a false OK.
+    #[test]
+    fn client_kill_forms_it_cannot_do_are_errors_not_ok() {
+        let (worker, port) = gate_worker("killother", false);
+        let got = serve(worker, port, |p| {
+            let mut c = Client::open(p);
+            ["CLIENT KILL 127.0.0.1:1", "CLIENT KILL ADDR 127.0.0.1:1", "CLIENT KILL TYPE normal",
+             "CLIENT KILL ID", "CLIENT KILL ID 0", "CLIENT KILL SKIPME maybe"]
+                .iter()
+                .map(|l| (l.to_string(), c.ask(l)))
+                .collect::<Vec<_>>()
+        });
+        let ok: Vec<_> = got.iter().filter(|(_, r)| !r.starts_with("-ERR")).collect();
+        assert!(ok.is_empty(), "not refused: {ok:?}");
+    }
+
+    // ---- commands that used to fall through to a catch-all OK ----
+    //
+    // CLIENT LIST, CLIENT INFO and every other CLIENT subcommand without its
+    // own arm, CONFIG, SELECT and DEBUG's other subcommands all answered +OK
+    // whatever they were asked, so a caller was told something had happened
+    // that had not, or got OK where it expected data.
+
+    /// The first reply line to `line` on a fresh connection.
+    fn first(port: u16, line: &str) -> String {
+        send(port, &[line]).into_iter().next().unwrap_or_default()
+    }
+
+    impl Client {
+        /// Send one command whose reply is a bulk string, and read all of it.
+        fn ask_bulk(&mut self, line: &str) -> String {
+            let header = self.ask(line);
+            let Some(len) = header.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) else {
+                return header;
+            };
+            let mut body = vec![0u8; len + 2];
+            std::io::Read::read_exact(&mut self.r, &mut body).expect("bulk body");
+            String::from_utf8_lossy(&body[..len]).into_owned()
+        }
+
+        /// The next line the server sends unprompted, waiting up to `ms`. Empty
+        /// when nothing came. Expected replies get the long default timeout (the
+        /// whole suite shares one process, and under that load a reply can be
+        /// slow); a check that nothing arrives waits briefly instead.
+        fn read_within(&mut self, ms: u64) -> String {
+            let _ = self.r.get_ref().set_read_timeout(Some(Duration::from_millis(ms)));
+            let mut out = String::new();
+            let _ = self.r.read_line(&mut out);
+            let _ = self.r.get_ref().set_read_timeout(Some(REPLY_WAIT));
+            out.trim_end().to_string()
+        }
+
+        /// What arrives unprompted in half a second, for checks that nothing does.
+        fn pending(&mut self) -> String {
+            self.read_within(500)
+        }
+    }
+
+    /// How long a test waits for a reply it expects.
+    const REPLY_WAIT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn client_list_and_info_describe_the_real_connections() {
+        let (worker, port) = gate_worker("clientlist", false);
+        let got = serve(worker, port, |p| {
+            let mut a = Client::open(p);
+            a.ask("CLIENT SETNAME alpha");
+            a.ask("SUBSCRIBE ch");
+            let mut b = Client::open(p);
+            b.ask("CLIENT SETINFO LIB-NAME mylib");
+            let id = b.id();
+            (b.ask_bulk("CLIENT INFO"), b.ask_bulk("CLIENT LIST"), id)
+        });
+        let (info, list, id) = got;
+        for field in [
+            format!("id={} ", &id[1..]),
+            "addr=127.0.0.1:".into(),
+            "laddr=127.0.0.1:".into(),
+            " fd=".into(),
+            " name= ".into(),
+            " db=0 ".into(),
+            " sub=0 ".into(),
+            " user=default ".into(),
+            " redir=-1 ".into(),
+            " resp=2".into(),
+            "lib-name=mylib".into(),
+        ] {
+            assert!(info.contains(&field), "CLIENT INFO lacks `{field}`: {info:?}");
+        }
+        let lines: Vec<&str> = list.lines().collect();
+        assert_eq!(lines.len(), 2, "CLIENT LIST: {list:?}");
+        assert!(
+            lines.iter().any(|l| l.contains(" name=alpha ") && l.contains(" sub=1 ")),
+            "the subscriber is not listed with its name and subscription: {list:?}"
+        );
+    }
+
+    /// Each CLIENT subcommand says what it did, or that it cannot.
+    #[test]
+    fn client_subcommands_answer_for_themselves() {
+        let (worker, port) = gate_worker("clientsubs", false);
+        let got = serve(worker, port, |p| {
+            [
+                "CLIENT GETREDIR", "CLIENT NO-EVICT on", "CLIENT NO-EVICT maybe",
+                "CLIENT NO-TOUCH on", "CLIENT NO-TOUCH off", "CLIENT UNPAUSE",
+                "CLIENT PAUSE 10", "CLIENT REPLY off", "CLIENT REPLY on",
+                "CLIENT TRACKINGINFO", "CLIENT UNBLOCK 1", "CLIENT SETINFO LIB-VER 1.0",
+                "CLIENT SETINFO bogus x", "CLIENT nosuch",
+            ]
+            .iter()
+            .map(|l| first(p, l))
+            .collect::<Vec<_>>()
+        });
+        let want = [
+            ":-1", "+OK", "-ERR syntax error",
+            "-ERR CLIENT NO-TOUCH ON is not supported", "+OK", "+OK",
+            "-ERR CLIENT PAUSE is not supported", "-ERR CLIENT REPLY OFF is not supported", "+OK",
+            "-ERR CLIENT TRACKINGINFO is not supported", ":0", "+OK",
+            "-ERR Unrecognized option 'bogus'", "-ERR unknown subcommand 'nosuch'. Try CLIENT HELP.",
+        ];
+        for (g, w) in got.iter().zip(want) {
+            assert!(g.starts_with(w), "got {g:?}, want it to start {w:?}; all: {got:?}");
+        }
+    }
+
+    #[test]
+    fn select_config_and_debug_are_not_a_blanket_ok() {
+        let (worker, port) = gate_worker("cfgsel", false);
+        let got = serve(worker, port, |p| {
+            [
+                "SELECT 0", "SELECT 1", "SELECT x", "CONFIG GET databases", "CONFIG GET maxmemory",
+                "CONFIG SET maxmemory 1", "CONFIG RESETSTAT", "CONFIG REWRITE", "CONFIG nosuch",
+                "DEBUG SLEEP 0", "DEBUG SLEEP 1", "DEBUG RELOAD",
+            ]
+            .iter()
+            .map(|l| first(p, l))
+            .collect::<Vec<_>>()
+        });
+        let want = [
+            "+OK", "-ERR DB index is out of range", "-ERR value is not an integer or out of range",
+            "*2", "*0", "-ERR CONFIG SET is not supported", "-ERR CONFIG RESETSTAT is not supported",
+            "-ERR CONFIG REWRITE is not supported", "-ERR unknown subcommand 'nosuch'. Try CONFIG HELP.",
+            "+OK", "-ERR DEBUG SLEEP is not supported", "-ERR DEBUG RELOAD is not supported",
+        ];
+        for (g, w) in got.iter().zip(want) {
+            assert!(g.starts_with(w), "got {g:?}, want it to start {w:?}; all: {got:?}");
+        }
+    }
+
+    /// A REDIRECT target that closes is gone for good: a connection that is
+    /// later accepted on the same fd must never receive the invalidations.
+    #[test]
+    fn a_redirect_never_reaches_a_connection_that_reused_the_fd() {
+        let (worker, port) = gate_worker("redirfd", false);
+        let got = serve(worker, port, |p| {
+            let mut writer = Client::open(p);
+            writer.ask("SET k v0");
+            let mut reader = Client::open(p);
+            // The tests share one process, so another test's socket can take the
+            // freed fd first. Repeat until a connection here is accepted on it,
+            // which is the case under test.
+            for _ in 0..20 {
+                if let Some(seen) = redirect_after_target_closes(p, &mut writer, &mut reader) {
+                    return Some(seen);
+                }
+            }
+            None
+        });
+        let (control, later) = got.expect("no new connection was ever accepted on a closed sink's fd");
+        assert_eq!(control, "*3", "the redirect target did not get the control invalidation");
+        assert!(later.iter().all(String::is_empty), "an invalidation reached a new connection: {later:?}");
+    }
+
+    /// One try of the scenario: `reader` redirects to a sink, the sink closes,
+    /// new connections are opened until one sits on the sink's old fd, then
+    /// `writer` invalidates. Returns the sink's control invalidation and what
+    /// each new connection received, or None when the fd went elsewhere.
+    fn redirect_after_target_closes(
+        p: u16,
+        writer: &mut Client,
+        reader: &mut Client,
+    ) -> Option<(String, Vec<String>)> {
+        let mut sink = Client::open(p);
+        let id = sink.id();
+        let sink_fd = info_fd(&sink.ask_bulk("CLIENT INFO"));
+        reader.ask("CLIENT TRACKING OFF");
+        reader.ask(&format!("CLIENT TRACKING ON REDIRECT {}", &id[1..]));
+        reader.ask_bulk("GET k"); // the whole reply, or later asks read its value
+        // Control: while the sink is open, the redirect does reach it.
+        // A value no earlier try wrote, so the write changes the key.
+        writer.ask(&format!("SET k control{}", &id[1..]));
+        let control = sink.read_within(5000);
+        reader.ask_bulk("GET k"); // tracked again, for the write below
+        drop(sink);
+        // Until the server has closed the sink, its fd is not free to reuse.
+        let gone = format!("id={} ", &id[1..]);
+        for _ in 0..50 {
+            if !writer.ask_bulk("CLIENT LIST").contains(&gone) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut later: Vec<Client> = Vec::new();
+        let mut reused = false;
+        while !reused && later.len() < 8 {
+            let mut c = Client::open(p);
+            reused = info_fd(&c.ask_bulk("CLIENT INFO")) == sink_fd;
+            later.push(c);
+        }
+        if !reused {
+            return None;
+        }
+        writer.ask("SET k v1");
+        std::thread::sleep(Duration::from_millis(100));
+        Some((control, later.iter_mut().map(Client::pending).collect()))
+    }
+
+    /// The `fd=` field of a CLIENT INFO line.
+    fn info_fd(info: &str) -> String {
+        info.split(' ').find(|f| f.starts_with("fd=")).unwrap_or_default().to_string()
+    }
+
+    // ---- A client that half-closes (0.9.2 release test round 2, R2-FF1) ----
+    //
+    // A client that sent its commands and then shut down its sending side
+    // stayed open on the server for good, in CLOSE_WAIT and in CLIENT LIST,
+    // until CLIENT KILL or a restart. The commands and the end of stream
+    // arrived in one read, the read loop stopped at the short read, and the
+    // poller, edge-triggered, never reported the socket readable again. Anyone
+    // who could reach the port could pile up sockets, with a password or not.
+
+    /// Writes `lines`, shuts down the sending side, and reads until the server
+    /// closes or REPLY_WAIT passes: every reply line, and whether it closed.
+    fn half_close(port: u16, lines: &[&str]) -> (Vec<String>, bool) {
+        let s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(REPLY_WAIT)).unwrap();
+        let mut w = &s;
+        for l in lines {
+            write!(w, "{l}\r\n").unwrap();
+        }
+        w.flush().unwrap();
+        s.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut r = BufReader::new(&s);
+        let mut out = Vec::new();
+        loop {
+            let mut line = String::new();
+            match r.read_line(&mut line) {
+                Ok(0) => return (out, true),
+                Ok(_) => out.push(line.trim_end().to_string()),
+                Err(_) => return (out, false),
+            }
+        }
+    }
+
+    #[test]
+    fn a_half_closed_connection_is_answered_then_closed() {
+        let (worker, port) = gate_worker("halfclose", false);
+        let got = serve(worker, port, |p| half_close(p, &["PING", "PING"]));
+        assert_eq!(got, (vec!["+PONG".to_string(), "+PONG".to_string()], true));
+    }
+
+    #[test]
+    fn a_half_closed_connection_that_never_logged_in_is_closed() {
+        let (worker, port) = gate_worker("halfnoauth", true);
+        let got = serve(worker, port, |p| half_close(p, &["PING"]));
+        assert_eq!(got, (vec![NOAUTH.to_string()], true));
+    }
+
+    #[test]
+    fn a_half_closed_connection_with_a_command_cut_short_is_closed() {
+        let (worker, port) = gate_worker("halfcut", false);
+        let got = serve(worker, port, |p| half_close(p, &["*2", "$3", "GET"]));
+        assert_eq!(got, (Vec::new(), true));
     }
 }

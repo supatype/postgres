@@ -182,7 +182,7 @@ supatype_write_keyspace_conf() {
 	if [ "$readthrough_forced_off" = yes ]; then
 		supatype_warn "SUPATYPE_KEYSPACE_ROWCACHE_READTHROUGH needs SUPATYPE_KEYSPACE_ROWCACHE_DECODE; forcing it off."
 	fi
-	supatype_note "pg_keyspace enabled: RESP on :${port}, durability=${durability}${overrides:+ (${overrides})}, database=${db}"
+	supatype_note "pg_keyspace enabled: RESP on :${port}, durability=${durability}${overrides:+ (${overrides})}, database=${db}${SUPATYPE_KEYSPACE_PASSWORD_PATH:+, AUTH required}"
 	if [ "$rowcache_decode" = on ]; then
 		local allowlisted="${output_plugins}"
 		supatype_pg_knows_setting output_plugin_libraries || allowlisted="not needed on this server"
@@ -209,12 +209,19 @@ supatype_render_keyspace_conf() {
 	# A single quote would end the literal and leave a file Postgres refuses to start on.
 	local db_lit="${db//\'/\'\'}"
 	local overrides_lit="${overrides//\'/\'\'}"
+	local password_path="${SUPATYPE_KEYSPACE_PASSWORD_PATH:-}"
+	local password_path_lit="${password_path//\'/\'\'}"
 
 	{
 		echo "# Written at container start from SUPATYPE_KEYSPACE_*; edits do not survive."
 		echo "# Unset SUPATYPE_KEYSPACE_ENABLED to go back to the shipped, inert configuration."
 		echo "shared_preload_libraries = '${preload}'"
 		echo "pg_keyspace.require_mask = ${require_mask}"
+		# The path, never the password: the extension reads the file itself, requires AUTH from
+		# its first connection, and reads the file again on every reload.
+		if [ -n "$password_path" ]; then
+			echo "pg_keyspace.password_file = '${password_path_lit}'"
+		fi
 		echo "pg_keyspace.port = ${port}"
 		echo "pg_keyspace.database = '${db_lit}'"
 		echo "pg_keyspace.durability = '${durability}'"
@@ -299,9 +306,12 @@ supatype_in_recovery() {
 	[ "$(supatype_psql 'SELECT pg_is_in_recovery()' 2>/dev/null)" = 't' ]
 }
 
-# Create the extension while the temporary server is up, so the real one starts with it.
+# Set the keyspace up while the temporary server is up, so the real one starts with it in place.
+# `supatype keyspace-setup` creates the extension in POSTGRES_DB, and creates SUPATYPE_KEYSPACE_DATABASE
+# and the extension in it when that names another database (the worker connects there, so that is
+# where its tables have to be). The bootstrap runs the same command on the first boot.
 #
-# Without it the worker serves RESP but refuses to persist, saying so once in the log and
+# Without the extension the worker serves RESP but refuses to persist, saying so once in the log and
 # nowhere else:
 #
 #   pg_keyspace worker: the pg_keyspace extension is not installed in database '...'; run
@@ -315,13 +325,66 @@ supatype_in_recovery() {
 # already present.
 #
 # Non-fatal: a cluster serving RESP without persistence is degraded, not broken, and the worker
-# already says so.
-supatype_create_keyspace_extension() {
+# already says so. The command says what went wrong itself.
+supatype_setup_keyspace() {
 	supatype_keyspace_enabled || return 0
-	if supatype_psql 'CREATE EXTENSION IF NOT EXISTS pg_keyspace' > /dev/null 2>&1; then
-		supatype_note "pg_keyspace extension present; persistence is available on the next start."
-	else
-		supatype_warn "could not create the pg_keyspace extension; RESP will serve without persistence."
+	supatype keyspace-setup || true
+}
+
+# Where a password given as SUPATYPE_KEYSPACE_PASSWORD is written for the extension to read.
+# /dev/shm is a tmpfs in every Docker and Kubernetes container, so the file is in no image layer, no
+# `docker commit` and no volume, and is gone when the container stops. The directory is the postgres
+# user's alone, and the file is readable by nobody else.
+readonly SUPATYPE_KEYSPACE_PASSWORD_DIR=/dev/shm/supatype
+
+# The RESP password, as a file pg_keyspace.password_file can name. The extension reads it, so the
+# password never passes through psql, a log or the conf file, and the server's processes do not
+# inherit it: the variable is unset here, before anything starts.
+#
+# SUPATYPE_KEYSPACE_PASSWORD_FILE works the way POSTGRES_PASSWORD_FILE does: the stock helper stops
+# the start when both forms are set, and that file is the one the extension is pointed at. A file
+# holding nothing but whitespace also stops the start; read as unset, it would quietly leave the
+# keyspace open when whoever mounted it asked for a password.
+#
+# Runs on both passes. The first exports SUPATYPE_KEYSPACE_PASSWORD_PATH, and the second, after the
+# gosu re-exec, finds it set and keeps it, so both render the same conf file.
+supatype_stage_keyspace_password() {
+	if [ -n "${SUPATYPE_KEYSPACE_PASSWORD_PATH:-}" ]; then
+		return 0
+	fi
+	local file="${SUPATYPE_KEYSPACE_PASSWORD_FILE:-}"
+	file_env 'SUPATYPE_KEYSPACE_PASSWORD'
+	local path=''
+	if [ -n "$file" ]; then
+		if [ -z "${SUPATYPE_KEYSPACE_PASSWORD//[[:space:]]/}" ]; then
+			printf >&2 'error: SUPATYPE_KEYSPACE_PASSWORD_FILE (%s) holds no password\n' "$file"
+			exit 1
+		fi
+		path="$file"
+	elif [ -n "${SUPATYPE_KEYSPACE_PASSWORD:-}" ] && supatype_keyspace_enabled; then
+		path="$SUPATYPE_KEYSPACE_PASSWORD_DIR/keyspace-password"
+		supatype_write_keyspace_password "$path"
+	fi
+	unset SUPATYPE_KEYSPACE_PASSWORD
+	export SUPATYPE_KEYSPACE_PASSWORD_PATH="$path"
+}
+
+# Write SUPATYPE_KEYSPACE_PASSWORD to $1, owned by postgres and readable by nobody else. A failure
+# stops the start: the conf file would name a file that is not there, and the keyspace would refuse
+# every client with nothing at start-up saying why.
+supatype_write_keyspace_password() {
+	if ! (
+		umask 077
+		mkdir -p "$SUPATYPE_KEYSPACE_PASSWORD_DIR"
+		printf '%s' "$SUPATYPE_KEYSPACE_PASSWORD" > "$1"
+		if [ "$(id -u)" = '0' ]; then
+			chown postgres:postgres "$SUPATYPE_KEYSPACE_PASSWORD_DIR" "$1"
+		fi
+		chmod 700 "$SUPATYPE_KEYSPACE_PASSWORD_DIR"
+		chmod 600 "$1"
+	); then
+		printf >&2 'error: could not write the keyspace password to %s\n' "$1"
+		exit 1
 	fi
 }
 
@@ -354,13 +417,16 @@ supatype_migrate_existing_cluster() {
 		supatype_note "cluster is in recovery (standby); its schema comes from the primary."
 	else
 		# The socket, always: a PGHOST inherited from the environment would send
-		# the runner somewhere that is not the server we just started.
+		# the runner and the keyspace setup somewhere that is not the server we
+		# just started. The keyspace is set up whether or not the migration
+		# succeeded, and the migration's status is what this subshell exits with.
 		(
 			unset PGHOST POSTGRES_HOST
-			export POSTGRES_PORT="$port"
-			supatype migrate sync
+			status=0
+			POSTGRES_PORT="$port" supatype migrate sync || status=$?
+			supatype_setup_keyspace
+			exit "$status"
 		) || rc=$?
-		supatype_create_keyspace_extension
 	fi
 
 	docker_temp_server_stop
@@ -381,6 +447,9 @@ fi
 if [ "${1-}" = 'postgres' ] && ! _pg_want_help "$@"; then
 	docker_setup_env
 	docker_create_db_directories
+
+	# Before the keyspace conf is written, which names the password file.
+	supatype_stage_keyspace_password
 
 	# Before anything starts a server, including the temporary one the migration path below uses:
 	# cron.database_name is read at postmaster start and never re-read, and pg_keyspace cannot be

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tenant-scoped pub/sub. Channels are namespaced by the authenticated
 # connection's tenant (the same `{tenant}:` prefix that isolates keys), so one
-# tenant's SUBSCRIBE/PUBLISH cannot reach another's — transparently: every frame
+# tenant's SUBSCRIBE/PUBLISH cannot reach another's. It is transparent: every frame
 # echoes the client's own unscoped channel name. Exempt (service_role)
 # connections use the raw namespace and can address a tenant channel explicitly.
 #
@@ -23,9 +23,10 @@ SELECT pg_reload_conf();
 SQL
 sleep 1
 
-# auto-detect TLS on the RESP port
-if redis-cli -p "$RESP" PING 2>/dev/null | grep -q PONG; then TLS=""; else TLS="--tls --insecure"; fi
-if [ -n "$TLS" ] && ! timeout 3 redis-cli $TLS -p "$RESP" PING 2>/dev/null | grep -q PONG; then
+# auto-detect TLS on the RESP port. Credentials are live by now, so an
+# unauthenticated PING answers NOAUTH, which is as good a plaintext answer as PONG.
+if redis-cli -p "$RESP" PING 2>&1 | grep -q 'PONG\|NOAUTH'; then TLS=""; else TLS="--tls --insecure"; fi
+if [ -n "$TLS" ] && ! timeout 3 redis-cli $TLS -p "$RESP" PING 2>&1 | grep -q 'PONG\|NOAUTH'; then
   echo "  SKIP  RESP worker not reachable on :$RESP"; exit 0
 fi
 A() { redis-cli $TLS -p "$RESP" --user "$1" -a "$2" --no-auth-warning "${@:3}" 2>/dev/null; }

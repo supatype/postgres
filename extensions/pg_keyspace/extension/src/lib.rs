@@ -214,11 +214,26 @@ static GUC_TLS_USE_PG_CERT: GucSetting<bool> = GucSetting::<bool>::new(false);
 /// changed rows from the row cache so it stays coherent with committed writes.
 /// Off by default: it needs `wal_level = logical` and holds a replication slot.
 /// Host advertised in `MOVED` redirects and the `CLUSTER` topology (the workers
-/// bind 0.0.0.0, so they cannot infer an address a remote client can reach).
+/// bind `pg_keyspace.listen_address`, 0.0.0.0 by default, so they cannot infer
+/// an address a remote client can reach).
 /// Deliberately unset by default: a persisted multi-worker cluster refuses to
 /// start without it rather than publishing an address that may only resolve on
 /// the server host.
 static GUC_ANNOUNCE_HOST: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+/// The IPv4 address every RESP slot worker binds. It was hard-coded to 0.0.0.0,
+/// so the keyspace answered on every interface the host has, whatever
+/// `listen_addresses` said about Postgres itself (0.9.2 release test).
+static GUC_LISTEN_ADDRESS: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(Some(c"0.0.0.0"));
+/// Require RESP AUTH even when `supacache.resp_credential` is empty. Without
+/// it a fresh start serves every client until a credential is loaded; with it
+/// that window refuses everything instead (fail closed).
+static GUC_REQUIRE_AUTH: GucSetting<bool> = GucSetting::<bool>::new(false);
+/// A file holding the password of the RESP user `supatype` (role
+/// `service_role`). The extension reads it itself, so whatever starts Postgres
+/// (the image, the native CLI) passes a path and never the password.
+static GUC_PASSWORD_FILE: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(None);
 static GUC_ROWCACHE_DECODE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static GUC_ROWCACHE_SLOT: GucSetting<Option<&'static CStr>> =
@@ -1119,7 +1134,7 @@ fn seg_base_for(w: usize) -> *mut u8 {
 /// The tier configured for keys no override covers. Not the same as what the
 /// instance must provide -- see `ks_effective_tier`.
 fn ks_tier() -> Tier {
-    match GUC_DURABILITY.get().and_then(|c| c.to_str().ok()) {
+    match guc_str(&GUC_DURABILITY).as_deref() {
         Some("relaxed") => Tier::Relaxed,
         Some("durable") => Tier::Durable,
         Some("replicated") => Tier::Replicated,
@@ -1130,10 +1145,9 @@ fn ks_tier() -> Tier {
 /// The durability policy: `pg_keyspace.durability` as the default, with
 /// `pg_keyspace.durability_overrides` layered on top (#164).
 fn ks_policy() -> Result<Policy, String> {
-    let spec = GUC_DURABILITY_OVERRIDES.get().and_then(|c| c.to_str().ok().map(str::to_string));
-    match spec {
-        Some(s) if !s.trim().is_empty() => Policy::parse(ks_tier(), &s),
-        _ => Ok(Policy::uniform(ks_tier())),
+    match guc_str(&GUC_DURABILITY_OVERRIDES) {
+        Some(s) => Policy::parse(ks_tier(), &s),
+        None => Ok(Policy::uniform(ks_tier())),
     }
 }
 
@@ -1290,7 +1304,7 @@ enum Addressing {
 }
 
 fn ks_addressing() -> Addressing {
-    match GUC_RECOVERY_ADDRESSING.get().and_then(|c| c.to_str().ok()) {
+    match guc_str(&GUC_RECOVERY_ADDRESSING).as_deref() {
         Some("owner") => Addressing::Owner,
         _ => Addressing::Slot,
     }
@@ -1405,6 +1419,20 @@ enum TlsChoice {
     Refuse(String),
 }
 
+/// A string setting's value, trimmed, or None when it is unset or blank: the
+/// reading every path-, host- and name-valued setting here wants.
+fn guc_str(g: &GucSetting<Option<&'static CStr>>) -> Option<String> {
+    g.get()
+        .and_then(|c| c.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// `pg_keyspace.database`, the database every background worker connects to.
+fn ks_database() -> String {
+    guc_str(&GUC_DATABASE).unwrap_or_else(|| "postgres".to_string())
+}
+
 /// Decide where the RESP port's certificate comes from.
 ///
 /// `pg_keyspace.tls_cert_file`/`tls_key_file` win whenever they are set; an
@@ -1421,13 +1449,7 @@ enum TlsChoice {
 /// opted in, a cluster with `ssl = off` is a contradiction to report, not a
 /// reason to quietly serve plaintext.
 fn tls_choice() -> TlsChoice {
-    let explicit = |g: &GucSetting<Option<&'static CStr>>| {
-        g.get()
-            .and_then(|c| c.to_str().ok().map(str::to_string))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-    match (explicit(&GUC_TLS_CERT), explicit(&GUC_TLS_KEY)) {
+    match (guc_str(&GUC_TLS_CERT), guc_str(&GUC_TLS_KEY)) {
         (Some(cert), Some(key)) => {
             return TlsChoice::Serve {
                 cert,
@@ -1782,12 +1804,50 @@ pub extern "C" fn _PG_init() {
     GucRegistry::define_string_guc(
         "pg_keyspace.cluster_announce_host",
         "Host advertised in MOVED redirects and CLUSTER topology replies",
-        "Slot workers bind 0.0.0.0, so a redirect or slot map must name an address \
-         the client can reach. Required when a persisted tier runs with workers > 1; \
-         set it to the hostname or IP your clients connect to (e.g. 127.0.0.1 for \
-         a purely local deployment).",
+        "Slot workers bind pg_keyspace.listen_address (0.0.0.0 by default), so a \
+         redirect or slot map must name an address the client can reach. Required \
+         when a persisted tier runs with workers > 1; set it to the hostname or IP \
+         your clients connect to (e.g. 127.0.0.1 for a purely local deployment).",
         &GUC_ANNOUNCE_HOST,
         GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.listen_address",
+        "IPv4 address the RESP slot workers listen on",
+        "Every slot worker binds this address, on pg_keyspace.port + its index. \
+         0.0.0.0 (the default) is every interface; 127.0.0.1 keeps the keyspace \
+         local to the host. A single IPv4 dotted quad only: a hostname, an IPv6 \
+         address or a list is refused and the worker does not serve, rather than \
+         falling back to every interface.",
+        &GUC_LISTEN_ADDRESS,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
+        "pg_keyspace.require_auth",
+        "Require RESP AUTH even when no credential is configured",
+        "Off (the default) keeps local no-auth mode while supacache.resp_credential \
+         is empty. On, every command but AUTH, HELLO, QUIT and RESET is refused with \
+         NOAUTH until a credential is loaded and a client logs in with it, so a \
+         fresh start fails closed instead of serving everyone. Reloadable, like the \
+         credentials themselves.",
+        &GUC_REQUIRE_AUTH,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_keyspace.password_file",
+        "File holding the password of the RESP user supatype",
+        "Empty (the default) leaves credentials to supacache.set_credential. Set, \
+         the RESP user supatype (role service_role, no tenant) has the password the \
+         file holds, less one trailing newline, and AUTH is required from the first \
+         connection, as with require_auth. The file is read again on every reload, \
+         so a rotated password applies on SELECT pg_reload_conf() with no restart. \
+         An unreadable or empty file is logged and leaves supatype refused. The \
+         server's user must be able to read it; keep it readable by nobody else.",
+        &GUC_PASSWORD_FILE,
+        GucContext::Sighup,
         GucFlags::empty(),
     );
     GucRegistry::define_int_guc(
@@ -2427,6 +2487,23 @@ extern "C" fn ks_shmem_startup() {
 
 // ---- the background worker: the RESP event loop --------------------------
 
+/// `pg_keyspace.listen_address`, trimmed. Empty reads as the default rather
+/// than as an address, the way an empty `listen_addresses` would not.
+fn listen_address() -> String {
+    guc_str(&GUC_LISTEN_ADDRESS).unwrap_or_else(|| "0.0.0.0".to_string())
+}
+
+/// Where this instance's own RESP port answers, for the relay's connection to
+/// it: the listen address, or loopback when that is the wildcard. Always
+/// loopback used to be right only because the bind was always the wildcard.
+fn resp_connect_host() -> String {
+    let addr = listen_address();
+    match addr.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        _ => addr,
+    }
+}
+
 #[no_mangle]
 #[pg_guard]
 pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
@@ -2471,21 +2548,27 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     let persisted = ks_persisted();
 
     let port = GUC_PORT.get() as u16 + w as u16;
-    let mut worker = match server::Worker::new(store.clone(), None, Tier::Ephemeral, "0.0.0.0", port)
+    let addr = listen_address();
+    let mut worker = match server::Worker::new(store.clone(), None, Tier::Ephemeral, &addr, port)
     {
         Ok(w) => w,
         Err(e) => {
-            log!("pg_keyspace worker: cannot listen on :{port}: {e}");
+            log!("pg_keyspace worker: cannot listen on {addr}:{port}: {e}");
             return;
         }
     };
+    // Before the event loop runs, so a fail-closed start never serves a command.
+    worker.set_require_auth(auth_required());
+    // Slot workers are separate processes, each counting its own CLIENT IDs;
+    // the index keeps two workers from handing a client the same id.
+    worker.set_worker_index(w);
     worker.set_max_value_bytes(GUC_MAX_VALUE_BYTES.get().max(1024) as usize);
     worker.set_tenant_rate_limit(GUC_TENANT_OPS_PER_SEC.get().max(0) as u32);
     // Cross-worker pub/sub. Without this a SUBSCRIBE here never sees a PUBLISH
     // on another worker, and the publisher's reply counts only its own local
     // subscribers, so neither side can tell the message was lost.
     if let Some(bus) = BUS.get() {
-        worker.set_bus(bus.clone(), w);
+        worker.set_bus(bus.clone());
     } else if worker_count() > 1 {
         log!(
             "pg_keyspace worker {w}: WARNING no shared pub/sub bus; PUBLISH and              SUBSCRIBE reach only clients connected to this worker"
@@ -2584,11 +2667,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
 
     // Connect SPI (always): needed to create/read the schema, run the
     // security self-check, load RESP AUTH credentials, and recover from tables.
-    let dbname = GUC_DATABASE
-        .get()
-        .and_then(|c| c.to_str().ok())
-        .unwrap_or("postgres")
-        .to_string();
+    let dbname = ks_database();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
 
     // The extension owns the supacache schema; only touch it once CREATE EXTENSION
@@ -2631,13 +2710,20 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     // load RESP AUTH + keyspace ACL. When credentials exist, enforcement is
     // on; when absent, the worker runs in local/no-auth mode (local dev). The
     // credential/ACL tables only exist once the extension is installed; without it
-    // there are no credentials to load, so stay in no-auth mode.
-    match ext_ready.then(load_auth_config).flatten() {
+    // there are no credentials to load, so stay in no-auth mode. The exception is
+    // pg_keyspace.password_file, whose credential needs no table.
+    match worker_auth_config(w, ext_ready) {
         Some(auth) => {
             let n = auth.creds.len();
             worker.set_auth_config(auth);
             log!("pg_keyspace worker: AUTH enforced ({n} credentials, ACL + tenant scoping on)");
         }
+        None if auth_required() => log!(
+            "pg_keyspace worker: no usable RESP credential, and pg_keyspace.require_auth or \
+             pg_keyspace.password_file requires one: every command is refused until one is \
+             loaded (fix the password file, or supacache.set_credential, then SELECT \
+             pg_reload_conf())"
+        ),
         None => log!("pg_keyspace worker: no RESP credentials configured, local/no-auth mode"),
     }
 
@@ -2646,11 +2732,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
     // (127.0.0.1) would hand remote clients a topology pointing at themselves,
     // which is a confusing connection failure rather than a clear misconfiguration. Fail
     // closed, as with a bad TLS cert.
-    let announce_host = GUC_ANNOUNCE_HOST
-        .get()
-        .and_then(|c| c.to_str().ok().map(str::to_string))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let announce_host = guc_str(&GUC_ANNOUNCE_HOST);
     // Only slot addressing redirects. Owner addressing recovers what each
     // worker wrote, so no worker ever has to send a client elsewhere and there
     // is no address to announce.
@@ -2802,7 +2884,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         }
     }
 
-    log!("pg_keyspace worker: RESP listening on 0.0.0.0:{port} (persisted={persisted})");
+    log!("pg_keyspace worker: RESP listening on {addr}:{port} (persisted={persisted})");
     // Poll frequently in sync-ack mode so committed durable writes ack promptly.
     let timeout_ms = if matches!(ks_effective_tier(), Tier::Durable | Tier::Replicated) {
         2
@@ -2833,11 +2915,9 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
             }
             if BackgroundWorker::sighup_received() {
                 unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
-                let cfg = if extension_installed() {
-                    load_auth_config()
-                } else {
-                    None
-                };
+                // The password file is read again here, so a rotated password
+                // applies on reload with no restart.
+                let cfg = worker_auth_config(w, extension_installed());
                 let n = cfg.as_ref().map(|c| c.creds.len()).unwrap_or(0);
                 // Cert rotation: re-read the same cert/key paths so an
                 // in-place renewal (e.g. cert-manager) takes effect with no
@@ -2846,6 +2926,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
                 let mut reload = server::Reload {
                     auth: Some(cfg),
                     tls: None,
+                    require_auth: Some(auth_required()),
                 };
                 match tls_choice() {
                     TlsChoice::Serve { cert, key, .. } => {
@@ -2890,11 +2971,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
 pub extern "C" fn pg_keyspace_persist_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
     let idx = unsafe { i32::from_datum(arg, false) }.unwrap_or(0).max(0) as usize;
-    let dbname = GUC_DATABASE
-        .get()
-        .and_then(|c| c.to_str().ok())
-        .unwrap_or("postgres")
-        .to_string();
+    let dbname = ks_database();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
     // The RESP worker owns schema creation (once the extension is installed); all
     // persist workers wait for it. If the tables never appear (no CREATE EXTENSION),
@@ -3374,6 +3451,83 @@ fn ensure_rowcache_catalogue() -> bool {
     table_exists("supacache.rowcache_reg")
 }
 
+/// The RESP credential -> role/tenant map. Shared by the worker's schema setup
+/// and `supacache.set_credential`, which may run first (see there).
+const RESP_CREDENTIAL_DDL: &str = "CREATE TABLE IF NOT EXISTS supacache.resp_credential (\
+     username text PRIMARY KEY, secret text NOT NULL, \
+     role_name text NOT NULL, tenant text NOT NULL DEFAULT '')";
+/// The keyspace ACL, which the credential loader reads beside the credentials.
+const ACL_DDL: &str = "CREATE TABLE IF NOT EXISTS supacache.acl (\
+     role_name text NOT NULL, prefix text NOT NULL, \
+     can_read boolean NOT NULL DEFAULT true, \
+     can_write boolean NOT NULL DEFAULT true, \
+     PRIMARY KEY (role_name, prefix))";
+
+/// Create the credential and ACL tables if the worker has not yet.
+///
+/// The worker creates them at its own start, but only once the extension
+/// exists. On a first boot the extension is created after the worker started,
+/// so an init script setting the first credential found no table and failed,
+/// and `pg_keyspace.require_auth` then refused every client with no credential
+/// to log in with. Only when missing: `CREATE TABLE IF NOT EXISTS` checks the
+/// schema's CREATE privilege even when the table is there.
+fn ensure_auth_tables() -> bool {
+    let missing = Spi::get_one::<bool>(
+        "SELECT to_regclass('supacache.resp_credential') IS NULL \
+             OR to_regclass('supacache.acl') IS NULL",
+    );
+    match missing {
+        Ok(Some(false)) => true,
+        Ok(Some(true)) => Spi::run(RESP_CREDENTIAL_DDL).is_ok() && Spi::run(ACL_DDL).is_ok(),
+        _ => false,
+    }
+}
+
+/// Store `secret` for `username` as a salted SHA-256 verifier
+/// (`sha256$<salt>$<hash>`), creating the tables if the worker has not. Shared
+/// by `supacache.set_credential` and the worker's `pg_keyspace.password_file`.
+fn store_credential(username: &str, secret: &str, role: &str, tenant: &str) -> bool {
+    if !ensure_auth_tables() {
+        return false;
+    }
+    let Some(stored) = credential_verifier(secret) else {
+        return false;
+    };
+    Spi::run_with_args(
+        "INSERT INTO supacache.resp_credential(username, secret, role_name, tenant) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (username) DO UPDATE SET \
+           secret = EXCLUDED.secret, role_name = EXCLUDED.role_name, tenant = EXCLUDED.tenant",
+        Some(vec![
+            (PgBuiltInOids::TEXTOID.oid(), username.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), stored.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), role.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), tenant.into_datum()),
+        ]),
+    )
+    .is_ok()
+}
+
+/// A fresh verifier for `secret`, salted with 128 bits from `gen_random_uuid()`.
+fn credential_verifier(secret: &str) -> Option<String> {
+    let salt = Spi::get_one::<String>("SELECT replace(gen_random_uuid()::text, '-', '')")
+        .ok()
+        .flatten()?;
+    Spi::get_one_with_args::<String>(
+        // convert_to, not `$2::bytea`: the cast reads backslash escapes, so a
+        // secret containing `\` hashed as different bytes from the ones a
+        // client sends, and that credential could never log in.
+        "SELECT 'sha256$' || $1 || '$' || \
+         encode(sha256(decode($1,'hex') || convert_to($2, 'UTF8')), 'hex')",
+        vec![
+            (PgBuiltInOids::TEXTOID.oid(), salt.into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), secret.into_datum()),
+        ],
+    )
+    .ok()
+    .flatten()
+}
+
 /// Create the `supacache` schema and the hash-partitioned `supacache.kv`
 /// backing table if absent. Idempotent; runs in one transaction.
 fn pg_ensure_schema() {
@@ -3393,11 +3547,7 @@ fn pg_ensure_schema() {
             ));
         }
         // RESP credential -> role/tenant map and keyspace ACL.
-        let _ = Spi::run(
-            "CREATE TABLE IF NOT EXISTS supacache.resp_credential (\
-             username text PRIMARY KEY, secret text NOT NULL, \
-             role_name text NOT NULL, tenant text NOT NULL DEFAULT '')",
-        );
+        let _ = Spi::run(RESP_CREDENTIAL_DDL);
         // Peers this instance relays to. Modelled on Citus's pg_dist_node: the
         // membership is a table an operator maintains, and the transport is
         // libpq, so authentication, TLS and pg_hba are Postgres's rather than
@@ -3408,13 +3558,7 @@ fn pg_ensure_schema() {
              enabled boolean NOT NULL DEFAULT true, \
              added_at timestamptz NOT NULL DEFAULT now())",
         );
-        let _ = Spi::run(
-            "CREATE TABLE IF NOT EXISTS supacache.acl (\
-             role_name text NOT NULL, prefix text NOT NULL, \
-             can_read boolean NOT NULL DEFAULT true, \
-             can_write boolean NOT NULL DEFAULT true, \
-             PRIMARY KEY (role_name, prefix))",
-        );
+        let _ = Spi::run(ACL_DDL);
         // TTL'd keys persist here, RANGE-partitioned by expiry time bucket,
         // so expiry is a whole-partition DROP (O(1), no vacuum churn) rather than
         // row-by-row DELETE. Partitions are created on demand by the persist
@@ -3562,21 +3706,7 @@ fn kv_has_supatype_label() -> bool {
 /// Exempt roles come from `supatype_mask.exempt_roles` so the two never drift.
 fn load_auth_config() -> Option<AuthConfig> {
     use std::panic::AssertUnwindSafe;
-    let exempt: HashSet<String> = {
-        let raw = unsafe {
-            let s = pg_sys::GetConfigOption(c"supatype_mask.exempt_roles".as_ptr(), true, false);
-            if s.is_null() {
-                String::new()
-            } else {
-                CStr::from_ptr(s).to_string_lossy().into_owned()
-            }
-        };
-        raw.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
-
+    let exempt = exempt_roles();
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
         let mut creds: HashMap<String, Cred> = HashMap::new();
         let mut acl: HashMap<String, Vec<AclRule>> = HashMap::new();
@@ -3619,6 +3749,110 @@ fn load_auth_config() -> Option<AuthConfig> {
             Some(AuthConfig { creds, acl, exempt })
         }
     }))
+}
+
+/// `supatype_mask.exempt_roles`, the roles that bypass the keyspace ACL and
+/// tenant scoping, read from the mask's own setting so the two never drift.
+fn exempt_roles() -> HashSet<String> {
+    pg_setting(c"supatype_mask.exempt_roles")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The largest password file read. A password is a line; this only stops a
+/// path pointed at something large (a log, a device) being read whole.
+const PASSWORD_FILE_MAX: u64 = 4096;
+
+/// `pg_keyspace.password_file`: None when it is unset, else its path and
+/// either the password or why the file cannot give one. The password is never
+/// logged; the path may be.
+fn file_password() -> Option<(String, Result<String, String>)> {
+    use std::io::Read as _;
+    let path = guc_str(&GUC_PASSWORD_FILE)?;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&path)
+        .and_then(|f| f.take(PASSWORD_FILE_MAX + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("cannot be read ({e})"));
+    let password = read.and_then(|n| {
+        if n as u64 > PASSWORD_FILE_MAX {
+            Err(format!("is larger than {PASSWORD_FILE_MAX} bytes, so it is not a password"))
+        } else {
+            server::password_from_file(&bytes)
+        }
+    });
+    Some((path, password))
+}
+
+/// Keep the table's `supatype` row in step with the password file, so an
+/// operator reading `supacache.resp_credential` sees the credential in force.
+/// Writes only when the stored verifier does not already match: a restart with
+/// the same password changes nothing. Ok(true) when it wrote.
+fn sync_file_credential(password: &str) -> Result<bool, ()> {
+    use std::panic::AssertUnwindSafe;
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        if !ensure_auth_tables() {
+            return Err(());
+        }
+        let stored = Spi::get_one_with_args::<String>(
+            "SELECT secret FROM supacache.resp_credential \
+             WHERE username = $1 AND role_name = $2 AND tenant = ''",
+            vec![
+                (PgBuiltInOids::TEXTOID.oid(), server::FILE_CRED_USER.into_datum()),
+                (PgBuiltInOids::TEXTOID.oid(), server::FILE_CRED_ROLE.into_datum()),
+            ],
+        )
+        .ok()
+        .flatten();
+        // A plaintext row that happens to match is still rewritten: the table
+        // should hold a verifier, never the password.
+        let current = stored
+            .filter(|s| s.starts_with("sha256$"))
+            .is_some_and(|s| server::verify_secret(&s, password.as_bytes()));
+        if current {
+            return Ok(false);
+        }
+        store_credential(server::FILE_CRED_USER, password, server::FILE_CRED_ROLE, "")
+            .then_some(true)
+            .ok_or(())
+    }))
+}
+
+/// Whether RESP AUTH is required even with no credential loaded: asked for
+/// outright, or implied by a password file, so the keyspace is closed from the
+/// first accept whether or not the file's credential has been read yet.
+fn auth_required() -> bool {
+    GUC_REQUIRE_AUTH.get() || guc_str(&GUC_PASSWORD_FILE).is_some()
+}
+
+/// The auth config worker `w` serves with: the table's credentials, with
+/// `supatype` taken from `pg_keyspace.password_file` when that is set. Worker 0
+/// also keeps the table in step with the file; every worker reads the file
+/// itself, so none depends on another having written the table first.
+fn worker_auth_config(w: usize, ext_ready: bool) -> Option<AuthConfig> {
+    let table = || ext_ready.then(load_auth_config).flatten();
+    let Some((path, password)) = file_password() else {
+        return table();
+    };
+    let user = server::FILE_CRED_USER;
+    match &password {
+        Err(why) => log!(
+            "pg_keyspace worker {w}: pg_keyspace.password_file '{path}' {why}; the RESP user \
+             '{user}' is refused until the file holds a password and the configuration is reloaded"
+        ),
+        Ok(pw) if w == 0 && ext_ready => match sync_file_credential(pw) {
+            Ok(true) => log!("pg_keyspace worker: RESP user '{user}' set from pg_keyspace.password_file"),
+            Ok(false) => {}
+            Err(()) => log!(
+                "pg_keyspace worker: could not record the RESP user '{user}' in \
+                 supacache.resp_credential; it still works, from pg_keyspace.password_file"
+            ),
+        },
+        Ok(_) => {}
+    }
+    server::with_file_credential(table(), exempt_roles(), password.as_deref().ok())
 }
 
 /// Rows per cursor fetch during recovery. The point is that worker memory stays
@@ -4068,9 +4302,7 @@ fn bulk_upsert(
 /// Comma-separated globs from `pg_keyspace.relay_channels`, trimmed and
 /// non-empty. Empty result means relaying is off.
 fn relay_patterns() -> Vec<String> {
-    GUC_RELAY_CHANNELS
-        .get()
-        .and_then(|c| c.to_str().ok().map(|s| s.to_string()))
+    guc_str(&GUC_RELAY_CHANNELS)
         .unwrap_or_default()
         .split(',')
         .map(|p| p.trim().to_string())
@@ -4115,11 +4347,7 @@ fn resp_cmd(parts: &[&[u8]]) -> Vec<u8> {
 #[pg_guard]
 pub extern "C" fn pg_keyspace_relay_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
-    let dbname = GUC_DATABASE
-        .get()
-        .and_then(|c| c.to_str().ok())
-        .unwrap_or("postgres")
-        .to_string();
+    let dbname = ks_database();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
 
     let patterns = relay_patterns();
@@ -4211,11 +4439,11 @@ pub extern "C" fn pg_keyspace_relay_main(_arg: pg_sys::Datum) {
 fn relay_connect(patterns: &[String]) -> Option<std::net::TcpStream> {
     use std::io::Write;
     let port = GUC_PORT.get() as u16;
-    let sock = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    let sock = std::net::TcpStream::connect((resp_connect_host(), port)).ok()?;
     sock.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
     let mut w = &sock;
-    let user = GUC_RELAY_USER.get().and_then(|c| c.to_str().ok().map(String::from));
-    if let Some(u) = user.filter(|u| !u.is_empty()) {
+    if let Some(u) = guc_str(&GUC_RELAY_USER) {
+        // Read raw, not through guc_str: spaces at either end are part of a secret.
         let secret = GUC_RELAY_SECRET
             .get()
             .and_then(|c| c.to_str().ok().map(String::from))
@@ -4497,11 +4725,7 @@ fn relay_to_peers(channel: &[u8], payload: &[u8]) -> Result<u64, ()> {
 #[pg_guard]
 pub extern "C" fn pg_keyspace_expiry_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGHUP);
-    let dbname = GUC_DATABASE
-        .get()
-        .and_then(|c| c.to_str().ok())
-        .unwrap_or("postgres")
-        .to_string();
+    let dbname = ks_database();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
     let mut ready = false;
     for _ in 0..100 {
@@ -4573,10 +4797,7 @@ fn parse_change(line: &str) -> Option<(char, u32, Vec<u8>)> {
 
 /// The configured stem every row-cache decode slot name is built from.
 fn rowcache_slot_base() -> String {
-    GUC_ROWCACHE_SLOT
-        .get()
-        .and_then(|c| c.to_str().ok().map(|s| s.to_string()))
-        .unwrap_or_else(|| "supacache_rowcache".to_string())
+    guc_str(&GUC_ROWCACHE_SLOT).unwrap_or_else(|| "supacache_rowcache".to_string())
 }
 
 /// Create the keys-only replication slot if it does not exist yet. Requires
@@ -5574,11 +5795,7 @@ pub extern "C" fn pg_keyspace_invalidation_main(arg: pg_sys::Datum) {
     // is empty and no registration has published yet -- fall back to
     // `pg_keyspace.database`, which is the one database that certainly exists,
     // and rebuild the directory from there.
-    let fallback = GUC_DATABASE
-        .get()
-        .and_then(|c| c.to_str().ok())
-        .unwrap_or("postgres")
-        .to_string();
+    let fallback = ks_database();
     let leased = rcdb_lease();
     let dbname = leased
         .as_ref()
@@ -6898,35 +7115,7 @@ mod supacache {
     /// `supacache.resp_credential` directly.
     #[pg_extern]
     fn set_credential(username: &str, secret: &str, role: &str, tenant: &str) -> bool {
-        let salt = match Spi::get_one::<String>(
-            "SELECT replace(gen_random_uuid()::text, '-', '')",
-        ) {
-            Ok(Some(s)) => s,
-            _ => return false,
-        };
-        let stored = match Spi::get_one_with_args::<String>(
-            "SELECT 'sha256$' || $1 || '$' || encode(sha256(decode($1,'hex') || $2::bytea), 'hex')",
-            vec![
-                (PgBuiltInOids::TEXTOID.oid(), salt.into_datum()),
-                (PgBuiltInOids::TEXTOID.oid(), secret.into_datum()),
-            ],
-        ) {
-            Ok(Some(s)) => s,
-            _ => return false,
-        };
-        Spi::run_with_args(
-            "INSERT INTO supacache.resp_credential(username, secret, role_name, tenant) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (username) DO UPDATE SET \
-               secret = EXCLUDED.secret, role_name = EXCLUDED.role_name, tenant = EXCLUDED.tenant",
-            Some(vec![
-                (PgBuiltInOids::TEXTOID.oid(), username.into_datum()),
-                (PgBuiltInOids::TEXTOID.oid(), stored.into_datum()),
-                (PgBuiltInOids::TEXTOID.oid(), role.into_datum()),
-                (PgBuiltInOids::TEXTOID.oid(), tenant.into_datum()),
-            ]),
-        )
-        .is_ok()
+        store_credential(username, secret, role, tenant)
     }
 
     /// Persistence ring diagnostics: total writes enqueued, writes dropped due

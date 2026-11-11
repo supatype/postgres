@@ -64,7 +64,9 @@ jobs:
   # Postgres; the extension build catches compile breaks in the pgrx crate.
   unit-and-build:
     name: unit tests + extension build (PG${{ matrix.pg }})
-    runs-on: ubuntu-latest
+    # 24.04, not latest: on ubuntu-latest (26.04) pgrx 0.12.9 cannot build its bindings, and the
+    # Redis the parity benches compare against is 8.0 rather than 7.0.
+    runs-on: ubuntu-24.04
     needs: changes
     strategy:
       fail-fast: false
@@ -174,7 +176,7 @@ jobs:
   # real redis-server the way the bench harnesses do, with no Postgres required.
   integration:
     name: RESP conformance (daemon + redis)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # Redis 7.0, as unit-and-build says
     needs: changes
     steps:
       - uses: actions/checkout@v4
@@ -346,7 +348,7 @@ jobs:
   # need the optimiser; the release build is covered by the packaging jobs.
   durability-in-postgres:
     name: durability + fault injection (in PG${{ matrix.pg }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pgrx 0.12.9, as unit-and-build says
     needs: changes
     if: needs.changes.outputs.pgks == 'true'
     strategy:

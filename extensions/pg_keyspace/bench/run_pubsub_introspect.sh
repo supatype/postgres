@@ -48,10 +48,12 @@ restart_pg() {
   su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/log -o '-p $PORT -k /tmp' -w start" >/dev/null 2>&1
   for i in $(seq 1 60); do psql_ "SELECT 1" | grep -q "^1$" && break; sleep 1; done
 }
+# A worker is up when it answers PING: PONG, or NOAUTH once credentials are loaded, since
+# every command but AUTH, HELLO, QUIT and RESET then waits for a login.
 wait_workers() {
   local up=0 w i
   for w in $(seq 0 $((WORKERS-1))); do
-    for i in $(seq 1 40); do redis-cli -p $((RESP+w)) PING 2>/dev/null | grep -q PONG && { up=$((up+1)); break; }; sleep 1; done
+    for i in $(seq 1 40); do redis-cli -p $((RESP+w)) PING 2>/dev/null | grep -qE 'PONG|NOAUTH' && { up=$((up+1)); break; }; sleep 1; done
   done
   echo $up
 }
@@ -101,8 +103,11 @@ for i in $(seq 1 30); do
 done
 chk "three subscribers registered, none on worker 0" "3" \
     "$(grep -l subscribe $OUT.w1.out $OUT.w2.out $OUT.w2p.out 2>/dev/null | wc -l | tr -d ' ')"
+# CLIENT LIST has no cmd= field, and CLIENT LIST used to answer OK, so a
+# 'cmd=subscribe' count was 0 whatever the truth. TYPE pubsub lists exactly the
+# connections holding a subscription.
 chk "worker 0 has no subscribers of its own" "0" \
-    "$(redis-cli -p $RESP CLIENT LIST 2>/dev/null | grep -c 'cmd=subscribe')"
+    "$(redis-cli -p $RESP CLIENT LIST TYPE pubsub 2>/dev/null | grep -c '^id=')"
 
 chk "worker 0 lists channels held on workers 1 and 2" "alpha,beta" \
     "$(redis-cli -p $RESP PUBSUB CHANNELS 2>&1 | sort | paste -sd,)"
