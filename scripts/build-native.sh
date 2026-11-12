@@ -229,6 +229,10 @@ configure_postgres() {
       # with -Werror=unguarded-availability-new on Intel macOS.
       export MACOSX_DEPLOYMENT_TARGET=15.4
     fi
+    # The same SDK fails the Apple Silicon build too. configure finds strchrnul in the SDK,
+    # but a macOS older than 15.4 lacks it. Telling configure it is missing makes snprintf.c
+    # use PostgreSQL's own copy, so the archive still runs on those older releases.
+    CONFIGURE_FLAGS+=(ac_cv_func_strchrnul=no)
     add_homebrew_flags
   fi
   ( cd "${PG_SRC_DIR}" && ./configure "${CONFIGURE_FLAGS[@]}" )
