@@ -224,15 +224,13 @@ configure_postgres() {
     export CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ AR=aarch64-linux-gnu-ar STRIP=aarch64-linux-gnu-strip
     CONFIGURE_FLAGS+=(--host=aarch64-linux-gnu --build=x86_64-linux-gnu)
   elif [[ "${HOST_PLATFORM}" == darwin ]]; then
-    if [[ "$(uname -m)" == x86_64 && -z "${MACOSX_DEPLOYMENT_TARGET:-}" ]]; then
-      # Xcode 16.4's SDK exposes strchrnul as macOS 15.4+, and PG17 builds
-      # with -Werror=unguarded-availability-new on Intel macOS.
+    if [[ -z "${MACOSX_DEPLOYMENT_TARGET:-}" ]]; then
+      # Xcode 16.4's SDK exposes strchrnul as macOS 15.4+, and PG17 builds with
+      # -Werror=unguarded-availability-new, on Intel and Apple Silicon alike. PostgreSQL 17.2
+      # cannot fall back to its own copy: that copy shares the SDK's name and fails to compile.
+      # Later releases rename it pg_strchrnul, so moving PG_VERSION past 17.2 lifts this floor.
       export MACOSX_DEPLOYMENT_TARGET=15.4
     fi
-    # The same SDK fails the Apple Silicon build too. configure finds strchrnul in the SDK,
-    # but a macOS older than 15.4 lacks it. Telling configure it is missing makes snprintf.c
-    # use PostgreSQL's own copy, so the archive still runs on those older releases.
-    CONFIGURE_FLAGS+=(ac_cv_func_strchrnul=no)
     add_homebrew_flags
   fi
   ( cd "${PG_SRC_DIR}" && ./configure "${CONFIGURE_FLAGS[@]}" )
