@@ -1656,7 +1656,10 @@ pub extern "C" fn _PG_init() {
          beside an ephemeral cache instead of putting every cache write through the WAL \
          to protect the small part that matters. Matching is against the key as stored, \
          which is the tenant-scoped form '{tenant}:{key}' when RESP AUTH is configured -- \
-         so a tenant name is a prefix like any other. The rings, the persistence workers \
+         so a tenant name is a prefix like any other. A prefix written '*:seg' matches \
+         'seg' right after any tenant (the key's first ':'), e.g. '*:mau:=ephemeral'; it \
+         covers the tenant plus 'seg' when competing for the longest match, and a literal \
+         prefix of equal length wins. The rings, the persistence workers \
          and the commit mode are provisioned for the strongest tier named here, not for \
          pg_keyspace.durability. Empty (the default) means one tier for the whole \
          keyspace, exactly as before this setting existed.",
@@ -2628,7 +2631,7 @@ pub extern "C" fn pg_keyspace_worker_main(arg: pg_sys::Datum) {
         // batch. Serving it would mean either charging every durable write the
         // standby round-trip or acking a replicated write that never waited
         // for a standby. Both are worse than saying no.
-        if policy.rules().iter().any(|(_, t)| *t == Tier::Replicated) {
+        if policy.overrides_name(Tier::Replicated) {
             log!(
                 "pg_keyspace worker {w}: REFUSING to start: pg_keyspace.durability_overrides \
                  names the 'replicated' tier, which cannot yet be mixed with others on one \

@@ -3,8 +3,11 @@
 #
 # `Policy::tier_for` runs on every write and sits in front of an op measured in
 # nanoseconds, so "a few byte compares, it will be fine" is not something to
-# assert in a comment. This runs the matcher at 0, 1, 4, 8 and 64 rules and
-# fails the build if either path leaves its budget.
+# assert in a comment. This runs the matcher at 0, 1, 4, 8 and 64 literal
+# rules, then at 1, 8 and 64 `*:` segment rules beside as many literals on
+# tenant-scoped keys, and fails the build if either path leaves its budget.
+# A segment miss still has to find the end of the tenant scope (~8 ns with a
+# UUID tenant), so it is held to the same miss budget rather than its own.
 #
 # The two budgets are not the same question:
 #

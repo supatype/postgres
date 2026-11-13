@@ -591,10 +591,24 @@ pg_keyspace.durability = 'durable'
 pg_keyspace.durability_overrides = 'cache:=ephemeral, metrics:=relaxed'
 ```
 
+A prefix names one tenant, because the tenant comes first in the stored key.
+To name a namespace in **every** tenant, start the rule with `*:`. It matches
+what follows the tenant scope, whatever the tenant is:
+
+```ini
+pg_keyspace.durability = 'durable'
+pg_keyspace.durability_overrides = '*:mau:=ephemeral'
+```
+
+Under that, `t1:dbcred:g1` and `t1:config` are durable and `t1:mau:org:O:d:2026-11-13`
+beside them is ephemeral, for `t1` and every other tenant, with nothing to
+change as tenants come and go.
+
 | | |
 |---|---|
 | **Matched against** | The key **as stored**: the tenant-scoped `{tenant}:{key}` form when RESP AUTH is configured, so a tenant name is a prefix like any other and per-tenant durability needs no separate setting |
-| **Overlap** | Longest prefix wins, so `a:` and `a:b:` can both be set without the answer depending on the order you wrote them in |
+| **`*:` rules** | `*:seg` matches when the key, after its **first** `:`, starts with `seg`. That boundary is exact: `t1:x:mau:y` does not match `*:mau:`, and neither does an unscoped `mau:x` (its first `:` ends `mau`). A tenant name containing `:` would move the boundary, so give tenants names without one; `supacache.publish()` already refuses such a tenant |
+| **Overlap** | The longest match wins, so `a:` and `a:b:` can both be set without the answer depending on the order you wrote them in. A `*:` rule counts the tenant scope as part of its match: on `t1:mau:x`, `t1:` covers 3 bytes and `*:mau:` covers 7, so `*:mau:` wins, and `t1:mau:org:` (11) would beat it for that tenant. On a tie the literal prefix wins, because it names the tenant |
 | **Empty** | Identical to not having the setting: one tier for the whole keyspace |
 | **Context** | `postmaster` (a restart), like `pg_keyspace.durability` itself |
 | **Bad entry** | The worker refuses to start and names the entry |
@@ -608,6 +622,12 @@ waiting for the commit.
 SELECT supacache.key_durability('acme:cert:example.com');    -- durable
 SELECT supacache.key_durability('cache:GET:/rest/v1/todos');  -- ephemeral
 ```
+
+A `*:` rule costs a key one extra search for its first `:`, and only on an
+instance that sets one. `bench/run_prefix_match_cost.sh` gates both forms
+under the same budgets; with UUID-length tenant scopes a `*:` miss measured
+about 8 ns/op and a hit 11 to 63 ns/op (1 to 64 rules of each form), against
+2.5 ns and 6 to 50 ns for literal prefixes alone, which are unchanged.
 
 **Provisioned for the strongest tier, not the default one.** The rings, the
 persistence workers and the commit mode follow the strongest tier any rule can

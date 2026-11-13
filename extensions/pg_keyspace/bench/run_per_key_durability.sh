@@ -71,12 +71,14 @@ wait_rows() {
   done
   return 1
 }
-set_overrides() {
-  grep -v "^pg_keyspace.durability_overrides" $PGDATA/postgresql.conf > $PGDATA/conf.tmp
+# Replace one setting in postgresql.conf: set_conf <name> <value>.
+set_conf() {
+  grep -v "^$1 " $PGDATA/postgresql.conf > $PGDATA/conf.tmp
   mv $PGDATA/conf.tmp $PGDATA/postgresql.conf
-  echo "pg_keyspace.durability_overrides = '$1'" >> $PGDATA/postgresql.conf
+  echo "$1 = '$2'" >> $PGDATA/postgresql.conf
   chown postgres:postgres $PGDATA/postgresql.conf
 }
+set_overrides() { set_conf pg_keyspace.durability_overrides "$1"; }
 kv_keys() { Q "SELECT coalesce(string_agg(convert_from(key,'UTF8'), ',' ORDER BY key), '') FROM supacache.kv"; }
 
 echo "=== build + install the extension ==="
@@ -201,10 +203,47 @@ for _ in $(seq 1 30); do grep -q 'durability_overrides is invalid' $PGDATA/log &
 chk "an unparseable spec stops the worker" "1" "$(grep -c 'durability_overrides is invalid' $PGDATA/log)"
 chk "and the message quotes the entry" "1" "$(grep -c 'forever' $PGDATA/log)"
 
-stop_pg immediate; set_overrides "acme:=replicated"; start_pg; wait_ready || true
-for _ in $(seq 1 30); do grep -q "names the 'replicated' tier" $PGDATA/log && break; sleep 1; done
-chk "a replicated tier mixed with others stops the worker" "1" \
-    "$(grep -c "names the 'replicated' tier" $PGDATA/log)"
+# refuses_replicated <overrides> <label>: restart with a fresh log under
+# <overrides> and check the worker refused the mixed `replicated` tier.
+refuses_replicated() {
+  stop_pg immediate; : > $PGDATA/log; chown postgres:postgres $PGDATA/log
+  set_overrides "$1"; start_pg; wait_ready || true
+  for _ in $(seq 1 30); do grep -q "names the 'replicated' tier" $PGDATA/log && break; sleep 1; done
+  chk "$2" "1" "$(grep -c "names the 'replicated' tier" $PGDATA/log)"
+}
+refuses_replicated "acme:=replicated" "a replicated tier mixed with others stops the worker"
+
+echo
+echo "########## 7b. a segment rule names one namespace in every tenant ##########"
+# The Cloud platform shape: every stored key is `{tenant}:...`, so no literal
+# prefix can say "mau: in any tenant". The keys are written here in their
+# stored form by an unscoped connection; forced scoping only prepends
+# `{tenant}:`, and the policy matches the stored bytes either way.
+MAU="t1:mau:org:O:d:2026-11-13"
+stop_pg immediate
+set_conf pg_keyspace.durability durable
+set_overrides "*:mau:=ephemeral"
+start_pg; wait_ready || exit 1; wait_resp || exit 1
+Q "DELETE FROM supacache.kv" >/dev/null
+chk "the tenant's credential resolves to the default" "durable" \
+    "$(Q "SELECT supacache.key_durability('t1:dbcred:g1')")"
+chk "and its MAU day-set to the segment rule" "ephemeral" \
+    "$(Q "SELECT supacache.key_durability('$MAU')")"
+R SET t1:config cfg >/dev/null
+R SET t1:dbcred:g1 secret >/dev/null
+R SADD "$MAU" user-1 user-2 >/dev/null
+wait_rows 2 || echo "  (timed out waiting for the tenant's durable rows)"
+chk "only the durable keys reached supacache.kv" "t1:config,t1:dbcred:g1" "$(kv_keys)"
+stop_pg immediate; start_pg; wait_ready || exit 1; wait_resp || exit 1
+chk "the credential survived kill -9" "secret" "$(R GET t1:dbcred:g1)"
+chk "and so did the config" "cfg" "$(R GET t1:config)"
+chk "the MAU day-set beside them did not" "0" "$(R EXISTS "$MAU")"
+
+# The replicated refusal has to see a segment rule too, or `*:x:=replicated`
+# would start and ack replicated writes that never waited for a standby.
+refuses_replicated "*:x:=replicated" "a replicated segment rule stops the worker"
+# Section 8 is written against the ephemeral default.
+stop_pg immediate; set_conf pg_keyspace.durability ephemeral
 
 echo
 echo "########## 8. it composes with scale-out, in both addressing modes ##########"

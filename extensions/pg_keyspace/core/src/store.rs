@@ -493,7 +493,39 @@ impl TenantUse {
 /// tenant.
 #[inline]
 fn tenant_scope(key: &[u8]) -> Option<&[u8]> {
-    key.iter().position(|b| *b == b':').map(|i| &key[..=i])
+    tenant_scope_len(key).map(|n| &key[..n])
+}
+
+/// The byte that ends a tenant scope in a stored key. Forced scoping writes
+/// `{tenant}:{key}`, so for any tenant without a `:` in its name the first `:`
+/// is exactly the boundary.
+const TENANT_SEP: u8 = b':';
+
+/// Length of `key`'s tenant scope including its `:`, or `None` for a key with
+/// no `:` at all. The one definition of the tenant boundary: eviction budgets
+/// (`tenant_scope`) and per-key durability's `*:` rules both read it, so they
+/// cannot disagree about where a tenant ends.
+///
+/// Every write under a `*:` durability rule pays this, and a UUID tenant puts
+/// the `:` 36 bytes in. `prefix_match_bench` measured a byte-at-a-time search
+/// at ~20 ns of a 25 ns miss budget; libc's `memchr` is vectorised, and libc
+/// is already how this crate reaches the platform.
+#[inline]
+pub(crate) fn tenant_scope_len(key: &[u8]) -> Option<usize> {
+    if key.is_empty() {
+        // An empty slice's pointer is dangling, and C asks for a valid one
+        // even when told to read nothing.
+        return None;
+    }
+    let start = key.as_ptr();
+    // SAFETY: memchr reads at most `key.len()` bytes from `start`, all of
+    // which lie inside the slice, and returns either null or a pointer into
+    // that same range.
+    let hit = unsafe { libc::memchr(start.cast(), TENANT_SEP as libc::c_int, key.len()) };
+    if hit.is_null() {
+        return None;
+    }
+    Some(hit as usize - start as usize + 1)
 }
 
 pub struct Store {
