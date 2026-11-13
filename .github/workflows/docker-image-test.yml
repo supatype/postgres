@@ -499,6 +499,14 @@ jobs:
           POSTGRES_PASSWORD: testpassword
         run: sh tests/role-search-path/check.sh pg_test supatype_admin
 
+      # PostgREST sets one JSON setting, request.jwt.claims. auth.uid() used to read only the
+      # per-claim settings it no longer sets, so it was NULL for every real request on a fresh
+      # database and a rule written on it matched nothing.
+      - name: auth.uid(), auth.role() and auth.email() read request.jwt.claims
+        env:
+          POSTGRES_PASSWORD: testpassword
+        run: sh tests/auth-helpers-jwt-claims/check.sh pg_test supatype_admin
+
       # SEC-SQL / SQ1a: the SQL editor inherits only the project owner, which carries no
       # predefined-role memberships, so it cannot read pg_authid or monitor and signal others.
       - name: The SQL editor has no superuser-adjacent powers

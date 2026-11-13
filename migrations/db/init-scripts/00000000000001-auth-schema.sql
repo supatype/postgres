@@ -92,17 +92,28 @@ VALUES  ('20171026211738'),
 
 -- Gets the User ID from the request cookie
 create or replace function auth.uid() returns uuid as $$
-  select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid;
+  select nullif(
+    case when c is not null then c ->> 'sub' else current_setting('request.jwt.claim.sub', true) end,
+    '')::uuid
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$ language sql stable;
 
 -- Gets the User ID from the request cookie
 create or replace function auth.role() returns text as $$
-  select nullif(current_setting('request.jwt.claim.role', true), '')::text;
+  select case
+    when c is not null then coalesce(c -> 'app_metadata' ->> 'role', c ->> 'role', 'anon')
+    else coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), 'anon')
+  end
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$ language sql stable;
 
 -- Gets the User email
 create or replace function auth.email() returns text as $$
-  select nullif(current_setting('request.jwt.claim.email', true), '')::text;
+  select case
+    when c is not null then coalesce(c ->> 'email', '')
+    else coalesce(nullif(current_setting('request.jwt.claim.email', true), ''), '')
+  end
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$ language sql stable;
 
 -- usage on auth functions to API roles

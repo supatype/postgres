@@ -160,7 +160,11 @@ COMMENT ON EXTENSION "uuid-ossp" IS 'generate universally unique identifiers (UU
 CREATE FUNCTION auth.email() RETURNS text
     LANGUAGE sql STABLE
     AS $$
-  select nullif(current_setting('request.jwt.claim.email', true), '')::text;
+  select case
+    when c is not null then coalesce(c ->> 'email', '')
+    else coalesce(nullif(current_setting('request.jwt.claim.email', true), ''), '')
+  end
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$;
 
 
@@ -171,7 +175,11 @@ $$;
 CREATE FUNCTION auth.role() RETURNS text
     LANGUAGE sql STABLE
     AS $$
-  select nullif(current_setting('request.jwt.claim.role', true), '')::text;
+  select case
+    when c is not null then coalesce(c -> 'app_metadata' ->> 'role', c ->> 'role', 'anon')
+    else coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), 'anon')
+  end
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$;
 
 
@@ -182,7 +190,10 @@ $$;
 CREATE FUNCTION auth.uid() RETURNS uuid
     LANGUAGE sql STABLE
     AS $$
-  select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid;
+  select nullif(
+    case when c is not null then c ->> 'sub' else current_setting('request.jwt.claim.sub', true) end,
+    '')::uuid
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$;
 
 

@@ -32,6 +32,8 @@ BEGIN
         set_config('request.jwt.claim.role', NULL, TRUE);
     PERFORM
         set_config('request.jwt.claim.email', NULL, TRUE);
+    PERFORM
+        set_config('request.jwt.claims', NULL, TRUE);
     RESET ROLE;
 END;
 $$;
@@ -59,6 +61,9 @@ BEGIN
         set_config('request.jwt.claim.role', (auth_user).ROLE, TRUE);
     PERFORM
         set_config('request.jwt.claim.email', (auth_user).email, TRUE);
+    -- What PostgREST sets today; the per-claim settings above are the legacy form.
+    PERFORM
+        set_config('request.jwt.claims', jsonb_build_object('sub', (auth_user).id, 'role', (auth_user).ROLE, 'email', (auth_user).email)::text, TRUE);
     RAISE NOTICE '%', format( 'SET ROLE %I; -- Logging in as %L (%L)', (auth_user).ROLE, (auth_user).id, (auth_user).email);
     EXECUTE format('SET ROLE %I', (auth_user).ROLE);
     RETURN auth_user;
