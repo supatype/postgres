@@ -239,6 +239,18 @@ chk "the credential survived kill -9" "secret" "$(R GET t1:dbcred:g1)"
 chk "and so did the config" "cfg" "$(R GET t1:config)"
 chk "the MAU day-set beside them did not" "0" "$(R EXISTS "$MAU")"
 
+# The boundary a `*:` rule (and the eviction budget) reads is the key's first
+# `:`, so a tenant whose name contains one would be split in the wrong place.
+# set_credential refuses it rather than storing a scope nothing can read
+# correctly. No reload follows, so a row a broken build lets through never
+# turns AUTH on for the sections below; it is deleted either way.
+chk "set_credential refuses a tenant containing ':'" "1" \
+    "$(Q "SELECT supacache.set_credential('colon-user','pw','service_role','a:b')" \
+       | grep -c "tenant 'a:b' contains ':'")"
+chk "and stores no credential for it" "0" \
+    "$(Q "SELECT count(*) FROM supacache.resp_credential WHERE username = 'colon-user'")"
+Q "DELETE FROM supacache.resp_credential WHERE username = 'colon-user'" >/dev/null
+
 # The replicated refusal has to see a segment rule too, or `*:x:=replicated`
 # would start and ack replicated writes that never waited for a standby.
 refuses_replicated "*:x:=replicated" "a replicated segment rule stops the worker"

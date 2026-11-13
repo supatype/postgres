@@ -7116,8 +7116,22 @@ mod supacache {
     /// and picks up the change on `SELECT pg_reload_conf()` (hot reload). Salt is
     /// 128 bits from `gen_random_uuid()`. Use this instead of inserting into
     /// `supacache.resp_credential` directly.
+    ///
+    /// A tenant containing `:` is refused. Keys are stored as `{tenant}:{key}`
+    /// and both the eviction budgets and `*:` durability rules take the first
+    /// `:` as the end of the tenant, so such a tenant would be split in the
+    /// wrong place; `supacache.publish()` refuses one for the same reason.
     #[pg_extern]
     fn set_credential(username: &str, secret: &str, role: &str, tenant: &str) -> bool {
+        if tenant.contains(':') {
+            error!(
+                "supacache.set_credential(): tenant '{tenant}' contains ':', which is the \
+                 tenant prefix separator: keys are stored as '{{tenant}}:{{key}}', and tenant \
+                 eviction budgets and '*:' durability rules both end the tenant at the first \
+                 ':', so this tenant would be split in the wrong place. Choose a tenant name \
+                 without ':'"
+            );
+        }
         store_credential(username, secret, role, tenant)
     }
 

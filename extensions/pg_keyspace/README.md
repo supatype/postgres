@@ -607,7 +607,7 @@ change as tenants come and go.
 | | |
 |---|---|
 | **Matched against** | The key **as stored**: the tenant-scoped `{tenant}:{key}` form when RESP AUTH is configured, so a tenant name is a prefix like any other and per-tenant durability needs no separate setting |
-| **`*:` rules** | `*:seg` matches when the key, after its **first** `:`, starts with `seg`. That boundary is exact: `t1:x:mau:y` does not match `*:mau:`, and neither does an unscoped `mau:x` (its first `:` ends `mau`). A tenant name containing `:` would move the boundary, so give tenants names without one; `supacache.publish()` already refuses such a tenant |
+| **`*:` rules** | `*:seg` matches when the key, after its **first** `:`, starts with `seg`. That boundary is exact: `t1:x:mau:y` does not match `*:mau:`, and neither does an unscoped `mau:x` (its first `:` ends `mau`). A tenant name containing `:` would move the boundary, so `supacache.set_credential()` refuses one, as `supacache.publish()` does |
 | **Overlap** | The longest match wins, so `a:` and `a:b:` can both be set without the answer depending on the order you wrote them in. A `*:` rule counts the tenant scope as part of its match: on `t1:mau:x`, `t1:` covers 3 bytes and `*:mau:` covers 7, so `*:mau:` wins, and `t1:mau:org:` (11) would beat it for that tenant. On a tie the literal prefix wins, because it names the tenant |
 | **Empty** | Identical to not having the setting: one tier for the whole keyspace |
 | **Context** | `postmaster` (a restart), like `pg_keyspace.durability` itself |
