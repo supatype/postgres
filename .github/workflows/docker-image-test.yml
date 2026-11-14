@@ -502,7 +502,7 @@ jobs:
       # PostgREST sets one JSON setting, request.jwt.claims. auth.uid() used to read only the
       # per-claim settings it no longer sets, so it was NULL for every real request on a fresh
       # database and a rule written on it matched nothing.
-      - name: The six auth helpers read request.jwt.claims and are callable by the API roles
+      - name: The seven auth helpers read request.jwt.claims and are callable by the API roles
         env:
           POSTGRES_PASSWORD: testpassword
         run: sh tests/auth-helpers-jwt-claims/check.sh pg_test supatype_admin

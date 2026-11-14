@@ -165,6 +165,17 @@ $$;
 
 
 --
+-- Name: claim_text(text); Type: FUNCTION; Schema: auth; Owner: -
+--
+
+CREATE FUNCTION auth.claim_text(claim_path text) RETURNS text
+    LANGUAGE sql STABLE
+    AS $$
+  select auth.jwt() #>> string_to_array(claim_path, '.');
+$$;
+
+
+--
 -- Name: email(); Type: FUNCTION; Schema: auth; Owner: -
 --
 

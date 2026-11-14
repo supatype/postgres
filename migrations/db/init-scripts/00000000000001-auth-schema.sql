@@ -134,6 +134,11 @@ create or replace function auth.claim(claim_path text) returns jsonb as $$
   select auth.jwt() #> string_to_array(claim_path, '.');
 $$ language sql stable;
 
+-- Gets the same claim as text, for scalar comparisons.
+create or replace function auth.claim_text(claim_path text) returns text as $$
+  select auth.jwt() #>> string_to_array(claim_path, '.');
+$$ language sql stable;
+
 -- Gets the roles claim as a text array.
 create or replace function auth.roles() returns text[] as $$
   select array(

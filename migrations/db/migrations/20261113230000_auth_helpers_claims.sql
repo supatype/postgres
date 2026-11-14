@@ -1,6 +1,6 @@
 -- migrate:up
 
--- All six auth helpers (uid, role, email, jwt, claim, roles) ship with the image and read the
+-- All seven auth helpers (uid, role, email, jwt, claim, claim_text, roles) ship with the image and read the
 -- claims PostgREST sets.
 --
 -- auth.uid, auth.role and auth.email used to read only the legacy per-claim settings, which
@@ -9,7 +9,7 @@
 -- written Supabase-style, and on a project whose owner role cannot create objects in schema auth the
 -- schema engine's push cannot install them. The init script creates all six on a new database; this
 -- brings an existing one up to date, and is safe to run on one that has them. The engine's own
--- definitions of jwt, claim and roles are matched, so a push that replaces them changes nothing.
+-- definitions of jwt, claim, claim_text and roles are matched, so a push that replaces them changes nothing.
 
 -- Gets the User ID from the request cookie
 create or replace function auth.uid() returns uuid as $$
@@ -55,6 +55,11 @@ create or replace function auth.claim(claim_path text) returns jsonb as $$
   select auth.jwt() #> string_to_array(claim_path, '.');
 $$ language sql stable;
 
+-- Gets the same claim as text, for scalar comparisons.
+create or replace function auth.claim_text(claim_path text) returns text as $$
+  select auth.jwt() #>> string_to_array(claim_path, '.');
+$$ language sql stable;
+
 -- Gets the roles claim as a text array.
 create or replace function auth.roles() returns text[] as $$
   select array(
@@ -62,7 +67,7 @@ create or replace function auth.roles() returns text[] as $$
   );
 $$ language sql stable;
 
--- Owned by the same role for all six (see 20211124212715_update-auth-owner). The first three
+-- Owned by the same role for all seven (see 20211124212715_update-auth-owner). The first three
 -- are already moved by that migration on a database that ran it; this covers the rest.
 DO $$
 BEGIN
@@ -97,6 +102,13 @@ BEGIN
     ALTER FUNCTION auth.claim(text) OWNER TO supatype_auth_admin;
 EXCEPTION WHEN OTHERS THEN
     RAISE WARNING 'Error encountered when changing owner of auth.claim to supatype_auth_admin';
+END $$;
+
+DO $$
+BEGIN
+    ALTER FUNCTION auth.claim_text(text) OWNER TO supatype_auth_admin;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'Error encountered when changing owner of auth.claim_text to supatype_auth_admin';
 END $$;
 
 DO $$
