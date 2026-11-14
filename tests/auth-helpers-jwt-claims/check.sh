@@ -1,5 +1,6 @@
 #!/bin/sh
-# Asserts that auth.uid(), auth.role() and auth.email() read the claims PostgREST sets.
+# Asserts that auth.uid(), auth.role(), auth.email(), auth.jwt(), auth.claim() and auth.roles() read the
+# claims PostgREST sets.
 #
 # PostgREST (v10 and later) puts the verified token in one JSON setting, `request.jwt.claims`, and
 # no longer sets the per-claim `request.jwt.claim.sub`, `.role` and `.email` the image's functions
@@ -76,6 +77,57 @@ expect "claims win over the legacy settings when both are set" \
 	"$(claims '{"sub":"'$SUB'"}'); $(legacy sub $OLD_SUB)" "auth.uid()::text" "$SUB"
 expect "claims without a sub do not borrow a stale legacy sub" \
 	"$(claims '{"role":"anon"}'); $(legacy sub $OLD_SUB)" "coalesce(auth.uid()::text, 'null')" "null"
+
+# auth.jwt(), auth.claim(path) and auth.roles() ship with the image too. Row security written
+# Supabase-style calls them, and on a project whose owner cannot create objects in schema auth
+# the engine's push cannot install them. Same sources and the same NULL behaviour as the engine's
+# definitions of them.
+TIER='{"sub":"'$SUB'","role":"authenticated","app_metadata":{"tier":"pro","sites":["a","b"]},"roles":["editor","admin"]}'
+
+expect "auth.jwt, auth.claim and auth.roles exist with the engine's signatures" "SELECT 1" \
+	"(SELECT string_agg(p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' || ' ' || pg_get_function_result(p.oid) || ' ' || p.provolatile::text, ',' ORDER BY p.proname)
+	    FROM pg_proc p WHERE p.pronamespace = 'auth'::regnamespace AND p.proname IN ('jwt', 'claim', 'roles'))" \
+	"claim(claim_path text) jsonb s,jwt() jsonb s,roles() text[] s"
+
+expect "claims: jwt returns the claims" \
+	"$(claims "$TIER")" "auth.jwt() ->> 'sub'" "$SUB"
+expect "claims: claim reads a nested path" \
+	"$(claims "$TIER")" "auth.claim('app_metadata.tier') #>> '{}'" "pro"
+expect "claims: claim keeps an array a jsonb array" \
+	"$(claims "$TIER")" "auth.claim('app_metadata.sites')::text" '["a", "b"]'
+expect "claims: a missing path is NULL" \
+	"$(claims "$TIER")" "coalesce(auth.claim('app_metadata.nope')::text, 'null')" "null"
+expect "claims: roles is the roles claim as a text array" \
+	"$(claims "$TIER")" "auth.roles()::text" "{editor,admin}"
+
+expect "legacy settings: jwt carries sub, role and email" \
+	"$(legacy sub $OLD_SUB); $(legacy role service_role); $(legacy email old@b.dev)" \
+	"(auth.jwt() ->> 'sub') || ' ' || (auth.jwt() ->> 'role') || ' ' || (auth.jwt() ->> 'email')" \
+	"$OLD_SUB service_role old@b.dev"
+expect "legacy settings: claim reads them by name" \
+	"$(legacy role service_role)" "auth.claim('role') #>> '{}'" "service_role"
+expect "claims win over the legacy settings for jwt" \
+	"$(claims '{"sub":"'$SUB'"}'); $(legacy sub $OLD_SUB); $(legacy role service_role)" \
+	"(auth.jwt() ->> 'sub') || ' ' || coalesce(auth.jwt() ->> 'role', 'null')" "$SUB null"
+
+expect "no settings at all: jwt is an empty object" "SELECT 1" "auth.jwt()::text" "{}"
+expect "no settings at all: claim is NULL" "SELECT 1" "coalesce(auth.claim('sub')::text, 'null')" "null"
+expect "no settings at all: roles is the empty array" "SELECT 1" "auth.roles()::text" "{}"
+expect "an empty claims setting reads as anonymous for jwt, claim and roles" \
+	"$(claims '')" "auth.jwt()::text || coalesce(auth.claim('sub')::text, 'null') || auth.roles()::text" "{}null{}"
+
+# The API roles run every query, so they have to be able to call all six.
+for role in anon authenticated; do
+	expect "$role can call all six helpers" \
+		"$(claims "$TIER"); SET LOCAL ROLE $role" \
+		"(auth.uid() IS NOT NULL) AND auth.role() = 'authenticated' AND auth.email() = ''
+		 AND auth.jwt() ? 'sub' AND auth.claim('app_metadata.tier') IS NOT NULL AND auth.roles() = '{editor,admin}'" "t"
+done
+
+# One owner for all six (D14): the image owns the auth helpers.
+expect "all six helpers exist with one owner and one set of grants" "SELECT 1" \
+	"(SELECT count(DISTINCT proowner) || ' owner, ' || count(DISTINCT proacl::text) || ' acl, ' || count(*) || ' functions' FROM pg_proc
+	   WHERE pronamespace = 'auth'::regnamespace AND proname IN ('uid', 'role', 'email', 'jwt', 'claim', 'roles'))" "1 owner, 1 acl, 6 functions"
 
 if [ "$failed" -ne 0 ]; then
 	echo "$failed check(s) failed"
