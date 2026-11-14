@@ -98,7 +98,7 @@ create or replace function auth.uid() returns uuid as $$
   from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$ language sql stable;
 
--- Gets the User ID from the request cookie
+-- Gets the application role
 create or replace function auth.role() returns text as $$
   select case
     when c is not null then coalesce(c -> 'app_metadata' ->> 'role', c ->> 'role', 'anon')
