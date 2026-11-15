@@ -832,6 +832,12 @@ jobs:
       - name: The keyspace refuses every command until AUTH
         run: sh tests/keyspace-auth/check.sh supatype-postgres:test pg_ksauth
 
+      # Run directly under Docker, an image whose PID 1 is postgres restarts itself when a health
+      # check Docker timed out leaves an orphan that exits 2. The script makes orphans two ways and
+      # fails if the server restarts, then checks a clean `docker stop` and no crash recovery after.
+      - name: An orphaned child does not restart the server
+        run: scripts/test-orphan-restart.sh supatype-postgres:test ci-orphan
+
       - name: Show logs on failure
         if: failure()
         run: |
@@ -861,5 +867,6 @@ jobs:
         run: |
           docker rm -f pg_test pg_bootstrap pg_operator pg_v1 pg_v2 pg_keyspace_test pg_rowcache_test pg_rowcache_guard \
             pg_ksconf-on pg_ksconf-readonly || true
+          docker ps -aq --filter name=ci-orphan | xargs -r docker rm -f
           docker volume rm pg_upgrade_vol || true
           exit 0

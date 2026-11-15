@@ -226,10 +226,12 @@ expect "password: pg_keyspace.password_file names the staged file, not the passw
 	"$(sql "$first" 'SHOW pg_keyspace.password_file' 2>&1)"
 expect "password: the staged file is the postgres user's alone" "600 postgres" \
 	"$(docker exec "$first" stat -c '%a %U' "$shm" 2>&1)"
-# PID 1 is the postmaster, which every backend and worker inherits its environment from. Read as
-# postgres: root in the container may not read another user's environ, and an unreadable file would
-# make the count 0 whatever it holds.
-environ=$(docker exec -u postgres "$first" sh -c "tr '\0' '\n' < /proc/1/environ" 2>&1)
+# The postmaster, which every backend and worker inherits its environment from. It is not PID 1:
+# tini is, and keeps the environment the container was created with, password included, so
+# PID 1 is the wrong place to look. The postmaster pid is the first line of postmaster.pid.
+# Read as postgres: root in the container may not read another user's environ, and an unreadable
+# file would make the count 0 whatever it holds.
+environ=$(docker exec -u postgres "$first" sh -c 'tr "\0" "\n" < /proc/$(head -n 1 "$PGDATA/postmaster.pid")/environ' 2>&1)
 case "$environ" in
 	*PATH=*) ok "password: the server's environment can be read" ;;
 	*) fail "password: could not read the server's environment: [$environ]" ;;
