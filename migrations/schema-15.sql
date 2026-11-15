@@ -19,6 +19,13 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
+-- Name: _supatype; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA _supatype;
+
+
+--
 -- Name: auth; Type: SCHEMA; Schema: -; Owner: -
 --
 
