@@ -157,6 +157,10 @@ RUN chmod +x /usr/local/bin/supatype \
              /usr/local/libexec/supatype/keyspace-setup \
              /usr/local/bin/supatype-entrypoint.sh
 
+# Init for PID 1, see ENTRYPOINT below.
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+  && rm -rf /var/lib/apt/lists/*
+
 ENV POSTGRES_USER=supatype_admin
 
 # Over TCP, not the socket: the entrypoint applies pending migrations against a
@@ -168,13 +172,23 @@ ENV POSTGRES_USER=supatype_admin
 # pg_isready asks whether the server answers, not whether the connection would succeed. But at one
 # line every five seconds it is most of what this image's log contains, and it buries anything worth
 # reading. It cost two CI cycles of an unreadable `docker logs --tail` to notice.
-HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
-  CMD pg_isready -h 127.0.0.1 -U supatype_admin -d postgres
+# Exec form, and pg_isready's own -t 2 sits under Docker's 5s timeout. Shell form made dash fork
+# pg_isready; when Docker timed a slow check out it killed the sh and orphaned pg_isready to
+# PID 1. As PID 1 postgres adopts orphans, and Postgres 17 treats an unknown child exiting
+# non-0/1 (pg_isready exits 2 when killed mid-wait) as a crashed backend and restarts the
+# whole server. Exec form has no shell to kill, and the -t makes pg_isready give up first.
+HEALTHCHECK --interval=5s --timeout=5s --retries=10 \
+  CMD ["pg_isready", "-h", "127.0.0.1", "-U", "supatype_admin", "-d", "postgres", "-t", "2"]
 
 EXPOSE 5432
 
 # Overrides the base image's ENTRYPOINT ["docker-entrypoint.sh"]; the wrapper
 # execs into that same script once it has dealt with pending migrations.
-ENTRYPOINT ["/usr/local/bin/supatype-entrypoint.sh"]
+# tini is PID 1 so postgres is not: PID 1 adopts every orphan in the container, and Postgres
+# restarts itself when an adopted child it never forked exits non-0/1 (see HEALTHCHECK above).
+# tini reaps those instead. The wrapper execs all the way down to postgres, so postgres is
+# tini's only child and tini's default of signalling that one child is enough (no -g): SIGTERM
+# and SIGINT reach postgres directly for smart and fast shutdown.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/supatype-entrypoint.sh"]
 
 CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
