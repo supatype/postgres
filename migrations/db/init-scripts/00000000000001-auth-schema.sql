@@ -92,17 +92,58 @@ VALUES  ('20171026211738'),
 
 -- Gets the User ID from the request cookie
 create or replace function auth.uid() returns uuid as $$
-  select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid;
+  select nullif(
+    case when c is not null then c ->> 'sub' else current_setting('request.jwt.claim.sub', true) end,
+    '')::uuid
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$ language sql stable;
 
--- Gets the User ID from the request cookie
+-- Gets the application role
 create or replace function auth.role() returns text as $$
-  select nullif(current_setting('request.jwt.claim.role', true), '')::text;
+  select case
+    when c is not null then coalesce(c -> 'app_metadata' ->> 'role', c ->> 'role', 'anon')
+    else coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), 'anon')
+  end
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$ language sql stable;
 
 -- Gets the User email
 create or replace function auth.email() returns text as $$
-  select nullif(current_setting('request.jwt.claim.email', true), '')::text;
+  select case
+    when c is not null then coalesce(c ->> 'email', '')
+    else coalesce(nullif(current_setting('request.jwt.claim.email', true), ''), '')
+  end
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
+$$ language sql stable;
+
+-- Gets the verified claims: request.jwt.claims, else an object built from the legacy per-claim
+-- settings, else an empty object. An empty claims setting reads as anonymous rather than as a JSON error.
+create or replace function auth.jwt() returns jsonb as $$
+  select coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb,
+    jsonb_strip_nulls(jsonb_build_object(
+      'sub', nullif(current_setting('request.jwt.claim.sub', true), ''),
+      'role', nullif(current_setting('request.jwt.claim.role', true), ''),
+      'email', nullif(current_setting('request.jwt.claim.email', true), '')
+    ))
+  );
+$$ language sql stable;
+
+-- Gets a nested claim by dotted path, e.g. 'app_metadata.tier'. NULL when the path is absent.
+create or replace function auth.claim(claim_path text) returns jsonb as $$
+  select auth.jwt() #> string_to_array(claim_path, '.');
+$$ language sql stable;
+
+-- Gets the same claim as text, for scalar comparisons.
+create or replace function auth.claim_text(claim_path text) returns text as $$
+  select auth.jwt() #>> string_to_array(claim_path, '.');
+$$ language sql stable;
+
+-- Gets the roles claim as a text array.
+create or replace function auth.roles() returns text[] as $$
+  select array(
+    select jsonb_array_elements_text(coalesce(auth.jwt() -> 'roles', '[]'::jsonb))
+  );
 $$ language sql stable;
 
 -- usage on auth functions to API roles

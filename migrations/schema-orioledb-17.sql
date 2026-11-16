@@ -154,13 +154,57 @@ COMMENT ON EXTENSION "uuid-ossp" IS 'generate universally unique identifiers (UU
 
 
 --
+-- Name: claim(text); Type: FUNCTION; Schema: auth; Owner: -
+--
+
+CREATE FUNCTION auth.claim(claim_path text) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+  select auth.jwt() #> string_to_array(claim_path, '.');
+$$;
+
+
+--
+-- Name: claim_text(text); Type: FUNCTION; Schema: auth; Owner: -
+--
+
+CREATE FUNCTION auth.claim_text(claim_path text) RETURNS text
+    LANGUAGE sql STABLE
+    AS $$
+  select auth.jwt() #>> string_to_array(claim_path, '.');
+$$;
+
+
+--
 -- Name: email(); Type: FUNCTION; Schema: auth; Owner: -
 --
 
 CREATE FUNCTION auth.email() RETURNS text
     LANGUAGE sql STABLE
     AS $$
-  select nullif(current_setting('request.jwt.claim.email', true), '')::text;
+  select case
+    when c is not null then coalesce(c ->> 'email', '')
+    else coalesce(nullif(current_setting('request.jwt.claim.email', true), ''), '')
+  end
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
+$$;
+
+
+--
+-- Name: jwt(); Type: FUNCTION; Schema: auth; Owner: -
+--
+
+CREATE FUNCTION auth.jwt() RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+  select coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb,
+    jsonb_strip_nulls(jsonb_build_object(
+      'sub', nullif(current_setting('request.jwt.claim.sub', true), ''),
+      'role', nullif(current_setting('request.jwt.claim.role', true), ''),
+      'email', nullif(current_setting('request.jwt.claim.email', true), '')
+    ))
+  );
 $$;
 
 
@@ -171,7 +215,24 @@ $$;
 CREATE FUNCTION auth.role() RETURNS text
     LANGUAGE sql STABLE
     AS $$
-  select nullif(current_setting('request.jwt.claim.role', true), '')::text;
+  select case
+    when c is not null then coalesce(c -> 'app_metadata' ->> 'role', c ->> 'role', 'anon')
+    else coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), 'anon')
+  end
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
+$$;
+
+
+--
+-- Name: roles(); Type: FUNCTION; Schema: auth; Owner: -
+--
+
+CREATE FUNCTION auth.roles() RETURNS text[]
+    LANGUAGE sql STABLE
+    AS $$
+  select array(
+    select jsonb_array_elements_text(coalesce(auth.jwt() -> 'roles', '[]'::jsonb))
+  );
 $$;
 
 
@@ -182,7 +243,10 @@ $$;
 CREATE FUNCTION auth.uid() RETURNS uuid
     LANGUAGE sql STABLE
     AS $$
-  select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid;
+  select nullif(
+    case when c is not null then c ->> 'sub' else current_setting('request.jwt.claim.sub', true) end,
+    '')::uuid
+  from (select nullif(current_setting('request.jwt.claims', true), '')::jsonb as c) as claims;
 $$;
 
 
