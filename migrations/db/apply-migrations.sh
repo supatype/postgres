@@ -326,6 +326,13 @@ health_checks_sql() {
 		        ELSE (SELECT rolbypassrls FROM pg_roles WHERE rolname = 'supatype_sql_editor')
 		             AND has_table_privilege('supatype_sql_editor', 'auth.users', 'SELECT')
 		             AND has_table_privilege('supatype_sql_editor', 'auth.users', 'UPDATE')
+		   END),
+		  ('20261121120000_sql_editor_reassign_owned.sql',
+		   'the SQL editor can hand what it creates to the database owner',
+		   CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supatype_sql_editor') THEN true
+		        WHEN to_regprocedure('public.supatype_sql_editor_reassign_owned()') IS NULL THEN false
+		        ELSE has_function_privilege('supatype_sql_editor',
+		               to_regprocedure('public.supatype_sql_editor_reassign_owned()'), 'EXECUTE')
 		   END)
 		) AS t(migration, description, ok)
 	SQL

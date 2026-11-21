@@ -528,6 +528,13 @@ jobs:
           POSTGRES_PASSWORD: testpassword
         run: sh tests/editor-auth-dml/check.sh pg_test supatype_admin
 
+      # The editor hands what it creates to the owner through a SECURITY DEFINER function only it
+      # may run, and still cannot SET ROLE into the owner.
+      - name: The SQL editor hands its objects to the owner without SET ROLE
+        env:
+          POSTGRES_PASSWORD: testpassword
+        run: sh tests/editor-reassign/check.sh pg_test supatype_admin
+
       # A cluster made before SQ5 has none of those grants; the migration adds them on the next
       # start. Take them away, forget the migration ran, and restart.
       - name: An existing cluster's SQL editor gets auth and storage rows on its next start
